@@ -483,12 +483,22 @@ management with SSM-state checkpointing at turn boundaries; an
 
 ds4's `edit` tool lets `old` carry a single `[upto]` marker between a head and a
 tail anchor; the tool then replaces everything from head through tail, so the
-model never has to reproduce a long middle section. It is a token-saving device,
-and it costs a lot to make safe. In ds4 it is opt-in behind `--edit-upto`,
-carries roughly thirty lines of prompt explaining how to choose anchors, warns
+model never has to reproduce a long middle section.
+
+**The reason to avoid it is empirical, not aesthetic:** DeepSeek V4 Flash has
+been observed failing on `[upto]` repeatedly in practice. The format is very
+likely out of distribution -- models are trained on ordinary diffs and
+search-and-replace blocks, not on a bespoke anchor marker. ds4's own code
+carries the same signal: the feature is opt-in behind `--edit-upto`, needs
+roughly thirty lines of prompt explaining how to choose anchors, warns
 specifically against generic tails like a bare `}` because they match many
 functions, and ships an `agent_edit_upto_forcer` that injects the marker into
-generation to keep the model using it.
+generation to keep the model using it. A format that has to be forced is a
+format the model does not reach for on its own.
+
+Qwen3.8 has not been tested on it either way, so this is a judgement carried
+over rather than a measurement on this model. Worth revisiting once the agent
+exists and there is something to measure it against.
 
 qwasar takes the ordinary path instead: `edit(path, old, new)` where `old` is a
 contiguous run of lines that must match the file **exactly once**, and is
@@ -497,9 +507,9 @@ guessing. No markers, no anchor heuristics, no generation forcing, and nothing
 to explain in the system prompt beyond "it must match exactly once".
 
 The cost is real and accepted: the model retypes the middle of a large edit, and
-at 5.8 tok/s (§2) those tokens are not free. The trade buys an edit that either
-does exactly what it says or refuses — which matters more for an agent editing
-its own source tree than the tokens do.
+at 5.8 tok/s (§2) those tokens are not free. Slower edits that land are worth
+more than faster edits that misfire, and a format the model already knows needs
+no prompt budget to teach.
 
 ### Milestone 3 — vision
 
