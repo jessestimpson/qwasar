@@ -478,6 +478,29 @@ todo tracking; the XML tool-call parser from §1.4; append-only session
 management with SSM-state checkpointing at turn boundaries; an
 `AGENT.md`-equivalent for project steering.
 
+**File editing: conventional line matching, not ds4's `[upto]`.** *(Directive,
+2026-08-20.)*
+
+ds4's `edit` tool lets `old` carry a single `[upto]` marker between a head and a
+tail anchor; the tool then replaces everything from head through tail, so the
+model never has to reproduce a long middle section. It is a token-saving device,
+and it costs a lot to make safe. In ds4 it is opt-in behind `--edit-upto`,
+carries roughly thirty lines of prompt explaining how to choose anchors, warns
+specifically against generic tails like a bare `}` because they match many
+functions, and ships an `agent_edit_upto_forcer` that injects the marker into
+generation to keep the model using it.
+
+qwasar takes the ordinary path instead: `edit(path, old, new)` where `old` is a
+contiguous run of lines that must match the file **exactly once**, and is
+replaced verbatim by `new`. Ambiguous or absent matches fail rather than
+guessing. No markers, no anchor heuristics, no generation forcing, and nothing
+to explain in the system prompt beyond "it must match exactly once".
+
+The cost is real and accepted: the model retypes the middle of a large edit, and
+at 5.8 tok/s (§2) those tokens are not free. The trade buys an edit that either
+does exactly what it says or refuses — which matters more for an agent editing
+its own source tree than the tokens do.
+
 ### Milestone 3 — vision
 
 Patch embedding, the 27-block SigLIP-style tower with 2D RoPE, spatial-merge
