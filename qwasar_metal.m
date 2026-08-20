@@ -76,6 +76,15 @@ bool qw_gpu_init(char *err, size_t errcap) {
         NSError *nserr = nil;
         NSString *source = [NSString stringWithUTF8String:qwasar_metal_source];
         MTLCompileOptions *opts = [MTLCompileOptions new];
+        /* Tiling constants come from qwasar_gpu.h so the kernel and the host's
+         * dispatch geometry are derived from the same numbers. */
+        opts.preprocessorMacros = @{
+            @"QW_QMM_BM" : @(QW_QMM_BM),
+            @"QW_QMM_BN" : @(QW_QMM_BN),
+            @"QW_QMM_BK" : @(QW_QMM_BK),
+            @"QW_QMM_TM" : @(QW_QMM_TM),
+            @"QW_QMM_TN" : @(QW_QMM_TN),
+        };
         g_library = [g_device newLibraryWithSource:source options:opts error:&nserr];
         if (!g_library) {
             snprintf(err, errcap, "Metal shader compilation failed: %s",
@@ -278,7 +287,7 @@ static void qw_set(id<MTLComputeCommandEncoder> enc, qw_ref r, NSUInteger idx) {
     [enc setBuffer:(__bridge id<MTLBuffer>)r.buf offset:r.off atIndex:idx];
 }
 
-typedef struct { uint32_t k, n, rows; } qw_qmv_args;
+typedef struct { uint32_t k, n, rows; } qw_matmul_args;
 
 void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
@@ -294,7 +303,7 @@ void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
     qw_set(enc, biases, 2);
     qw_set(enc, x, 3);
     qw_set(enc, y, 4);
-    qw_qmv_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)rows };
+    qw_matmul_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)rows };
     [enc setBytes:&args length:sizeof args atIndex:5];
 
     /* One simdgroup per QW_QMV_ROWS output rows; 8 simdgroups per threadgroup
@@ -304,6 +313,45 @@ void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
     MTLSize grid = MTLSizeMake(((NSUInteger)n + per_tg - 1) / per_tg, (NSUInteger)rows, 1);
     MTLSize tg   = MTLSizeMake(32 * nsg, 1, 1);
     [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+}
+
+void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
+                  qw_ref w, qw_ref scales, qw_ref biases,
+                  int32_t k, int32_t n, int32_t rows) {
+    if (!c || !c->enc) return;
+    /* The tile walks K in steps of 32 with no remainder handling; every
+     * projection in this model has k divisible by 64, so refuse loudly rather
+     * than compute a truncated dot product. */
+    if (k % QW_QMM_BK != 0) {
+        fprintf(stderr, "qwasar: qmm needs k divisible by %d, got %d\n", QW_QMM_BK, k);
+        return;
+    }
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_qmm_q4_g64");
+    if (!ps) return;
+
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, w, 0);
+    qw_set(enc, scales, 1);
+    qw_set(enc, biases, 2);
+    qw_set(enc, x, 3);
+    qw_set(enc, y, 4);
+    qw_matmul_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)rows };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+
+    MTLSize grid = MTLSizeMake(((NSUInteger)n + QW_QMM_BN - 1) / QW_QMM_BN,
+                               ((NSUInteger)rows + QW_QMM_BM - 1) / QW_QMM_BM, 1);
+    [enc dispatchThreadgroups:grid
+        threadsPerThreadgroup:MTLSizeMake(QW_QMM_THREADS, 1, 1)];
+}
+
+void qw_op_qmat_q4(qw_cmd c, qw_ref y, qw_ref x,
+                   qw_ref w, qw_ref scales, qw_ref biases,
+                   int32_t k, int32_t n, int32_t rows) {
+    if (rows >= QW_QMM_MIN_ROWS && k % 32 == 0)
+        qw_op_qmm_q4(c, y, x, w, scales, biases, k, n, rows);
+    else
+        qw_op_qmv_q4(c, y, x, w, scales, biases, k, n, rows);
 }
 
 typedef struct { uint32_t dim, rows; float eps, out_scale; uint32_t has_weight; } qw_norm_args;

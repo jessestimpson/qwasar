@@ -220,8 +220,8 @@ static qw_ref qw_off(qw_buf b, size_t elems) { return qw_ref_at(b, elems * 4); }
 
 static void qw_encode_qlinear(qw_cmd c, const qw_qlinear *ql, qw_ref out, qw_ref in,
                               int32_t rows) {
-    qw_op_qmv_q4(c, out, in, qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
-                 qw_tensor_ref(ql->biases), ql->in_features, ql->out_features, rows);
+    qw_op_qmat_q4(c, out, in, qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
+                  qw_tensor_ref(ql->biases), ql->in_features, ql->out_features, rows);
 }
 
 static void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,

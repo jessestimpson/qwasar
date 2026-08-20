@@ -3,13 +3,11 @@
  * Decoding one token reads every weight in the model exactly once, so this
  * kernel is a bandwidth problem, not an arithmetic one: ~14 GB moved per token
  * against ~120 GB/s.  Everything here is arranged around making the weight
- * reads coalesce and never re-reading a byte. */
-
-struct qw_qmv_args {
-    uint k;      /* input features  */
-    uint n;      /* output features */
-    uint rows;   /* tokens in this step */
-};
+ * reads coalesce and never re-reading a byte.
+ *
+ * It dispatches one threadgroup row per token, which is right for decode and
+ * badly wrong for prefill: N tokens would re-read the weights N times.  Prefill
+ * uses qw_qmm_q4_g64 instead, which tiles over tokens. */
 
 /* Output rows handled per simdgroup.  Each activation element is fetched once
  * and reused across all of them, which is what keeps the x traffic negligible
@@ -22,7 +20,7 @@ kernel void qw_qmv_q4_g64(
     device const ushort  *biases  [[buffer(2)]],   /* [n, k/64] bf16 */
     device const float   *x       [[buffer(3)]],   /* [rows, k] */
     device       float   *y       [[buffer(4)]],   /* [rows, n] */
-    constant qw_qmv_args &a       [[buffer(5)]],
+    constant qw_matmul_args &a    [[buffer(5)]],
     uint3 tgid  [[threadgroup_position_in_grid]],
     uint  sgid  [[simdgroup_index_in_threadgroup]],
     uint  nsg   [[simdgroups_per_threadgroup]],

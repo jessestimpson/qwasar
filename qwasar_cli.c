@@ -16,7 +16,7 @@ static void usage(FILE *out) {
         "  -m, --model <dir>     model directory (config.json + *.safetensors)\n"
         "  -c, --context <n>     context size in tokens (default 32768)\n"
         "      --chunk <n>       prefill tokens per forward pass (default 256)\n"
-        "  -n, --predict <n>     tokens to generate (default 128)\n"
+        "  -n, --predict <n>     tokens to generate (default 512)\n"
         "  -p, --prompt <text>   user message\n"
         "  -s, --system <text>   system message\n"
         "      --effort <level>  reasoning effort: xhigh (default), medium, low\n"
@@ -68,7 +68,7 @@ int main(int argc, char **argv) {
     const char *system_text = NULL;
     const char *effort = "xhigh";
     bool thinking = true, show_think = false;
-    int n_predict = 128;
+    int n_predict = 512;   /* xhigh reasoning alone often exceeds 128 */
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -152,10 +152,25 @@ int main(int argc, char **argv) {
     }
     if (n_prompt <= 0) { fprintf(stderr, "qwasar: empty prompt\n"); return 2; }
 
+    /* The first forward pass through a fresh process faults in ~10 GB of
+     * mapped weights, which would otherwise be charged to prefill and make its
+     * reported rate several times worse than the steady-state one.  Pay it here
+     * on a throwaway session so the numbers below mean what they say. */
+    {
+        double tw = now_sec();
+        qwasar_session *warm = qwasar_session_new(e, err, sizeof err);
+        if (warm) {
+            int32_t one = prompt[0];
+            qwasar_session_eval(warm, &one, 1, err, sizeof err);
+            qwasar_session_free(warm);
+        }
+        t_load += now_sec() - tw;
+    }
+
     qwasar_session *s = qwasar_session_new(e, err, sizeof err);
     if (!s) { fprintf(stderr, "qwasar: %s\n", err); return 1; }
 
-    fprintf(stderr, "loaded in %.2fs | prompt %d tokens\n", t_load, n_prompt);
+    fprintf(stderr, "ready in %.2fs | prompt %d tokens\n", t_load, n_prompt);
 
     t0 = now_sec();
     const float *logits = qwasar_session_eval(s, prompt, n_prompt, err, sizeof err);

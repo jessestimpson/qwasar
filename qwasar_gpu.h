@@ -65,10 +65,47 @@ const char *qw_cmd_error(qw_cmd c);
  *   y       F32  [rows, n]
  *
  * `rows` is the token count: 1 while decoding, the chunk size while prefilling.
- */
+ *
+ * qw_op_qmat_q4 is what the graph calls; it picks between the two
+ * implementations by shape.  The matvec reads every weight once per token,
+ * which is optimal at rows = 1 and quadratically wasteful beyond it; the matmul
+ * tiles over tokens so a weight block is read and dequantised once for the
+ * whole tile, but pads its token tile to 64 and so wastes work on small counts.
+ * The others are exposed for tests and benchmarks. */
+void qw_op_qmat_q4(qw_cmd c, qw_ref y, qw_ref x,
+                   qw_ref w, qw_ref scales, qw_ref biases,
+                   int32_t k, int32_t n, int32_t rows);
+
 void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
                   int32_t k, int32_t n, int32_t rows);
+
+void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
+                  qw_ref w, qw_ref scales, qw_ref biases,
+                  int32_t k, int32_t n, int32_t rows);
+
+/* Token count at or above which qw_op_qmat_q4 switches to the tiled matmul.
+ *
+ * Measured: the matmul pads its token tile to QW_QMM_BM and so costs the same
+ * for 1 token as for 64, roughly 2.6 s through the whole model, while the
+ * matvec costs about 0.18 s per token.  They cross a little under 15. */
+#define QW_QMM_MIN_ROWS 16
+
+/* Tiling for qw_qmm_q4_g64.  These are the single source of truth: the host
+ * derives its dispatch geometry from them and injects them into the Metal
+ * compile as preprocessor macros, so the kernel and the launch cannot disagree.
+ *
+ *   threads per threadgroup = (BM/TM) * (BN/TN)
+ *   threadgroup memory      = (BM + BN) * BK * 4 bytes, must stay under 32 KB
+ *   inner-loop ALU:LDS      = TM*TN fused multiply-adds per TM+TN loads
+ *
+ * BK must divide 32 so a packed word never spans two quantisation groups. */
+#define QW_QMM_BM 64
+#define QW_QMM_BN 64
+#define QW_QMM_BK 32
+#define QW_QMM_TM 4
+#define QW_QMM_TN 4
+#define QW_QMM_THREADS ((QW_QMM_BM / QW_QMM_TM) * (QW_QMM_BN / QW_QMM_TN))
 
 /* RMS norm over the last axis of an [rows, dim] fp32 buffer.
  *

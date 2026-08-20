@@ -49,7 +49,10 @@ static double row_rel_err(const qw_qlinear *ql, const float *x, float got, int32
     return mag > 0.0 ? fabs(acc - (double)got) / mag : fabs(acc - (double)got);
 }
 
-static void test_linear(const qw_qlinear *ql, const char *label, int32_t rows) {
+typedef enum { QW_USE_QMV, QW_USE_QMM } qw_impl;
+
+static void test_linear_impl(const qw_qlinear *ql, const char *label, int32_t rows,
+                             qw_impl impl) {
     const int32_t k = ql->in_features, n = ql->out_features;
 
     qw_buf xb = qw_buf_alloc((size_t)rows * k * sizeof(float));
@@ -63,9 +66,14 @@ static void test_linear(const qw_qlinear *ql, const char *label, int32_t rows) {
     memset(y, 0xCD, (size_t)rows * n * sizeof(float));   /* poison, to catch no-ops */
 
     qw_cmd c = qw_cmd_begin();
-    qw_op_qmv_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0),
-                 qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
-                 qw_tensor_ref(ql->biases), k, n, rows);
+    if (impl == QW_USE_QMM)
+        qw_op_qmm_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0),
+                     qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
+                     qw_tensor_ref(ql->biases), k, n, rows);
+    else
+        qw_op_qmv_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0),
+                     qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
+                     qw_tensor_ref(ql->biases), k, n, rows);
     qw_cmd_wait(c);
     CHECK(qw_cmd_error(c) == NULL, "%s: GPU error: %s", label, qw_cmd_error(c));
     qw_cmd_free(c);
@@ -103,12 +111,24 @@ static void test_linear(const qw_qlinear *ql, const char *label, int32_t rows) {
      * k terms, not by the quantisation. */
     CHECK(worst < 2e-6, "%s: worst relative error %.3g at row %d (rows=%d)",
           label, worst, worst_row, rows);
-    printf("  %-28s k=%-6d n=%-7d rows=%d  worst rel err %.2e\n",
-           label, k, n, rows, worst);
+    printf("  %-3s %-24s k=%-6d n=%-7d rows=%-3d  worst rel err %.2e\n",
+           impl == QW_USE_QMM ? "mm" : "mv", label, k, n, rows, worst);
 
     free(scratch);
     qw_buf_free(xb);
     qw_buf_free(yb);
+}
+
+static void test_linear(const qw_qlinear *ql, const char *label, int32_t rows) {
+    test_linear_impl(ql, label, rows, QW_USE_QMV);
+}
+
+/* The two implementations must agree; prefill and decode traverse the same
+ * weights through different kernels, and generation quality would depend on
+ * which path a prompt happened to take. */
+static void test_both(const qw_qlinear *ql, const char *label, int32_t rows) {
+    test_linear_impl(ql, label, rows, QW_USE_QMV);
+    test_linear_impl(ql, label, rows, QW_USE_QMM);
 }
 
 int main(int argc, char **argv) {
@@ -142,6 +162,14 @@ int main(int argc, char **argv) {
         test_linear(&l0->down_proj,   "l0.mlp.down_proj", 1);
         /* Multi-row is the prefill shape; it must give the same answers. */
         test_linear(&l3->k_proj,      "l3.self_attn.k_proj", 3);
+
+        /* The tiled matmul, at sizes that exercise its blocking: exactly one
+         * tile, a ragged token tail, and several full tiles. */
+        test_both(&l3->k_proj,        "l3.self_attn.k_proj", 64);
+        test_both(&l3->k_proj,        "l3.self_attn.k_proj", 7);
+        test_both(&l0->gate_proj,     "l0.mlp.gate_proj", 65);
+        test_both(&l0->down_proj,     "l0.mlp.down_proj", 128);
+        test_both(&l0->in_proj_b,     "l0.linear_attn.in_proj_b", 33);
     }
 
     /* n = 48 is not a multiple of the kernel's 4-rows-per-simdgroup blocking

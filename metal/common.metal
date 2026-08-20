@@ -64,6 +64,15 @@ inline float qw_softplus(float x) {
     return x > 20.0f ? x : log(1.0f + exp(x));
 }
 
+/* Shared by both quantised matrix kernels: qw_qmv_q4_g64 (decode, one row per
+ * dispatch) and qw_qmm_q4_g64 (prefill, tiled over rows).  One definition so
+ * the two cannot drift apart. */
+struct qw_matmul_args {
+    uint k;      /* input features  */
+    uint n;      /* output features */
+    uint rows;   /* tokens in this step */
+};
+
 /* Smoke kernel: proves the library compiled and the queue dispatches. */
 kernel void qw_probe(device float *out       [[buffer(0)]],
                      constant uint &n        [[buffer(1)]],
