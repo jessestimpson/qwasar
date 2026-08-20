@@ -1,0 +1,21 @@
+# build outputs
+qwasar
+qwasar-agent
+qwasar-bench
+*.o
+*.dSYM/
+tools/bin2c
+
+# compiled test binaries, but keep their sources
+tests/test_*
+!tests/test_*.c
+
+# generated: embedded Metal sources (see Makefile / tools/bin2c.c)
+qwasar_metal_src.inc
+.metal_check.metal
+
+# reference implementations, kept locally for study and for generating
+# golden vectors; not part of this project
+reference/
+
+.DS_Store
