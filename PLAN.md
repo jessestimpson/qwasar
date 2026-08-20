@@ -526,8 +526,42 @@ a `maxval` function, it read the file, diagnosed the bug, applied a one-line
 `edit`, rebuilt with `bash`, and confirmed the output. The edit was minimal and
 indentation-preserving.
 
-Still to do: a REPL for multi-turn sessions (today it takes one task and exits),
-todo tracking, and glob.
+The REPL is in: with no task argument it opens a prompt with linenoise history
+and `/help`, `/new`, `/effort`, `/think`, `/yes`, `/ctx`, `/quit`. Prefill shows
+a progress bar in ds4-agent's style, with the rate written into the unfilled run
+of the bar so the line keeps one width. It draws only on a terminal, and only
+above 128 tokens -- a tool result is a few dozen tokens and a bar that appears
+and vanishes is worse than none.
+
+Still to do: todo tracking, glob, and interrupting a running turn.
+
+### Disk KV cache: ds4 has one, qwasar does not
+
+**qwasar has no disk persistence of any kind.** Session state is allocated per
+session and freed at exit, so every run re-prefills from scratch -- including
+the ~900-token system prompt, which is about 26 seconds.
+
+ds4 has a real one in `ds4_kvstore.c`: checkpoints keyed by a SHA1 of the
+*rendered byte prefix* rather than the token sequence, a header carrying token
+count, hit count, context size and timestamps, eviction against a 4 GB budget
+with a six-hour hit half-life, and save reasons that include `AGENT_SYSTEM` and
+`AGENT_SESSION` so the agent can reload both its system prefix and a whole
+conversation.
+
+Two things make this different for qwasar, and both should be settled before
+building it:
+
+- **A checkpoint is not just the KV cache.** 48 of 64 layers are recurrent, so a
+  restorable point needs the conv state and the delta-rule state as well. That
+  is fine -- they are ordinary buffers -- but it changes the size profile
+  sharply. For a 900-token prefix: KV is 57 MB, conv is 2 MB, and the recurrent
+  state is **147 MB regardless of prefix length**. Checkpoints have a large
+  fixed floor and a shallow slope, which is the opposite of a pure-attention
+  model and argues for far fewer, larger checkpoints than ds4 keeps.
+- **Prefix-only reuse is mandatory, not an optimisation.** A recurrent state
+  cannot be truncated, so a checkpoint is usable only when it is a strict prefix
+  of the incoming prompt. ds4's byte-prefix hashing already has exactly this
+  shape, so the key design carries over unchanged.
 
 **File editing: conventional line matching, not ds4's `[upto]`.** *(Directive,
 2026-08-20.)*

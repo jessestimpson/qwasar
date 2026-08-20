@@ -116,6 +116,13 @@ const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32
 
 int32_t qwasar_session_n_past(const qwasar_session *s);
 
+/* Progress during prefill, reported once per chunk.  Prompt processing is the
+ * one part of a turn with no visible output, and on a long prompt it is the
+ * longest part, so callers that face a person should show it something.
+ * Decoding does not report -- its progress is the text appearing. */
+typedef void (*qwasar_progress_fn)(void *ud, int32_t done, int32_t total);
+void qwasar_session_set_progress(qwasar_session *s, qwasar_progress_fn fn, void *ud);
+
 /* Diagnostic: record the residual stream for the final token after each of the
  * given layers, so a divergence can be located rather than just detected.
  * Pass n = 0 to turn off.  Returns false if the capture buffer cannot be sized. */

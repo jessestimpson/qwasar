@@ -35,6 +35,14 @@ Fixed. The comparison `v[i] < best` was tracking the minimum instead of the
 maximum. Rebuilt and ran: mean=2.80 max=5.00
 ```
 
+With no task it opens a REPL instead, with history and `/help`, `/new`,
+`/effort`, `/think`, `/yes`, `/ctx`, `/quit`. Prompt processing shows a progress
+bar, since it is the one part of a turn with nothing to look at:
+
+```
+prefill [▶▶▶▶▶▶▶▶▶▶▶▶▶▶▶▶ 24 tok/s ··] 512/886 58%
+```
+
 Reading runs unattended; writing files and running commands ask first, unless
 `--yes`. If `AGENT.md` exists in the working directory it is added to the system
 prompt as project guidance.
@@ -99,7 +107,8 @@ qwasar.c            config, safetensors mmap, weight table
 qwasar_graph.c      session state and the forward pass
 qwasar_tokenizer.c  byte-level BPE, plus the ChatML template
 qwasar_toolcall.c   tool-call parsing and the line-anchored edit matcher
-qwasar_agent.c      the agent loop and its tools
+qwasar_agent.c      the agent loop, its tools, and the REPL
+linenoise.c         vendored line editing (BSD-2, antirez)
 qwasar_unicode.inc  generated codepoint tables for the pre-tokenizer
 qwasar_metal.m      Metal runtime: device, library, pipelines, dispatch
 qwasar_cpu.c        scalar fp32 reference twins for every kernel

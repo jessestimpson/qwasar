@@ -37,10 +37,11 @@ help:
 qwasar: qwasar_cli.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-qwasar-agent: qwasar_agent.o $(CORE_OBJS)
+qwasar-agent: qwasar_agent.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-qwasar_agent.o: qwasar_agent.c qwasar.h qwasar_toolcall.h
+qwasar_agent.o: qwasar_agent.c qwasar.h qwasar_toolcall.h linenoise.h
+linenoise.o:    linenoise.c linenoise.h
 
 # Kernel sources are embedded rather than read from disk at runtime, so the
 # binary stays relocatable and cannot silently pick up a stale metal/ tree.

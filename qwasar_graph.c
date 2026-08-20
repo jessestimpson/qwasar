@@ -58,6 +58,9 @@ struct qwasar_session {
     qw_buf mlp_gate, mlp_up, mlp_act;            /* mlp */
     qw_buf logits;
 
+    qwasar_progress_fn progress;
+    void              *progress_ud;
+
     /* diagnostic capture (see qwasar_session_set_capture) */
     int32_t *capture_layers;
     int32_t  n_capture;
@@ -191,6 +194,12 @@ void qwasar_session_free(qwasar_session *s) {
 }
 
 int32_t qwasar_session_n_past(const qwasar_session *s) { return s ? s->n_past : 0; }
+
+void qwasar_session_set_progress(qwasar_session *s, qwasar_progress_fn fn, void *ud) {
+    if (!s) return;
+    s->progress = fn;
+    s->progress_ud = ud;
+}
 
 bool qwasar_session_set_capture(qwasar_session *s, const int32_t *layers, int32_t n) {
     free(s->capture_layers);
@@ -389,6 +398,11 @@ const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32
         return NULL;
     }
 
+    /* Only worth reporting when there is a prompt to grind through; a
+     * single-token decode step would just flicker. */
+    const bool report = s->progress && n > 1;
+    if (report) s->progress(s->progress_ud, 0, n);
+
     for (int32_t done = 0; done < n; ) {
         const int32_t rows = (n - done < s->max_rows) ? n - done : s->max_rows;
         const bool last_chunk = (done + rows == n);
@@ -416,6 +430,7 @@ const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32
 
         s->n_past += rows;
         done += rows;
+        if (report) s->progress(s->progress_ud, done, n);
     }
     return qw_buf_contents(s->logits);
 }

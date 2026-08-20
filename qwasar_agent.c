@@ -14,6 +14,7 @@
 
 #include "qwasar.h"
 #include "qwasar_toolcall.h"
+#include "linenoise.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -304,6 +305,68 @@ static void dispatch(const qw_tool_call *c, const agent_cfg *cfg, str *result) {
     else str_printf(result, "error: no tool named '%s'", c->name);
 }
 
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* ---- prefill progress ------------------------------------------------------
+ *
+ * Prompt processing is the one stretch of a turn with nothing to look at, and
+ * on a long conversation it is the longest.  The rate is written into the
+ * unfilled part of the bar, so the line stays one width whether or not there is
+ * a number to show yet -- a trick worth stealing from ds4-agent. */
+
+#define AGENT_BAR_WIDTH 28
+
+/* Below this the prompt is processed faster than the eye can follow, and a bar
+ * that appears and vanishes is worse than no bar.  A tool result is usually a
+ * few dozen tokens; a conversation being reloaded is thousands. */
+#define AGENT_BAR_MIN_TOKENS 128
+
+typedef struct {
+    double  started;
+    int32_t last_done;
+} progress_state;
+
+static void progress_cb(void *ud, int32_t done, int32_t total) {
+    progress_state *ps = ud;
+    /* The bar redraws in place, which needs a terminal; piped output would
+     * otherwise collect one line per chunk. */
+    if (total < AGENT_BAR_MIN_TOKENS || !isatty(STDERR_FILENO)) return;
+    if (done == 0) { ps->started = now_sec(); ps->last_done = 0; return; }
+
+    const double elapsed = now_sec() - ps->started;
+    const double tps = elapsed > 0.0 ? (double)done / elapsed : 0.0;
+
+    char rate[24] = "";
+    if (tps > 0.0) snprintf(rate, sizeof rate, " %.0f tok/s ", tps);
+    const size_t rate_len = strlen(rate);
+
+    const int filled = total > 0 ? (int)(((long long)done * AGENT_BAR_WIDTH) / total) : 0;
+
+    char bar[AGENT_BAR_WIDTH * 4 + 1];
+    size_t pos = 0;
+    for (int i = 0; i < AGENT_BAR_WIDTH; i++) {
+        const char *cell;
+        if (i < filled)                                        cell = "\u25b6";
+        else if (rate_len && (size_t)(i - filled) < rate_len) { char c[2] = { rate[i - filled], 0 };
+                                                                memcpy(bar + pos, c, 1); pos += 1; continue; }
+        else                                                    cell = "\u00b7";
+        size_t n = strlen(cell);
+        memcpy(bar + pos, cell, n);
+        pos += n;
+    }
+    bar[pos] = 0;
+
+    fprintf(stderr, "\r  prefill [%s] %d/%d %.0f%%   ",
+            bar, done, total, 100.0 * (double)done / (double)(total > 0 ? total : 1));
+    if (done >= total) fprintf(stderr, "\r%*s\r", AGENT_BAR_WIDTH + 32, "");
+    fflush(stderr);
+    ps->last_done = done;
+}
+
 /* ---- generation ------------------------------------------------------------ */
 
 typedef struct {
@@ -393,122 +456,45 @@ static bool generate(qwasar_engine *e, qwasar_session *s, const qwasar_tokenizer
     return true;
 }
 
-/* ---- loop ------------------------------------------------------------------ */
+/* ---- session ---------------------------------------------------------------- */
 
-static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+typedef struct {
+    qwasar_engine       *e;
+    qwasar_tokenizer    *tok;
+    qwasar_session      *s;
+    qwasar_chat_options  chat;
+    agent_cfg            cfg;
+    progress_state       prog;
+    const char          *guidance;
+} agent;
+
+static bool agent_open_session(agent *a, char *err, size_t errcap) {
+    if (a->s) qwasar_session_free(a->s);
+    a->s = qwasar_session_new(a->e, err, errcap);
+    if (!a->s) return false;
+    qwasar_session_set_progress(a->s, progress_cb, &a->prog);
+    return true;
 }
 
-static void usage(FILE *out) {
-    fprintf(out,
-        "qwasar-agent -- an agentic loop on Qwen3.8\n"
-        "\n"
-        "usage: qwasar-agent -m <model-dir> [options] [task...]\n"
-        "\n"
-        "  -m, --model <dir>    model directory\n"
-        "  -C, --chdir <dir>    work in this directory\n"
-        "  -c, --context <n>    context size in tokens (default 32768)\n"
-        "  -y, --yes            do not ask before writing files or running commands\n"
-        "      --steps <n>      maximum tool calls per task (default 24)\n"
-        "  -n, --predict <n>    maximum tokens per turn (default 2048)\n"
-        "      --effort <lvl>   reasoning effort: xhigh (default), medium, low\n"
-        "      --show-think     print the reasoning block\n"
-        "  -h, --help           this message\n"
-        "\n"
-        "Tools: read, write, edit, list, grep, bash.  Reading runs unattended;\n"
-        "writing and running commands ask first unless --yes.\n"
-        "If AGENT.md exists in the working directory it is added to the system\n"
-        "prompt as project guidance.\n");
-}
-
-int main(int argc, char **argv) {
-    qwasar_options opts = { 0 };
-    agent_cfg cfg = { .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 2048 };
-    const char *effort = "xhigh";
-    const char *workdir = NULL;
-    str task = { 0 };
-
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if ((!strcmp(a, "-m") || !strcmp(a, "--model")) && i + 1 < argc) opts.model_path = argv[++i];
-        else if ((!strcmp(a, "-C") || !strcmp(a, "--chdir")) && i + 1 < argc) workdir = argv[++i];
-        else if ((!strcmp(a, "-c") || !strcmp(a, "--context")) && i + 1 < argc) opts.context_size = atoi(argv[++i]);
-        else if (!strcmp(a, "-y") || !strcmp(a, "--yes")) cfg.yes = true;
-        else if (!strcmp(a, "--steps") && i + 1 < argc) cfg.max_steps = atoi(argv[++i]);
-        else if ((!strcmp(a, "-n") || !strcmp(a, "--predict")) && i + 1 < argc) cfg.max_tokens = atoi(argv[++i]);
-        else if (!strcmp(a, "--effort") && i + 1 < argc) effort = argv[++i];
-        else if (!strcmp(a, "--show-think")) cfg.show_think = true;
-        else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
-        else if (a[0] == '-') { fprintf(stderr, "qwasar-agent: unknown argument '%s'\n\n", a); usage(stderr); return 2; }
-        else { if (task.len) str_puts(&task, " "); str_puts(&task, a); }
-    }
-
-    if (!opts.model_path) { fprintf(stderr, "qwasar-agent: -m/--model is required\n\n"); usage(stderr); return 2; }
-    if (!task.len) { fprintf(stderr, "qwasar-agent: give it a task\n\n"); usage(stderr); return 2; }
-    if (workdir && chdir(workdir) != 0) {
-        fprintf(stderr, "qwasar-agent: cannot enter %s: %s\n", workdir, strerror(errno));
-        return 1;
-    }
-
-    char err[512] = "";
-    double t0 = now_sec();
-    qwasar_engine *e = qwasar_engine_load(&opts, err, sizeof err);
-    if (!e) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
-
-    qwasar_tokenizer *tok = qwasar_tokenizer_load(opts.model_path, err, sizeof err);
-    if (!tok) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
-
-    /* Project guidance, if the repository provides any. */
-    str guidance = { 0 };
-    str_puts(&guidance,
-             "You are qwasar-agent, working in the user's current directory. "
-             "Use the tools to inspect and change real files. Prefer edit over "
-             "write for existing files. Check your work when you are done.");
-    str agentmd = { 0 };
-    if (read_file("AGENT.md", &agentmd) && agentmd.len) {
-        str_puts(&guidance, "\n\nProject guidance from AGENT.md:\n\n");
-        str_add(&guidance, agentmd.p, agentmd.len);
-    }
-    str_free(&agentmd);
-
-    qwasar_chat_options chat = {
-        .enable_thinking = true,
-        .reasoning_effort = effort,
-        .add_generation_prompt = true,
-        .tools = AGENT_TOOLS,
-        .n_tools = AGENT_N_TOOLS,
-    };
-
-    qwasar_message msgs[2] = {
-        { "system", guidance.p, NULL },
-        { "user",   task.p,     NULL },
-    };
-    int32_t n_prompt = 0;
-    int32_t *prompt = qwasar_apply_chat_template(tok, msgs, 2, &chat, &n_prompt, err, sizeof err);
-    if (!prompt) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
-
-    qwasar_session *s = qwasar_session_new(e, err, sizeof err);
-    if (!s) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
-
-    fprintf(stderr, "loaded in %.1fs | %d tools | prompt %d tokens\n",
-            now_sec() - t0, AGENT_N_TOOLS, n_prompt);
-
+/* Runs one task to completion: generate, and while the model asks for a tool,
+ * run it and hand the result back.  `prompt` is consumed. */
+static bool agent_run(agent *a, int32_t *prompt, int32_t n_prompt,
+                      char *err, size_t errcap) {
     int step = 0;
     for (;;) {
         turn t;
-        if (!generate(e, s, tok, &cfg, prompt, n_prompt, &t, err, sizeof err)) {
-            fprintf(stderr, "\nqwasar-agent: %s\n", err);
-            return 1;
+        if (!generate(a->e, a->s, a->tok, &a->cfg, prompt, n_prompt, &t, err, errcap)) {
+            free(prompt);
+            return false;
         }
         free(prompt);
         prompt = NULL;
 
         if (!t.has_call) {
             printf("\n");
+            fflush(stdout);
             turn_free(&t);
-            break;
+            return true;
         }
 
         qw_tool_calls calls;
@@ -524,38 +510,256 @@ int main(int argc, char **argv) {
             for (int i = 0; i < n; i++) {
                 const char *on = isatty(STDERR_FILENO) ? "\033[1;36m" : "";
                 const char *off = isatty(STDERR_FILENO) ? "\033[0m" : "";
-                fprintf(stderr, "\n  %s%s%s", on, calls.calls[i].name, off);
+                fprintf(stderr, "  %s%s%s", on, calls.calls[i].name, off);
                 for (int j = 0; j < calls.calls[i].n_params; j++) {
                     const char *v = calls.calls[i].params[j].value;
-                    size_t vl = strlen(v);
-                    fprintf(stderr, " %s=%.60s%s", calls.calls[i].params[j].key,
-                            v, vl > 60 ? "..." : "");
+                    fprintf(stderr, " %s=%.50s%s", calls.calls[i].params[j].key,
+                            v, strlen(v) > 50 ? "..." : "");
                 }
                 fprintf(stderr, "\n");
                 if (i) str_puts(&result, "\n");
-                dispatch(&calls.calls[i], &cfg, &result);
+                dispatch(&calls.calls[i], &a->cfg, &result);
             }
         }
         qw_tool_calls_free(&calls);
+        turn_free(&t);
 
-        if (++step >= cfg.max_steps) {
-            fprintf(stderr, "\nqwasar-agent: stopping after %d tool calls\n", step);
+        if (++step >= a->cfg.max_steps) {
+            fprintf(stderr, "  [stopped after %d tool calls]\n", step);
             str_free(&result);
-            turn_free(&t);
-            break;
+            return true;
         }
 
-        prompt = qwasar_render_tool_result(tok, result.p ? result.p : "", &chat, &n_prompt);
+        prompt = qwasar_render_tool_result(a->tok, result.p ? result.p : "",
+                                           &a->chat, &n_prompt);
         str_free(&result);
-        turn_free(&t);
-        if (!prompt) { fprintf(stderr, "\nqwasar-agent: cannot render the tool result\n"); return 1; }
+        if (!prompt) {
+            snprintf(err, errcap, "cannot render the tool result");
+            return false;
+        }
+    }
+}
+
+/* ---- repl ------------------------------------------------------------------- */
+
+static void repl_help(void) {
+    printf("  /help            this message\n"
+           "  /new             start a fresh conversation\n"
+           "  /effort <level>  xhigh, medium or low\n"
+           "  /think           show or hide the reasoning block\n"
+           "  /yes             toggle asking before writes and commands\n"
+           "  /ctx             context used\n"
+           "  /quit            leave\n");
+}
+
+/* Returns false when the command asked to quit. */
+static bool repl_command(agent *a, const char *line, bool *handled) {
+    *handled = true;
+    if (!strcmp(line, "/quit") || !strcmp(line, "/exit")) return false;
+    if (!strcmp(line, "/help")) { repl_help(); return true; }
+    if (!strcmp(line, "/ctx")) {
+        printf("  %d tokens used\n", qwasar_session_n_past(a->s));
+        return true;
+    }
+    if (!strcmp(line, "/think")) {
+        a->cfg.show_think = !a->cfg.show_think;
+        printf("  reasoning block %s\n", a->cfg.show_think ? "shown" : "hidden");
+        return true;
+    }
+    if (!strcmp(line, "/yes")) {
+        a->cfg.yes = !a->cfg.yes;
+        printf("  %s before writes and commands\n",
+               a->cfg.yes ? "no longer asking" : "asking");
+        return true;
+    }
+    if (!strncmp(line, "/effort", 7)) {
+        const char *lvl = line + 7;
+        while (*lvl == ' ') lvl++;
+        if (!strcmp(lvl, "xhigh") || !strcmp(lvl, "medium") || !strcmp(lvl, "low")) {
+            a->chat.reasoning_effort = !strcmp(lvl, "low")    ? "low"
+                                     : !strcmp(lvl, "medium") ? "medium" : "xhigh";
+            /* The effort instruction lives in the system turn, which is already
+             * in the cache; it only takes effect on a fresh conversation. */
+            printf("  effort will be %s from the next /new\n", a->chat.reasoning_effort);
+        } else {
+            printf("  effort must be xhigh, medium or low\n");
+        }
+        return true;
+    }
+    if (!strcmp(line, "/new")) { *handled = false; return true; }   /* caller resets */
+    printf("  unknown command; try /help\n");
+    return true;
+}
+
+static void usage(FILE *out) {
+    fprintf(out,
+        "qwasar-agent -- an agentic loop on Qwen3.8\n"
+        "\n"
+        "usage: qwasar-agent -m <model-dir> [options] [task...]\n"
+        "\n"
+        "With a task it runs once and exits.  With no task it opens a REPL.\n"
+        "\n"
+        "  -m, --model <dir>    model directory\n"
+        "  -C, --chdir <dir>    work in this directory\n"
+        "  -c, --context <n>    context size in tokens (default 32768)\n"
+        "  -y, --yes            do not ask before writing files or running commands\n"
+        "  -i, --interactive    open the REPL after running the task\n"
+        "      --steps <n>      maximum tool calls per task (default 24)\n"
+        "  -n, --predict <n>    maximum tokens per turn (default 2048)\n"
+        "      --effort <lvl>   reasoning effort: xhigh (default), medium, low\n"
+        "      --show-think     print the reasoning block\n"
+        "  -h, --help           this message\n"
+        "\n"
+        "Tools: read, write, edit, list, grep, bash.  Reading runs unattended;\n"
+        "writing and running commands ask first unless --yes.\n"
+        "If AGENT.md exists in the working directory it is added to the system\n"
+        "prompt as project guidance.\n");
+}
+
+int main(int argc, char **argv) {
+    qwasar_options opts = { 0 };
+    agent a = { 0 };
+    a.cfg = (agent_cfg){ .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 2048 };
+    const char *effort = "xhigh";
+    const char *workdir = NULL;
+    bool interactive = false;
+    str task = { 0 };
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if ((!strcmp(arg, "-m") || !strcmp(arg, "--model")) && i + 1 < argc) opts.model_path = argv[++i];
+        else if ((!strcmp(arg, "-C") || !strcmp(arg, "--chdir")) && i + 1 < argc) workdir = argv[++i];
+        else if ((!strcmp(arg, "-c") || !strcmp(arg, "--context")) && i + 1 < argc) opts.context_size = atoi(argv[++i]);
+        else if (!strcmp(arg, "-y") || !strcmp(arg, "--yes")) a.cfg.yes = true;
+        else if (!strcmp(arg, "-i") || !strcmp(arg, "--interactive")) interactive = true;
+        else if (!strcmp(arg, "--steps") && i + 1 < argc) a.cfg.max_steps = atoi(argv[++i]);
+        else if ((!strcmp(arg, "-n") || !strcmp(arg, "--predict")) && i + 1 < argc) a.cfg.max_tokens = atoi(argv[++i]);
+        else if (!strcmp(arg, "--effort") && i + 1 < argc) effort = argv[++i];
+        else if (!strcmp(arg, "--show-think")) a.cfg.show_think = true;
+        else if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) { usage(stdout); return 0; }
+        else if (arg[0] == '-') { fprintf(stderr, "qwasar-agent: unknown argument '%s'\n\n", arg); usage(stderr); return 2; }
+        else { if (task.len) str_puts(&task, " "); str_puts(&task, arg); }
     }
 
-    free(prompt);
+    if (!opts.model_path) { fprintf(stderr, "qwasar-agent: -m/--model is required\n\n"); usage(stderr); return 2; }
+    if (workdir && chdir(workdir) != 0) {
+        fprintf(stderr, "qwasar-agent: cannot enter %s: %s\n", workdir, strerror(errno));
+        return 1;
+    }
+    if (!task.len) interactive = true;
+
+    char err[512] = "";
+    double t0 = now_sec();
+    a.e = qwasar_engine_load(&opts, err, sizeof err);
+    if (!a.e) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
+    a.tok = qwasar_tokenizer_load(opts.model_path, err, sizeof err);
+    if (!a.tok) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
+
+    str guidance = { 0 };
+    str_puts(&guidance,
+             "You are qwasar-agent, working in the user's current directory. "
+             "Use the tools to inspect and change real files. Prefer edit over "
+             "write for existing files. Check your work when you are done.");
+    str agentmd = { 0 };
+    if (read_file("AGENT.md", &agentmd) && agentmd.len) {
+        str_puts(&guidance, "\n\nProject guidance from AGENT.md:\n\n");
+        str_add(&guidance, agentmd.p, agentmd.len);
+    }
+    str_free(&agentmd);
+
+    a.chat = (qwasar_chat_options){
+        .enable_thinking = true,
+        .reasoning_effort = effort,
+        .add_generation_prompt = true,
+        .tools = AGENT_TOOLS,
+        .n_tools = AGENT_N_TOOLS,
+    };
+    a.guidance = guidance.p;
+
+    if (!agent_open_session(&a, err, sizeof err)) {
+        fprintf(stderr, "qwasar-agent: %s\n", err);
+        return 1;
+    }
+    fprintf(stderr, "loaded in %.1fs | %d tools | %s\n", now_sec() - t0, AGENT_N_TOOLS,
+            a.cfg.yes ? "not asking before writes" : "asking before writes");
+
+    bool fresh = true;   /* the next turn must render the system prompt */
+    int rc = 0;
+
+    /* One-shot task, if given. */
+    if (task.len) {
+        qwasar_message msgs[2] = {
+            { "system", a.guidance, NULL },
+            { "user",   task.p,     NULL },
+        };
+        int32_t n = 0;
+        int32_t *p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
+        if (!p) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
+        fresh = false;
+        if (!agent_run(&a, p, n, err, sizeof err)) {
+            fprintf(stderr, "qwasar-agent: %s\n", err);
+            rc = 1;
+        }
+    }
+
+    if (interactive && rc == 0) {
+        printf("\nqwasar-agent. /help for commands, /quit to leave.\n\n");
+        linenoiseHistorySetMaxLen(500);
+        for (;;) {
+            char *line = linenoise("\033[1;32m>\033[0m ");
+            if (!line) break;                      /* ctrl-D */
+            if (!*line) { linenoiseFree(line); continue; }
+            linenoiseHistoryAdd(line);
+
+            if (line[0] == '/') {
+                bool handled = true;
+                bool keep = repl_command(&a, line, &handled);
+                if (!keep) { linenoiseFree(line); break; }
+                if (handled) { linenoiseFree(line); continue; }
+                /* /new: drop the conversation and start over. */
+                if (!agent_open_session(&a, err, sizeof err)) {
+                    fprintf(stderr, "qwasar-agent: %s\n", err);
+                    linenoiseFree(line);
+                    rc = 1;
+                    break;
+                }
+                fresh = true;
+                printf("  new conversation\n");
+                linenoiseFree(line);
+                continue;
+            }
+
+            int32_t n = 0;
+            int32_t *p;
+            if (fresh) {
+                qwasar_message msgs[2] = {
+                    { "system", a.guidance, NULL },
+                    { "user",   line,       NULL },
+                };
+                p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
+                fresh = false;
+            } else {
+                p = qwasar_render_user_turn(a.tok, line, &a.chat, &n);
+                if (!p) snprintf(err, sizeof err, "cannot render the turn");
+            }
+            linenoiseFree(line);
+            if (!p) { fprintf(stderr, "qwasar-agent: %s\n", err); rc = 1; break; }
+
+            if (!agent_run(&a, p, n, err, sizeof err)) {
+                /* Running out of context is a normal end to a long conversation,
+                 * not a crash: say so and let /new carry on. */
+                fprintf(stderr, "qwasar-agent: %s\n", err);
+                if (strstr(err, "context exhausted"))
+                    fprintf(stderr, "  use /new to start over\n");
+                else { rc = 1; break; }
+            }
+        }
+    }
+
     str_free(&task);
     str_free(&guidance);
-    qwasar_session_free(s);
-    qwasar_tokenizer_free(tok);
-    qwasar_engine_free(e);
-    return 0;
+    qwasar_session_free(a.s);
+    qwasar_tokenizer_free(a.tok);
+    qwasar_engine_free(a.e);
+    return rc;
 }
