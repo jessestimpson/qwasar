@@ -17,13 +17,15 @@ static void usage(FILE *out) {
         "  -c, --context <n>     context size in tokens (default 32768)\n"
         "      --chunk <n>       prefill tokens per forward pass (default 256)\n"
         "  -n, --predict <n>     tokens to generate (default 128)\n"
-        "      --tokens <ids>    comma-separated prompt token ids\n"
+        "  -p, --prompt <text>   user message\n"
+        "  -s, --system <text>   system message\n"
+        "      --effort <level>  reasoning effort: xhigh (default), medium, low\n"
+        "      --no-think        skip the reasoning block\n"
+        "      --show-think      print the reasoning block (hidden by default)\n"
+        "      --tokens <ids>    comma-separated prompt token ids, instead of -p\n"
         "      --info            print the parsed architecture and exit\n"
         "  -v, --verbose         verbose loading\n"
-        "  -h, --help            this message\n"
-        "\n"
-        "BPE encoding is not wired up yet, so prompts are given as token ids\n"
-        "via --tokens.  Generated text is decoded and streamed.\n");
+        "  -h, --help            this message\n");
 }
 
 static double now_sec(void) {
@@ -62,6 +64,10 @@ int main(int argc, char **argv) {
     qwasar_options opts = { 0 };
     bool want_info = false;
     const char *token_spec = NULL;
+    const char *prompt_text = NULL;
+    const char *system_text = NULL;
+    const char *effort = "xhigh";
+    bool thinking = true, show_think = false;
     int n_predict = 128;
 
     for (int i = 1; i < argc; i++) {
@@ -74,6 +80,16 @@ int main(int argc, char **argv) {
             opts.prefill_chunk = atoi(argv[++i]);
         } else if ((!strcmp(a, "-n") || !strcmp(a, "--predict")) && i + 1 < argc) {
             n_predict = atoi(argv[++i]);
+        } else if ((!strcmp(a, "-p") || !strcmp(a, "--prompt")) && i + 1 < argc) {
+            prompt_text = argv[++i];
+        } else if ((!strcmp(a, "-s") || !strcmp(a, "--system")) && i + 1 < argc) {
+            system_text = argv[++i];
+        } else if (!strcmp(a, "--effort") && i + 1 < argc) {
+            effort = argv[++i];
+        } else if (!strcmp(a, "--no-think")) {
+            thinking = false;
+        } else if (!strcmp(a, "--show-think")) {
+            show_think = true;
         } else if (!strcmp(a, "--tokens") && i + 1 < argc) {
             token_spec = argv[++i];
         } else if (!strcmp(a, "--info")) {
@@ -108,8 +124,8 @@ int main(int argc, char **argv) {
         qw_gpu_shutdown();
         return 0;
     }
-    if (!token_spec) {
-        fprintf(stderr, "qwasar: nothing to do; pass --tokens or --info\n");
+    if (!token_spec && !prompt_text) {
+        fprintf(stderr, "qwasar: nothing to do; pass -p, --tokens, or --info\n");
         qwasar_engine_free(e);
         qw_gpu_shutdown();
         return 2;
@@ -119,8 +135,22 @@ int main(int argc, char **argv) {
     if (!tok) { fprintf(stderr, "qwasar: %s\n", err); return 1; }
 
     int32_t n_prompt = 0;
-    int32_t *prompt = parse_tokens(token_spec, &n_prompt);
-    if (n_prompt <= 0) { fprintf(stderr, "qwasar: no prompt tokens parsed\n"); return 2; }
+    int32_t *prompt = NULL;
+    if (token_spec) {
+        prompt = parse_tokens(token_spec, &n_prompt);
+    } else {
+        qwasar_message msgs[2];
+        int32_t n_msgs = 0;
+        if (system_text) msgs[n_msgs++] = (qwasar_message){ "system", system_text, NULL };
+        msgs[n_msgs++] = (qwasar_message){ "user", prompt_text, NULL };
+        qwasar_chat_options chat = { .enable_thinking = thinking,
+                                     .reasoning_effort = effort,
+                                     .add_generation_prompt = true };
+        prompt = qwasar_apply_chat_template(tok, msgs, n_msgs, &chat, &n_prompt,
+                                            err, sizeof err);
+        if (!prompt) { fprintf(stderr, "qwasar: %s\n", err); return 1; }
+    }
+    if (n_prompt <= 0) { fprintf(stderr, "qwasar: empty prompt\n"); return 2; }
 
     qwasar_session *s = qwasar_session_new(e, err, sizeof err);
     if (!s) { fprintf(stderr, "qwasar: %s\n", err); return 1; }
@@ -133,17 +163,27 @@ int main(int argc, char **argv) {
     double t_prefill = now_sec() - t0;
 
     const int32_t vocab = qwasar_vocab_size(e);
+    const int32_t think_close = qwasar_token_id(tok, "</think>");
     int generated = 0;
     double t_decode = 0.0;
+
+    /* The generation prompt leaves <think> open, so everything up to </think>
+     * is reasoning.  Hidden unless asked for, but always consumed. */
+    bool in_reasoning = thinking && !token_spec;
 
     for (; generated < n_predict; generated++) {
         int32_t next = argmax(logits, vocab);
         if (qwasar_is_eos(e, next)) break;
 
-        size_t len = 0;
-        bool special = false;
-        const char *text = qwasar_token_bytes(tok, next, &len, &special);
-        if (text && len) { fwrite(text, 1, len, stdout); fflush(stdout); }
+        if (next == think_close && in_reasoning) {
+            in_reasoning = false;
+            if (show_think) printf("\n--- answer ---\n");
+        } else if (!in_reasoning || show_think) {
+            size_t len = 0;
+            bool special = false;
+            const char *text = qwasar_token_bytes(tok, next, &len, &special);
+            if (text && len && !special) { fwrite(text, 1, len, stdout); fflush(stdout); }
+        }
 
         double t1 = now_sec();
         logits = qwasar_session_eval(s, &next, 1, err, sizeof err);

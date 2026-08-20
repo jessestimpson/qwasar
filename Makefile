@@ -49,7 +49,7 @@ qwasar_metal.o: qwasar_metal.m qwasar_gpu.h qwasar_metal_src.inc
 
 qwasar.o:      qwasar.c qwasar.h qwasar_gpu.h qwasar_json.h qwasar_model.h
 qwasar_graph.o: qwasar_graph.c qwasar.h qwasar_gpu.h qwasar_model.h
-qwasar_tokenizer.o: qwasar_tokenizer.c qwasar.h qwasar_json.h
+qwasar_tokenizer.o: qwasar_tokenizer.c qwasar.h qwasar_json.h qwasar_unicode.inc
 qwasar_cpu.o:  qwasar_cpu.c qwasar_model.h
 qwasar_json.o: qwasar_json.c qwasar_json.h
 qwasar_cli.o:  qwasar_cli.c qwasar.h qwasar_gpu.h
@@ -59,7 +59,8 @@ qwasar_cli.o:  qwasar_cli.c qwasar.h qwasar_gpu.h
 
 QWASAR_TEST_MODEL ?= $(HOME)/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit
 
-TESTS := tests/test_json tests/test_qmv tests/test_ops tests/test_gdn tests/test_attn tests/test_forward
+TESTS := tests/test_json tests/test_tokenizer tests/test_qmv tests/test_ops \
+         tests/test_gdn tests/test_attn tests/test_forward
 
 tests/test_json: tests/test_json.c qwasar_json.o qwasar_json.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_json.c qwasar_json.o $(LDLIBS)
@@ -78,6 +79,9 @@ tests/test_attn: tests/test_attn.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_mod
 
 tests/test_forward: tests/test_forward.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_forward.c $(CORE_OBJS) $(LDLIBS)
+
+tests/test_tokenizer: tests/test_tokenizer.c $(CORE_OBJS) qwasar.h qwasar_json.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_tokenizer.c $(CORE_OBJS) $(LDLIBS)
 
 test: $(TESTS)
 	@for t in $(TESTS); do echo "== $$t"; \

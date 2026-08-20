@@ -8,20 +8,14 @@ runtime, one `make` away from a binary, abstractions shaped around *inference*
 rather than around supporting many architectures.
 
 ```
-$ qwasar -m ~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit -n 120 \
-      --tokens 248045,846,198,657,2250,9944,4947,13,248046,198,248045,74455,198,248068,198
+$ qwasar -m ~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit \
+      -p "Name three prime numbers, with one sentence on why each is prime."
 
-The user asks me to name three prime numbers. Prime numbers are numbers greater
-than 1 that have no positive divisors other than 1 and themselves...
-</think>
+2 is prime because its only positive divisors are 1 and itself.
+3 is prime because it cannot be divided evenly by any whole number other than 1 and 3.
+5 is prime because its only positive divisors are 1 and 5.
 
-Here are three prime numbers:
-
-1. **2** (the only even prime)
-2. **7**
-3. **13**
-
-prefill 15 tokens | decode 109 tokens (5.83 tok/s)
+prefill 66 tokens | decode 157 tokens (5.82 tok/s)
 ```
 
 ## Build
@@ -43,16 +37,20 @@ make check-metal   # optional offline kernel lint (needs the Metal Toolchain)
 ## Run
 
 ```
-qwasar -m <model-dir> --info                  # parsed architecture + weight inventory
-qwasar -m <model-dir> --tokens <ids> -n 120   # generate
+qwasar -m <model-dir> --info                     # architecture + weight inventory
+qwasar -m <model-dir> -p "..."                   # generate
+qwasar -m <model-dir> -p "..." --show-think      # include the reasoning block
+qwasar -m <model-dir> -p "..." --no-think        # skip reasoning entirely
+qwasar -m <model-dir> -s "..." -p "..."          # with a system message
+qwasar -m <model-dir> -p "..." --effort low      # xhigh (default) | medium | low
 ```
+
+Reasoning is on by default for this model, and the reasoning block is consumed
+but not printed unless you ask for it.
 
 Weights are the MLX 4-bit conversion, e.g.
 `lmstudio-community/Qwen3.8-27B-MLX-4bit`. Nothing needs converting; qwasar reads
 the safetensors shards directly and mmaps them.
-
-BPE *encoding* is not wired up yet, so prompts are currently given as token ids.
-Decoding works, so generated text streams normally.
 
 ## What this model is
 
@@ -73,7 +71,8 @@ rewinding it means re-evaluating.
 qwasar.h            public engine boundary -- no tensor internals escape it
 qwasar.c            config, safetensors mmap, weight table
 qwasar_graph.c      session state and the forward pass
-qwasar_tokenizer.c  byte-level BPE (decoding)
+qwasar_tokenizer.c  byte-level BPE, plus the ChatML template
+qwasar_unicode.inc  generated codepoint tables for the pre-tokenizer
 qwasar_metal.m      Metal runtime: device, library, pipelines, dispatch
 qwasar_cpu.c        scalar fp32 reference twins for every kernel
 metal/*.metal       kernels
@@ -83,11 +82,31 @@ tools/              build helper; dev-only golden-vector generator (not built)
 
 `PLAN.md` carries the design, the measurements, and the roadmap.
 
+## Correctness
+
+Every kernel has a scalar fp32 CPU twin and a test that runs both against real
+model weights — synthetic weights would not catch a misread of the quantisation
+layout. On top of that:
+
+- the full forward pass matches the mlx-vlm reference's **argmax and all five
+  top-5 ranks exactly**;
+- the tokenizer reproduces the reference's ids on 24 cases and the chat template
+  on all 6, exactly;
+- the gated-delta recurrence is **bit-identical** between streaming and batched
+  execution, which is the prefill/decode seam;
+- attention provably ignores cache entries past its own position.
+
+One deliberate divergence: `qwasar_encode` never emits control tokens, however
+the input spells them. The reference splits input on added tokens, which would
+let message content forge a `<|im_start|>` role boundary. The template emits
+control tokens by id instead.
+
 ## Status
 
-Text generation works and matches the reference implementation's argmax and
-top-5 ordering exactly. Decode runs at 5.8 tok/s on an M4, which is the
-bandwidth roof for a dense 27B at ~120 GB/s — see `PLAN.md` §2.
+Milestone 1 is complete: text in, text out, verified against the reference.
 
-Next: BPE encoding and the chat template, then a tiled `qmm` for prefill, then
-the agent, then vision.
+Decode runs at 5.8 tok/s on an M4 — the memory-bandwidth roof for a dense 27B at
+~120 GB/s (`PLAN.md` §2). Prefill is currently no faster, because the matvec
+re-reads the weights once per token; a tiled `qmm` is the next significant win.
+
+Next: prefill `qmm`, then the agent, then vision.

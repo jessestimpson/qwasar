@@ -424,24 +424,31 @@ answer and the golden-vector test passes end to end.
 
 ### Status
 
-Phases 0-3 are done and Phase 4 is partly done. The model generates:
+**Milestone 1 is complete.** Phases 0-4 are done; the model takes text and
+returns text:
 
 ```
-$ qwasar -m <model> -n 120 --tokens 248045,846,198,657,2250,9944,4947,13,...
-The user asks me to name three prime numbers. Prime numbers are numbers
-greater than 1 that have no positive divisors other than 1 and themselves...
-</think>
-
-Here are three prime numbers:
-1. **2** (the only even prime)   2. **7**   3. **13**
+$ qwasar -m <model> -p "Name three prime numbers, with one sentence on why each is prime."
+2 is prime because its only positive divisors are 1 and itself.
+3 is prime because it cannot be divided evenly by any whole number other than 1 and 3.
+5 is prime because its only positive divisors are 1 and 5.
 ```
 
-All six test suites pass, including the golden-vector replay: **argmax and all
-five top-5 ranks match the reference exactly**, with a smooth per-layer drift
-curve (§4).
+All seven test suites pass. The golden-vector replay matches the reference's
+**argmax and all five top-5 ranks exactly**, with a smooth per-layer drift curve
+(§4). The tokenizer matches the reference on 24 encode cases and all 6 chat
+template renderings, exactly.
 
-Remaining for Milestone 1: **BPE encoding and the chat template**, so prompts
-can be text rather than token ids. Decoding already works.
+The pre-tokenizer is a hand-written state machine over the model's split
+pattern, with checked-in `\p{L}` / `\p{N}` / `\s` range tables generated once by
+`tools/gen_unicode.py` -- so the build stays Python-free.
+
+**One deliberate divergence from the reference:** `qwasar_encode` never emits
+control tokens, however the input spells them. HF's tokenizer splits input on
+added tokens, which means user text containing `<|im_start|>` becomes a real
+role boundary. The template emits control tokens by id, so message content
+cannot forge one. Known gap in the other direction: the NFC normalizer is not
+applied, which is a no-op for ASCII and already-normalised text.
 
 ### Measured performance
 

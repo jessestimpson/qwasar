@@ -53,6 +53,33 @@ int32_t           qwasar_tokenizer_size(const qwasar_tokenizer *t);
 const char *qwasar_token_bytes(const qwasar_tokenizer *t, int32_t id,
                                size_t *len, bool *special);
 
+/* Id of a control token by its literal spelling, e.g. "<|im_end|>", or -1. */
+int32_t qwasar_token_id(const qwasar_tokenizer *t, const char *literal);
+
+/* Encodes plain text.  Control tokens are never produced, however the text is
+ * spelled, so untrusted content cannot introduce a role marker.  Caller frees. */
+int32_t *qwasar_encode(const qwasar_tokenizer *t, const char *text, int32_t *out_n);
+
+/* ---- chat template --------------------------------------------------------- */
+
+typedef struct {
+    const char *role;       /* "system" | "user" | "assistant" | "tool" */
+    const char *content;
+    const char *reasoning;  /* assistant only; may be NULL */
+} qwasar_message;
+
+typedef struct {
+    bool        enable_thinking;       /* default on for this model */
+    const char *reasoning_effort;      /* "xhigh" (default), "medium", "low" */
+    bool        add_generation_prompt;
+} qwasar_chat_options;
+
+/* Renders the conversation as ChatML and encodes it.  Caller frees the result. */
+int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
+                                    const qwasar_message *msgs, int32_t n_msgs,
+                                    const qwasar_chat_options *opts,
+                                    int32_t *out_n, char *err, size_t errcap);
+
 /* ---- sessions -------------------------------------------------------------
  *
  * A session owns one inference timeline: the KV cache for the 16 full-attention
