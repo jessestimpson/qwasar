@@ -141,18 +141,38 @@ int main(int argc, char **argv) {
     /* Chat template.  Each fixture pins one behaviour of the Qwen3.8 template:
      * the synthesised reasoning system message, the open <think>, the closed
      * one when thinking is disabled, and multi-turn assistant reasoning. */
+    /* Byte-identical to the JSON the fixture generator hands the reference
+     * template; the tools block is embedded in the prompt verbatim, so any
+     * difference in spacing or key order would change the token ids. */
+    static const char *const TOOLS[] = {
+        "{\"type\": \"function\", \"function\": {\"name\": \"read\", "
+        "\"description\": \"Read a file from disk.\", \"parameters\": "
+        "{\"type\": \"object\", \"properties\": {\"path\": {\"type\": "
+        "\"string\", \"description\": \"File path.\"}}, \"required\": "
+        "[\"path\"]}}}",
+        "{\"type\": \"function\", \"function\": {\"name\": \"bash\", "
+        "\"description\": \"Run a shell command.\", \"parameters\": "
+        "{\"type\": \"object\", \"properties\": {\"command\": {\"type\": "
+        "\"string\", \"description\": \"Command.\"}}, \"required\": "
+        "[\"command\"]}}}",
+    };
+
     struct { const char *name; qwasar_chat_options o; int n; qwasar_message m[4]; } chats[] = {
-        { "simple", { true, "xhigh", true }, 1,
+        { "simple", { true, "xhigh", true, NULL, 0 }, 1,
           { { "user", "What is 2+2?", NULL } } },
-        { "with_system", { true, "xhigh", true }, 2,
+        { "with_system", { true, "xhigh", true, NULL, 0 }, 2,
           { { "system", "You are terse.", NULL }, { "user", "Hi", NULL } } },
-        { "no_thinking", { false, "xhigh", true }, 1,
+        { "no_thinking", { false, "xhigh", true, NULL, 0 }, 1,
           { { "user", "Hi", NULL } } },
-        { "low_effort", { true, "low", true }, 1,
+        { "low_effort", { true, "low", true, NULL, 0 }, 1,
           { { "user", "Hi", NULL } } },
-        { "medium_effort", { true, "medium", true }, 1,
+        { "medium_effort", { true, "medium", true, NULL, 0 }, 1,
           { { "user", "Hi", NULL } } },
-        { "multi_turn", { true, "xhigh", true }, 3,
+        { "with_tools", { true, "xhigh", true, TOOLS, 2 }, 1,
+          { { "user", "Read /tmp/a.txt", NULL } } },
+        { "tools_and_system", { true, "xhigh", true, TOOLS, 2 }, 2,
+          { { "system", "Be careful.", NULL }, { "user", "Read /tmp/a.txt", NULL } } },
+        { "multi_turn", { true, "xhigh", true, NULL, 0 }, 3,
           { { "user", "First question", NULL },
             { "assistant", "First answer", "thinking here" },
             { "user", "Second question", NULL } } },

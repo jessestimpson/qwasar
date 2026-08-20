@@ -97,6 +97,11 @@ struct qwasar_tokenizer {
     qw_merge_slot *merges;
     uint32_t       merge_cap;
 
+    /* The 33 added tokens, listed so lookups by literal do not scan a 248k
+     * vocabulary. */
+    int32_t  *special_ids;
+    int32_t   n_special;
+
     int32_t byte_token[256];   /* single-byte token per byte value */
 };
 
@@ -324,6 +329,11 @@ qwasar_tokenizer *qwasar_tokenizer_load(const char *model_path, char *err, size_
         t->len[i] = (uint32_t)clen;
         t->special[i] = 1;
         arena.used += clen;
+
+        int32_t *ids = realloc(t->special_ids, (size_t)(t->n_special + 1) * sizeof *ids);
+        if (!ids) goto oom;
+        t->special_ids = ids;
+        t->special_ids[t->n_special++] = i;
     }
     t->arena = arena.p;
 
@@ -347,6 +357,7 @@ void qwasar_tokenizer_free(qwasar_tokenizer *t) {
     free(t->special);
     free(t->vhash);
     free(t->merges);
+    free(t->special_ids);
     free(t);
 }
 
@@ -363,9 +374,10 @@ const char *qwasar_token_bytes(const qwasar_tokenizer *t, int32_t id,
 int32_t qwasar_token_id(const qwasar_tokenizer *t, const char *literal) {
     if (!t || !literal) return -1;
     size_t n = strlen(literal);
-    for (int32_t id = 0; id < t->n; id++)
-        if (t->special[id] && t->len[id] == n && !memcmp(t->arena + t->off[id], literal, n))
-            return id;
+    for (int32_t i = 0; i < t->n_special; i++) {
+        int32_t id = t->special_ids[i];
+        if (t->len[id] == n && !memcmp(t->arena + t->off[id], literal, n)) return id;
+    }
     return -1;
 }
 
@@ -630,6 +642,151 @@ static void qw_put_text(qw_chat *c, const char *s, size_t len) {
 
 static void qw_put_str(qw_chat *c, const char *s) { qw_put_text(c, s, s ? strlen(s) : 0); }
 
+/* Longest control-token literal starting at `s`, or -1.  Every added token in
+ * this vocabulary begins with '<', so the scan is cheap. */
+static int32_t qw_special_at(const qwasar_tokenizer *t, const char *s, size_t *len) {
+    if (*s != '<') return -1;
+    int32_t best = -1;
+    size_t best_len = 0;
+    for (int32_t i = 0; i < t->n_special; i++) {
+        const int32_t id = t->special_ids[i];
+        size_t n = t->len[id];
+        if (n == 0) continue;
+        if (n > best_len && !strncmp(s, t->arena + t->off[id], n)) {
+            best = id;
+            best_len = n;
+        }
+    }
+    if (best >= 0) *len = best_len;
+    return best;
+}
+
+/* Emits one of qwasar's own template strings, mapping control-token literals to
+ * their ids.
+ *
+ * The model's tool-format description contains "<tool_call>" and friends as
+ * literal text, and in training those tokenized as control tokens -- encoding
+ * them as plain text would hand the model a prompt it has never seen.  This is
+ * the one place that mapping is applied: message content still goes through
+ * qw_put_text, which never emits a control token, so user text cannot forge a
+ * role boundary while the trained prompt still tokenizes as it did. */
+static void qw_put_template(qw_chat *c, const char *s) {
+    if (!c->ok || !s) return;
+    const char *run = s;
+    for (const char *p = s; *p; ) {
+        size_t n = 0;
+        int32_t id = qw_special_at(c->t, p, &n);
+        if (id < 0) { p++; continue; }
+        qw_put_text(c, run, (size_t)(p - run));
+        qw_put_id(c, id);
+        p += n;
+        run = p;
+    }
+    qw_put_text(c, run, strlen(run));
+}
+
+/* Verbatim from the model's chat template.  The call-format description is not
+ * documentation for us -- it is the text the model was trained to condition on,
+ * so it is reproduced exactly rather than paraphrased. */
+static const char *QW_TOOLS_HEAD =
+    "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+static const char *QW_TOOLS_TAIL =
+    "\n</tools>\n\nIf you choose to call a function ONLY reply in the following "
+    "format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n"
+    "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+    "<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+    "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n"
+    "<IMPORTANT>\nReminder:\n"
+    "- Function calls MUST follow the specified format: an inner "
+    "<function=...></function> block must be nested within <tool_call></tool_call> "
+    "XML tags\n"
+    "- Required parameters MUST be specified\n"
+    "- You may provide optional reasoning for your function call in natural "
+    "language BEFORE the function call, but NOT after\n"
+    "- If there is no function call available, answer the question like normal "
+    "with your current knowledge and do not tell the user about function calls\n"
+    "</IMPORTANT>";
+
+/* Opens an assistant turn and its reasoning block. */
+static void qw_put_generation_prompt(qw_chat *c, const qwasar_chat_options *opts) {
+    qw_put_id(c, c->im_start);
+    qw_put_str(c, "assistant\n");
+    qw_put_id(c, c->think_open);
+    if (opts->enable_thinking) {
+        qw_put_str(c, "\n");
+    } else {
+        qw_put_str(c, "\n\n");
+        qw_put_id(c, c->think_close);
+        qw_put_str(c, "\n\n");
+    }
+}
+
+static bool qw_chat_init(qw_chat *c, const qwasar_tokenizer *t, char *err, size_t errcap) {
+    memset(c, 0, sizeof *c);
+    c->t = t;
+    c->ok = true;
+    c->im_start    = qwasar_token_id(t, "<|im_start|>");
+    c->im_end      = qwasar_token_id(t, "<|im_end|>");
+    c->think_open  = qwasar_token_id(t, "<think>");
+    c->think_close = qwasar_token_id(t, "</think>");
+    c->tr_open     = qwasar_token_id(t, "<tool_response>");
+    c->tr_close    = qwasar_token_id(t, "</tool_response>");
+    if (c->im_start < 0 || c->im_end < 0 || c->think_open < 0 || c->think_close < 0) {
+        snprintf(err, errcap, "tokenizer is missing ChatML control tokens");
+        return false;
+    }
+    return true;
+}
+
+int32_t *qwasar_render_tool_result(const qwasar_tokenizer *t, const char *result,
+                                   const qwasar_chat_options *opts, int32_t *out_n) {
+    char err[128];
+    qw_chat c;
+    *out_n = 0;
+    if (!qw_chat_init(&c, t, err, sizeof err)) return NULL;
+    if (c.tr_open < 0 || c.tr_close < 0) return NULL;
+
+    /* Close the assistant turn the model left open when it stopped at
+     * </tool_call>, then deliver the result as a user turn. */
+    qw_put_id(&c, c.im_end);
+    qw_put_str(&c, "\n");
+    qw_put_id(&c, c.im_start);
+    qw_put_str(&c, "user\n");
+    qw_put_id(&c, c.tr_open);
+    qw_put_str(&c, "\n");
+    qw_put_str(&c, result);
+    qw_put_str(&c, "\n");
+    qw_put_id(&c, c.tr_close);
+    qw_put_id(&c, c.im_end);
+    qw_put_str(&c, "\n");
+    qw_put_generation_prompt(&c, opts);
+
+    if (!c.ok) { free(c.v.v); return NULL; }
+    *out_n = c.v.n;
+    return c.v.v;
+}
+
+int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
+                                 const qwasar_chat_options *opts, int32_t *out_n) {
+    char err[128];
+    qw_chat c;
+    *out_n = 0;
+    if (!qw_chat_init(&c, t, err, sizeof err)) return NULL;
+
+    qw_put_id(&c, c.im_end);
+    qw_put_str(&c, "\n");
+    qw_put_id(&c, c.im_start);
+    qw_put_str(&c, "user\n");
+    qw_put_str(&c, text);
+    qw_put_id(&c, c.im_end);
+    qw_put_str(&c, "\n");
+    qw_put_generation_prompt(&c, opts);
+
+    if (!c.ok) { free(c.v.v); return NULL; }
+    *out_n = c.v.n;
+    return c.v.v;
+}
+
 int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
                                     const qwasar_message *msgs, int32_t n_msgs,
                                     const qwasar_chat_options *opts,
@@ -645,17 +802,8 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
         return NULL;
     }
 
-    qw_chat c = { .t = t, .ok = true };
-    c.im_start    = qwasar_token_id(t, "<|im_start|>");
-    c.im_end      = qwasar_token_id(t, "<|im_end|>");
-    c.think_open  = qwasar_token_id(t, "<think>");
-    c.think_close = qwasar_token_id(t, "</think>");
-    c.tr_open     = qwasar_token_id(t, "<tool_response>");
-    c.tr_close    = qwasar_token_id(t, "</tool_response>");
-    if (c.im_start < 0 || c.im_end < 0 || c.think_open < 0 || c.think_close < 0) {
-        snprintf(err, errcap, "tokenizer is missing ChatML control tokens");
-        return NULL;
-    }
+    qw_chat c;
+    if (!qw_chat_init(&c, t, err, errcap)) return NULL;
 
     const char *reasoning = qw_reasoning_text(opts);
     const bool has_system = !strcmp(msgs[0].role, "system");
@@ -663,7 +811,26 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
     size_t soff = 0, slen = 0;
     if (has_system) qw_trim(msgs[0].content, &soff, &slen);
 
-    if (slen || reasoning) {
+    if (opts->n_tools > 0 && opts->tools) {
+        /* With tools the system turn is rebuilt around them, and it is always
+         * emitted -- the format description has to reach the model even when
+         * the caller supplied no system message of its own. */
+        qw_put_id(&c, c.im_start);
+        qw_put_str(&c, "system\n");
+        if (reasoning) { qw_put_str(&c, reasoning); qw_put_str(&c, "\n\n"); }
+        qw_put_template(&c, QW_TOOLS_HEAD);
+        for (int32_t i = 0; i < opts->n_tools; i++) {
+            qw_put_str(&c, "\n");
+            qw_put_str(&c, opts->tools[i]);
+        }
+        qw_put_template(&c, QW_TOOLS_TAIL);
+        if (slen) {
+            qw_put_str(&c, "\n\n");
+            qw_put_text(&c, msgs[0].content + soff, slen);
+        }
+        qw_put_id(&c, c.im_end);
+        qw_put_str(&c, "\n");
+    } else if (slen || reasoning) {
         qw_put_id(&c, c.im_start);
         qw_put_str(&c, "system\n");
         if (reasoning) {
@@ -728,19 +895,7 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
         }
     }
 
-    if (opts->add_generation_prompt) {
-        qw_put_id(&c, c.im_start);
-        qw_put_str(&c, "assistant\n");
-        qw_put_id(&c, c.think_open);
-        if (opts->enable_thinking) {
-            qw_put_str(&c, "\n");
-        } else {
-            /* The marker still has to be there; it is just closed immediately. */
-            qw_put_str(&c, "\n\n");
-            qw_put_id(&c, c.think_close);
-            qw_put_str(&c, "\n\n");
-        }
-    }
+    if (opts->add_generation_prompt) qw_put_generation_prompt(&c, opts);
 
     if (!c.ok) {
         snprintf(err, errcap, "out of memory encoding the prompt");

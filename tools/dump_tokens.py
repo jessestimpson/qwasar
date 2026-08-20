@@ -37,6 +37,33 @@ CASES = [
     "The quick brown fox jumps over the lazy dog. " * 5,
 ]
 
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a file from disk.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "File path."}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string", "description": "Command."}},
+                "required": ["command"],
+            },
+        },
+    },
+]
+
 CHATS = [
     {
         "name": "simple",
@@ -65,6 +92,19 @@ CHATS = [
         "name": "medium_effort",
         "messages": [{"role": "user", "content": "Hi"}],
         "kwargs": {"add_generation_prompt": True, "reasoning_effort": "medium"},
+    },
+    {
+        "name": "with_tools",
+        "messages": [{"role": "user", "content": "Read /tmp/a.txt"}],
+        "kwargs": {"add_generation_prompt": True, "tools": TOOLS},
+    },
+    {
+        "name": "tools_and_system",
+        "messages": [
+            {"role": "system", "content": "Be careful."},
+            {"role": "user", "content": "Read /tmp/a.txt"},
+        ],
+        "kwargs": {"add_generation_prompt": True, "tools": TOOLS},
     },
     {
         "name": "multi_turn",

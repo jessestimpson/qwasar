@@ -72,6 +72,12 @@ typedef struct {
     bool        enable_thinking;       /* default on for this model */
     const char *reasoning_effort;      /* "xhigh" (default), "medium", "low" */
     bool        add_generation_prompt;
+    /* Tool definitions as JSON objects, one per tool.  When present the system
+     * turn is rebuilt around them, as the model's own template does: the call
+     * format is XML rather than JSON, and the format description is part of the
+     * prompt the model was trained against. */
+    const char *const *tools;
+    int32_t            n_tools;
 } qwasar_chat_options;
 
 /* Renders the conversation as ChatML and encodes it.  Caller frees the result. */
@@ -79,6 +85,15 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
                                     const qwasar_message *msgs, int32_t n_msgs,
                                     const qwasar_chat_options *opts,
                                     int32_t *out_n, char *err, size_t errcap);
+
+/* Continuations, for an agent loop that feeds back the tokens it generated
+ * rather than re-rendering the whole conversation each turn.  Both close the
+ * open assistant turn, add their own turn, and reopen a generation prompt.
+ * Caller frees. */
+int32_t *qwasar_render_tool_result(const qwasar_tokenizer *t, const char *result,
+                                   const qwasar_chat_options *opts, int32_t *out_n);
+int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
+                                 const qwasar_chat_options *opts, int32_t *out_n);
 
 /* ---- sessions -------------------------------------------------------------
  *
