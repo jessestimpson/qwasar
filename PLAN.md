@@ -507,12 +507,27 @@ barrier count too. Both operands are well inside fp16 range -- dequantised
 4-bit weights and post-norm activations -- but it changes the numerics, so it
 needs re-validation against the CPU reference rather than being assumed safe.
 
-### Milestone 2 — `qwasar-agent`
+### Milestone 2 — `qwasar-agent` *(working)*
 
-Agentic loop on the same engine: read/write/edit files, glob/grep, shell,
-todo tracking; the XML tool-call parser from §1.4; append-only session
-management with SSM-state checkpointing at turn boundaries; an
-`AGENT.md`-equivalent for project steering.
+Agentic loop on the same engine, with six tools: `read`, `write`, `edit`,
+`list`, `grep`, `bash`. Reading runs unattended; writing files and running
+commands ask first unless `--yes`. `AGENT.md` in the working directory is
+folded into the system prompt.
+
+**The append-only constraint turned out to cost nothing here.** An agent loop
+only ever appends, so each step feeds back exactly the tokens the model just
+produced plus the rendered tool result, and the KV cache and recurrent state
+carry forward untouched. No SSM checkpointing was needed. Re-rendering the
+conversation each turn — the obvious implementation — would have been both
+slower and, for the recurrent half, wrong.
+
+Verified end to end on real tasks: given a C file with an inverted comparison in
+a `maxval` function, it read the file, diagnosed the bug, applied a one-line
+`edit`, rebuilt with `bash`, and confirmed the output. The edit was minimal and
+indentation-preserving.
+
+Still to do: a REPL for multi-turn sessions (today it takes one task and exits),
+todo tracking, and glob.
 
 **File editing: conventional line matching, not ds4's `[upto]`.** *(Directive,
 2026-08-20.)*

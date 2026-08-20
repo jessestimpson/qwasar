@@ -18,6 +18,32 @@ $ qwasar -m ~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit \
 prefill 66 tokens | decode 157 tokens (5.82 tok/s)
 ```
 
+## qwasar-agent
+
+An agentic loop on the same engine, with six tools: `read`, `write`, `edit`,
+`list`, `grep`, `bash`.
+
+```
+$ qwasar-agent -m <model-dir> -C ~/src/proj \
+      "maxval in stats.c returns the wrong answer. Fix it, rebuild, and check."
+
+  read path=stats.c
+  edit path=stats.c old=        if (v[i] < best) best = v[i]; new=        if (v[i] > b...
+  bash command=cc -o stats stats.c && ./stats
+
+Fixed. The comparison `v[i] < best` was tracking the minimum instead of the
+maximum. Rebuilt and ran: mean=2.80 max=5.00
+```
+
+Reading runs unattended; writing files and running commands ask first, unless
+`--yes`. If `AGENT.md` exists in the working directory it is added to the system
+prompt as project guidance.
+
+`edit` uses conventional line-anchored replacement: the quoted text must match a
+run of whole lines **exactly once**, or the edit is refused and nothing changes.
+There are no anchor markers and no fuzzy matching — an edit either does what it
+says or tells the model why it could not.
+
 ## Build
 
 ```
@@ -72,6 +98,8 @@ qwasar.h            public engine boundary -- no tensor internals escape it
 qwasar.c            config, safetensors mmap, weight table
 qwasar_graph.c      session state and the forward pass
 qwasar_tokenizer.c  byte-level BPE, plus the ChatML template
+qwasar_toolcall.c   tool-call parsing and the line-anchored edit matcher
+qwasar_agent.c      the agent loop and its tools
 qwasar_unicode.inc  generated codepoint tables for the pre-tokenizer
 qwasar_metal.m      Metal runtime: device, library, pipelines, dispatch
 qwasar_cpu.c        scalar fp32 reference twins for every kernel
@@ -109,4 +137,8 @@ Decode runs at 5.8 tok/s on an M4 — the memory-bandwidth roof for a dense 27B 
 ~120 GB/s (`PLAN.md` §2). Prefill is currently no faster, because the matvec
 re-reads the weights once per token; a tiled `qmm` is the next significant win.
 
-Next: prefill `qmm`, then the agent, then vision.
+Prefill runs at 35 tok/s after two rounds of work on the quantised matmul: a
+tiled version, then moving its inner product onto the GPU's 8x8 matrix units.
+That is 55% of this machine's measured fp32 peak.
+
+Next: vision, and half-precision operand tiles in the matmul.

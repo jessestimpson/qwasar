@@ -1,0 +1,561 @@
+/* qwasar-agent -- an agentic loop on the qwasar engine.
+ *
+ * The conversation is append-only, which is not a simplification but a
+ * requirement: 48 of this model's 64 layers carry recurrent state with no
+ * per-position history, so a session can be extended but never rewound (see
+ * qwasar.h).  An agent loop happens to be a natural fit -- every turn appends,
+ * nothing edits history -- so each step feeds back exactly the tokens the model
+ * just produced plus the rendered tool result, and the KV cache and recurrent
+ * state carry forward untouched.  Re-rendering the whole conversation each turn
+ * would be both slower and, for the recurrent half, wrong.
+ *
+ * Tools that only read run unattended.  Tools that write to the filesystem or
+ * run commands ask first, unless --yes. */
+
+#include "qwasar.h"
+#include "qwasar_toolcall.h"
+
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define AGENT_MAX_READ   (256 * 1024)
+#define AGENT_MAX_OUTPUT (64 * 1024)
+
+/* ---- tool definitions ------------------------------------------------------
+ *
+ * One JSON object per tool, embedded verbatim in the system turn.  The edit
+ * description spells out the match rule because that rule is the tool's whole
+ * contract: the model has to know that quoting too little will be rejected as
+ * ambiguous rather than applied somewhere arbitrary. */
+static const char *const AGENT_TOOLS[] = {
+"{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": "
+"\"Read a file and return its exact contents, with no line numbers or other "
+"decoration, so the text can be quoted back to edit.\", \"parameters\": {\"type\": "
+"\"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": "
+"\"Path to the file.\"}}, \"required\": [\"path\"]}}}",
+
+"{\"type\": \"function\", \"function\": {\"name\": \"write\", \"description\": "
+"\"Create a file or replace its entire contents. Use edit for changes to an "
+"existing file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": "
+"{\"type\": \"string\", \"description\": \"Path to the file.\"}, \"content\": "
+"{\"type\": \"string\", \"description\": \"The complete new contents.\"}}, "
+"\"required\": [\"path\", \"content\"]}}}",
+
+"{\"type\": \"function\", \"function\": {\"name\": \"edit\", \"description\": "
+"\"Replace a run of whole lines in a file. The old text must match complete "
+"lines exactly once, including indentation; if it matches nowhere or in more "
+"than one place the edit is refused and nothing changes. Quote enough "
+"surrounding lines to be unique. To insert, set old to a unique nearby line and "
+"new to that same line plus the addition. To delete, set new to an empty "
+"string.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": "
+"{\"type\": \"string\", \"description\": \"Path to the file.\"}, \"old\": {\"type\": "
+"\"string\", \"description\": \"Exact existing lines to replace.\"}, \"new\": "
+"{\"type\": \"string\", \"description\": \"Replacement lines.\"}}, \"required\": "
+"[\"path\", \"old\", \"new\"]}}}",
+
+"{\"type\": \"function\", \"function\": {\"name\": \"list\", \"description\": "
+"\"List the entries of a directory.\", \"parameters\": {\"type\": \"object\", "
+"\"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory "
+"path; defaults to the working directory.\"}}, \"required\": []}}}",
+
+"{\"type\": \"function\", \"function\": {\"name\": \"grep\", \"description\": "
+"\"Search files recursively for a regular expression and return matching lines "
+"with their file and line number.\", \"parameters\": {\"type\": \"object\", "
+"\"properties\": {\"pattern\": {\"type\": \"string\", \"description\": \"Extended "
+"regular expression.\"}, \"path\": {\"type\": \"string\", \"description\": \"File "
+"or directory to search; defaults to the working directory.\"}}, \"required\": "
+"[\"pattern\"]}}}",
+
+"{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"description\": "
+"\"Run a shell command and return its combined output and exit status.\", "
+"\"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": "
+"\"string\", \"description\": \"Command to run via /bin/sh.\"}}, \"required\": "
+"[\"command\"]}}}",
+};
+#define AGENT_N_TOOLS ((int32_t)(sizeof AGENT_TOOLS / sizeof *AGENT_TOOLS))
+
+/* ---- growable text --------------------------------------------------------- */
+
+typedef struct { char *p; size_t len, cap; } str;
+
+static bool str_add(str *s, const char *data, size_t n) {
+    if (s->len + n + 1 > s->cap) {
+        size_t cap = s->cap ? s->cap * 2 : 4096;
+        while (cap < s->len + n + 1) cap *= 2;
+        char *p = realloc(s->p, cap);
+        if (!p) return false;
+        s->p = p;
+        s->cap = cap;
+    }
+    memcpy(s->p + s->len, data, n);
+    s->len += n;
+    s->p[s->len] = 0;
+    return true;
+}
+static bool str_puts(str *s, const char *t) { return str_add(s, t, strlen(t)); }
+static void str_free(str *s) { free(s->p); s->p = NULL; s->len = s->cap = 0; }
+
+static void str_printf(str *s, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n > 0) str_add(s, buf, (size_t)n < sizeof buf ? (size_t)n : sizeof buf - 1);
+}
+
+/* ---- subprocess ------------------------------------------------------------
+ *
+ * argv is passed to execvp directly, so a pattern or path from the model is
+ * never seen by a shell.  Only the bash tool goes through /bin/sh, and that one
+ * asks for confirmation first. */
+static bool run_capture(char *const argv[], str *out, int *status) {
+    int fds[2];
+    if (pipe(fds) != 0) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return false; }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        dup2(fds[1], STDERR_FILENO);
+        close(fds[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    close(fds[1]);
+
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(fds[0], buf, sizeof buf)) > 0) {
+        if (out->len < AGENT_MAX_OUTPUT) str_add(out, buf, (size_t)n);
+    }
+    close(fds[0]);
+
+    int st = 0;
+    waitpid(pid, &st, 0);
+    *status = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+
+    if (out->len >= AGENT_MAX_OUTPUT)
+        str_puts(out, "\n[output truncated]");
+    return true;
+}
+
+/* ---- tools ----------------------------------------------------------------- */
+
+typedef struct {
+    bool yes;          /* skip confirmations */
+    bool show_think;
+    int  max_steps;
+    int  max_tokens;
+} agent_cfg;
+
+/* Mutating tools ask before acting.  A refusal is reported back to the model as
+ * a tool result rather than aborting, so it can choose something else. */
+static bool confirm(const agent_cfg *cfg, const char *what, const char *detail) {
+    if (cfg->yes) return true;
+    const char *on = isatty(STDERR_FILENO) ? "\033[1;33m" : "";
+    const char *off = isatty(STDERR_FILENO) ? "\033[0m" : "";
+    fprintf(stderr, "\n  %s%s%s %s\n  proceed? [y/N] ", on, what, off, detail);
+    fflush(stderr);
+    char line[64];
+    if (!fgets(line, sizeof line, stdin)) return false;
+    return line[0] == 'y' || line[0] == 'Y';
+}
+
+static bool read_file(const char *path, str *out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        if (out->len >= AGENT_MAX_READ) { str_puts(out, "\n[file truncated]"); break; }
+        str_add(out, buf, n);
+    }
+    fclose(f);
+    return true;
+}
+
+static void tool_read(const qw_tool_call *c, str *result) {
+    const char *path = qw_tool_arg(c, "path");
+    if (!path) { str_puts(result, "error: read requires a path"); return; }
+    if (!read_file(path, result))
+        str_printf(result, "error: cannot read %s: %s", path, strerror(errno));
+    else if (result->len == 0)
+        str_puts(result, "[the file is empty]");
+}
+
+static void tool_write(const qw_tool_call *c, const agent_cfg *cfg, str *result) {
+    const char *path = qw_tool_arg(c, "path");
+    const char *content = qw_tool_arg(c, "content");
+    if (!path || !content) { str_puts(result, "error: write requires path and content"); return; }
+
+    char detail[512];
+    snprintf(detail, sizeof detail, "write %zu bytes to %s", strlen(content), path);
+    if (!confirm(cfg, "WRITE", detail)) {
+        str_puts(result, "error: the user declined this write");
+        return;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) { str_printf(result, "error: cannot open %s: %s", path, strerror(errno)); return; }
+    size_t n = fwrite(content, 1, strlen(content), f);
+    fclose(f);
+    str_printf(result, "wrote %zu bytes to %s", n, path);
+}
+
+static void tool_edit(const qw_tool_call *c, const agent_cfg *cfg, str *result) {
+    const char *path = qw_tool_arg(c, "path");
+    const char *old  = qw_tool_arg(c, "old");
+    const char *new  = qw_tool_arg(c, "new");
+    if (!path || !old || !new) {
+        str_puts(result, "error: edit requires path, old and new");
+        return;
+    }
+
+    str content = { 0 };
+    if (!read_file(path, &content)) {
+        str_printf(result, "error: cannot read %s: %s", path, strerror(errno));
+        str_free(&content);
+        return;
+    }
+
+    char *edited = NULL;
+    size_t edited_len = 0;
+    int matches = 0;
+    qw_edit_status st = qw_edit_apply(content.p ? content.p : "", content.len,
+                                      old, new, &edited, &edited_len, &matches);
+    str_free(&content);
+
+    if (st != QW_EDIT_OK) {
+        /* Told plainly, with the count, so the model knows whether to quote
+         * more context or to go and look at the file again. */
+        str_printf(result, "error: %s (%d matches). Nothing was changed. %s",
+                   qw_edit_status_text(st), matches,
+                   st == QW_EDIT_AMBIGUOUS
+                       ? "Quote more surrounding lines to make it unique."
+                       : "Read the file and quote the lines exactly, including indentation.");
+        return;
+    }
+
+    char detail[512];
+    snprintf(detail, sizeof detail, "replace lines in %s", path);
+    if (!confirm(cfg, "EDIT", detail)) {
+        free(edited);
+        str_puts(result, "error: the user declined this edit");
+        return;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        str_printf(result, "error: cannot write %s: %s", path, strerror(errno));
+        free(edited);
+        return;
+    }
+    fwrite(edited, 1, edited_len, f);
+    fclose(f);
+    free(edited);
+    str_printf(result, "edited %s", path);
+}
+
+static void tool_list(const qw_tool_call *c, str *result) {
+    const char *path = qw_tool_arg(c, "path");
+    char *argv[] = { "ls", "-lA", (char *)(path ? path : "."), NULL };
+    int status = 0;
+    if (!run_capture(argv, result, &status)) str_puts(result, "error: cannot run ls");
+}
+
+static void tool_grep(const qw_tool_call *c, str *result) {
+    const char *pat = qw_tool_arg(c, "pattern");
+    const char *path = qw_tool_arg(c, "path");
+    if (!pat) { str_puts(result, "error: grep requires a pattern"); return; }
+    char *argv[] = { "grep", "-rnE", "--", (char *)pat, (char *)(path ? path : "."), NULL };
+    int status = 0;
+    if (!run_capture(argv, result, &status)) { str_puts(result, "error: cannot run grep"); return; }
+    if (status == 1 && result->len == 0) str_puts(result, "[no matches]");
+}
+
+static void tool_bash(const qw_tool_call *c, const agent_cfg *cfg, str *result) {
+    const char *cmd = qw_tool_arg(c, "command");
+    if (!cmd) { str_puts(result, "error: bash requires a command"); return; }
+    if (!confirm(cfg, "RUN", cmd)) {
+        str_puts(result, "error: the user declined to run this command");
+        return;
+    }
+    char *argv[] = { "/bin/sh", "-c", (char *)cmd, NULL };
+    int status = 0;
+    if (!run_capture(argv, result, &status)) { str_puts(result, "error: cannot run the command"); return; }
+    str_printf(result, "\n[exit status %d]", status);
+}
+
+static void dispatch(const qw_tool_call *c, const agent_cfg *cfg, str *result) {
+    if      (!strcmp(c->name, "read"))  tool_read(c, result);
+    else if (!strcmp(c->name, "write")) tool_write(c, cfg, result);
+    else if (!strcmp(c->name, "edit"))  tool_edit(c, cfg, result);
+    else if (!strcmp(c->name, "list"))  tool_list(c, result);
+    else if (!strcmp(c->name, "grep"))  tool_grep(c, result);
+    else if (!strcmp(c->name, "bash"))  tool_bash(c, cfg, result);
+    else str_printf(result, "error: no tool named '%s'", c->name);
+}
+
+/* ---- generation ------------------------------------------------------------ */
+
+typedef struct {
+    str      text;      /* everything after </think> */
+    str      think;
+    int32_t *tokens;    /* what the model produced, to feed straight back */
+    int32_t  n_tokens;
+    bool     hit_eos;
+    bool     has_call;
+} turn;
+
+static void turn_free(turn *t) {
+    str_free(&t->text);
+    str_free(&t->think);
+    free(t->tokens);
+    memset(t, 0, sizeof *t);
+}
+
+static bool turn_push(turn *t, int32_t id) {
+    int32_t *v = realloc(t->tokens, (size_t)(t->n_tokens + 1) * sizeof *v);
+    if (!v) return false;
+    t->tokens = v;
+    t->tokens[t->n_tokens++] = id;
+    return true;
+}
+
+static int32_t argmax(const float *v, int32_t n) {
+    int32_t best = 0;
+    for (int32_t i = 1; i < n; i++) if (v[i] > v[best]) best = i;
+    return best;
+}
+
+/* Runs one assistant turn to completion: to a finished tool call, to
+ * end-of-turn, or to the token budget. */
+static bool generate(qwasar_engine *e, qwasar_session *s, const qwasar_tokenizer *tok,
+                     const agent_cfg *cfg, const int32_t *prompt, int32_t n_prompt,
+                     turn *out, char *err, size_t errcap) {
+    memset(out, 0, sizeof *out);
+
+    const float *logits = qwasar_session_eval(s, prompt, n_prompt, err, errcap);
+    if (!logits) return false;
+
+    const int32_t vocab = qwasar_vocab_size(e);
+    const int32_t think_close = qwasar_token_id(tok, "</think>");
+    const int32_t call_open   = qwasar_token_id(tok, "<tool_call>");
+    const bool tty = isatty(STDOUT_FILENO);
+    bool reasoning = true;
+    /* The call itself is markup, not prose.  It is still accumulated for the
+     * parser, but echoing it would bury any narration the model wrote first --
+     * and the model is told it may narrate before a call. */
+    bool in_call = false;
+
+    for (int i = 0; i < cfg->max_tokens; i++) {
+        int32_t next = argmax(logits, vocab);
+        if (qwasar_is_eos(e, next)) { out->hit_eos = true; break; }
+        if (!turn_push(out, next)) { snprintf(err, errcap, "out of memory"); return false; }
+
+        size_t len = 0;
+        bool special = false;
+        const char *bytes = qwasar_token_bytes(tok, next, &len, &special);
+
+        if (next == think_close) {
+            reasoning = false;
+            if (cfg->show_think && tty) fputs("\033[0m", stdout);
+            if (cfg->show_think) fputs("\n", stdout);
+        } else if (bytes && len) {
+            if (!reasoning && next == call_open) in_call = true;
+            str_add(reasoning ? &out->think : &out->text, bytes, len);
+            if (!special && !in_call && (!reasoning || cfg->show_think)) {
+                if (reasoning && tty && out->think.len == len) fputs("\033[2m", stdout);
+                fwrite(bytes, 1, len, stdout);
+                fflush(stdout);
+            }
+        }
+
+        /* Stop at a finished call.  Only after </think>: the model routinely
+         * writes the tag inside its reasoning while planning the call, and
+         * stopping there would truncate the plan and emit nothing. */
+        if (!reasoning && qw_tool_call_complete(out->text.p ? out->text.p : "", out->text.len)) {
+            out->has_call = true;
+            break;
+        }
+
+        logits = qwasar_session_eval(s, &next, 1, err, errcap);
+        if (!logits) return false;
+    }
+    return true;
+}
+
+/* ---- loop ------------------------------------------------------------------ */
+
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void usage(FILE *out) {
+    fprintf(out,
+        "qwasar-agent -- an agentic loop on Qwen3.8\n"
+        "\n"
+        "usage: qwasar-agent -m <model-dir> [options] [task...]\n"
+        "\n"
+        "  -m, --model <dir>    model directory\n"
+        "  -C, --chdir <dir>    work in this directory\n"
+        "  -c, --context <n>    context size in tokens (default 32768)\n"
+        "  -y, --yes            do not ask before writing files or running commands\n"
+        "      --steps <n>      maximum tool calls per task (default 24)\n"
+        "  -n, --predict <n>    maximum tokens per turn (default 2048)\n"
+        "      --effort <lvl>   reasoning effort: xhigh (default), medium, low\n"
+        "      --show-think     print the reasoning block\n"
+        "  -h, --help           this message\n"
+        "\n"
+        "Tools: read, write, edit, list, grep, bash.  Reading runs unattended;\n"
+        "writing and running commands ask first unless --yes.\n"
+        "If AGENT.md exists in the working directory it is added to the system\n"
+        "prompt as project guidance.\n");
+}
+
+int main(int argc, char **argv) {
+    qwasar_options opts = { 0 };
+    agent_cfg cfg = { .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 2048 };
+    const char *effort = "xhigh";
+    const char *workdir = NULL;
+    str task = { 0 };
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if ((!strcmp(a, "-m") || !strcmp(a, "--model")) && i + 1 < argc) opts.model_path = argv[++i];
+        else if ((!strcmp(a, "-C") || !strcmp(a, "--chdir")) && i + 1 < argc) workdir = argv[++i];
+        else if ((!strcmp(a, "-c") || !strcmp(a, "--context")) && i + 1 < argc) opts.context_size = atoi(argv[++i]);
+        else if (!strcmp(a, "-y") || !strcmp(a, "--yes")) cfg.yes = true;
+        else if (!strcmp(a, "--steps") && i + 1 < argc) cfg.max_steps = atoi(argv[++i]);
+        else if ((!strcmp(a, "-n") || !strcmp(a, "--predict")) && i + 1 < argc) cfg.max_tokens = atoi(argv[++i]);
+        else if (!strcmp(a, "--effort") && i + 1 < argc) effort = argv[++i];
+        else if (!strcmp(a, "--show-think")) cfg.show_think = true;
+        else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
+        else if (a[0] == '-') { fprintf(stderr, "qwasar-agent: unknown argument '%s'\n\n", a); usage(stderr); return 2; }
+        else { if (task.len) str_puts(&task, " "); str_puts(&task, a); }
+    }
+
+    if (!opts.model_path) { fprintf(stderr, "qwasar-agent: -m/--model is required\n\n"); usage(stderr); return 2; }
+    if (!task.len) { fprintf(stderr, "qwasar-agent: give it a task\n\n"); usage(stderr); return 2; }
+    if (workdir && chdir(workdir) != 0) {
+        fprintf(stderr, "qwasar-agent: cannot enter %s: %s\n", workdir, strerror(errno));
+        return 1;
+    }
+
+    char err[512] = "";
+    double t0 = now_sec();
+    qwasar_engine *e = qwasar_engine_load(&opts, err, sizeof err);
+    if (!e) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
+
+    qwasar_tokenizer *tok = qwasar_tokenizer_load(opts.model_path, err, sizeof err);
+    if (!tok) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
+
+    /* Project guidance, if the repository provides any. */
+    str guidance = { 0 };
+    str_puts(&guidance,
+             "You are qwasar-agent, working in the user's current directory. "
+             "Use the tools to inspect and change real files. Prefer edit over "
+             "write for existing files. Check your work when you are done.");
+    str agentmd = { 0 };
+    if (read_file("AGENT.md", &agentmd) && agentmd.len) {
+        str_puts(&guidance, "\n\nProject guidance from AGENT.md:\n\n");
+        str_add(&guidance, agentmd.p, agentmd.len);
+    }
+    str_free(&agentmd);
+
+    qwasar_chat_options chat = {
+        .enable_thinking = true,
+        .reasoning_effort = effort,
+        .add_generation_prompt = true,
+        .tools = AGENT_TOOLS,
+        .n_tools = AGENT_N_TOOLS,
+    };
+
+    qwasar_message msgs[2] = {
+        { "system", guidance.p, NULL },
+        { "user",   task.p,     NULL },
+    };
+    int32_t n_prompt = 0;
+    int32_t *prompt = qwasar_apply_chat_template(tok, msgs, 2, &chat, &n_prompt, err, sizeof err);
+    if (!prompt) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
+
+    qwasar_session *s = qwasar_session_new(e, err, sizeof err);
+    if (!s) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
+
+    fprintf(stderr, "loaded in %.1fs | %d tools | prompt %d tokens\n",
+            now_sec() - t0, AGENT_N_TOOLS, n_prompt);
+
+    int step = 0;
+    for (;;) {
+        turn t;
+        if (!generate(e, s, tok, &cfg, prompt, n_prompt, &t, err, sizeof err)) {
+            fprintf(stderr, "\nqwasar-agent: %s\n", err);
+            return 1;
+        }
+        free(prompt);
+        prompt = NULL;
+
+        if (!t.has_call) {
+            printf("\n");
+            turn_free(&t);
+            break;
+        }
+
+        qw_tool_calls calls;
+        char perr[256] = "";
+        int n = qw_tool_parse(t.text.p ? t.text.p : "", &calls, perr, sizeof perr);
+
+        str result = { 0 };
+        if (n < 0) {
+            str_printf(&result, "error: %s. Re-issue the call in the required format.", perr);
+        } else if (n == 0) {
+            str_puts(&result, "error: no tool call was found.");
+        } else {
+            for (int i = 0; i < n; i++) {
+                const char *on = isatty(STDERR_FILENO) ? "\033[1;36m" : "";
+                const char *off = isatty(STDERR_FILENO) ? "\033[0m" : "";
+                fprintf(stderr, "\n  %s%s%s", on, calls.calls[i].name, off);
+                for (int j = 0; j < calls.calls[i].n_params; j++) {
+                    const char *v = calls.calls[i].params[j].value;
+                    size_t vl = strlen(v);
+                    fprintf(stderr, " %s=%.60s%s", calls.calls[i].params[j].key,
+                            v, vl > 60 ? "..." : "");
+                }
+                fprintf(stderr, "\n");
+                if (i) str_puts(&result, "\n");
+                dispatch(&calls.calls[i], &cfg, &result);
+            }
+        }
+        qw_tool_calls_free(&calls);
+
+        if (++step >= cfg.max_steps) {
+            fprintf(stderr, "\nqwasar-agent: stopping after %d tool calls\n", step);
+            str_free(&result);
+            turn_free(&t);
+            break;
+        }
+
+        prompt = qwasar_render_tool_result(tok, result.p ? result.p : "", &chat, &n_prompt);
+        str_free(&result);
+        turn_free(&t);
+        if (!prompt) { fprintf(stderr, "\nqwasar-agent: cannot render the tool result\n"); return 1; }
+    }
+
+    free(prompt);
+    str_free(&task);
+    str_free(&guidance);
+    qwasar_session_free(s);
+    qwasar_tokenizer_free(tok);
+    qwasar_engine_free(e);
+    return 0;
+}

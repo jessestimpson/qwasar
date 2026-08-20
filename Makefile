@@ -25,17 +25,22 @@ CORE_OBJS  := qwasar.o qwasar_graph.o qwasar_tokenizer.o qwasar_toolcall.o \
 
 .PHONY: all clean test help check-metal
 
-all: qwasar
+all: qwasar qwasar-agent
 
 help:
 	@echo "qwasar build targets:"
-	@echo "  make          build ./qwasar"
+	@echo "  make          build ./qwasar and ./qwasar-agent"
 	@echo "  make test     build and run tests"
 	@echo "  make clean    remove build outputs"
 	@echo "  make check-metal  offline kernel syntax check (needs the Metal Toolchain)"
 
 qwasar: qwasar_cli.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+qwasar-agent: qwasar_agent.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+qwasar_agent.o: qwasar_agent.c qwasar.h qwasar_toolcall.h
 
 # Kernel sources are embedded rather than read from disk at runtime, so the
 # binary stays relocatable and cannot silently pick up a stale metal/ tree.
