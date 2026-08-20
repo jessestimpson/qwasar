@@ -95,17 +95,21 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
  * derives its dispatch geometry from them and injects them into the Metal
  * compile as preprocessor macros, so the kernel and the launch cannot disagree.
  *
- *   threads per threadgroup = (BM/TM) * (BN/TN)
- *   threadgroup memory      = (BM + BN) * BK * 4 bytes, must stay under 32 KB
- *   inner-loop ALU:LDS      = TM*TN fused multiply-adds per TM+TN loads
+ * The output tile is BM tokens by BN weight rows, walked over K in steps of BK.
+ * It is divided among an SG_M x SG_N grid of simdgroups, each of which owns a
+ * (BM/SG_M) x (BN/SG_N) region and accumulates it in 8x8 matrix fragments.
  *
- * BK must divide 32 so a packed word never spans two quantisation groups. */
+ *   threads per threadgroup = SG_M * SG_N * 32
+ *   threadgroup memory      = max(BK * (BM + BN), BM * BN) * 4 bytes, under 32 KB
+ *
+ * BK must be a multiple of 8 and divide 64, so a fragment step stays inside one
+ * quantisation group and a packed word never spans two. */
 #define QW_QMM_BM 64
 #define QW_QMM_BN 64
 #define QW_QMM_BK 32
-#define QW_QMM_TM 4
-#define QW_QMM_TN 4
-#define QW_QMM_THREADS ((QW_QMM_BM / QW_QMM_TM) * (QW_QMM_BN / QW_QMM_TN))
+#define QW_QMM_SG_M 2
+#define QW_QMM_SG_N 4
+#define QW_QMM_THREADS (QW_QMM_SG_M * QW_QMM_SG_N * 32)
 
 /* RMS norm over the last axis of an [rows, dim] fp32 buffer.
  *

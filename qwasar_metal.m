@@ -82,8 +82,8 @@ bool qw_gpu_init(char *err, size_t errcap) {
             @"QW_QMM_BM" : @(QW_QMM_BM),
             @"QW_QMM_BN" : @(QW_QMM_BN),
             @"QW_QMM_BK" : @(QW_QMM_BK),
-            @"QW_QMM_TM" : @(QW_QMM_TM),
-            @"QW_QMM_TN" : @(QW_QMM_TN),
+            @"QW_QMM_SG_M" : @(QW_QMM_SG_M),
+            @"QW_QMM_SG_N" : @(QW_QMM_SG_N),
         };
         g_library = [g_device newLibraryWithSource:source options:opts error:&nserr];
         if (!g_library) {

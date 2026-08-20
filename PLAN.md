@@ -459,7 +459,7 @@ Separating one-time costs from steady state, on the M4:
 | engine load | 8.6 s — dominated by the 4.99 GB alignment copy (§3.3) |
 | first forward pass | 4.8 s — faulting 9.96 GB of mapped weights in; the CLI now pays this during load so its prefill figure is the steady-state one |
 | **decode** | **5.8 tok/s** steady (0.17 s/token) |
-| **prefill** | **26 tok/s** at a 256-token chunk (was 7.0 before `qmm`) |
+| **prefill** | **35 tok/s** at a 256-token chunk (7.0 before `qmm`, 26 register-tiled) |
 
 Decode landed inside the 5.5-7 band predicted from bandwidth, first try.
 
@@ -467,24 +467,26 @@ Decode landed inside the 5.5-7 band predicted from bandwidth, first try.
 `qw_qmv_q4_g64` dispatches one row per token, so an N-token prefill re-read all
 15 GB of weights N times. The tiled matmul stages a 64x64 output block through
 threadgroup memory, so each weight block is fetched and dequantised once and
-reused across the whole token tile. Measured: **7 -> 26 tok/s at a 256-token
-chunk, 3.7x.** `qw_op_qmat_q4` picks between the two by row count.
+reused across the whole token tile. Measured: **7 -> 35 tok/s at a 256-token
+chunk, 5x.** `qw_op_qmat_q4` picks between the two by row count.
 
 The crossover is not where intuition puts it. The matmul pads its token tile to
-64, so it costs the same for 8 tokens as for 64 -- about 2.6 s through the whole
-model -- while the matvec costs ~0.18 s per token. They cross just under 15, so
+64, so it costs the same for 8 tokens as for 64 -- about 2.0 s through the whole
+model -- while the matvec costs ~0.18 s per token. They cross just under 12, so
 `QW_QMM_MIN_ROWS` is 16. An earlier guess of 6 made 8-token prefills *slower*
 than before.
 
 ### Where the remaining prefill headroom is
 
-Measured in isolation, `qmm` sustains **1.2-1.33 TFLOP/s** on every projection
-shape and every row count -- so it is the whole of prefill time, and the
-flatness says the limit is kernel structure rather than any shape or tail
-effect. A pure-FMA kernel measures this machine's fp32 peak at **3.33 TFLOP/s**,
-putting `qmm` at **39% of peak**.
+The first version was register-tiled: a 4x4 accumulator per thread, eight
+threadgroup loads for every sixteen fused multiply-adds. It held **1.2-1.33
+TFLOP/s** on every projection shape and every row count. A pure-FMA kernel
+measures this machine's fp32 peak at **3.33 TFLOP/s**, so that was 39%, and the
+flatness across shapes said the limit was kernel structure rather than any
+shape or tail effect.
 
-Things that did *not* move it, so they are not the limit:
+Rebalancing the tile did not help, which is what ruled out the load-to-arithmetic
+ratio as something tunable:
 
 | change | result |
 |---|---|
@@ -493,9 +495,17 @@ Things that did *not* move it, so they are not the limit:
 | `BM=BN=64, TM=TN=8` (ALU:LDS 4.0, 64 threads) | 3.9 tok/s -- two simdgroups per threadgroup starves the core |
 | `BM=BN=128, BK=16` | far worse; halving BK doubles the barrier count |
 
-The remaining 2.5x needs `simdgroup_matrix` -- Apple's 8x8 matrix units -- not
-further tile tuning. That is the next prefill task, and it is a rewrite of the
-inner loop rather than a parameter change.
+Moving the inner product onto the **8x8 matrix units** did: one
+`simdgroup_multiply_accumulate` performs an entire 8x8x8 product, which removes
+the ratio as a limit instead of tuning around it. **1.83 TFLOP/s, 55% of peak**,
+and prefill went 26 -> 35 tok/s.
+
+Remaining headroom is the other 45%. The next lever is holding the operand tiles
+in `half` rather than `float`: Apple's matrix units run fp16 inputs at a higher
+rate, and halving the tiles would allow `BK=64` at the same 16 KB, halving the
+barrier count too. Both operands are well inside fp16 range -- dequantised
+4-bit weights and post-norm activations -- but it changes the numerics, so it
+needs re-validation against the CPU reference rather than being assumed safe.
 
 ### Milestone 2 — `qwasar-agent`
 
@@ -549,9 +559,10 @@ axes diverge. Image loading in C (stb_image, vendored).
 Only after correctness is locked and a benchmark exists. In expected order of
 payoff:
 
-1. **`simdgroup_matrix` in `qmm`** — the tiled matmul landed and took prefill
-   from 7 to 26 tok/s, but sits at 39% of measured peak and tile tuning is
-   exhausted. Apple's 8x8 matrix units are the remaining 2.5x.
+1. **`half` operand tiles in `qmm`** — the matmul now runs on the 8x8 matrix
+   units at 55% of measured peak. fp16 tiles would raise the matrix-unit rate
+   and allow `BK=64` at the same threadgroup memory, halving the barriers.
+   Needs re-validation against the CPU reference, since it changes numerics.
 2. `qmv_q4_g64` — the whole decode budget, already at 69% of peak bandwidth.
    Vectorised `uint4` loads, scales/biases resident in registers, tuned
    rows-per-threadgroup. Target: ≥85% of measured `memcpy` bandwidth.

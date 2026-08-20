@@ -6,22 +6,23 @@
  * per token re-reads all 15 GB of weights N times, which is why prefill was no
  * faster than decode before this kernel existed.
  *
- * Blocking:
+ * Each threadgroup computes a BM x BN block of the output -- BM tokens by BN
+ * weight rows -- walking K in steps of BK, with both operand tiles staged in
+ * threadgroup memory so a weight block is dequantised once and reused across
+ * the whole token tile.
  *
- *   Each threadgroup computes a BM x BN block of the output -- BM tokens by BN
- *   weight rows -- walking K in steps of BK.  Both operand tiles are staged in
- *   threadgroup memory, so a weight block is dequantised once and then reused
- *   by all BM tokens.  Each of the 256 threads keeps a TM x TN register tile,
- *   giving 16 fused multiply-adds per 8 threadgroup reads in the inner loop.
+ * The inner product runs on the GPU's 8x8 matrix units.  A register-tiled
+ * version of this kernel held 1.3 TFLOP/s against a measured machine peak of
+ * 3.33: with a 4x4 register tile it issues eight threadgroup loads for every
+ * sixteen fused multiply-adds, and no rebalancing fixed that -- larger register
+ * tiles starved the threadgroup of threads, smaller K steps multiplied the
+ * barrier count.  simdgroup_multiply_accumulate performs an entire 8x8x8
+ * product per instruction, which removes the load-to-arithmetic ratio as the
+ * limit rather than tuning around it.
  *
- *   Tiles are stored K-major ([BK][BM], [BK][BN]) rather than row-major.  That
- *   makes the inner loop read runs of consecutive floats: lanes sharing a token
- *   index broadcast from one address, and lanes walking weight rows read
- *   consecutive addresses instead of colliding on one bank.
- *
- * Arithmetic intensity here is roughly 900 flop per byte of weight, so unlike
- * the matvec this kernel is compute-bound and the dequantisation cost is
- * amortised across the token tile. */
+ * Tiles are stored K-major: As is [BK][BM] and Bs is [BK][BN].  Bs is then
+ * exactly B's natural [K][N] layout and loads directly; As is A transposed, so
+ * its fragments load with the transpose flag set. */
 
 /* Tiling comes from qwasar_gpu.h, injected as preprocessor macros when the
  * library is compiled, so the host's dispatch geometry cannot drift from the
@@ -31,10 +32,14 @@
 #define QW_QMM_BM 64
 #define QW_QMM_BN 64
 #define QW_QMM_BK 32
-#define QW_QMM_TM 4
-#define QW_QMM_TN 4
+#define QW_QMM_SG_M 2
+#define QW_QMM_SG_N 4
 #endif
-#define QW_QMM_THREADS ((QW_QMM_BM / QW_QMM_TM) * (QW_QMM_BN / QW_QMM_TN))
+
+#define QW_QMM_THREADS (QW_QMM_SG_M * QW_QMM_SG_N * 32)
+#define QW_SG_TILE      8                                   /* matrix unit edge */
+#define QW_QMM_FRAG_M  ((QW_QMM_BM / QW_QMM_SG_M) / QW_SG_TILE)
+#define QW_QMM_FRAG_N  ((QW_QMM_BN / QW_QMM_SG_N) / QW_SG_TILE)
 
 kernel void qw_qmm_q4_g64(
     device const uint    *w       [[buffer(0)]],   /* [n, k/8]  packed nibbles */
@@ -44,10 +49,16 @@ kernel void qw_qmm_q4_g64(
     device       float   *y       [[buffer(4)]],   /* [rows, n] */
     constant qw_matmul_args &a    [[buffer(5)]],
     uint3 tgid [[threadgroup_position_in_grid]],
-    uint  tid  [[thread_index_in_threadgroup]])
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup float As[QW_QMM_BK][QW_QMM_BM];
-    threadgroup float Bs[QW_QMM_BK][QW_QMM_BN];
+    /* One pool, used as the two operand tiles during the K loop and then as the
+     * output tile once the loop is done.  BK*(BM+BN) and BM*BN are both 4096
+     * floats here, so the reuse is exact and keeps the kernel at 16 KB rather
+     * than the 32 KB separate arrays would need. */
+    threadgroup float pool[QW_QMM_BK * (QW_QMM_BM + QW_QMM_BN)];
+    threadgroup float *As = pool;                              /* [BK][BM] */
+    threadgroup float *Bs = pool + QW_QMM_BK * QW_QMM_BM;      /* [BK][BN] */
 
     const uint words  = a.k / QW_QPER_WORD;
     const uint groups = a.k / QW_QGROUP;
@@ -55,14 +66,18 @@ kernel void qw_qmm_q4_g64(
     const uint row0 = tgid.y * QW_QMM_BM;   /* first token in this block */
     const uint col0 = tgid.x * QW_QMM_BN;   /* first weight row in this block */
 
-    const uint tm = tid / (QW_QMM_BN / QW_QMM_TN);   /* 0..15, token sub-tile */
-    const uint tn = tid % (QW_QMM_BN / QW_QMM_TN);   /* 0..15, weight sub-tile */
+    /* This simdgroup's corner of the output tile. */
+    const uint sg_m = sgid / QW_QMM_SG_N;
+    const uint sg_n = sgid % QW_QMM_SG_N;
+    const uint m_base = sg_m * (QW_QMM_BM / QW_QMM_SG_M);
+    const uint n_base = sg_n * (QW_QMM_BN / QW_QMM_SG_N);
 
-    float acc[QW_QMM_TM][QW_QMM_TN];
+    simdgroup_float8x8 acc[QW_QMM_FRAG_M][QW_QMM_FRAG_N];
 #pragma unroll
-    for (uint i = 0; i < QW_QMM_TM; ++i)
+    for (uint i = 0; i < QW_QMM_FRAG_M; ++i)
 #pragma unroll
-        for (uint j = 0; j < QW_QMM_TN; ++j) acc[i][j] = 0.0f;
+        for (uint j = 0; j < QW_QMM_FRAG_N; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
     for (uint k0 = 0; k0 < a.k; k0 += QW_QMM_BK) {
 
@@ -72,7 +87,7 @@ kernel void qw_qmm_q4_g64(
             const uint kk = idx % QW_QMM_BK;
             const uint mm = idx / QW_QMM_BK;
             const uint gm = row0 + mm;
-            As[kk][mm] = (gm < a.rows) ? x[(ulong)gm * a.k + k0 + kk] : 0.0f;
+            As[kk * QW_QMM_BM + mm] = (gm < a.rows) ? x[(ulong)gm * a.k + k0 + kk] : 0.0f;
         }
 
         /* Weights, one packed word (8 values) per thread.  A word never spans
@@ -95,33 +110,57 @@ kernel void qw_qmm_q4_g64(
             }
 #pragma unroll
             for (uint j = 0; j < QW_QPER_WORD; ++j)
-                Bs[wk * QW_QPER_WORD + j][nn] = fma(sc, float((ww >> (4 * j)) & 0xF), bi);
+                Bs[(wk * QW_QPER_WORD + j) * QW_QMM_BN + nn] =
+                    fma(sc, float((ww >> (4 * j)) & 0xF), bi);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint kk = 0; kk < QW_QMM_BK; ++kk) {
-            float av[QW_QMM_TM], bv[QW_QMM_TN];
+        for (uint ks = 0; ks < QW_QMM_BK; ks += QW_SG_TILE) {
+            simdgroup_float8x8 af[QW_QMM_FRAG_M], bf[QW_QMM_FRAG_N];
+
+            /* As holds A transposed, so the fragment load transposes back. */
 #pragma unroll
-            for (uint i = 0; i < QW_QMM_TM; ++i) av[i] = As[kk][tm * QW_QMM_TM + i];
+            for (uint i = 0; i < QW_QMM_FRAG_M; ++i)
+                simdgroup_load(af[i], As + ks * QW_QMM_BM + m_base + i * QW_SG_TILE,
+                               QW_QMM_BM, 0, /*transpose=*/true);
 #pragma unroll
-            for (uint j = 0; j < QW_QMM_TN; ++j) bv[j] = Bs[kk][tn * QW_QMM_TN + j];
+            for (uint j = 0; j < QW_QMM_FRAG_N; ++j)
+                simdgroup_load(bf[j], Bs + ks * QW_QMM_BN + n_base + j * QW_SG_TILE,
+                               QW_QMM_BN, 0, /*transpose=*/false);
+
 #pragma unroll
-            for (uint i = 0; i < QW_QMM_TM; ++i)
+            for (uint i = 0; i < QW_QMM_FRAG_M; ++i)
 #pragma unroll
-                for (uint j = 0; j < QW_QMM_TN; ++j)
-                    acc[i][j] = fma(av[i], bv[j], acc[i][j]);
+                for (uint j = 0; j < QW_QMM_FRAG_N; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    for (uint i = 0; i < QW_QMM_TM; ++i) {
-        const uint gm = row0 + tm * QW_QMM_TM + i;
-        if (gm >= a.rows) continue;
-        for (uint j = 0; j < QW_QMM_TN; ++j) {
-            const uint gn = col0 + tn * QW_QMM_TN + j;
-            if (gn < a.n) y[(ulong)gm * a.n + gn] = acc[i][j];
-        }
+    /* Reuse the operand pool as the output tile.  Every simdgroup has finished
+     * reading it above, and the barrier ending the last K step is what makes
+     * that safe. */
+    threadgroup float *Cs = pool;    /* [BM][BN] */
+
+#pragma unroll
+    for (uint i = 0; i < QW_QMM_FRAG_M; ++i)
+#pragma unroll
+        for (uint j = 0; j < QW_QMM_FRAG_N; ++j)
+            simdgroup_store(acc[i][j],
+                            Cs + (m_base + i * QW_SG_TILE) * QW_QMM_BN
+                               + n_base + j * QW_SG_TILE,
+                            QW_QMM_BN, 0, /*transpose=*/false);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Ragged tiles are handled here rather than by the fragment stores, which
+     * always write a full 8x8. */
+    for (uint idx = tid; idx < QW_QMM_BM * QW_QMM_BN; idx += QW_QMM_THREADS) {
+        const uint mm = idx / QW_QMM_BN;
+        const uint nn = idx % QW_QMM_BN;
+        const uint gm = row0 + mm, gn = col0 + nn;
+        if (gm < a.rows && gn < a.n) y[(ulong)gm * a.n + gn] = Cs[idx];
     }
 }
