@@ -58,6 +58,35 @@ struct qwasar_session {
     qw_buf mlp_gate, mlp_up, mlp_act;            /* mlp */
     qw_buf logits;
 
+    /* ---- MTP draft head -------------------------------------------------
+     *
+     * The head runs only after a base forward has completed, so it borrows
+     * that pass's scratch (hn, hn2, qg, q, gate, k, v, attn_out, mlp_*) and
+     * needs its own storage only for what has to outlive a step.
+     *
+     * `mtp_hidden` is [1 + max_rows, hidden].  Row 0 is the PENDING slot and
+     * the rest are the last forward's post-norm hidden states, and the offset
+     * is the whole bookkeeping: head row p is
+     *
+     *     fused(embed(token_{p+1}), hidden_p)
+     *
+     * so a position's hidden state pairs with the NEXT token, and the last
+     * position of any forward cannot be committed until that token exists.
+     * It waits in row 0 for the following step to supply it. */
+    bool    mtp_on;
+    qw_buf  mtp_kcache, mtp_vcache;   /* [kv_heads, max_ctx, head_dim] fp16 */
+    int32_t mtp_n_past;               /* committed head rows */
+    qw_buf  mtp_hidden;               /* [1 + max_rows, hidden] fp32 */
+    bool    mtp_pending;              /* row 0 holds a hidden awaiting its token */
+    int32_t mtp_pending_pos;
+    qw_buf  mtp_tokens, mtp_positions;
+    qw_buf  mtp_embed, mtp_fused, mtp_h, mtp_out, mtp_logits;
+
+    /* Acceptance, counted per draft position.  Drafting is free of the
+     * exactness surface, so these are the only way to know it is working. */
+    int64_t mtp_drafted[QWASAR_MAX_DRAFT];
+    int64_t mtp_accepted[QWASAR_MAX_DRAFT];
+
     qwasar_progress_fn progress;
     void              *progress_ud;
 
@@ -142,6 +171,32 @@ static bool qw_alloc_all(qwasar_session *s, char *err, size_t errcap) {
      * clearing because attention only reads positions that were written. */
     memset(qw_buf_contents(s->ssm_state), 0, ssm_per_layer * sh->n_linear_attn_layers);
     memset(qw_buf_contents(s->conv_state), 0, conv_per_layer * sh->n_linear_attn_layers);
+
+    /* The draft head, if one was loaded.  Its KV cache is a sixteenth of one
+     * base attention layer's, and everything else it needs is a handful of
+     * single rows. */
+    const qw_mtp *m = qwasar_engine_mtp(s->e);
+    if (m->present) {
+        const size_t mtp_kv = (size_t)c->num_key_value_heads * s->max_ctx
+                            * c->head_dim * sizeof(uint16_t);
+        s->mtp_kcache = qw_buf_alloc(mtp_kv);
+        s->mtp_vcache = qw_buf_alloc(mtp_kv);
+        s->mtp_hidden = qw_buf_alloc((size_t)(1 + R) * c->hidden_size * 4);
+        s->mtp_tokens = qw_buf_alloc((size_t)R * sizeof(int32_t));
+        s->mtp_positions = qw_buf_alloc((size_t)3 * R * sizeof(int32_t));
+        s->mtp_embed  = qw_buf_alloc((size_t)R * c->hidden_size * 4);
+        s->mtp_fused  = qw_buf_alloc((size_t)R * 2 * c->hidden_size * 4);
+        s->mtp_h      = qw_buf_alloc((size_t)R * c->hidden_size * 4);
+        s->mtp_out    = qw_buf_alloc((size_t)R * c->hidden_size * 4);
+        s->mtp_logits = qw_buf_alloc((size_t)c->vocab_size * 4);
+        if (!s->mtp_kcache || !s->mtp_vcache || !s->mtp_hidden || !s->mtp_tokens
+            || !s->mtp_positions || !s->mtp_embed || !s->mtp_fused || !s->mtp_h
+            || !s->mtp_out || !s->mtp_logits) {
+            qw_gerrf(err, errcap, "cannot allocate MTP head state");
+            return false;
+        }
+        s->mtp_on = true;
+    }
 
     /* rope tables */
     const int32_t nfreq = c->rotary_dim / 2;
@@ -461,6 +516,156 @@ static void qw_encode_attention_layer(qwasar_session *s, qw_cmd c,
 }
 
 /* Encodes one chunk of `rows` tokens. */
+/* ---- MTP draft head -------------------------------------------------------
+ *
+ * One full-attention layer, dense bf16, with its own KV cache.  Structurally it
+ * is qw_encode_attention_layer above -- the same gated output, the same q and k
+ * norms, the same partial RoPE -- differing only in reading unquantised weights
+ * and its own cache.
+ *
+ * The head only PROPOSES.  Nothing it computes reaches an emitted token except
+ * through the target's verification, so none of this sits on the exactness
+ * surface: a bug here costs acceptance rate, not correctness.  Which is also
+ * why it has to be measured.  There is no wrong answer for it to produce, only
+ * a worse one, and nothing will report it. */
+
+static void qw_encode_dense(qw_cmd c, const qw_dense *d, qw_ref out, qw_ref in,
+                            int32_t rows) {
+    qw_op_dmat_bf16(c, out, in, qw_tensor_ref(d->weight),
+                    d->in_features, d->out_features, rows);
+}
+
+/* Fuses `rows` (hidden, next-token) pairs, runs them through the head's layer,
+ * and appends their keys and values to the head cache at `mtp_n_past`.
+ *
+ * `hidden` is [rows, hidden_size] of post-norm backbone hidden states;
+ * `mtp_embed` must already hold the embeddings of the paired next tokens and
+ * `mtp_positions` their backbone positions.  The result lands in `mtp_out`,
+ * which is what the base lm_head reads. */
+static void qw_encode_mtp_rows(qwasar_session *s, qw_cmd c, qw_ref hidden,
+                               int32_t rows) {
+    const qw_config *cfg = s->cfg;
+    const qw_shape  *sh  = s->shape;
+    const qw_mtp    *m   = qwasar_engine_mtp(s->e);
+    const int32_t hd = cfg->head_dim;
+
+    /* [ norm_e(embed(next)) | norm_h(hidden) ] -- embedding half first.  That
+     * is the opposite of the DeepSeek layout this head otherwise resembles;
+     * reversed, it loads, runs at full speed, and drafts nonsense. */
+    qw_op_rms_norm_concat(c, qw_ref_at(s->mtp_fused, 0),
+                          qw_ref_at(s->mtp_embed, 0),
+                          qw_tensor_ref(m->pre_fc_norm_embedding),
+                          hidden, qw_tensor_ref(m->pre_fc_norm_hidden),
+                          cfg->hidden_size, rows, cfg->rms_norm_eps);
+    qw_encode_dense(c, &m->fc, qw_ref_at(s->mtp_h, 0), qw_ref_at(s->mtp_fused, 0), rows);
+
+    qw_op_rms_norm(c, qw_ref_at(s->hn, 0), qw_ref_at(s->mtp_h, 0),
+                   qw_tensor_ref(m->input_layernorm),
+                   cfg->hidden_size, rows, cfg->rms_norm_eps, 1.0f);
+
+    qw_encode_dense(c, &m->q_proj, qw_ref_at(s->qg, 0), qw_ref_at(s->hn, 0), rows);
+    qw_encode_dense(c, &m->k_proj, qw_ref_at(s->k, 0),  qw_ref_at(s->hn, 0), rows);
+    qw_encode_dense(c, &m->v_proj, qw_ref_at(s->v, 0),  qw_ref_at(s->hn, 0), rows);
+
+    qw_op_split_heads2(c, qw_ref_at(s->q, 0), qw_ref_at(s->gate, 0), qw_ref_at(s->qg, 0),
+                       rows, cfg->num_attention_heads, hd);
+    qw_op_rms_norm(c, qw_ref_at(s->q, 0), qw_ref_at(s->q, 0), qw_tensor_ref(m->q_norm),
+                   hd, rows * cfg->num_attention_heads, cfg->rms_norm_eps, 1.0f);
+    qw_op_rms_norm(c, qw_ref_at(s->k, 0), qw_ref_at(s->k, 0), qw_tensor_ref(m->k_norm),
+                   hd, rows * cfg->num_key_value_heads, cfg->rms_norm_eps, 1.0f);
+
+    qw_op_rope_partial(c, qw_ref_at(s->q, 0), qw_ref_at(s->mtp_positions, 0),
+                       qw_ref_at(s->rope_axis, 0), qw_ref_at(s->rope_inv_freq, 0),
+                       rows, cfg->num_attention_heads, hd, cfg->rotary_dim);
+    qw_op_rope_partial(c, qw_ref_at(s->k, 0), qw_ref_at(s->mtp_positions, 0),
+                       qw_ref_at(s->rope_axis, 0), qw_ref_at(s->rope_inv_freq, 0),
+                       rows, cfg->num_key_value_heads, hd, cfg->rotary_dim);
+
+    qw_op_kv_write(c, qw_ref_at(s->mtp_kcache, 0), qw_ref_at(s->mtp_vcache, 0),
+                   qw_ref_at(s->k, 0), qw_ref_at(s->v, 0),
+                   rows, cfg->num_key_value_heads, hd, s->max_ctx, s->mtp_n_past);
+    qw_op_attn_decode(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->q, 0),
+                      qw_ref_at(s->mtp_kcache, 0), qw_ref_at(s->mtp_vcache, 0),
+                      rows, cfg->num_attention_heads, cfg->num_key_value_heads,
+                      hd, s->max_ctx, s->mtp_n_past, 1.0f / sqrtf((float)hd));
+    qw_op_mul_sigmoid(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->gate, 0),
+                      rows * sh->q_dim);
+    qw_encode_dense(c, &m->o_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->attn_out, 0), rows);
+    qw_op_add_inplace(c, qw_ref_at(s->mtp_h, 0), qw_ref_at(s->hn2, 0),
+                      rows * cfg->hidden_size);
+
+    qw_op_rms_norm(c, qw_ref_at(s->hn, 0), qw_ref_at(s->mtp_h, 0),
+                   qw_tensor_ref(m->post_attention_layernorm),
+                   cfg->hidden_size, rows, cfg->rms_norm_eps, 1.0f);
+    qw_encode_dense(c, &m->gate_proj, qw_ref_at(s->mlp_gate, 0), qw_ref_at(s->hn, 0), rows);
+    qw_encode_dense(c, &m->up_proj,   qw_ref_at(s->mlp_up, 0),   qw_ref_at(s->hn, 0), rows);
+    qw_op_swiglu(c, qw_ref_at(s->mlp_act, 0), qw_ref_at(s->mlp_gate, 0),
+                 qw_ref_at(s->mlp_up, 0), rows * cfg->intermediate_size);
+    qw_encode_dense(c, &m->down_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->mlp_act, 0), rows);
+    qw_op_add_inplace(c, qw_ref_at(s->mtp_h, 0), qw_ref_at(s->hn2, 0),
+                      rows * cfg->hidden_size);
+
+    qw_op_rms_norm(c, qw_ref_at(s->mtp_out, 0), qw_ref_at(s->mtp_h, 0),
+                   qw_tensor_ref(m->norm), cfg->hidden_size, rows,
+                   cfg->rms_norm_eps, 1.0f);
+}
+
+/* Fills the head's position buffer.  Text-only positions are identical on all
+ * three MRoPE axes, and the stride is the row count of this call. */
+static void qw_mtp_positions(qwasar_session *s, int32_t first, int32_t rows) {
+    int32_t *pv = qw_buf_contents(s->mtp_positions);
+    for (int axis = 0; axis < 3; axis++)
+        for (int32_t r = 0; r < rows; r++) pv[axis * rows + r] = first + r;
+}
+
+/* Extends the head's committed history by every row whose next token is
+ * already known -- which, after a forward over `rows` tokens, is all of them
+ * but the last.
+ *
+ * This is the part that decides whether drafting is worth anything at all.  A
+ * head asked to predict from a single position instead of the whole committed
+ * prefix accepts about a quarter of the time rather than nine tenths, so the
+ * history is not an optimisation and cannot be skipped; it is what the head
+ * was trained to read.
+ *
+ * The bookkeeping follows from one invariant: head row p pairs the backbone's
+ * hidden state at p with the embedding of token p+1.  A position's own next
+ * token is therefore the thing that is missing at the end of every forward, so
+ * the last row waits in `mtp_hidden` row 0 for the following call -- an eval
+ * that supplies it as its first input token, or a draft that supplies the
+ * token just emitted. */
+static void qw_encode_mtp_upkeep(qwasar_session *s, qw_cmd c, int32_t rows) {
+    const qw_config *cfg = s->cfg;
+    const qw_qlinear *embed = qwasar_engine_embed(s->e);
+
+    /* With a row pending, the tokens are this chunk's inputs and the hidden
+     * states run from the pending row through all but this chunk's last.
+     * Without one -- the first forward of a session -- there is no position
+     * before the first, so the first token pairs with nothing. */
+    const int32_t n_up = s->mtp_pending ? rows : rows - 1;
+    if (n_up > 0) {
+        const int32_t *tokens = qw_buf_contents(s->tokens);
+        int32_t *tv = qw_buf_contents(s->mtp_tokens);
+        memcpy(tv, tokens + (s->mtp_pending ? 0 : 1), (size_t)n_up * sizeof *tv);
+        qw_mtp_positions(s, s->mtp_n_past, n_up);
+
+        qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_ref_at(s->mtp_tokens, 0),
+                       qw_tensor_ref(embed->weight), qw_tensor_ref(embed->scales),
+                       qw_tensor_ref(embed->biases), cfg->hidden_size, n_up);
+        qw_encode_mtp_rows(s, c,
+                           qw_off(s->mtp_hidden,
+                                  s->mtp_pending ? 0 : (size_t)cfg->hidden_size),
+                           n_up);
+        s->mtp_n_past += n_up;
+    }
+
+    /* Park this chunk's last hidden state in the pending slot. */
+    qw_op_slice_rows(c, qw_ref_at(s->mtp_hidden, 0),
+                     qw_off(s->mtp_hidden, (size_t)rows * cfg->hidden_size),
+                     1, cfg->hidden_size, 0, cfg->hidden_size);
+    s->mtp_pending = true;
+}
+
 static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool want_logits) {
     const qw_config *cfg = s->cfg;
     qwasar_engine *e = s->e;
@@ -503,15 +708,98 @@ static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wa
                                  1, cfg->hidden_size, 0, cfg->hidden_size);
     }
 
-    if (!want_logits) return;
+    /* The draft head reads this same normalised hidden state, so the norm runs
+     * on every chunk when a head is attached rather than only on the one that
+     * produces logits. */
+    if (!want_logits && !s->mtp_on) return;
 
-    /* Only the final token's logits are ever used, and the head is the single
-     * widest matvec in the model, so it runs on one row rather than `rows`. */
     qw_op_rms_norm(c, qw_ref_at(s->hn, 0), qw_ref_at(s->h, 0),
                    qw_tensor_ref(qwasar_engine_final_norm(e)),
                    cfg->hidden_size, rows, cfg->rms_norm_eps, 1.0f);
-    qw_encode_qlinear(c, qwasar_engine_head(e), qw_ref_at(s->logits, 0),
-                      qw_off(s->hn, (size_t)(rows - 1) * cfg->hidden_size), 1);
+
+    /* Rows 1.. of mtp_hidden hold this chunk's post-norm hidden states; row 0
+     * is the pending slot the upkeep below reads and then refills. */
+    if (s->mtp_on)
+        qw_op_slice_rows(c, qw_off(s->mtp_hidden, (size_t)cfg->hidden_size),
+                         qw_ref_at(s->hn, 0), rows, cfg->hidden_size,
+                         0, cfg->hidden_size);
+
+    /* Only the final token's logits are ever used, and the head is the single
+     * widest matvec in the model, so it runs on one row rather than `rows`.
+     * It goes before the draft head's own pass, which reuses `hn` as scratch. */
+    if (want_logits)
+        qw_encode_qlinear(c, qwasar_engine_head(e), qw_ref_at(s->logits, 0),
+                          qw_off(s->hn, (size_t)(rows - 1) * cfg->hidden_size), 1);
+
+    if (s->mtp_on) qw_encode_mtp_upkeep(s, c, rows);
+}
+
+static int32_t qw_argmax(const float *v, int32_t n) {
+    int32_t best = 0;
+    for (int32_t i = 1; i < n; i++) if (v[i] > v[best]) best = i;
+    return best;
+}
+
+bool qwasar_session_has_mtp(const qwasar_session *s) { return s && s->mtp_on; }
+
+int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
+                             int32_t *drafts, int32_t n_draft,
+                             char *err, size_t errcap) {
+    if (!s || !s->mtp_on) { qw_gerrf(err, errcap, "no MTP draft head"); return -1; }
+    if (!s->mtp_pending)  { qw_gerrf(err, errcap, "nothing to draft from"); return -1; }
+    if (n_draft < 1) return 0;
+    if (n_draft > QWASAR_MAX_DRAFT) n_draft = QWASAR_MAX_DRAFT;
+
+    const qw_config  *cfg   = s->cfg;
+    const qw_qlinear *embed = qwasar_engine_embed(s->e);
+
+    /* The first row completes the pending position and is therefore committed:
+     * both of its inputs -- the backbone's hidden state and the token just
+     * emitted -- are real.  Every row after it is built on a token the head
+     * only guessed, so those rows are speculative and are dropped at the end by
+     * rewinding the write cursor. */
+    const int32_t committed = s->mtp_n_past + 1;
+    int32_t token  = emitted;
+    qw_ref  hidden = qw_ref_at(s->mtp_hidden, 0);
+    int32_t n = 0;
+
+    for (; n < n_draft; n++) {
+        int32_t *tv = qw_buf_contents(s->mtp_tokens);
+        tv[0] = token;
+        qw_mtp_positions(s, s->mtp_n_past, 1);
+
+        /* A round trip per draft, because the next row needs this row's token
+         * id on the CPU to look up its embedding.  Chaining the whole block in
+         * one command buffer would need argmax and the embedding gather to run
+         * on the GPU; worth doing when the schedule is being tuned, not while
+         * the acceptance rate is still unknown. */
+        qw_cmd c = qw_cmd_begin();
+        if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return -1; }
+        qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_ref_at(s->mtp_tokens, 0),
+                       qw_tensor_ref(embed->weight), qw_tensor_ref(embed->scales),
+                       qw_tensor_ref(embed->biases), cfg->hidden_size, 1);
+        qw_encode_mtp_rows(s, c, hidden, 1);
+        qw_encode_qlinear(c, qwasar_engine_head(s->e), qw_ref_at(s->mtp_logits, 0),
+                          qw_ref_at(s->mtp_out, 0), 1);
+        qw_cmd_wait(c);
+        const char *cerr = qw_cmd_error(c);
+        if (cerr) {
+            qw_gerrf(err, errcap, "GPU error: %s", cerr);
+            qw_cmd_free(c);
+            return -1;
+        }
+        qw_cmd_free(c);
+
+        s->mtp_n_past++;
+        if (n == 0) s->mtp_pending = false;
+
+        token = qw_argmax(qw_buf_contents(s->mtp_logits), cfg->vocab_size);
+        drafts[n] = token;
+        hidden = qw_ref_at(s->mtp_out, 0);
+    }
+
+    s->mtp_n_past = committed;
+    return n;
 }
 
 const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32_t n,

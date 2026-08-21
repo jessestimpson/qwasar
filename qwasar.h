@@ -145,6 +145,31 @@ const float *qwasar_session_logits(const qwasar_session *s);
 typedef void (*qwasar_progress_fn)(void *ud, int32_t done, int32_t total);
 void qwasar_session_set_progress(qwasar_session *s, qwasar_progress_fn fn, void *ud);
 
+/* ---- speculative drafting -------------------------------------------------
+ *
+ * True when the engine was loaded with an MTP draft head.  The head proposes
+ * tokens; it never decides one, so nothing here can change what the model
+ * emits -- only how many forward passes it takes to emit it. */
+bool qwasar_session_has_mtp(const qwasar_session *s);
+
+/* Longest chained draft the head will produce in one round.  The head's own
+ * config says it was trained for a block of 3; this is the ceiling on asking
+ * for more than that. */
+#define QWASAR_MAX_DRAFT 8
+
+/* Drafts up to `n_draft` tokens for the positions after `emitted`, which must
+ * be the token the session's last evaluation produced.  Writes them oldest
+ * first and returns how many were produced, or -1 with `err` filled.
+ *
+ * The first draft costs a pass over the head; each one after it is chained from
+ * the head's own output, so acceptance falls with depth.  Committed history is
+ * maintained by the session itself: the head attends over the whole conversation
+ * so far, which is worth roughly three times the acceptance rate of drafting
+ * from a single position. */
+int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
+                             int32_t *drafts, int32_t n_draft,
+                             char *err, size_t errcap);
+
 /* ---- sampling ---------------------------------------------------------------
  *
  * Filters apply in a fixed order: temperature, top-k, min-p, top-p.

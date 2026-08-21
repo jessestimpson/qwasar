@@ -18,6 +18,7 @@ static void usage(FILE *out) {
         "  -c, --context <n>     context size in tokens (default 32768)\n"
         "      --chunk <n>       prefill tokens per forward pass (default 256)\n"
         "      --mtp <dir>       multi-token-prediction draft head directory\n"
+        "      --mtp-depth <n>   measure draft acceptance at this depth\n"
         "  -n, --predict <n>     tokens to generate (default 512)\n"
         "  -p, --prompt <text>   user message\n"
         "  -s, --system <text>   system message\n"
@@ -85,6 +86,7 @@ int main(int argc, char **argv) {
     const char *effort = "xhigh";
     bool thinking = true, show_think = false;
     int n_predict = 512;   /* xhigh reasoning alone often exceeds 128 */
+    int mtp_depth = 0;     /* 0 = do not measure draft acceptance */
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -96,6 +98,8 @@ int main(int argc, char **argv) {
             opts.prefill_chunk = atoi(argv[++i]);
         } else if (!strcmp(a, "--mtp") && i + 1 < argc) {
             opts.mtp_path = argv[++i];
+        } else if (!strcmp(a, "--mtp-depth") && i + 1 < argc) {
+            mtp_depth = atoi(argv[++i]);
         } else if ((!strcmp(a, "-n") || !strcmp(a, "--predict")) && i + 1 < argc) {
             n_predict = atoi(argv[++i]);
         } else if ((!strcmp(a, "-p") || !strcmp(a, "--prompt")) && i + 1 < argc) {
@@ -196,6 +200,28 @@ int main(int argc, char **argv) {
     int generated = 0;
     double t_decode = 0.0;
 
+    /* ---- draft acceptance ------------------------------------------------
+     *
+     * Measured against ordinary decoding, with no rollback anywhere: the target
+     * decides every token exactly as it would have, and the head is asked what
+     * it WOULD have proposed.  Nothing here can change the output, which is the
+     * point -- the acceptance rate has to be known before any of the machinery
+     * that depends on it is worth building.
+     *
+     * A round drafts `mtp_depth` tokens, then the target generates until one of
+     * them is wrong, which is exactly how a real verify would advance; the next
+     * round starts from there.  Position i is only counted when every draft
+     * before it was accepted, so these are the conditional probabilities the
+     * depth schedule needs, not marginal ones. */
+    int32_t drafts[QWASAR_MAX_DRAFT];
+    int64_t drafted[QWASAR_MAX_DRAFT] = { 0 }, accepted[QWASAR_MAX_DRAFT] = { 0 };
+    int64_t rounds = 0, round_tokens = 0;
+    int32_t n_drafted = 0, draft_at = 0;
+    double t_draft = 0.0;
+    const bool measure = mtp_depth > 0 && qwasar_session_has_mtp(s);
+    if (mtp_depth > 0 && !measure)
+        fprintf(stderr, "qwasar: --mtp-depth needs --mtp <dir>\n");
+
     /* The generation prompt leaves <think> open, so everything up to </think>
      * is reasoning.  Hidden unless asked for, but always consumed. */
     bool in_reasoning = thinking && !token_spec;
@@ -203,6 +229,28 @@ int main(int argc, char **argv) {
     for (; generated < n_predict; generated++) {
         int32_t next = argmax(logits, vocab);
         if (qwasar_is_eos(e, next)) break;
+
+        if (measure) {
+            if (n_drafted > 0) {
+                /* One draft stands for this position.  A miss ends the round,
+                 * exactly as a rejected token would end a verify. */
+                const bool ok = (drafts[draft_at] == next);
+                drafted[draft_at]++;
+                if (ok) accepted[draft_at]++;
+                round_tokens++;
+                if (!ok || ++draft_at >= n_drafted) n_drafted = 0;
+            }
+            if (n_drafted == 0) {
+                double td = now_sec();
+                int32_t got = qwasar_session_draft(s, next, drafts, mtp_depth,
+                                                   err, sizeof err);
+                t_draft += now_sec() - td;
+                if (got < 0) { fprintf(stderr, "\nqwasar: %s\n", err); return 1; }
+                n_drafted = got;
+                draft_at = 0;
+                rounds++;
+            }
+        }
 
         if (next == think_close && in_reasoning) {
             in_reasoning = false;
@@ -220,6 +268,21 @@ int main(int argc, char **argv) {
         if (!logits) { fprintf(stderr, "\nqwasar: %s\n", err); return 1; }
     }
     printf("\n");
+
+    if (measure && rounds > 0) {
+        fprintf(stderr, "\nmtp  %lld rounds, %.2f tokens per round, %.1fs drafting\n",
+                (long long)rounds, (double)round_tokens / (double)rounds, t_draft);
+        double reach = 1.0;
+        for (int i = 0; i < mtp_depth && i < QWASAR_MAX_DRAFT; i++) {
+            if (!drafted[i]) break;
+            double p = (double)accepted[i] / (double)drafted[i];
+            reach *= p;
+            fprintf(stderr, "     draft %d: %lld/%lld accepted (%.1f%%), "
+                            "reach %.1f%%\n",
+                    i, (long long)accepted[i], (long long)drafted[i],
+                    100.0 * p, 100.0 * reach);
+        }
+    }
 
     /* Silence here would be indistinguishable from a finished answer, and with
      * reasoning hidden the visible output can be a fraction of the budget. */

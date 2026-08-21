@@ -824,20 +824,51 @@ on the serial path before it is called a regression.
 
 #### Order of work
 
-1. Batched `qmv` for B <= 8, measured against the per-token path. Nothing below
-   is worth starting until the width curve is on paper.
-2. Head load (`--mtp`), bf16, with the concat-and-`fc` CPU twin.
-3. Persistent committed-history head cache. Instrument acceptance per position
-   before optimising anything.
+1. Batched `qmv` for B <= 8, measured against the per-token path. *(done)*
+2. Head load (`--mtp`), bf16, with the concat-and-`fc` CPU twin. *(done)*
+3. Persistent committed-history head cache, and acceptance per position. *(done)*
 4. Per-boundary GDN checkpoints and KV rewind; the token-identity gate.
-5. Fixed depth 2, measured end to end against serial on the same thermal
+5. Fixed depth 3, measured end to end against serial on the same thermal
    footing -- the paired back-to-back method §2 already uses.
 6. Only then the adaptive schedule, refitting the price constant from qwasar's
    own width curve.
 
-Steps 1-5 are the milestone. Expect them to land near break-even, because that
-is what break-even looks like on a tuned harness with an untuned schedule. Step
-6 is where the multiple comes from.
+#### Measured: what the head actually accepts
+
+`--mtp-depth N` drafts and compares without rolling anything back, so the target
+decides every token exactly as it would have. Verified: output is byte-identical
+with and without it. Position *i* is counted only when every draft before it was
+accepted, so these are conditional probabilities, which is what a depth schedule
+needs.
+
+| depth | tokens/round | d0 | d1 | d2 | d3 | d4 | d5 |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.99 | 87% | | | | | |
+| 2 | 1.83 | 87% | 74% | | | | |
+| 3 | 2.64 | 96% | 74% | 77% | | | |
+| 4 | 2.75 | 83% | 66% | 84% | 88% | | |
+| 6 | 3.41 | 82% | 83% | 68% | 46%* | 60% | 50% |
+
+\* small samples past depth 3; a hundred generated tokens is 29 rounds.
+
+This is far better than the prior warranted, and it settles the pre-norm vs
+post-norm contradiction between the two references empirically: **post-norm**.
+A first-draft acceptance of 83-96% is not what a head reading the wrong hidden
+state produces, and neither is it what a reversed concatenation produces.
+
+Drafting cost lands where the arithmetic said it would: ~18 ms per draft against
+a ~178 ms decode step, or **h ≈ 0.10**, which is the head's 849 MB plus the
+lm_head's 715 MB against the backbone's 14.95 GB. Layr Labs measured 0.18 on
+their stack; the difference is theirs is a 4-bit head with chained-launch
+overhead, and ours has not paid for its round trips yet.
+
+At depth 3 that projects to a round of 3 x 18 ms of drafting plus one verify.
+If the verify of four tokens costs ~1.15 decode steps, the round is ~258 ms for
+2.64 tokens, against 178 ms per token serial: **~1.8x**. That number is a
+projection until step 4 exists -- there is no verify yet, only the acceptance it
+would have had.
+
+Steps 4-5 are the rest of the milestone. Step 6 is where the multiple grows.
 
 *Sources for the measured figures in this section: Layr Labs'
 `qwen-3.8-mtp-challenge` (MIT), kept under `reference/`. The numbers are theirs
