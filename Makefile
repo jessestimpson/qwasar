@@ -38,7 +38,7 @@ help:
 qwasar: qwasar_cli.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-qwasar-agent: qwasar_agent.o linenoise.o $(CORE_OBJS)
+qwasar-agent: qwasar_agent.o qwasar_tui.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 qwasar-server: qwasar_server.o $(CORE_OBJS)
@@ -46,7 +46,8 @@ qwasar-server: qwasar_server.o $(CORE_OBJS)
 
 qwasar_server.o: qwasar_server.c qwasar.h qwasar_json.h qwasar_toolcall.h
 
-qwasar_agent.o: qwasar_agent.c qwasar.h qwasar_toolcall.h linenoise.h
+qwasar_agent.o: qwasar_agent.c qwasar.h qwasar_toolcall.h qwasar_tui.h
+qwasar_tui.o:   qwasar_tui.c qwasar_tui.h linenoise.h
 linenoise.o:    linenoise.c linenoise.h
 
 # Kernel sources are embedded rather than read from disk at runtime, so the

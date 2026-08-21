@@ -850,7 +850,24 @@ of the bar so the line keeps one width. It draws only on a terminal, and only
 above 128 tokens -- a tool result is a few dozen tokens and a bar that appears
 and vanishes is worse than none.
 
-Still to do: todo tracking, glob, and interrupting a running turn.
+The REPL runs on a scroll region, following ds4-agent: no alternate screen, so
+the transcript stays in normal scrollback, with the bottom two rows reserved for
+a prompt and a status footer that output scrolls underneath.
+
+Two things about that were only discoverable by rendering the escape stream
+through a real terminal emulator rather than reasoning about it:
+
+- **DECSC/DECRC cannot hold the output position.** A saved cursor is an absolute
+  screen cell, and scrolling the region silently invalidates it, so two turns of
+  output landed on the same line and overwrote each other. The append point is
+  now tracked as a column on a fixed row, which scrolling cannot invalidate.
+- **linenoise must not own the status row.** Its relative-motion redraws and its
+  full-width status padding both fight the region, and status lines ended up
+  scrolled into the transcript. The prompt row is still linenoise's; the status
+  row is painted directly, absolutely, and truncated a column short of the
+  width so it can never wrap.
+
+Still to do: todo tracking and glob.
 
 ### Disk KV cache
 
