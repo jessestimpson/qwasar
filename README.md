@@ -446,6 +446,21 @@ Stated plainly, because a README that only lists what works is not much use:
 
 ---
 
+# License
+
+MIT — see [LICENSE](LICENSE).
+
+Everything qwasar builds on is permissively licensed and MIT-compatible: MLX and
+mlx-vlm are MIT, ds4 is MIT, and linenoise is BSD-2-Clause.
+[THIRD-PARTY.md](THIRD-PARTY.md) records each of them, what its terms require,
+and — for the ones that require nothing — why the acknowledgement is there
+anyway.
+
+Model weights are not part of this repository and carry their own licence from
+the Qwen team.
+
+---
+
 # Notes on the code
 
 A few conventions, inherited from ds4 and worth knowing before reading:

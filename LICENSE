@@ -1,0 +1,35 @@
+MIT License
+
+Copyright (c) 2026 Jesse Stimpson
+Copyright (c) 2023 Apple Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+The Apple Inc. copyright above is carried deliberately.  qwasar does not link
+against MLX, but two of its Metal kernels follow the structure of MLX's, which
+were read closely while writing them: the gated-delta recurrence takes its grid
+layout, per-lane state slicing and simd_sum reduction from MLX's kernel, and the
+attention kernel follows MLX's vector-SDPA shape.  MLX is MIT licensed, so
+nothing here requires this notice; it is kept because the debt is real.  See
+THIRD-PARTY.md.
+
+qwasar also vendors linenoise, which is BSD-2-Clause and carries its own notice.
+That one is an obligation, not a courtesy.  See THIRD-PARTY.md.
