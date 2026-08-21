@@ -106,11 +106,22 @@ static void test_linear_impl(const qw_qlinear *ql, const char *label, int32_t ro
         }
     }
 
-    /* Both sides accumulate in fp32 but in different orders (a simdgroup tree
-     * versus a sequential loop), so agreement is bounded by fp32 rounding over
-     * k terms, not by the quantisation. */
-    CHECK(worst < 2e-6, "%s: worst relative error %.3g at row %d (rows=%d)",
-          label, worst, worst_row, rows);
+    /* The two kernels have different error floors by design.
+     *
+     * qmv keeps everything in fp32, so it is bounded by fp32 rounding over k
+     * terms -- nothing to do with the quantisation.
+     *
+     * qmm stages its operands in half to halve threadgroup traffic, which costs
+     * about two decimal digits.  That is worth measuring against what it buys
+     * rather than against zero: the reference implementation runs bf16
+     * activations throughout, and disagrees with *itself* by 7.4e-2 on logits
+     * when only the accumulation order changes (PLAN.md section 4).  A per-op
+     * error of 1e-5 is two thousand times inside that, and tests/test_forward
+     * is what actually holds the line -- it requires the whole model's argmax
+     * and top-5 ordering to still match the reference exactly. */
+    const double tol = (impl == QW_USE_QMM) ? 5e-5 : 2e-6;
+    CHECK(worst < tol, "%s: worst relative error %.3g at row %d (rows=%d, %s)",
+          label, worst, worst_row, rows, impl == QW_USE_QMM ? "qmm" : "qmv");
     printf("  %-3s %-24s k=%-6d n=%-7d rows=%-3d  worst rel err %.2e\n",
            impl == QW_USE_QMM ? "mm" : "mv", label, k, n, rows, worst);
 

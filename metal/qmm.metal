@@ -20,9 +20,14 @@
  * product per instruction, which removes the load-to-arithmetic ratio as the
  * limit rather than tuning around it.
  *
- * Tiles are stored K-major: As is [BK][BM] and Bs is [BK][BN].  Bs is then
- * exactly B's natural [K][N] layout and loads directly; As is A transposed, so
- * its fragments load with the transpose flag set. */
+ * Bs is stored K-major, [BK][BN], which is exactly B's natural [K][N] layout,
+ * so its fragments load directly.  As is stored M-major, [BM][BK], which is A's
+ * natural layout for the same reason -- neither fragment load has to transpose.
+ *
+ * (An earlier register-tiled version stored As K-major so the inner loop could
+ * read float4 runs.  That reason disappeared with the matrix units, and keeping
+ * it cost twice over: a transposing fragment load, and a strided threadgroup
+ * write during staging.) */
 
 /* Tiling comes from qwasar_gpu.h, injected as preprocessor macros when the
  * library is compiled, so the host's dispatch geometry cannot drift from the
@@ -53,12 +58,17 @@ kernel void qw_qmm_q4_g64(
     uint  sgid [[simdgroup_index_in_threadgroup]])
 {
     /* One pool, used as the two operand tiles during the K loop and then as the
-     * output tile once the loop is done.  BK*(BM+BN) and BM*BN are both 4096
-     * floats here, so the reuse is exact and keeps the kernel at 16 KB rather
-     * than the 32 KB separate arrays would need. */
-    threadgroup float pool[QW_QMM_BK * (QW_QMM_BM + QW_QMM_BN)];
-    threadgroup float *As = pool;                              /* [BK][BM] */
-    threadgroup float *Bs = pool + QW_QMM_BK * QW_QMM_BM;      /* [BK][BN] */
+     * output tile once the loop is done.
+     *
+     * Operands are half, accumulators stay float.  Dequantised 4-bit weights
+     * and post-norm activations both sit far inside half's range, and halving
+     * the tiles halves the threadgroup traffic in the inner loop, which is
+     * where this kernel spends its time.  The matrix units themselves are not
+     * meaningfully faster for half on this hardware -- measured 16.5 against
+     * 15.6 -- so the win is bandwidth, not arithmetic. */
+    threadgroup float pool[QW_QMM_BM * QW_QMM_BN];
+    threadgroup half *As = (threadgroup half *)pool;                     /* [BM][BK] */
+    threadgroup half *Bs = (threadgroup half *)pool + QW_QMM_BK * QW_QMM_BM;
 
     const uint words  = a.k / QW_QPER_WORD;
     const uint groups = a.k / QW_QGROUP;
@@ -87,7 +97,10 @@ kernel void qw_qmm_q4_g64(
             const uint kk = idx % QW_QMM_BK;
             const uint mm = idx / QW_QMM_BK;
             const uint gm = row0 + mm;
-            As[kk * QW_QMM_BM + mm] = (gm < a.rows) ? x[(ulong)gm * a.k + k0 + kk] : 0.0f;
+            /* Consecutive threads take consecutive k for one token, so both the
+             * global read and the threadgroup write run contiguously. */
+            As[mm * QW_QMM_BK + kk] = (gm < a.rows)
+                                    ? half(x[(ulong)gm * a.k + k0 + kk]) : half(0);
         }
 
         /* Weights, one packed word (8 values) per thread.  A word never spans
@@ -111,19 +124,19 @@ kernel void qw_qmm_q4_g64(
 #pragma unroll
             for (uint j = 0; j < QW_QPER_WORD; ++j)
                 Bs[(wk * QW_QPER_WORD + j) * QW_QMM_BN + nn] =
-                    fma(sc, float((ww >> (4 * j)) & 0xF), bi);
+                    half(fma(sc, float((ww >> (4 * j)) & 0xF), bi));
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint ks = 0; ks < QW_QMM_BK; ks += QW_SG_TILE) {
-            simdgroup_float8x8 af[QW_QMM_FRAG_M], bf[QW_QMM_FRAG_N];
+            simdgroup_half8x8 af[QW_QMM_FRAG_M], bf[QW_QMM_FRAG_N];
 
-            /* As holds A transposed, so the fragment load transposes back. */
 #pragma unroll
             for (uint i = 0; i < QW_QMM_FRAG_M; ++i)
-                simdgroup_load(af[i], As + ks * QW_QMM_BM + m_base + i * QW_SG_TILE,
-                               QW_QMM_BM, 0, /*transpose=*/true);
+                simdgroup_load(af[i],
+                               As + (m_base + i * QW_SG_TILE) * QW_QMM_BK + ks,
+                               QW_QMM_BK, 0, /*transpose=*/false);
 #pragma unroll
             for (uint j = 0; j < QW_QMM_FRAG_N; ++j)
                 simdgroup_load(bf[j], Bs + ks * QW_QMM_BN + n_base + j * QW_SG_TILE,

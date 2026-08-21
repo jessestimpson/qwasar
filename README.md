@@ -151,8 +151,9 @@ Decode runs at 5.8 tok/s on an M4 — the memory-bandwidth roof for a dense 27B 
 ~120 GB/s (`PLAN.md` §2). Prefill is currently no faster, because the matvec
 re-reads the weights once per token; a tiled `qmm` is the next significant win.
 
-Prefill runs at 35 tok/s after two rounds of work on the quantised matmul: a
-tiled version, then moving its inner product onto the GPU's 8x8 matrix units.
-That is 55% of this machine's measured fp32 peak.
+Prefill runs at 42.6 tok/s after three rounds of work on the quantised matmul:
+a tiled version, then moving its inner product onto the GPU's 8x8 matrix units,
+then half-precision operand tiles. That is 80% of what MLX's own quantised
+matmul achieves on identical shapes.
 
 Next: vision, and half-precision operand tiles in the matmul.
