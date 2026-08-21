@@ -74,7 +74,11 @@ static bool term_size(int *rows, int *cols) {
  * This replaces an earlier DECSC/DECRC scheme, which was wrong in a way that
  * only a real terminal showed: a saved cursor is an absolute screen cell, and
  * scrolling silently invalidates it, so two turns of output landed on the same
- * line and overwrote each other. */
+ * line and overwrote each other.
+ *
+ * The returned column may be `cols`, meaning the row is exactly full.  That is
+ * a real terminal state, not an overflow: wrapping is deferred until the next
+ * cell is drawn, so the scroll has not happened yet.  tui_out resolves it. */
 static int advance_col(int col, const char *s, size_t n, int cols) {
     for (size_t i = 0; i < n; i++) {
         if (s[i] == '\x1b') {                     /* escapes occupy no cells */
@@ -90,8 +94,8 @@ static int advance_col(int col, const char *s, size_t n, int cols) {
         if ((unsigned char)s[i] < 0x20) continue;
         /* UTF-8 continuation bytes are part of the cell already counted. */
         if (((unsigned char)s[i] & 0xC0) == 0x80) continue;
+        if (cols > 0 && col >= cols) col = 0;      /* a pending wrap resolves */
         col++;
-        if (cols > 0 && col >= cols) col = 0;      /* the terminal wrapped */
     }
     return col;
 }
@@ -403,7 +407,20 @@ void tui_out(qw_tui *t, const char *s, size_t n) {
     if (!t->hidden) tui_hide(t);
     if (t->region) csi_move(t->out_bottom, t->out_col + 1);
     wr(s, n);
-    if (t->region) t->out_col = advance_col(t->out_col, s, n, t->cols);
+    if (t->region) {
+        t->out_col = advance_col(t->out_col, s, n, t->cols);
+        /* A write that ends exactly at the right margin leaves the terminal
+         * with a wrap pending: it has not scrolled yet, and the absolute cursor
+         * move at the head of the next write cancels the pending wrap, so the
+         * continuation lands back on this same row and overwrites it.  Force
+         * the wrap now, while the cursor is still the terminal's own.  Nothing
+         * is owed afterwards -- the cursor sits at the start of a fresh row. */
+        if (t->cols > 0 && t->out_col >= t->cols) {
+            wrs("\r\n");
+            t->out_col = 0;
+            t->line_open = false;
+        }
+    }
 }
 
 void tui_puts(qw_tui *t, const char *s) { if (s) tui_out(t, s, strlen(s)); }

@@ -330,9 +330,6 @@ static double now_sec(void) {
  * few dozen tokens; a conversation being reloaded is thousands. */
 #define AGENT_BAR_MIN_TOKENS 128
 
-/* Only the prefill start time is needed; the rate is derived from it. */
-typedef struct { double started; } progress_state;
-
 /* ---- generation ------------------------------------------------------------ */
 
 typedef struct {
@@ -373,7 +370,6 @@ typedef struct {
     qwasar_session      *s;
     qwasar_chat_options  chat;
     agent_cfg            cfg;
-    progress_state       prog;
     const char          *guidance;
     bool                 no_cache;
 
@@ -383,6 +379,8 @@ typedef struct {
     int32_t              ctx_max;
     double               turn_started;
     int32_t              turn_tokens;
+    /* Only the prefill start time is kept; the rate is derived from it. */
+    double               prefill_started;
     bool                 interrupted;
 } agent;
 
@@ -415,18 +413,21 @@ static void status_set(agent *a, const char *what) {
 static void progress_cb(void *ud, int32_t done, int32_t total) {
     agent *a = ud;
     if (!a->tui || total < AGENT_BAR_MIN_TOKENS) return;
-    if (done == 0) { a->prog.started = now_sec(); return; }
+    if (done == 0) { a->prefill_started = now_sec(); return; }
 
-    const double elapsed = now_sec() - a->prog.started;
+    const double elapsed = now_sec() - a->prefill_started;
     const double tps = elapsed > 0.0 ? (double)done / elapsed : 0.0;
 
     /* The rate is written into the unfilled run of the bar rather than after
      * it, so the footer keeps one width whether or not there is a number yet. */
     char rate[24] = "";
     if (tps > 0.0) snprintf(rate, sizeof rate, " %.0f t/s ", tps);
-    const size_t rate_len = strlen(rate);
+    size_t rate_len = strlen(rate);
 
     const int filled = (int)(((long long)done * AGENT_BAR_WIDTH) / total);
+    /* Near the end the bar overruns the rate; a clipped "17]" is worse than a
+     * bar that simply finishes, so drop the number once it no longer fits. */
+    if (rate_len + (size_t)filled > AGENT_BAR_WIDTH) rate_len = 0;
     char bar[AGENT_BAR_WIDTH * 4 + 1];
     size_t pos = 0;
     for (int i = 0; i < AGENT_BAR_WIDTH; i++) {
@@ -502,7 +503,10 @@ static bool agent_open_session(agent *a, char *err, size_t errcap) {
     if (a->s) qwasar_session_free(a->s);
     a->s = qwasar_session_new(a->e, err, errcap);
     if (!a->s) return false;
-    qwasar_session_set_progress(a->s, progress_cb, &a->prog);
+    /* The callback reads the whole agent -- the tui, the session, the context
+     * limit -- so the whole agent is what it gets.  Handing it a sub-object
+     * compiles either way through the void *, and misreads the struct. */
+    qwasar_session_set_progress(a->s, progress_cb, a);
     return true;
 }
 
