@@ -478,7 +478,25 @@ typedef struct {
  * regardless of length, so saving every turn would fill the budget with
  * near-duplicates.  /save exists for when a conversation is worth keeping. */
 static int32_t agent_prefill(agent *a, const int32_t *tokens, int32_t n,
-                             int32_t sys_n, char *err, size_t errcap) {
+                             char *err, size_t errcap) {
+    /* Where the system turn ends inside this prompt.  Rendered here rather than
+     * cached at startup because /effort rewrites the system turn, so a value
+     * captured earlier can describe a prompt that no longer exists -- and one
+     * that is longer than the current prompt makes the caller's suffix length
+     * negative. */
+    int32_t sys_n = 0;
+    {
+        qwasar_message sys = { "system", a->guidance, NULL };
+        qwasar_chat_options only = a->chat;
+        only.add_generation_prompt = false;
+        char serr[256];
+        int32_t *p = qwasar_apply_chat_template(a->tok, &sys, 1, &only, &sys_n,
+                                                serr, sizeof serr);
+        free(p);
+        if (!p) sys_n = 0;
+    }
+    if (sys_n > n) sys_n = n;
+
     int32_t covered = 0;
     if (!a->no_cache) {
         double t0 = now_sec();
@@ -500,7 +518,7 @@ static int32_t agent_prefill(agent *a, const int32_t *tokens, int32_t n,
                 fprintf(stderr, "  [cached %d-token system prefix]\n", sys_n);
         }
     }
-    return covered;
+    return covered > n ? n : covered;
 }
 
 static bool agent_open_session(agent *a, char *err, size_t errcap) {
@@ -736,18 +754,6 @@ int main(int argc, char **argv) {
     bool fresh = true;   /* the next turn must render the system prompt */
     int rc = 0;
 
-    /* The system turn alone, so its boundary inside a full prompt is known and
-     * a checkpoint can be left exactly there. */
-    int32_t sys_n = 0;
-    {
-        qwasar_message sys = { "system", a.guidance, NULL };
-        qwasar_chat_options only = a.chat;
-        only.add_generation_prompt = false;
-        int32_t *p = qwasar_apply_chat_template(a.tok, &sys, 1, &only, &sys_n,
-                                                err, sizeof err);
-        free(p);
-        if (!p) sys_n = 0;
-    }
 
     /* One-shot task, if given. */
     if (task.len) {
@@ -758,7 +764,7 @@ int main(int argc, char **argv) {
         int32_t n = 0;
         int32_t *p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
         if (!p) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
-        int32_t covered = agent_prefill(&a, p, n, sys_n, err, sizeof err);
+        int32_t covered = agent_prefill(&a, p, n, err, sizeof err);
         if (covered < 0) { fprintf(stderr, "qwasar-agent: %s\n", err); free(p); return 1; }
         memmove(p, p + covered, (size_t)(n - covered) * sizeof *p);
         n -= covered;
@@ -805,7 +811,7 @@ int main(int argc, char **argv) {
                 };
                 p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
                 if (p) {
-                    int32_t covered = agent_prefill(&a, p, n, sys_n, err, sizeof err);
+                    int32_t covered = agent_prefill(&a, p, n, err, sizeof err);
                     if (covered < 0) { free(p); p = NULL; }
                     else { memmove(p, p + covered, (size_t)(n - covered) * sizeof *p);
                            n -= covered; }
