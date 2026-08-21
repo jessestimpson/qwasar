@@ -535,66 +535,49 @@ and vanishes is worse than none.
 
 Still to do: todo tracking, glob, and interrupting a running turn.
 
-### Disk KV cache: ds4 has one, qwasar does not
+### Disk KV cache
 
-**qwasar has no disk persistence of any kind.** Session state is allocated per
-session and freed at exit, so every run re-prefills from scratch -- including
-the ~900-token system prompt, which is about 26 seconds.
+Checkpoints live in `~/.cache/qwasar/kv`, keyed by a hash of their token
+sequence, evicted LRU against a 6 GB budget. A checkpoint is written to a
+temporary file and renamed, so it is either complete or absent -- a half-written
+one would restore silently corrupt state.
 
-ds4 has a real one in `ds4_kvstore.c`: checkpoints keyed by a SHA1 of the
-*rendered byte prefix* rather than the token sequence, a header carrying token
-count, hit count, context size and timestamps, eviction against a 4 GB budget
-with a six-hour hit half-life, and save reasons that include `AGENT_SYSTEM` and
-`AGENT_SESSION` so the agent can reload both its system prefix and a whole
-conversation.
+**Measured on a cold agent start:** 46.7 s to 21.1 s. The restore itself reads
+874 tokens of state in **0.02 s**, against roughly 25 s to prefill them.
 
-Two things make this different for qwasar, and both should be settled before
-building it:
+Two things differ from ds4's `ds4_kvstore.c`, both forced by the architecture:
 
-- **A checkpoint is not just the KV cache.** 48 of 64 layers are recurrent, so a
-  restorable point needs the conv state and the delta-rule state as well. That
-  is fine -- they are ordinary buffers -- but it changes the size profile
-  sharply. For a 900-token prefix: KV is 57 MB, conv is 2 MB, and the recurrent
-  state is **147 MB regardless of prefix length**. Checkpoints have a large
-  fixed floor and a shallow slope, which is the opposite of a pure-attention
-  model and argues for far fewer, larger checkpoints than ds4 keeps.
-- **Prefix-only reuse is mandatory, not an optimisation.** A recurrent state
-  cannot be truncated, so a checkpoint is usable only when it is a strict prefix
-  of the incoming prompt. ds4's byte-prefix hashing already has exactly this
-  shape, so the key design carries over unchanged.
+- **A checkpoint is not just the KV cache.** Forty-eight of sixty-four layers
+  are recurrent, so the conv and delta-rule state travel with it. Those are the
+  same size for a short prefix as for a long one -- about 149 MB -- so every
+  checkpoint has a large fixed floor and a shallow slope. An 874-token
+  checkpoint is 214 MB, of which only 56 MB is KV. That is why the store keeps
+  few large entries rather than ds4's many small ones, why there is a
+  256-token minimum, and why whole conversations are saved only on `/save`
+  rather than after every turn.
+- **Prefix-only reuse is mandatory, not an optimisation.** A KV cache can be
+  truncated to any length; a recurrent state keeps no per-position history and
+  cannot be rewound. A checkpoint is usable exactly when its tokens are a prefix
+  of the incoming prompt. ds4 keys on a hash of the rendered byte prefix for the
+  same reason, so that part of the design carried over unchanged.
 
-**File editing: conventional line matching, not ds4's `[upto]`.** *(Directive,
-2026-08-20.)*
+The agent checkpoints the **system prefix** automatically, since that span is
+identical on every run and is most of a cold start. It stops the first eval at
+the system boundary to leave the checkpoint exactly there, which costs nothing:
+the same tokens get evaluated either way.
 
-ds4's `edit` tool lets `old` carry a single `[upto]` marker between a head and a
-tail anchor; the tool then replaces everything from head through tail, so the
-model never has to reproduce a long middle section.
+Not yet borrowed from ds4: hit-weighted eviction with a six-hour half-life
+(plain LRU for now), and saving on shutdown.
 
-**The reason to avoid it is empirical, not aesthetic:** DeepSeek V4 Flash has
-been observed failing on `[upto]` repeatedly in practice. The format is very
-likely out of distribution -- models are trained on ordinary diffs and
-search-and-replace blocks, not on a bespoke anchor marker. ds4's own code
-carries the same signal: the feature is opt-in behind `--edit-upto`, needs
-roughly thirty lines of prompt explaining how to choose anchors, warns
-specifically against generic tails like a bare `}` because they match many
-functions, and ships an `agent_edit_upto_forcer` that injects the marker into
-generation to keep the model using it. A format that has to be forced is a
-format the model does not reach for on its own.
-
-Qwen3.8 has not been tested on it either way, so this is a judgement carried
-over rather than a measurement on this model. Worth revisiting once the agent
-exists and there is something to measure it against.
-
-qwasar takes the ordinary path instead: `edit(path, old, new)` where `old` is a
-contiguous run of lines that must match the file **exactly once**, and is
-replaced verbatim by `new`. Ambiguous or absent matches fail rather than
-guessing. No markers, no anchor heuristics, no generation forcing, and nothing
-to explain in the system prompt beyond "it must match exactly once".
-
-The cost is real and accepted: the model retypes the middle of a large edit, and
-at 5.8 tok/s (§2) those tokens are not free. Slower edits that land are worth
-more than faster edits that misfire, and a format the model already knows needs
-no prompt budget to teach.
+**What the test pins is indistinguishability, not speed.** A session continued
+from disk must produce exactly what the original would have produced next, so
+the test evaluates one more token on both paths and requires the logits to be
+**bit-identical** -- rel l2 exactly 0. Anything else would mean some part of the
+recurrent state did not survive the round trip, which would surface as a model
+that answers differently after a restart. The negative cases matter as much: a
+prompt differing one token into the prefix must miss, a prompt shorter than the
+checkpoint must miss, and a truncated file must be rejected rather than
+restored as garbage.
 
 ### Milestone 3 — vision
 

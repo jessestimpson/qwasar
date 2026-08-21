@@ -61,6 +61,11 @@ struct qwasar_session {
     qwasar_progress_fn progress;
     void              *progress_ud;
 
+    /* Every token evaluated, in order.  Needed to key a disk checkpoint and to
+     * tell how much of an incoming prompt a checkpoint already covers. */
+    int32_t *history;
+    int32_t  n_history;
+
     /* diagnostic capture (see qwasar_session_set_capture) */
     int32_t *capture_layers;
     int32_t  n_capture;
@@ -189,6 +194,7 @@ void qwasar_session_free(qwasar_session *s) {
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) qw_buf_free(*all[i]);
     qw_buf_free(s->capture);
     free(s->capture_layers);
+    free(s->history);
     free(s->kind_index);
     free(s);
 }
@@ -221,6 +227,112 @@ const float *qwasar_session_captured(const qwasar_session *s, int32_t which) {
     if (!s->capture || which < 0 || which >= s->n_capture) return NULL;
     return (const float *)qw_buf_contents(s->capture)
          + (size_t)which * s->cfg->hidden_size;
+}
+
+/* ---- state serialisation ----------------------------------------------------
+ *
+ * Packed layout, in order:
+ *
+ *   KV     [n_full][kv_heads][n_tokens][head_dim] fp16, K then V per layer
+ *   SSM    [n_linear][hv][dv][dk] fp32
+ *   conv   [n_linear][ksize-1][conv_dim] fp32
+ *
+ * The KV cache is stored head-major with max_ctx as its stride, so packing
+ * compacts each head's rows down to the tokens actually used.  That is what
+ * makes a checkpoint portable across context sizes -- and it is also why the
+ * recurrent halves dominate: SSM and conv are the same size no matter how short
+ * the prefix is. */
+
+static size_t qw_kv_row_bytes(const qwasar_session *s) {
+    return (size_t)s->cfg->head_dim * sizeof(uint16_t);
+}
+
+size_t qw_session_state_bytes(const qwasar_session *s, int32_t n_tokens) {
+    const qw_config *c = s->cfg;
+    const qw_shape  *sh = s->shape;
+    size_t kv = (size_t)sh->n_full_attn_layers * c->num_key_value_heads
+              * (size_t)n_tokens * qw_kv_row_bytes(s) * 2;
+    size_t ssm = (size_t)sh->n_linear_attn_layers * c->linear_num_value_heads
+               * c->linear_value_head_dim * c->linear_key_head_dim * sizeof(float);
+    size_t conv = (size_t)sh->n_linear_attn_layers
+                * (size_t)(c->linear_conv_kernel_dim - 1) * sh->conv_dim * sizeof(float);
+    return kv + ssm + conv;
+}
+
+bool qw_session_pack(const qwasar_session *s, void *dst, size_t cap) {
+    const qw_config *c = s->cfg;
+    const qw_shape  *sh = s->shape;
+    const int32_t n = s->n_past;
+    if (cap < qw_session_state_bytes(s, n)) return false;
+
+    char *out = dst;
+    const size_t row = qw_kv_row_bytes(s);
+    const size_t used = (size_t)n * row;
+    const size_t head_stride = (size_t)s->max_ctx * row;
+    const size_t layer_stride = (size_t)c->num_key_value_heads * head_stride;
+
+    const char *kc = qw_buf_contents(s->kcache);
+    const char *vc = qw_buf_contents(s->vcache);
+    for (int32_t l = 0; l < sh->n_full_attn_layers; l++)
+        for (int32_t h = 0; h < c->num_key_value_heads; h++) {
+            const size_t off = (size_t)l * layer_stride + (size_t)h * head_stride;
+            memcpy(out, kc + off, used); out += used;
+            memcpy(out, vc + off, used); out += used;
+        }
+
+    size_t ssm = (size_t)sh->n_linear_attn_layers * c->linear_num_value_heads
+               * c->linear_value_head_dim * c->linear_key_head_dim * sizeof(float);
+    memcpy(out, qw_buf_contents(s->ssm_state), ssm);
+    out += ssm;
+
+    size_t conv = (size_t)sh->n_linear_attn_layers
+                * (size_t)(c->linear_conv_kernel_dim - 1) * sh->conv_dim * sizeof(float);
+    memcpy(out, qw_buf_contents(s->conv_state), conv);
+    return true;
+}
+
+bool qw_session_unpack(qwasar_session *s, const void *src, size_t len,
+                       const int32_t *tokens, int32_t n_tokens) {
+    const qw_config *c = s->cfg;
+    const qw_shape  *sh = s->shape;
+    if (n_tokens > s->max_ctx) return false;
+    if (len != qw_session_state_bytes(s, n_tokens)) return false;
+
+    const char *in = src;
+    const size_t row = qw_kv_row_bytes(s);
+    const size_t used = (size_t)n_tokens * row;
+    const size_t head_stride = (size_t)s->max_ctx * row;
+    const size_t layer_stride = (size_t)c->num_key_value_heads * head_stride;
+
+    char *kc = qw_buf_contents(s->kcache);
+    char *vc = qw_buf_contents(s->vcache);
+    for (int32_t l = 0; l < sh->n_full_attn_layers; l++)
+        for (int32_t h = 0; h < c->num_key_value_heads; h++) {
+            const size_t off = (size_t)l * layer_stride + (size_t)h * head_stride;
+            memcpy(kc + off, in, used); in += used;
+            memcpy(vc + off, in, used); in += used;
+        }
+
+    size_t ssm = (size_t)sh->n_linear_attn_layers * c->linear_num_value_heads
+               * c->linear_value_head_dim * c->linear_key_head_dim * sizeof(float);
+    memcpy(qw_buf_contents(s->ssm_state), in, ssm);
+    in += ssm;
+
+    size_t conv = (size_t)sh->n_linear_attn_layers
+                * (size_t)(c->linear_conv_kernel_dim - 1) * sh->conv_dim * sizeof(float);
+    memcpy(qw_buf_contents(s->conv_state), in, conv);
+
+    if (!s->history) s->history = malloc((size_t)s->max_ctx * sizeof *s->history);
+    if (!s->history) return false;
+    memcpy(s->history, tokens, (size_t)n_tokens * sizeof *s->history);
+    s->n_history = n_tokens;
+    s->n_past = n_tokens;
+    return true;
+}
+
+const int32_t *qw_session_history(const qwasar_session *s, int32_t *n) {
+    if (n) *n = s ? s->n_history : 0;
+    return s ? s->history : NULL;
 }
 
 /* ---- the forward pass ------------------------------------------------------ */
@@ -408,6 +520,15 @@ const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32
         const bool last_chunk = (done + rows == n);
 
         memcpy(qw_buf_contents(s->tokens), tokens + done, (size_t)rows * sizeof(int32_t));
+
+        if (s->n_history + rows <= s->max_ctx) {
+            if (!s->history) s->history = malloc((size_t)s->max_ctx * sizeof *s->history);
+            if (s->history) {
+                memcpy(s->history + s->n_history, tokens + done,
+                       (size_t)rows * sizeof *s->history);
+                s->n_history += rows;
+            }
+        }
 
         /* Text-only positions are identical on all three MRoPE axes; images are
          * what make them diverge, and that is Milestone 3's business. */

@@ -466,7 +466,42 @@ typedef struct {
     agent_cfg            cfg;
     progress_state       prog;
     const char          *guidance;
+    bool                 no_cache;
 } agent;
+
+/* Evaluates a prompt, using a disk checkpoint for whatever prefix it already
+ * covers, and leaves a checkpoint at the system turn.
+ *
+ * The system prefix is the one span that is byte-identical on every run, and at
+ * ~900 tokens it is most of a cold start.  Whole conversations are not saved
+ * automatically: a checkpoint carries the recurrent state, which is ~149 MB
+ * regardless of length, so saving every turn would fill the budget with
+ * near-duplicates.  /save exists for when a conversation is worth keeping. */
+static int32_t agent_prefill(agent *a, const int32_t *tokens, int32_t n,
+                             int32_t sys_n, char *err, size_t errcap) {
+    int32_t covered = 0;
+    if (!a->no_cache) {
+        double t0 = now_sec();
+        covered = qwasar_session_restore(a->s, a->e, tokens, n);
+        if (covered > 0)
+            fprintf(stderr, "  [restored %d tokens from cache in %.2fs]\n",
+                    covered, now_sec() - t0);
+    }
+
+    /* Stop at the system boundary so a checkpoint can be left there, then
+     * continue.  Same total work either way. */
+    if (covered < sys_n) {
+        if (!qwasar_session_eval(a->s, tokens + covered, sys_n - covered, err, errcap))
+            return -1;
+        covered = sys_n;
+        if (!a->no_cache) {
+            char serr[256];
+            if (qwasar_session_save(a->s, a->e, serr, sizeof serr))
+                fprintf(stderr, "  [cached %d-token system prefix]\n", sys_n);
+        }
+    }
+    return covered;
+}
 
 static bool agent_open_session(agent *a, char *err, size_t errcap) {
     if (a->s) qwasar_session_free(a->s);
@@ -548,7 +583,8 @@ static void repl_help(void) {
            "  /effort <level>  xhigh, medium or low\n"
            "  /think           show or hide the reasoning block\n"
            "  /yes             toggle asking before writes and commands\n"
-           "  /ctx             context used\n"
+           "  /ctx             context and disk cache usage\n"
+           "  /save            checkpoint this conversation to disk\n"
            "  /quit            leave\n");
 }
 
@@ -558,7 +594,19 @@ static bool repl_command(agent *a, const char *line, bool *handled) {
     if (!strcmp(line, "/quit") || !strcmp(line, "/exit")) return false;
     if (!strcmp(line, "/help")) { repl_help(); return true; }
     if (!strcmp(line, "/ctx")) {
-        printf("  %d tokens used\n", qwasar_session_n_past(a->s));
+        uint64_t bytes = 0;
+        int entries = 0;
+        qwasar_kv_cache_stats(&bytes, &entries);
+        printf("  %d tokens used | disk cache %d entries, %.1f GB\n",
+               qwasar_session_n_past(a->s), entries, (double)bytes / 1e9);
+        return true;
+    }
+    if (!strcmp(line, "/save")) {
+        char serr[256];
+        if (qwasar_session_save(a->s, a->e, serr, sizeof serr))
+            printf("  saved %d tokens\n", qwasar_session_n_past(a->s));
+        else
+            printf("  not saved: %s\n", serr);
         return true;
     }
     if (!strcmp(line, "/think")) {
@@ -608,6 +656,7 @@ static void usage(FILE *out) {
         "  -n, --predict <n>    maximum tokens per turn (default 2048)\n"
         "      --effort <lvl>   reasoning effort: xhigh (default), medium, low\n"
         "      --show-think     print the reasoning block\n"
+        "      --no-cache       do not use or write disk checkpoints\n"
         "  -h, --help           this message\n"
         "\n"
         "Tools: read, write, edit, list, grep, bash.  Reading runs unattended;\n"
@@ -636,6 +685,7 @@ int main(int argc, char **argv) {
         else if ((!strcmp(arg, "-n") || !strcmp(arg, "--predict")) && i + 1 < argc) a.cfg.max_tokens = atoi(argv[++i]);
         else if (!strcmp(arg, "--effort") && i + 1 < argc) effort = argv[++i];
         else if (!strcmp(arg, "--show-think")) a.cfg.show_think = true;
+        else if (!strcmp(arg, "--no-cache")) a.no_cache = true;
         else if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) { usage(stdout); return 0; }
         else if (arg[0] == '-') { fprintf(stderr, "qwasar-agent: unknown argument '%s'\n\n", arg); usage(stderr); return 2; }
         else { if (task.len) str_puts(&task, " "); str_puts(&task, arg); }
@@ -686,6 +736,19 @@ int main(int argc, char **argv) {
     bool fresh = true;   /* the next turn must render the system prompt */
     int rc = 0;
 
+    /* The system turn alone, so its boundary inside a full prompt is known and
+     * a checkpoint can be left exactly there. */
+    int32_t sys_n = 0;
+    {
+        qwasar_message sys = { "system", a.guidance, NULL };
+        qwasar_chat_options only = a.chat;
+        only.add_generation_prompt = false;
+        int32_t *p = qwasar_apply_chat_template(a.tok, &sys, 1, &only, &sys_n,
+                                                err, sizeof err);
+        free(p);
+        if (!p) sys_n = 0;
+    }
+
     /* One-shot task, if given. */
     if (task.len) {
         qwasar_message msgs[2] = {
@@ -695,6 +758,10 @@ int main(int argc, char **argv) {
         int32_t n = 0;
         int32_t *p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
         if (!p) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
+        int32_t covered = agent_prefill(&a, p, n, sys_n, err, sizeof err);
+        if (covered < 0) { fprintf(stderr, "qwasar-agent: %s\n", err); free(p); return 1; }
+        memmove(p, p + covered, (size_t)(n - covered) * sizeof *p);
+        n -= covered;
         fresh = false;
         if (!agent_run(&a, p, n, err, sizeof err)) {
             fprintf(stderr, "qwasar-agent: %s\n", err);
@@ -737,6 +804,12 @@ int main(int argc, char **argv) {
                     { "user",   line,       NULL },
                 };
                 p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
+                if (p) {
+                    int32_t covered = agent_prefill(&a, p, n, sys_n, err, sizeof err);
+                    if (covered < 0) { free(p); p = NULL; }
+                    else { memmove(p, p + covered, (size_t)(n - covered) * sizeof *p);
+                           n -= covered; }
+                }
                 fresh = false;
             } else {
                 p = qwasar_render_user_turn(a.tok, line, &a.chat, &n);

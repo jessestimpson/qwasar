@@ -171,6 +171,22 @@ const void *qw_tensor_data(const qw_tensor *t);
 /* A GPU argument referring to the whole tensor. */
 qw_ref      qw_tensor_ref(const qw_tensor *t);
 
+/* ---- session state, for the disk cache -------------------------------------
+ *
+ * The layout lives here rather than in the kvstore so the file format never
+ * needs to know how the graph arranges its buffers.  Packed state is
+ * independent of the session's context size: the KV cache is compacted to the
+ * tokens actually used, so a checkpoint written at one context length restores
+ * into another. */
+
+size_t  qw_session_state_bytes(const qwasar_session *s, int32_t n_tokens);
+bool    qw_session_pack  (const qwasar_session *s, void *dst, size_t cap);
+bool    qw_session_unpack(qwasar_session *s, const void *src, size_t len,
+                          const int32_t *tokens, int32_t n_tokens);
+
+/* The tokens this session has evaluated, in order. */
+const int32_t *qw_session_history(const qwasar_session *s, int32_t *n);
+
 /* ---- CPU reference ops ----------------------------------------------------
  *
  * Scalar fp32 twins of the Metal kernels, used by tests to prove the GPU path.

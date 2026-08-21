@@ -123,6 +123,23 @@ int32_t qwasar_session_n_past(const qwasar_session *s);
 typedef void (*qwasar_progress_fn)(void *ud, int32_t done, int32_t total);
 void qwasar_session_set_progress(qwasar_session *s, qwasar_progress_fn fn, void *ud);
 
+/* ---- disk checkpoints -------------------------------------------------------
+ *
+ * Saves the session so a later run can skip prefilling whatever prefix it
+ * shares.  Because 48 of this model's 64 layers are recurrent, a checkpoint
+ * carries their state as well as the KV cache, and can only be reused as a
+ * strict prefix -- a recurrent state cannot be rewound the way a KV cache can
+ * be truncated.
+ *
+ * qwasar_session_restore fills a *fresh* session from the longest cached prefix
+ * of `tokens` and returns how many tokens it covered; the caller then evaluates
+ * only the remainder.  Returns 0 when nothing matched, which is not an error. */
+bool    qwasar_session_save(qwasar_session *s, const qwasar_engine *e,
+                            char *err, size_t errcap);
+int32_t qwasar_session_restore(qwasar_session *s, const qwasar_engine *e,
+                               const int32_t *tokens, int32_t n);
+void    qwasar_kv_cache_stats(uint64_t *bytes, int *entries);
+
 /* Diagnostic: record the residual stream for the final token after each of the
  * given layers, so a divergence can be located rather than just detected.
  * Pass n = 0 to turn off.  Returns false if the capture buffer cannot be sized. */
