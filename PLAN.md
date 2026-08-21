@@ -655,91 +655,194 @@ already run sixteen of, and every kernel it needs exists.** The only new op is a
 concat and one matmul. That is the reason this is a smaller build than vision
 despite being worth more.
 
-It is 425M parameters, 849 MB in bf16 -- 5.7% of the weight traffic of a base
-decode step, about 7 ms of bandwidth per drafted token. It carries its own KV
-cache, 4 KB/token, 134 MB at 32K.
+It is 425M parameters, 849 MB in bf16. That is *not* the cost of a drafted
+token, which was the first thing this plan got wrong: a draft also has to run
+the **`lm_head` readout over 248,320 rows**, ~0.65 GiB at 4-bit, which is
+larger than a 4-bit head body. Layr Labs' harness measures the whole draft step
+at **h ≈ 0.18 verify-forwards**, and prices its schedule off that constant.
 
 #### Getting the weights
 
 They are not in the MLX 4-bit checkpoint: mlx-vlm's `sanitize` drops every
 `mtp.` key, which its own `test_qwen3_5_mtp_sanitize.py` pins as intended
-behaviour, so every MLX conversion downstream of it is missing them.
+behaviour, so every MLX conversion downstream of it is missing them. The reason
+is worse than tidiness -- mlx-lm's `qwen3_5` `sanitize` treats the presence of
+any `mtp.` key as a signal to **+1-shift every trunk norm weight**, which
+corrupts the model. That is why heads ship as separate trees rather than merged
+checkpoints, and it is a hazard for anything that reads a merged directory
+through the Python stack. qwasar's loader is its own and is unaffected.
 
-They are in upstream `Qwen/Qwen3.8-27B`, shard 18 of 18, and -- checked, not
-assumed -- **the fifteen tensors are contiguous**: bytes 2,542,798,560 to
-3,392,197,344, 849 MB, one HTTP range request. The rest of that 3.4 GB shard is
-`lm_head`, which we already have.
+No fetch tool is needed. `EigenLabs/Qwen3.8-27B-MTP-bf16` publishes exactly this
+head as four files -- `model.safetensors` at 849,400,347 bytes, plus a config
+and index that exist only as compatibility assertions -- with **bare** tensor
+names (`fc.*`, `norm.weight`, `pre_fc_norm_*`, `layers.0.*`), no `mtp.` prefix
+and no tokenizer. `--mtp <dir>` loads it, following ds4's flag of the same name.
 
-`tools/fetch-mtp.sh` (curl, dev-only, no Python) takes the header range and the
-tensor range; `tools/mtp-pack` rebases the offsets into a standalone
-`qwen3.8-27b-mtp.safetensors`. `--mtp <file>` loads it, following ds4's flag of
-the same name. Run it in bf16 first: it avoids writing a quantiser, and 849 MB
-against a 24 GB machine is affordable. Repack to 4-bit only if the draft cost
-shows up in a measurement.
+Run it in bf16 first: it avoids writing a quantiser. A 4-bit repack is a known
+quantity rather than a hope -- the previous generation's head was published as
+`mlx-community/Qwen3.6-27B-MTP-4bit`, 258 MB, its 8 matrices appearing as
+weight/scales/biases triples beside the 7 norms for 31 tensors -- so if the
+draft cost shows up in a measurement, the target to hit is 258 MB.
 
-#### The hard part: rewinding a model that cannot be rewound
+#### The blocker: qwasar cannot yet evaluate 2-8 tokens for one weight read
 
-Speculation means evaluating tokens that may be thrown away. For the sixteen
-full-attention layers that is free -- move the write cursor back. For the
-forty-eight Gated DeltaNet layers it is the central problem of this milestone,
-and it is the same property that shaped the disk cache: the state is advanced in
-place and there is no per-position history. It is not invertible in practice
-either; undoing `S = g·S + outer(delta, k)` means dividing by a decayed `g`.
+This is the finding that reorders the milestone, and it comes from qwasar's own
+kernels rather than from the model.
 
-Snapshot-and-restore would work -- the state is 157 MB (SSM 48 layers × 48 value
-heads × 128 × 128 × fp32 = 151 MB, conv 5.9 MB), about 1.3 ms to copy -- but
-there is a version that costs nothing:
+Speculation pays for exactly one reason: K+1 tokens are verified in a single
+pass over the weights. qwasar has no kernel that does that at speculative
+widths.
 
-**Ping-pong the state through K+1 slots.** Step *i* of the verify pass reads slot
-*i-1* and writes slot *i*; accepting *j* tokens makes slot *j* live by swapping a
-pointer. The recurrence already reads and writes the entire state on every step,
-so writing it somewhere else is the same traffic. The only new cost is the
-allocation: (K+1) × 157 MB, or 628 MB at K=3.
+- `qmv` dispatches **one threadgroup row per token** and its own header says
+  what that means: "badly wrong for prefill: N tokens would re-read the weights
+  N times". A width-3 verify through `qmv` costs three decode steps. There is no
+  speedup to divide.
+- `qmm` pads its token tile to `QW_QMM_BM` and so "costs the same for 1 token as
+  for 64" -- about 14.4 token-equivalents (§3.5). Worse at these widths, which
+  is why `QW_QMM_MIN_ROWS` is 16 in the first place.
 
-The disk checkpoint format does not change -- only the live slot is ever
+So the enabling work is a **batched matvec**: `qmv` with the token loop hoisted
+inside the weight walk, accumulating `[QW_QMV_ROWS][B]` for B ≤ 8 so each weight
+byte is read once for the whole block. Register pressure is the design
+constraint and `QW_QMV_ROWS` may have to fall to pay for B. Nothing else in the
+engine needs this kernel; MTP is entirely gated behind it, and it should be
+built and measured **before** any head is downloaded.
+
+Its width curve must then be measured rather than assumed flat. Layr Labs found
+theirs is not: the step into verify width 6 cost 27.3 ms against 13.4 ms into
+width 5, a dispatch-shape cliff, and they cap depth at 7 and segment wider
+rounds into <= 5-row launches because of it.
+
+#### The head drafts from committed history, not from one position
+
+The largest measured effect in the whole design, and the one this plan had
+wrong by omission. The head has its own KV cache, and what goes in it decides
+whether any of this works:
+
+> accept **0.903** with history vs **0.262** without.
+
+A head that drafts from ~one position of context is not worth running. So the
+head keeps **one persistent KV cache**: the prompt is streamed into it once, and
+each *committed* token's fused row is appended, so it attends over the whole
+committed prefix. Layout invariant: head position `p` holds
+`fused(embed(token_{p+1}), hidden_p)` -- the hidden state at a position pairs
+with the *next* token.
+
+Speculative rows must never survive a round; only committed ones are appended.
+History upkeep folds into the next draft forward as extra leading rows, so the
+head weights are still read once per drafting round.
+
+Because the head only *proposes*, all of this sits outside the exactness
+surface: a better or worse draft changes the accept rate and never an emitted
+token.
+
+#### Rewinding a model that cannot be rewound
+
+For the sixteen full-attention layers, discarding a rejected draft is a cursor
+rewind. For the forty-eight Gated DeltaNet layers it is the same property that
+shaped the disk cache: the state is advanced in place with no per-position
+history, and it is not invertible -- undoing `S = g·S + outer(delta, k)` means
+dividing by a decayed `g`.
+
+Two mechanisms exist and the choice is settled by measurement, not taste:
+
+- **Replay.** Snapshot once before the verify, restore on rejection, then re-run
+  the accepted prefix.
+- **Per-boundary checkpoints.** Materialise the state at every possible accept
+  boundary during the verify pass; committing is then a pointer swap.
+
+Layr Labs ships checkpoints and quantifies the difference: a reject "pays a
+repair forward" under replay, and their break-even head-cost ratio moves from
+**0.43 to ~0.20** with checkpoints -- the mechanism roughly halves the price of
+drafting. Take checkpoints.
+
+**But not for free, and this plan claimed free.** The earlier draft of this
+section argued the copies cost nothing because the recurrence already streams
+the whole state every step. That is true of a naive kernel and false of ours:
+`qw_gated_delta` deliberately holds the entire `[Dv, Dk]` state **in registers
+for the duration of the call** and touches device memory once per layer, not
+once per timestep -- the comment at the top of `metal/gated_delta.metal` says
+so, and it is why the kernel is fast. Writing a checkpoint per boundary adds
+traffic the kernel currently does not have: 157 MB per boundary (SSM 48 layers x
+48 value heads x 128 x 128 x fp32 = 151 MB, conv 5.9 MB), ~1.3 ms, straight out
+of registers at the right timestep. At K=3 that is ~4 ms against a ~172 ms
+round: cheap, worth it, and not zero. Say the real number.
+
+The disk checkpoint format does not change -- only the committed state is ever
 persisted -- so existing cache entries stay valid.
 
-#### The verify pass
+#### The schedule is where the speedup actually lives
 
-K+1 tokens go through the existing `qmm` path in one pass, so the weights are
-read once. Compute is roughly 23.5 ms per token at prefill's measured rate
-against a 125 ms weight read, which puts the crossover where extra draft tokens
-stop being free at about K+1 = 5. ds4 defaults to `--mtp-draft 2`.
+The number that should govern expectations: on Layr Labs' ranked runner, an
+**unmodified depth-2 tree medians ~0.994** -- six tenths of a percent *slower*
+than serial decode. Tuned trees on the same harness and the same weights median
+**~2.8-3.3x**. Naive block MTP nets nothing on this model; essentially all of
+the win is in deciding how deep to draft and in making the drafting path cheap.
 
-Acceptance:
+So a fixed depth is the wrong shape. Their scheduler, which is the design to
+follow:
+
+- Per-position acceptance EMAs, `p[i] = P(draft i accepted | 0..<i accepted)`,
+  alpha 0.15 (half-life ~9 rounds, which converges well inside a 512-token
+  window), seeded with an optimistic decaying prior `0.85 * 0.98^i` capped at
+  0.95. The cap is load-bearing: uncapped optimism over-drafts on hard prompts.
+- A marginal rule -- draft one more only while expected committed tokens per
+  unit round time still rises -- against a measured per-depth price, not a
+  constant.
+- A confidence gate from **the target's own top-2 logit margin** at the
+  boundary: `p := min(p, sigmoid(margin/2))`. This is the disciplined version of
+  ds4's `--mtp-margin`: a near-tied argmax is exactly when a draft is about to
+  be wrong, and the target already computed the evidence.
+
+qwasar's own price constant has to be fitted here, not copied: h ≈ 0.18 is
+measured against their kernels and their 4-bit head, and both differ.
+
+#### Acceptance
 
 - **Greedy:** accept while the drafted token equals the argmax. Exact by
-  construction -- and that gives the strongest test available, below.
+  construction.
 - **Sampled:** modified rejection sampling, which preserves the target
   distribution exactly. Do not ship an "accept if close enough" rule; a sampler
-  that silently changes the distribution is the kind of unexplained drift §6
-  forbids.
-
-ds4 restricts MTP to greedy and adds a confidence gate (`--mtp-margin`) so a
-likely-rejected draft is not paid for. Measure whether that is needed here
-before copying it.
+  that silently changes the distribution is the unexplained drift §6 forbids.
 
 #### How this is tested
 
 The invariant is unusually strong and unusually cheap: **with drafting on, the
 generated token sequence must be identical to greedy decoding with drafting
-off.** Not close -- identical. Any bug in the state slots, the KV rewind, or the
-acceptance rule breaks it immediately. That test is the milestone's real
-acceptance criterion.
+off.** Not close -- identical. Any bug in the checkpoints, the KV rewind, the
+head history, or the acceptance rule breaks it immediately, and it is the same
+gate the challenge harness makes absolute.
 
-Under it: a CPU twin for the concat-and-`fc` step, the only new op; and a slot
-test that accepts *j* of *K* drafts, continues, and compares the resulting state
-against a plain run of the same tokens.
+Under it: a CPU twin for the concat-and-`fc` step, the only new op; a boundary
+test that accepts *j* of *K* drafts and compares the resulting state against a
+plain run of the same tokens; and a batched-`qmv` test against the existing
+per-token path.
 
-#### What is being claimed, and what is not
+One caveat worth carrying: a near-tie argmax can diverge between Apple Silicon
+generations even for correct code. A token-identity failure needs the same run
+on the serial path before it is called a regression.
 
-At K=3 a step costs about 1.15 base decode steps and can yield up to 4 tokens,
-so the arithmetic ceiling is ~3.5x. The real number is set by acceptance rate,
-which is a property of the trained head that nobody here can predict, so the
-first deliverable is instrumentation -- per-position acceptance and tokens per
-step, printed by `--mtp-timing` -- and the projection stays a projection until
-that prints. ds4 calls its own MTP path an experimental slight speedup, which is
-the honest prior.
+#### Order of work
+
+1. Batched `qmv` for B <= 8, measured against the per-token path. Nothing below
+   is worth starting until the width curve is on paper.
+2. Head load (`--mtp`), bf16, with the concat-and-`fc` CPU twin.
+3. Persistent committed-history head cache. Instrument acceptance per position
+   before optimising anything.
+4. Per-boundary GDN checkpoints and KV rewind; the token-identity gate.
+5. Fixed depth 2, measured end to end against serial on the same thermal
+   footing -- the paired back-to-back method §2 already uses.
+6. Only then the adaptive schedule, refitting the price constant from qwasar's
+   own width curve.
+
+Steps 1-5 are the milestone. Expect them to land near break-even, because that
+is what break-even looks like on a tuned harness with an untuned schedule. Step
+6 is where the multiple comes from.
+
+*Sources for the measured figures in this section: Layr Labs'
+`qwen-3.8-mtp-challenge` (MIT), kept under `reference/`. The numbers are theirs
+and were measured on an M5 against MLX Swift; every one of them has to be
+re-measured here before it is trusted. The kernel facts are qwasar's own.*
 
 ### Milestone 4 — vision
 

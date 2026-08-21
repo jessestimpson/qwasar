@@ -108,6 +108,25 @@ copied.
 
 ---
 
+## Layr Labs `qwen-3.8-mtp-challenge` — MIT, studied, not used
+
+MIT, Copyright (c) 2026 Layr Labs, Inc.
+
+A Swift/MLX benchmark harness for this exact model's MTP head.  Nothing from it
+is compiled into qwasar and no code was copied; it is cited in PLAN.md §5
+Milestone 3 for measured facts that would otherwise have cost weeks to learn --
+that the head must draft from committed history (accept 0.903 with, 0.262
+without), that per-boundary recurrent checkpoints roughly halve the price of
+drafting against replay, that an untuned depth-2 configuration lands slightly
+below serial, and that verify cost is not flat in width.
+
+Those numbers were measured on other hardware against another runtime and are
+recorded as prior expectations to re-measure, not as qwasar results.
+
+* Upstream: <https://github.com/Layr-Labs/qwen-3.8-mtp-challenge>
+
+---
+
 ## Qwen3.8 chat template — from the model repository
 
 `qwasar_tokenizer.c` embeds the tool-calling format description from the model's
