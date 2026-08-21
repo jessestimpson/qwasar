@@ -1,11 +1,16 @@
 # qwasar
 
-A single-model inference engine for **Qwen3.8 27B** on macOS Metal, written in
-C with Objective-C only where Metal requires it.
+**qwasar** is a small native inference engine for **Qwen3.8 27B** on macOS
+Metal. It is written in C, with Objective-C only where Metal requires it, and it
+is deliberately narrow: not a general model runner, but one model implemented
+end to end. Weight loading, the tokenizer, the chat template, the Metal kernels,
+the KV and recurrent state, the disk cache, and the coding agent are built and
+tested together.
 
-Modelled on [ds4](https://github.com/antirez/ds4): no Python in the build or the
-runtime, one `make` away from a binary, abstractions shaped around *inference*
-rather than around supporting many architectures.
+It is modelled on [ds4](https://github.com/antirez/ds4) (DwarfStar4), and takes
+its shape from it: no Python in the build or the runtime, one `make` to a
+self-contained binary, abstractions built for inference rather than for
+supporting many architectures, and an agent shipped in the same tree.
 
 ```
 $ qwasar -m ~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit \
@@ -14,47 +19,93 @@ $ qwasar -m ~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit \
 2 is prime because its only positive divisors are 1 and itself.
 3 is prime because it cannot be divided evenly by any whole number other than 1 and 3.
 5 is prime because its only positive divisors are 1 and 5.
-
-prefill 66 tokens | decode 157 tokens (5.82 tok/s)
 ```
 
-## qwasar-agent
+## What you can do with this
 
-An agentic loop on the same engine, with six tools: `read`, `write`, `edit`,
-`list`, `grep`, `bash`.
+* Run a capable 27B model locally on an ordinary Mac, from a binary you can read
+  end to end. The engine is about 5,600 lines of C, Objective-C, and Metal;
+  7,200 with the CLI and the agent, and 2,000 more of tests.
+* Use `qwasar-agent` to let the model read and edit real files, search a tree,
+  and run commands, either as a one-shot task or in a REPL.
+* Read a complete, working implementation of a **hybrid recurrent/attention**
+  model. The interesting parts of this architecture — the gated delta rule, the
+  output-gated attention, partial multimodal RoPE — are each a page of C with a
+  scalar reference twin beside them.
+* Take the Metal kernels as a starting point. They are commented for why, not
+  what, and each has a CPU reference and a test that runs both against real
+  weights.
 
-```
-$ qwasar-agent -m <model-dir> -C ~/src/proj \
-      "maxval in stats.c returns the wrong answer. Fix it, rebuild, and check."
+## Motivations
 
-  read path=stats.c
-  edit path=stats.c old=        if (v[i] < best) best = v[i]; new=        if (v[i] > b...
-  bash command=cc -o stats stats.c && ./stats
+* Qwen3.8 27B is a genuinely good model that fits in 4-bit on a 32 GB machine.
+* A hybrid model with 48 recurrent layers behaves differently enough from a
+  plain transformer — in memory, in caching, in what a session can and cannot do
+  — that implementing it properly is worth doing rather than bolting onto a
+  generic runner.
+* An engine narrow enough to hold in your head is easier to make fast than a
+  general one, and easier to hand to a coding agent to make faster still.
 
-Fixed. The comparison `v[i] < best` was tracking the minimum instead of the
-maximum. Rebuilt and ran: mean=2.80 max=5.00
-```
+# AI full disclosure
 
-With no task it opens a REPL instead, with history and `/help`, `/new`,
-`/effort`, `/think`, `/yes`, `/ctx`, `/quit`. Prompt processing shows a progress
-bar, since it is the one part of a turn with nothing to look at:
+**This software was written almost entirely by Claude Opus 5**, working from
+direction, review, and hardware provided by the human author. The design
+decisions, the measurements, the kernel work, and the prose in this file are all
+model output, shaped by a human deciding what to build, what to reject, and what
+to measure next.
 
-```
-prefill [▶▶▶▶▶▶▶▶▶▶▶▶▶▶▶▶ 24 tok/s ··] 512/886 58%
-```
+We say this plainly because it shaped the result. If you would rather not use
+AI-written code, this is not the project for you. If you would, then the
+disclosure matters in the other direction too: everything here that claims a
+number was measured on the machine described below, and where a measurement
+contradicted an assumption, the code and the notes follow the measurement. There
+are several such cases recorded in `PLAN.md`, including a few where the first
+answer was wrong.
 
-Prompt processing is checkpointed to `~/.cache/qwasar/kv`, so the system prefix
-is prefilled once and restored on later runs — a cold start of 46.7 s becomes
-21.1 s, with the restore itself taking 0.02 s. `--no-cache` turns it off.
+## Thanks
 
-Reading runs unattended; writing files and running commands ask first, unless
-`--yes`. If `AGENT.md` exists in the working directory it is added to the system
-prompt as project guidance.
+**[ds4](https://github.com/antirez/ds4) and Salvatore Sanfilippo.** qwasar
+exists because ds4 showed what a single-model native inference engine looks
+like when it is done with care. The shape of this project is borrowed
+throughout: the build story, the CPU reference twins, the engine/session
+boundary, the agent living in the same tree, the disk KV cache, and the prefill
+progress bar. Where qwasar departs — line-anchored edits instead of `[upto]`
+anchors, a different checkpoint design — it is because this model forced it, not
+because the original was wrong. `linenoise.c` is vendored from that tree, under
+its own BSD-2 licence and with its notices intact.
 
-`edit` uses conventional line-anchored replacement: the quoted text must match a
-run of whole lines **exactly once**, or the edit is refused and nothing changes.
-There are no anchor markers and no fuzzy matching — an edit either does what it
-says or tells the model why it could not.
+**[MLX](https://github.com/ml-explore/mlx) and
+[mlx-vlm](https://github.com/Blaizzy/mlx-vlm).** The reference implementation of
+Qwen3.8 in mlx-vlm is what made this possible at all: it is the specification
+this engine was written against, and the oracle every layer was validated
+against. The 4-bit affine quantisation format qwasar reads is MLX's. MLX's own
+quantised matmul is the throughput target the kernels here are measured against,
+and it is still ahead.
+
+**The Qwen team**, for open weights worth building for, and for a model card and
+chat template precise enough to reimplement from.
+
+## Status
+
+Beta, and young. Text generation, the tokenizer, the chat template, the agent,
+and the disk cache all work and are covered by tests that run against the real
+model. **Vision is not implemented** — the tower is parsed and reported but not
+executed. Expect rough edges, and see *What is not implemented* below.
+
+---
+
+# Getting started
+
+## Requirements
+
+* An Apple Silicon Mac. Developed and measured on an M4 with 32 GB.
+* Xcode command line tools. That is all: `cc`, Foundation, and Metal.
+* About 16 GB of free RAM for the model, plus a few GB for cache and context.
+
+You do **not** need the Metal Toolchain component. Kernels are embedded in the
+binary as source and compiled at startup, so the binary is self-contained and
+builds on a machine that has never opened Xcode. If you happen to have the
+toolchain installed, `make check-metal` will use it as a fast offline lint.
 
 ## Build
 
@@ -62,48 +113,285 @@ says or tells the model why it could not.
 make
 ```
 
-That is the whole story: `cc`, Foundation, and Metal. Metal kernels under
-`metal/` are embedded into the binary as source (`tools/bin2c`) and compiled at
-startup, so **the Metal Toolchain component is not required** — the binary is
-self-contained and relocatable.
+That is the whole thing. It produces `./qwasar` and `./qwasar-agent`.
 
 ```
-make test          # unit and golden-vector suites (needs a model)
-make check-metal   # optional offline kernel lint (needs the Metal Toolchain)
+make test          # unit and golden-vector suites; needs the model
+make check-metal   # optional offline kernel lint; needs the Metal Toolchain
+```
+
+## Weights
+
+qwasar reads the **MLX 4-bit conversion** of Qwen3.8 27B directly. Nothing needs
+converting. If you use LM Studio you likely already have it:
+
+```
+~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit
+```
+
+Otherwise fetch the `lmstudio-community/Qwen3.8-27B-MLX-4bit` repository from
+Hugging Face with whatever you normally use — the `hf` CLI, `git lfs`, or the
+web UI.
+
+The directory needs `config.json`, `tokenizer.json`, and the
+`model-*.safetensors` shards. Start by confirming qwasar agrees with you about
+what it found:
+
+```
+qwasar -m <model-dir> --info
+```
+
+```
+model      /Users/you/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit
+device     Apple M4  (working set 25.0 GB, max buffer 18.7 GB)
+shards     3, 2180 tensors  (9.96 GB mapped, 4.99 GB copied for alignment)
+
+text       hidden 5120  layers 64  vocab 248320  ffn 17408  eps 1e-06
+schedule   full attention every 4 layers -> 16 full, 48 gated-delta
+attention  24 q heads x 256 dim, 4 kv heads (gqa 6), output gate on
+rope       theta 10000000  partial 0.25 -> rotate 64 of 256 dims  mrope interleaved [11,11,10]
+delta-net  48 v heads x 128, 16 k heads x 128 (gqa 3), conv k=4 over 10240 ch
+quant      MLX affine 4-bit, group 64
+
+weights    14.09 GB text + 0.86 GB vision = 14.95 GB
+kv cache   64 KB/token (2.00 GB at 32K)
+ssm state  147 MB, constant in context length
 ```
 
 ## Run
 
 ```
-qwasar -m <model-dir> --info                     # architecture + weight inventory
-qwasar -m <model-dir> -p "..."                   # generate
-qwasar -m <model-dir> -p "..." --show-think      # include the reasoning block
-qwasar -m <model-dir> -p "..." --no-think        # skip reasoning entirely
-qwasar -m <model-dir> -s "..." -p "..."          # with a system message
-qwasar -m <model-dir> -p "..." --effort low      # xhigh (default) | medium | low
+qwasar -m <model-dir> -p "..."                  # generate
+qwasar -m <model-dir> -p "..." --show-think     # include the reasoning block
+qwasar -m <model-dir> -p "..." --no-think       # skip reasoning entirely
+qwasar -m <model-dir> -s "..." -p "..."         # with a system message
+qwasar -m <model-dir> -p "..." --effort low     # xhigh (default) | medium | low
 ```
 
-Reasoning is on by default for this model, and the reasoning block is consumed
-but not printed unless you ask for it.
+**Reasoning is on by default for this model**, and at the default `xhigh`
+effort it thinks at length — often past a few hundred tokens before the answer
+starts. The reasoning block is consumed but not printed unless you ask. Two
+consequences worth knowing on your first run: `-n` defaults to 512 for a reason,
+and `--effort low` is usually what you want for short factual questions and for
+tool work.
 
-Weights are the MLX 4-bit conversion, e.g.
-`lmstudio-community/Qwen3.8-27B-MLX-4bit`. Nothing needs converting; qwasar reads
-the safetensors shards directly and mmaps them.
+## The agent
 
-## What this model is
+```
+qwasar-agent -m <model-dir> -C ~/src/project "fix the bug in stats.c and rebuild"
+```
 
-Not a plain transformer. 64 layers in a hybrid schedule — **48 Gated DeltaNet
-(recurrent) layers and 16 full-attention layers**, one full-attention every
-fourth. Attention is output-gated with per-head Q/K norms, `head_dim` 256, and
-only the first 64 dims rotated (partial multimodal RoPE). Dense SwiGLU MLP, no
-experts. There is also a vision tower, not yet implemented.
+```
+  read path=stats.c
+  edit path=stats.c old=        if (v[i] < best) best = v[i];  new=        if (v[i] > b...
+  bash command=cc -o stats stats.c && ./stats
 
-One consequence is visible in the API: the 48 recurrent layers carry state with
-no per-position history, so **a session is append-only**. A KV cache can be
-truncated to any prefix; a recurrent state cannot. Extending a session is cheap,
-rewinding it means re-evaluating.
+Fixed. The comparison `v[i] < best` was tracking the minimum instead of the
+maximum. Rebuilt and ran: mean=2.80 max=5.00
+```
 
-## Layout
+With no task it opens a REPL instead:
+
+```
+$ qwasar-agent -m <model-dir> -C ~/src/project
+qwasar-agent. /help for commands, /quit to leave.
+
+> how many lines in words.txt?
+  bash command=wc -l words.txt
+`words.txt` has **3 lines**.
+```
+
+Commands: `/help`, `/new`, `/effort`, `/think`, `/yes`, `/ctx`, `/save`,
+`/quit`. Six tools: `read`, `write`, `edit`, `list`, `grep`, `bash`.
+
+**Reading runs unattended. Writing files and running commands ask first**,
+unless you pass `--yes`. Tool arguments never reach a shell except for `bash`
+itself — `list` and `grep` pass argv to `execvp` directly. A declined action is
+reported back to the model as a tool result, so it can choose something else
+rather than the turn failing.
+
+If `AGENT.md` exists in the working directory it is added to the system prompt
+as project guidance.
+
+`edit` is conventional line-anchored search and replace: the quoted text must
+match a run of **whole lines exactly once**, or the edit is refused and nothing
+changes. There are no anchor markers and no fuzzy matching. Quoting a bare `}`
+fails outright rather than landing in an arbitrary function.
+
+Prompt processing is checkpointed to `~/.cache/qwasar/kv`, so the system prefix
+is prefilled once and restored on later runs. `--no-cache` turns that off.
+
+---
+
+# The model
+
+Qwen3.8 27B is not a plain transformer, and most of what is interesting about
+implementing it follows from that.
+
+**64 layers in a hybrid schedule.** Every fourth layer is full attention; the
+other 48 are **Gated DeltaNet**, a recurrent linear-attention layer. So 16
+layers keep a KV cache and 48 keep a fixed-size recurrent state.
+
+**The recurrent half is a delta rule.** Per value head it carries a
+`[128, 128]` state matrix, and per token: decay it, read what it already
+predicts for the incoming value, write back only the residual scaled by a
+learned gate, then read out with the query. The state is fp32 and updated in
+place.
+
+**Attention is output-gated.** `q_proj` is twice as wide as you would expect;
+half of it is a gate, and the attention result is multiplied by its sigmoid
+before `o_proj`. Q and K carry per-head RMS norms.
+
+**RoPE is partial and multimodal.** `head_dim` is 256 but only the first 64 dims
+rotate, and each of the 32 frequencies draws its position from one of three axes
+interleaved so the section counts land on `[11, 11, 10]`. For text all three
+axes agree and it collapses to ordinary partial RoPE.
+
+Two practical consequences fall out of the recurrent half:
+
+**Long context is unusually cheap.** Only a quarter of the layers pay per-token
+KV, so the cache is 64 KB/token — 2 GB at 32K, where a comparable
+all-attention model would be four times that. The recurrent state is 147 MB no
+matter how long the conversation runs.
+
+**A session is append-only.** A KV cache can be truncated to any prefix; a
+recurrent state keeps no per-position history and cannot be rewound. Extending
+a session is cheap, rewinding means re-evaluating. This is visible in the API,
+it is why the disk cache can only reuse strict prefixes, and it is why the agent
+feeds back the tokens it generated rather than re-rendering the conversation.
+
+---
+
+# Benchmarks
+
+Early numbers, one machine. Everything below was measured on:
+
+> **MacBook Pro, Apple M4** — 10 CPU cores, 10 GPU cores, 32 GB unified memory,
+> macOS 26.5.1. Metal reports a 25.0 GB working set and an 18.7 GB maximum
+> buffer. Model is `Qwen3.8-27B-MLX-4bit`, 14.95 GB of weights.
+
+## Throughput
+
+Prefill in 256-token chunks; decode measured over 24 greedy tokens at the stated
+depth.
+
+| Context | Prefill | Decode |
+| ---: | ---: | ---: |
+| 512 | 42.6 t/s | 5.71 t/s |
+| 2048 | 41.1 t/s | 5.53 t/s |
+| 4096 | 36.4 t/s | 5.21 t/s |
+
+**Decode is at the memory bandwidth roof and will not go much faster on this
+machine.** This is a dense 27B: every decoded token reads every weight. At
+~120 GB/s, 14.95 GB per token is an 8.0 t/s ceiling by arithmetic, not by
+implementation quality. Kernel work here is about reaching 6 rather than sitting
+at 2. If you want interactive speed on this model, the lever is a Pro/Max/Ultra
+machine, not a better kernel.
+
+Decode holding up across context — 5.71 to 5.21 from 512 to 4096 — is the
+hybrid schedule earning its keep. Only 16 layers grow with position.
+
+## Where prefill went
+
+Prefill started at 7 t/s and took three rounds of work to reach 42.6.
+
+| | `qmm` | prefill |
+| --- | ---: | ---: |
+| matvec, one dispatch per token | — | 7.0 t/s |
+| tiled matmul, registers | 1.30 TFLOP/s | 26 t/s |
+| inner product on the 8×8 matrix units | 1.83 TFLOP/s | 35 t/s |
+| half operand tiles, A stored M-major | **2.25 TFLOP/s** | **42.6 t/s** |
+
+For scale: a pure-FMA kernel measures this machine's fp32 peak at **3.33
+TFLOP/s**, and **MLX's own quantised matmul sustains 2.73–2.82 TFLOP/s** on
+identical shapes. qwasar is at roughly 80% of MLX, which is the honest target —
+not the hardware peak, and definitely not the 15.6 TFLOP/s a naive synthetic
+benchmark first reported before the loop-invariant product was noticed being
+hoisted.
+
+## Startup and the disk cache
+
+| | |
+| --- | ---: |
+| engine load | 6–9 s |
+| first forward pass | 4.8 s |
+| agent cold start, empty cache | 46.7 s |
+| agent start, system prefix cached | **21.1 s** |
+| restoring 874 tokens from a checkpoint | **0.02 s** |
+
+Load time is dominated by a 4.99 GB copy: one safetensors shard in this
+checkpoint starts its data section at an odd byte, so it cannot be mapped and
+read as packed 32-bit words. The other two shards are mapped zero-copy. The
+first forward pass then faults in ~10 GB of mapped weights, which the CLI pays
+during load so its reported prefill rate is the steady-state one.
+
+Checkpoints are large: 214 MB for an 874-token prefix, of which only 56 MB is
+KV. The rest is the recurrent state, which is the same size for any prefix
+length. That single fact drives the cache design — few large entries, a
+256-token minimum, and whole conversations saved only on `/save`.
+
+## Memory
+
+| | |
+| --- | ---: |
+| language model weights, 4-bit | 14.09 GB |
+| vision tower, bf16 (loaded, not yet used) | 0.86 GB |
+| KV cache | 64 KB/token — 2 GB at 32K |
+| recurrent state | 147 MB, constant |
+
+---
+
+# Correctness
+
+Every Metal kernel has a **scalar fp32 CPU twin** and a test that runs both
+against **real weights from the model**. Synthetic weights would not catch a
+misread of the quantisation layout, which is the failure this most needs to
+catch.
+
+On top of that, `tests/test_forward.c` replays golden activations captured from
+mlx-vlm through the C engine. It requires the **argmax and all five top-5 ranks
+to match the reference exactly**, and reports the per-layer drift so a
+divergence is located rather than merely detected.
+
+A few properties are pinned directly because an aggregate error would hide them:
+
+* The gated-delta recurrence is **bit-identical** between streaming and batched
+  execution. That is the prefill/decode seam, and a mismatch would mean the
+  model answers differently depending on how a prompt was chunked.
+* Attention provably ignores cache entries past its own position — the test
+  poisons 471 slots beyond the query and requires the output to be unchanged.
+* A session restored from disk produces **bit-identical** logits for its next
+  token. Anything else would mean part of the recurrent state did not survive a
+  restart.
+* The tokenizer reproduces the reference's ids on 24 cases and all 8 chat
+  template renderings exactly.
+
+**On tolerances.** The reference runs bf16 activations, and disagrees with
+*itself* by 7.4e-2 relative on logits when only the accumulation order changes.
+So logit L2 is a weak signal here and is not what the tests lean on; argmax,
+top-5 ordering, and a smooth per-layer drift curve are. This is written down in
+`PLAN.md` next to the numbers, because it is the kind of thing that otherwise
+gets "fixed" into a false failure later.
+
+```
+make test
+```
+
+```
+ok: json
+ok: toolcall
+ok: tokenizer
+ok: qmv
+ok: ops
+ok: gdn
+ok: attn
+ok: kvstore
+ok: forward
+```
+
+---
+
+# Layout
 
 ```
 qwasar.h            public engine boundary -- no tensor internals escape it
@@ -112,48 +400,61 @@ qwasar_graph.c      session state and the forward pass
 qwasar_kvstore.c    disk checkpoints of session state
 qwasar_tokenizer.c  byte-level BPE, plus the ChatML template
 qwasar_toolcall.c   tool-call parsing and the line-anchored edit matcher
-qwasar_agent.c      the agent loop, its tools, and the REPL
-linenoise.c         vendored line editing (BSD-2, antirez)
-qwasar_unicode.inc  generated codepoint tables for the pre-tokenizer
-qwasar_metal.m      Metal runtime: device, library, pipelines, dispatch
 qwasar_cpu.c        scalar fp32 reference twins for every kernel
+qwasar_metal.m      Metal runtime: device, library, pipelines, dispatch
+qwasar_agent.c      the agent loop, its tools, and the REPL
 metal/*.metal       kernels
-tests/              unit + golden-vector regression
-tools/              build helper; dev-only golden-vector generator (not built)
+tests/              unit and golden-vector regression
+tools/              build helper; dev-only fixture generators (never built)
+linenoise.c         vendored line editing (BSD-2, antirez)
 ```
 
-`PLAN.md` carries the design, the measurements, and the roadmap.
+`PLAN.md` carries the design, the measurements, the roadmap, and — deliberately
+— the things that were tried and did not work, so they are not retried.
 
-## Correctness
+---
 
-Every kernel has a scalar fp32 CPU twin and a test that runs both against real
-model weights — synthetic weights would not catch a misread of the quantisation
-layout. On top of that:
+# What is not implemented
 
-- the full forward pass matches the mlx-vlm reference's **argmax and all five
-  top-5 ranks exactly**;
-- the tokenizer reproduces the reference's ids on 24 cases and the chat template
-  on all 6, exactly;
-- the gated-delta recurrence is **bit-identical** between streaming and batched
-  execution, which is the prefill/decode seam;
-- attention provably ignores cache entries past its own position.
+Stated plainly, because a README that only lists what works is not much use:
 
-One deliberate divergence: `qwasar_encode` never emits control tokens, however
-the input spells them. The reference splits input on added tokens, which would
-let message content forge a `<|im_start|>` role boundary. The template emits
-control tokens by id instead.
+* **Vision.** The tower is parsed, sized, and reported by `--info`, and its
+  weights are loaded, but it is not executed. Image input does nothing yet. This
+  is the largest remaining piece.
+* **Sampling.** Generation is greedy. Temperature, top-k, top-p, and min-p are
+  designed but not wired up; the model's own defaults are `temp 1.0, top_k 20,
+  top_p 0.95`.
+* **An HTTP server.** ds4 has one; qwasar does not.
+* **Speculative decoding.** The model ships an MTP draft head, but as a separate
+  shard that is not in this checkpoint.
+* **NFC normalisation** in the tokenizer. A no-op for ASCII and already-normalised
+  text; decomposed input would tokenize differently from the reference.
+* **Interrupting a running turn** in the agent, and todo tracking.
+* **Multi-GPU, CUDA, distributed inference.** Not planned. This targets one Mac.
 
-## Status
+## Known rough edges
 
-Milestone 1 is complete: text in, text out, verified against the reference.
+* One shard of the standard checkpoint costs a 4.99 GB copy at load because of
+  where its data section starts. A disk-cached aligned repack would remove it
+  and is not written yet.
+* The prefill progress bar advances once per 256-token chunk, so a short prompt
+  gets four frames. Finer granularity means splitting the command buffer
+  mid-chunk, which costs throughput.
+* `qmm` is at 80% of MLX's throughput. Threadgroup memory bounds occupancy, but
+  every way of freeing it so far gives up coalesced output writes and loses more
+  than it gains.
 
-Decode runs at 5.8 tok/s on an M4 — the memory-bandwidth roof for a dense 27B at
-~120 GB/s (`PLAN.md` §2). Prefill is currently no faster, because the matvec
-re-reads the weights once per token; a tiled `qmm` is the next significant win.
+---
 
-Prefill runs at 42.6 tok/s after three rounds of work on the quantised matmul:
-a tiled version, then moving its inner product onto the GPU's 8x8 matrix units,
-then half-precision operand tiles. That is 80% of what MLX's own quantised
-matmul achieves on identical shapes.
+# Notes on the code
 
-Next: vision, and half-precision operand tiles in the matmul.
+A few conventions, inherited from ds4 and worth knowing before reading:
+
+* **No Python** in the build or the runtime. `tools/` contains dev-only fixture
+  generators that are never required to build, test, or run.
+* **No C++.**
+* Correctness before speed. A faster path with unexplained drift does not ship.
+* Loading is mmap-backed. A 15 GB model is not eagerly copied.
+* Comments explain **why** — a shape, an ordering, a cache boundary, a memory
+  policy — and live beside the code rather than in a separate document.
+* `qwasar.h` stays narrow. CLI and agent code never learn what a tensor is.
