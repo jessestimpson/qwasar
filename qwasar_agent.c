@@ -338,6 +338,11 @@ typedef struct {
     int32_t *tokens;    /* what the model produced, to feed straight back */
     int32_t  n_tokens;
     bool     hit_eos;
+    /* Why the turn ended, which the caller has to be able to tell apart: a
+     * finished answer and a truncated one look identical otherwise. */
+    bool     hit_budget;
+    bool     in_reasoning;   /* still inside <think> when it ended */
+    int32_t  n_think;        /* tokens spent reasoning, which are not printed */
     bool     has_call;
 } turn;
 
@@ -528,7 +533,8 @@ static bool generate(agent *a, const int32_t *prompt, int32_t n_prompt,
     a->turn_tokens = 0;
     a->interrupted = false;
 
-    for (int i = 0; i < a->cfg.max_tokens; i++) {
+    int i = 0;
+    for (; i < a->cfg.max_tokens; i++) {
         if (tui_interrupted(a->tui)) {
             a->interrupted = true;
             tui_newline(a->tui);
@@ -540,6 +546,7 @@ static bool generate(agent *a, const int32_t *prompt, int32_t n_prompt,
         if (qwasar_is_eos(a->e, next)) { out->hit_eos = true; break; }
         if (!turn_push(out, next)) { snprintf(err, errcap, "out of memory"); return false; }
         a->turn_tokens++;
+        if (reasoning) out->n_think++;
 
         size_t len = 0;
         bool special = false;
@@ -573,6 +580,10 @@ static bool generate(agent *a, const int32_t *prompt, int32_t n_prompt,
         logits = qwasar_session_eval(a->s, &next, 1, err, errcap);
         if (!logits) return false;
     }
+    /* Reaching the bound is the one way this loop ends with nothing to show for
+     * it, so it is recorded rather than inferred from an empty answer. */
+    out->hit_budget  = (i == a->cfg.max_tokens);
+    out->in_reasoning = reasoning;
     if (tui_is_tty(a->tui)) tui_puts(a->tui, "\x1b[0m");
     return true;
 }
@@ -647,8 +658,24 @@ static bool agent_run(agent *a, int32_t *prompt, int32_t n_prompt,
 
         if (!t.has_call || a->interrupted) {
             tui_newline(a->tui);
+            /* A turn cut off by the token budget used to end exactly like a
+             * finished one: no message, and -- when the budget ran out inside
+             * the reasoning block -- no output at all, because reasoning is not
+             * printed.  From the outside that is generation stopping for no
+             * reason, which is precisely what it looked like. */
+            if (t.hit_budget) {
+                if (t.in_reasoning)
+                    tui_printf(a->tui, "  [stopped at the %d-token budget while still "
+                               "reasoning, so there is no answer to show; raise it with "
+                               "-n, or use /effort low]\n", a->cfg.max_tokens);
+                else
+                    tui_printf(a->tui, "  [stopped at the %d-token budget, %d of them "
+                               "reasoning; raise it with -n]\n",
+                               a->cfg.max_tokens, t.n_think);
+            }
             turn_free(&t);
-            status_set(a, a->interrupted ? "interrupted" : "done");
+            status_set(a, a->interrupted ? "interrupted"
+                                         : (t.hit_budget ? "truncated" : "done"));
             return true;
         }
 
@@ -769,7 +796,7 @@ static void usage(FILE *out) {
         "  -y, --yes            do not ask before writing files or running commands\n"
         "  -i, --interactive    open the REPL after running the task\n"
         "      --steps <n>      maximum tool calls per task (default 24)\n"
-        "  -n, --predict <n>    maximum tokens per turn (default 2048)\n"
+        "  -n, --predict <n>    maximum tokens per turn (default 8192)\n"
         "      --effort <lvl>   reasoning effort: xhigh (default), medium, low\n"
         "      --show-think     print the reasoning block\n"
         "      --no-cache       do not use or write disk checkpoints\n"
@@ -798,7 +825,14 @@ static bool resolve_model(qwasar_options *opts, const char *prog) {
 int main(int argc, char **argv) {
     qwasar_options opts = { 0 };
     agent a = { 0 };
-    a.cfg = (agent_cfg){ .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 2048 };
+    /* The turn budget bounds a runaway generation; it is not meant to bound
+     * ordinary work, and the two failure modes are not symmetric.  Too high
+     * wastes time on a turn ctrl-C can stop; too low silently truncates the
+     * answer, and at the default xhigh effort most of the budget goes to a
+     * reasoning block the user never sees, so the truncation arrives with only
+     * a few dozen visible tokens on screen.  8192 leaves several turns inside
+     * the 32K context. */
+    a.cfg = (agent_cfg){ .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 8192 };
     const char *effort = "xhigh";
     const char *workdir = NULL;
     bool interactive = false;

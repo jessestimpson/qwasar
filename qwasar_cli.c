@@ -221,6 +221,12 @@ int main(int argc, char **argv) {
     }
     printf("\n");
 
+    /* Silence here would be indistinguishable from a finished answer, and with
+     * reasoning hidden the visible output can be a fraction of the budget. */
+    if (generated == n_predict)
+        fprintf(stderr, "\nqwasar: stopped at the %d-token budget%s; raise it with -n\n",
+                n_predict, in_reasoning ? " while still reasoning" : "");
+
     fprintf(stderr, "\nprefill %d tokens in %.2fs (%.1f tok/s) | "
                     "decode %d tokens in %.2fs (%.2f tok/s)\n",
             n_prompt, t_prefill, n_prompt / t_prefill,

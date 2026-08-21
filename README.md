@@ -233,6 +233,11 @@ consequences worth knowing on your first run: `-n` defaults to 512 for a reason,
 and `--effort low` is usually what you want for short factual questions and for
 tool work.
 
+If a turn stops before it has finished, it says so and names the budget it hit.
+That matters more than it sounds: reasoning tokens count against `-n` but are
+not printed, so a turn can spend almost all of its budget thinking and then be
+cut off after a few dozen visible tokens.
+
 ## The agent
 
 ```
