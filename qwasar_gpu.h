@@ -47,6 +47,9 @@ typedef struct { qw_buf buf; size_t off; } qw_ref;
 
 static inline qw_ref qw_ref_at(qw_buf b, size_t off) { qw_ref r = { b, off }; return r; }
 
+/* A view further into an existing view; for walking blocks of a tensor. */
+static inline qw_ref qw_ref_offset(qw_ref r, size_t off) { r.off += off; return r; }
+
 typedef struct qw_cmd_s *qw_cmd;
 
 qw_cmd qw_cmd_begin(void);
@@ -66,12 +69,14 @@ const char *qw_cmd_error(qw_cmd c);
  *
  * `rows` is the token count: 1 while decoding, the chunk size while prefilling.
  *
- * qw_op_qmat_q4 is what the graph calls; it picks between the two
+ * qw_op_qmat_q4 is what the graph calls; it picks among the three
  * implementations by shape.  The matvec reads every weight once per token,
- * which is optimal at rows = 1 and quadratically wasteful beyond it; the matmul
+ * which is optimal at rows = 1 and linearly wasteful beyond it; the matmul
  * tiles over tokens so a weight block is read and dequantised once for the
- * whole tile, but pads its token tile to 64 and so wastes work on small counts.
- * The others are exposed for tests and benchmarks. */
+ * whole tile, but pads its token tile to 64 and so wastes work on small counts;
+ * the batched matvec covers the gap between them, reading the weights once for
+ * a block of up to QW_QMVB_B tokens.  The others are exposed for tests and
+ * benchmarks. */
 void qw_op_qmat_q4(qw_cmd c, qw_ref y, qw_ref x,
                    qw_ref w, qw_ref scales, qw_ref biases,
                    int32_t k, int32_t n, int32_t rows);
@@ -84,12 +89,52 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
                   int32_t k, int32_t n, int32_t rows);
 
+/* Evaluates `rows` tokens in ceil(rows / QW_QMVB_B) passes over the weights.
+ * Correct for any row count; only worth calling below QW_QMM_MIN_ROWS. */
+void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
+                   qw_ref w, qw_ref scales, qw_ref biases,
+                   int32_t k, int32_t n, int32_t rows);
+
 /* Token count at or above which qw_op_qmat_q4 switches to the tiled matmul.
  *
- * Measured: the matmul pads its token tile to QW_QMM_BM and so costs the same
- * for 1 token as for 64, roughly 2.6 s through the whole model, while the
- * matvec costs about 0.18 s per token.  They cross a little under 15. */
-#define QW_QMM_MIN_ROWS 16
+ * The matmul pads its token tile to QW_QMM_BM and so costs the same for 1 token
+ * as for 64; the batched matvec costs one flat block per QW_QMVB_B tokens.  On
+ * gate_proj that is 4.7 ms against 0.85 ms per block, so the matmul wins from
+ * the sixth block on.  down_proj crosses in the same place, which is why one
+ * constant is enough.
+ *
+ * This was 16 when the choice was between the matmul and the single-token
+ * matvec.  The batched matvec pushed it out to 21 by being faster than both
+ * everywhere in between. */
+#define QW_QMM_MIN_ROWS 21
+
+/* Blocking for qw_qmvb_q4_g64, injected into the Metal compile alongside the
+ * matmul's.  B is the token block: a whole block is evaluated against one pass
+ * over the weights, so a speculative verify costs one flat block rather than
+ * one decode step per token.
+ *
+ * Both numbers are measured, and the sweep is worth recording because the
+ * plausible reasoning was wrong.  Arithmetic intensity here is 4B FLOP per
+ * weight byte against a machine ratio of 37, which says B = 8 should still be
+ * bandwidth-bound; it is not, because half the ALU goes on unpacking nibbles
+ * rather than on the dot product.  Measured cost per block of B tokens on
+ * gate_proj, best of three, against 0.56 ms for one pass over its weights:
+ *
+ *   B=4 ROWS=4  0.85 ms   <- shipped
+ *   B=4 ROWS=2  1.13 ms
+ *   B=5 ROWS=4  1.28 ms
+ *   B=8 ROWS=4  1.78 ms
+ *   B=4 ROWS=8  1.99 ms
+ *
+ * So B = 4 costs 0.21 ms per token against the single-token kernel's 0.52, and
+ * doing 5 and 8 in one block is slower than doing them in two blocks of 4.
+ *
+ * ROWS is output rows per simdgroup.  ROWS * B accumulators plus ROWS * 8
+ * dequantised weights must stay in registers, which is what caps both: the
+ * kernel is at 59 GB/s against the 90 GB/s the single-token path reaches, and
+ * the remaining gap is ALU, not bandwidth. */
+#define QW_QMVB_B    4
+#define QW_QMVB_ROWS 4
 
 /* Tiling for qw_qmm_q4_g64.  These are the single source of truth: the host
  * derives its dispatch geometry from them and injects them into the Metal

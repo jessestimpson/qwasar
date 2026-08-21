@@ -49,7 +49,11 @@ static double row_rel_err(const qw_qlinear *ql, const float *x, float got, int32
     return mag > 0.0 ? fabs(acc - (double)got) / mag : fabs(acc - (double)got);
 }
 
-typedef enum { QW_USE_QMV, QW_USE_QMM } qw_impl;
+typedef enum { QW_USE_QMV, QW_USE_QMM, QW_USE_QMVB } qw_impl;
+
+static const char *impl_name(qw_impl i) {
+    return i == QW_USE_QMM ? "mm" : i == QW_USE_QMVB ? "mvb" : "mv";
+}
 
 static void test_linear_impl(const qw_qlinear *ql, const char *label, int32_t rows,
                              qw_impl impl) {
@@ -70,6 +74,10 @@ static void test_linear_impl(const qw_qlinear *ql, const char *label, int32_t ro
         qw_op_qmm_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0),
                      qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
                      qw_tensor_ref(ql->biases), k, n, rows);
+    else if (impl == QW_USE_QMVB)
+        qw_op_qmvb_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0),
+                      qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
+                      qw_tensor_ref(ql->biases), k, n, rows);
     else
         qw_op_qmv_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0),
                      qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
@@ -121,9 +129,9 @@ static void test_linear_impl(const qw_qlinear *ql, const char *label, int32_t ro
      * and top-5 ordering to still match the reference exactly. */
     const double tol = (impl == QW_USE_QMM) ? 5e-5 : 2e-6;
     CHECK(worst < tol, "%s: worst relative error %.3g at row %d (rows=%d, %s)",
-          label, worst, worst_row, rows, impl == QW_USE_QMM ? "qmm" : "qmv");
+          label, worst, worst_row, rows, impl_name(impl));
     printf("  %-3s %-24s k=%-6d n=%-7d rows=%-3d  worst rel err %.2e\n",
-           impl == QW_USE_QMM ? "mm" : "mv", label, k, n, rows, worst);
+           impl_name(impl), label, k, n, rows, worst);
 
     free(scratch);
     qw_buf_free(xb);
@@ -140,6 +148,16 @@ static void test_linear(const qw_qlinear *ql, const char *label, int32_t rows) {
 static void test_both(const qw_qlinear *ql, const char *label, int32_t rows) {
     test_linear_impl(ql, label, rows, QW_USE_QMV);
     test_linear_impl(ql, label, rows, QW_USE_QMM);
+}
+
+/* The batched matvec is what a speculative verify runs on, so it has to agree
+ * with the single-token path it replaces to the same fp32 error floor -- it
+ * does the same arithmetic in the same order, just for several tokens at once.
+ * The row counts that matter are the block boundary and either side of it:
+ * a short block predicates token lanes off, and rows > B walks more than one
+ * block with an offset into x and y. */
+static void test_batched(const qw_qlinear *ql, const char *label, int32_t rows) {
+    test_linear_impl(ql, label, rows, QW_USE_QMVB);
 }
 
 int main(int argc, char **argv) {
@@ -173,6 +191,15 @@ int main(int argc, char **argv) {
         test_linear(&l0->down_proj,   "l0.mlp.down_proj", 1);
         /* Multi-row is the prefill shape; it must give the same answers. */
         test_linear(&l3->k_proj,      "l3.self_attn.k_proj", 3);
+
+        /* Speculative verify widths, plus the block boundary and past it. */
+        test_batched(&l3->k_proj,     "l3.self_attn.k_proj", 1);
+        test_batched(&l3->k_proj,     "l3.self_attn.k_proj", 2);
+        test_batched(&l3->q_proj,     "l3.self_attn.q_proj", 5);
+        test_batched(&l0->gate_proj,  "l0.mlp.gate_proj", 8);
+        test_batched(&l0->down_proj,  "l0.mlp.down_proj", 9);
+        test_batched(&l0->in_proj_b,  "l0.linear_attn.in_proj_b", 8);
+        test_batched(&l3->k_proj,     "l3.self_attn.k_proj", 17);
 
         /* The tiled matmul, at sizes that exercise its blocking: exactly one
          * tile, a ragged token tail, and several full tiles. */

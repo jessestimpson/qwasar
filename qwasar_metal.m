@@ -84,6 +84,8 @@ bool qw_gpu_init(char *err, size_t errcap) {
             @"QW_QMM_BK" : @(QW_QMM_BK),
             @"QW_QMM_SG_M" : @(QW_QMM_SG_M),
             @"QW_QMM_SG_N" : @(QW_QMM_SG_N),
+            @"QW_QMVB_B" : @(QW_QMVB_B),
+            @"QW_QMVB_ROWS" : @(QW_QMVB_ROWS),
         };
         g_library = [g_device newLibraryWithSource:source options:opts error:&nserr];
         if (!g_library) {
@@ -345,11 +347,46 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
         threadsPerThreadgroup:MTLSizeMake(QW_QMM_THREADS, 1, 1)];
 }
 
+/* Blocks of QW_QMVB_B tokens, each block one pass over the weights.  The
+ * remainder is a short block rather than a separate path: the kernel predicates
+ * its dead token lanes off, and the arithmetic that wastes is arithmetic this
+ * kernel has to spare. */
+void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
+                   qw_ref w, qw_ref scales, qw_ref biases,
+                   int32_t k, int32_t n, int32_t rows) {
+    if (!c || !c->enc) return;
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_qmvb_q4_g64");
+    if (!ps) return;
+
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, w, 0);
+    qw_set(enc, scales, 1);
+    qw_set(enc, biases, 2);
+
+    const NSUInteger nsg = 8;
+    NSUInteger per_tg = nsg * QW_QMVB_ROWS;
+    MTLSize grid = MTLSizeMake(((NSUInteger)n + per_tg - 1) / per_tg, 1, 1);
+    MTLSize tg   = MTLSizeMake(32 * nsg, 1, 1);
+
+    for (int32_t base = 0; base < rows; base += QW_QMVB_B) {
+        int32_t block = rows - base;
+        if (block > QW_QMVB_B) block = QW_QMVB_B;
+        qw_set(enc, qw_ref_offset(x, (size_t)base * k * sizeof(float)), 3);
+        qw_set(enc, qw_ref_offset(y, (size_t)base * n * sizeof(float)), 4);
+        qw_matmul_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)block };
+        [enc setBytes:&args length:sizeof args atIndex:5];
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+    }
+}
+
 void qw_op_qmat_q4(qw_cmd c, qw_ref y, qw_ref x,
                    qw_ref w, qw_ref scales, qw_ref biases,
                    int32_t k, int32_t n, int32_t rows) {
     if (rows >= QW_QMM_MIN_ROWS && k % 32 == 0)
         qw_op_qmm_q4(c, y, x, w, scales, biases, k, n, rows);
+    else if (rows > 1)
+        qw_op_qmvb_q4(c, y, x, w, scales, biases, k, n, rows);
     else
         qw_op_qmv_q4(c, y, x, w, scales, biases, k, n, rows);
 }
