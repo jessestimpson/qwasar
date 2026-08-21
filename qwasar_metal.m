@@ -380,6 +380,33 @@ void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
     }
 }
 
+/* Dense bf16, blocked exactly like qw_op_qmvb_q4.  Only the MTP head uses it. */
+void qw_op_dmat_bf16(qw_cmd c, qw_ref y, qw_ref x, qw_ref w,
+                     int32_t k, int32_t n, int32_t rows) {
+    if (!c || !c->enc) return;
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_dmvb_bf16");
+    if (!ps) return;
+
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, w, 0);
+
+    const NSUInteger nsg = 8;
+    NSUInteger per_tg = nsg * QW_QMVB_ROWS;
+    MTLSize grid = MTLSizeMake(((NSUInteger)n + per_tg - 1) / per_tg, 1, 1);
+    MTLSize tg   = MTLSizeMake(32 * nsg, 1, 1);
+
+    for (int32_t base = 0; base < rows; base += QW_QMVB_B) {
+        int32_t block = rows - base;
+        if (block > QW_QMVB_B) block = QW_QMVB_B;
+        qw_set(enc, qw_ref_offset(x, (size_t)base * k * sizeof(float)), 1);
+        qw_set(enc, qw_ref_offset(y, (size_t)base * n * sizeof(float)), 2);
+        qw_matmul_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)block };
+        [enc setBytes:&args length:sizeof args atIndex:3];
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+    }
+}
+
 void qw_op_qmat_q4(qw_cmd c, qw_ref y, qw_ref x,
                    qw_ref w, qw_ref scales, qw_ref biases,
                    int32_t k, int32_t n, int32_t rows) {
@@ -418,6 +445,26 @@ void qw_op_rms_norm(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight,
     qw_norm_args args = { (uint32_t)dim, (uint32_t)rows, eps, out_scale,
                           weight.buf ? 1u : 0u };
     [enc setBytes:&args length:sizeof args atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+        threadsPerThreadgroup:qw_norm_threads(dim)];
+}
+
+void qw_op_rms_norm_concat(qw_cmd c, qw_ref y, qw_ref e, qw_ref we,
+                           qw_ref h, qw_ref wh, int32_t dim, int32_t rows,
+                           float eps) {
+    if (!c || !c->enc) return;
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_rms_norm_concat");
+    if (!ps) return;
+
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, e, 0);
+    qw_set(enc, we, 1);
+    qw_set(enc, h, 2);
+    qw_set(enc, wh, 3);
+    qw_set(enc, y, 4);
+    qw_norm_args args = { (uint32_t)dim, (uint32_t)rows, eps, 1.0f, 1u };
+    [enc setBytes:&args length:sizeof args atIndex:5];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
         threadsPerThreadgroup:qw_norm_threads(dim)];
 }

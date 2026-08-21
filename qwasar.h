@@ -21,6 +21,7 @@ typedef struct qwasar_session qwasar_session;
 
 typedef struct {
     const char *model_path;   /* directory holding config.json + *.safetensors */
+    const char *mtp_path;     /* optional MTP draft head directory; NULL to skip */
     int         context_size;  /* max tokens; 0 = engine default (32768) */
     int         prefill_chunk; /* tokens per forward pass; 0 = default (256) */
     bool        verbose;

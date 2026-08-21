@@ -75,15 +75,21 @@ qwasar_cli.o:  qwasar_cli.c qwasar.h qwasar_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 QWASAR_TEST_MODEL ?= $(HOME)/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit
+# The MTP draft head is a separate download; tests/test_mtp skips without it.
+# See PLAN.md section 5, milestone 3 for where it comes from.
+QWASAR_TEST_MTP ?= $(HOME)/.cache/qwasar/mtp/Qwen3.8-27B-MTP-bf16
 
 TESTS := tests/test_json tests/test_toolcall tests/test_sample tests/test_tokenizer tests/test_qmv tests/test_ops \
-         tests/test_gdn tests/test_attn tests/test_kvstore tests/test_forward
+         tests/test_gdn tests/test_attn tests/test_kvstore tests/test_mtp tests/test_forward
 
 tests/test_json: tests/test_json.c qwasar_json.o qwasar_json.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_json.c qwasar_json.o $(LDLIBS)
 
 tests/test_qmv: tests/test_qmv.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_qmv.c $(CORE_OBJS) $(LDLIBS)
+
+tests/test_mtp: tests/test_mtp.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_mtp.c $(CORE_OBJS) $(LDLIBS)
 
 tests/test_ops: tests/test_ops.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_ops.c $(CORE_OBJS) $(LDLIBS)
@@ -109,9 +115,12 @@ tests/test_kvstore: tests/test_kvstore.c $(CORE_OBJS) qwasar.h qwasar_model.h
 tests/test_sample: tests/test_sample.c qwasar_sample.o qwasar.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_sample.c qwasar_sample.o -lm
 
+# QWASAR_TEST_MTP names the multi-token-prediction head directory, which is a
+# separate download; tests/test_mtp skips without it rather than failing.
 test: $(TESTS)
 	@for t in $(TESTS); do echo "== $$t"; \
-		QWASAR_TEST_MODEL="$(QWASAR_TEST_MODEL)" ./$$t || exit 1; done
+		QWASAR_TEST_MODEL="$(QWASAR_TEST_MODEL)" \
+		QWASAR_TEST_MTP="$(QWASAR_TEST_MTP)" ./$$t || exit 1; done
 
 # Optional offline syntax check for the kernels.
 #

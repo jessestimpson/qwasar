@@ -54,6 +54,16 @@ typedef struct {
     int32_t out_features;
 } qw_qlinear;
 
+/* An unquantised projection.  Only the MTP draft head has these: the base
+ * model is 4-bit throughout, but the head ships from its own repository in
+ * bf16 and there is no reason to quantise it before its cost has been
+ * measured (PLAN.md section 5, milestone 3). */
+typedef struct {
+    const qw_tensor *weight;    /* BF16 [out_features, in_features] */
+    int32_t in_features;
+    int32_t out_features;
+} qw_dense;
+
 typedef struct {
     bool is_linear_attn;   /* gated delta if true, full attention otherwise */
 
@@ -74,6 +84,42 @@ typedef struct {
     /* mlp */
     qw_qlinear gate_proj, up_proj, down_proj;
 } qw_layer;
+
+/* The multi-token-prediction draft head.
+ *
+ * One full-attention layer of exactly the shape the base model runs sixteen
+ * of, fused onto the backbone by a concatenation and a single projection:
+ *
+ *     fused = fc([ norm_e(embed(next_token)) ; norm_h(hidden) ])
+ *     out   = norm(layer(fused))
+ *
+ * and then the BASE model's lm_head reads `out`.  The head carries no
+ * embedding table and no output projection of its own -- the head config's
+ * `mtp_use_dedicated_embeddings: false` says so, and neither tensor is in its
+ * repository.
+ *
+ * The concatenation order is embedding first, hidden second.  That is the
+ * opposite of the DeepSeek layout it otherwise resembles, and getting it
+ * backwards would produce a head that loads, runs, and drafts nonsense. */
+typedef struct {
+    bool present;
+
+    const qw_tensor *pre_fc_norm_hidden;
+    const qw_tensor *pre_fc_norm_embedding;
+    qw_dense fc;                       /* [hidden, 2 * hidden] */
+
+    const qw_tensor *input_layernorm;
+    const qw_tensor *post_attention_layernorm;
+    qw_dense q_proj, k_proj, v_proj, o_proj;
+    const qw_tensor *q_norm, *k_norm;
+    qw_dense gate_proj, up_proj, down_proj;
+
+    const qw_tensor *norm;             /* final norm, before the base lm_head */
+
+    /* Draft tokens the head was trained to produce in one round; the head's own
+     * config.json carries it.  Verify width is one more than this. */
+    int32_t block_size;
+} qw_mtp;
 
 typedef struct {
     /* text */
@@ -162,6 +208,9 @@ const qw_tensor *qwasar_engine_tensor(const qwasar_engine *e, const char *name);
 const qw_qlinear *qwasar_engine_embed(const qwasar_engine *e);
 const qw_qlinear *qwasar_engine_head (const qwasar_engine *e);
 const qw_tensor  *qwasar_engine_final_norm(const qwasar_engine *e);
+
+/* The MTP draft head; `present` is false unless --mtp named a head directory. */
+const qw_mtp     *qwasar_engine_mtp(const qwasar_engine *e);
 int32_t qwasar_engine_context_size (const qwasar_engine *e);
 int32_t qwasar_engine_prefill_chunk(const qwasar_engine *e);
 
@@ -200,6 +249,11 @@ void qw_cpu_qmv_q4(float *y, const float *x, const uint32_t *w,
 
 void qw_cpu_rms_norm(float *y, const float *x, const uint16_t *w,
                      int32_t dim, int32_t rows, float eps, float out_scale);
+void qw_cpu_rms_norm_concat(float *y, const float *e, const uint16_t *we,
+                            const float *h, const uint16_t *wh,
+                            int32_t dim, int32_t rows, float eps);
+void qw_cpu_dmv_bf16(float *y, const float *x, const uint16_t *w,
+                     int32_t k, int32_t n, int32_t rows);
 void qw_cpu_rms_norm_gated(float *y, const float *x, const uint16_t *w,
                            const float *gate, int32_t dim, int32_t rows,
                            float eps, float out_scale);

@@ -104,3 +104,47 @@ kernel void qw_rms_norm_gated(
         yr[i] = v * qw_silu(gr[i]);
     }
 }
+
+/* Two RMS norms written straight into the concatenated layout the MTP head's
+ * `fc` consumes:
+ *
+ *     y[t] = [ norm_e(e[t]) | norm_h(h[t]) ]        each half `dim` wide
+ *
+ * Embedding first, hidden second.  The order is the head's, not a convention,
+ * and reversing it produces a head that runs and drafts nonsense.
+ *
+ * Fusing the pair saves nothing but a launch; what it really buys is that the
+ * concatenation has no separate existence to get wrong.  One threadgroup per
+ * token, the two halves reduced independently. */
+kernel void qw_rms_norm_concat(
+    device const float   *e  [[buffer(0)]],   /* [rows, dim] */
+    device const ushort  *we [[buffer(1)]],   /* [dim] bf16 */
+    device const float   *h  [[buffer(2)]],   /* [rows, dim] */
+    device const ushort  *wh [[buffer(3)]],   /* [dim] bf16 */
+    device       float   *y  [[buffer(4)]],   /* [rows, 2 * dim] */
+    constant qw_norm_args &a [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint ntg  [[threads_per_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint nsg  [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float partial[32];
+
+    device       float *yr = y + (ulong)tgid * 2 * a.dim;
+
+    for (uint half_i = 0; half_i < 2; ++half_i) {
+        device const float  *xr = (half_i == 0 ? e : h) + (ulong)tgid * a.dim;
+        device const ushort *wr =  half_i == 0 ? we : wh;
+
+        float sumsq = qw_row_sumsq(xr, a.dim, tid, ntg, sgid, nsg, lane, partial);
+        const float inv = rsqrt(sumsq / float(a.dim) + a.eps);
+
+        for (uint i = tid; i < a.dim; i += ntg)
+            yr[half_i * a.dim + i] = xr[i] * inv * qw_bf16_to_f32(wr[i]);
+
+        /* partial[] is reused by the second half's reduction. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}

@@ -16,6 +16,7 @@ static void usage(FILE *out) {
         "  -m, --model <dir>     model directory (config.json + *.safetensors)\n"
         "  -c, --context <n>     context size in tokens (default 32768)\n"
         "      --chunk <n>       prefill tokens per forward pass (default 256)\n"
+        "      --mtp <dir>       multi-token-prediction draft head directory\n"
         "  -n, --predict <n>     tokens to generate (default 512)\n"
         "  -p, --prompt <text>   user message\n"
         "  -s, --system <text>   system message\n"
@@ -78,6 +79,8 @@ int main(int argc, char **argv) {
             opts.context_size = atoi(argv[++i]);
         } else if (!strcmp(a, "--chunk") && i + 1 < argc) {
             opts.prefill_chunk = atoi(argv[++i]);
+        } else if (!strcmp(a, "--mtp") && i + 1 < argc) {
+            opts.mtp_path = argv[++i];
         } else if ((!strcmp(a, "-n") || !strcmp(a, "--predict")) && i + 1 < argc) {
             n_predict = atoi(argv[++i]);
         } else if ((!strcmp(a, "-p") || !strcmp(a, "--prompt")) && i + 1 < argc) {

@@ -232,9 +232,11 @@ struct qwasar_engine {
     qw_layer  layers[QW_MAX_LAYERS];
     qw_qlinear embed_tokens, lm_head;
     const qw_tensor *final_norm;
+    qw_mtp    mtp;
 
     size_t weight_bytes;       /* total bytes of bound tensors */
     size_t weight_bytes_text;
+    size_t weight_bytes_mtp;
     size_t weight_bytes_vision;
     size_t bytes_mapped;       /* zero-copy, file-backed */
     size_t bytes_copied;       /* materialized for alignment */
@@ -605,6 +607,136 @@ static const qw_tensor *qw_bind_norm(qwasar_engine *e, const char *fmt, int laye
     return t;
 }
 
+/* ---- MTP draft head -------------------------------------------------------
+ *
+ * The head is a separate repository, not part of the checkpoint, and it has to
+ * be: mlx-lm's qwen3_5 sanitize() reacts to the presence of any `mtp.` key by
+ * shifting every trunk norm weight by one, so a merged directory is a trap for
+ * the Python stack even though it would be nothing to us.  Its tensor names are
+ * bare -- `fc.weight`, `layers.0.self_attn.q_proj.weight` -- and the base
+ * model's are all under `language_model.`, so the two name sets share one table
+ * without prefixing or collision. */
+
+static bool qw_bind_dense(qwasar_engine *e, qw_dense *d, const char *name,
+                          int32_t in_features, int32_t out_features,
+                          char *err, size_t errcap) {
+    d->weight = qw_table_find(&e->tensors, name);
+    if (!d->weight) {
+        qw_errf(err, errcap, "MTP head is missing %s", name);
+        return false;
+    }
+    if (d->weight->dtype != QW_DT_BF16) {
+        qw_errf(err, errcap, "%s is %s, expected bf16", name,
+                qw_dtype_name(d->weight->dtype));
+        return false;
+    }
+    if (d->weight->ndim != 2 || d->weight->shape[0] != out_features
+        || d->weight->shape[1] != in_features) {
+        qw_errf(err, errcap, "%s is [%lld,%lld], expected [%d,%d]", name,
+                (long long)d->weight->shape[0], (long long)d->weight->shape[1],
+                out_features, in_features);
+        return false;
+    }
+    d->in_features  = in_features;
+    d->out_features = out_features;
+    e->weight_bytes_mtp += d->weight->nbytes;
+    return true;
+}
+
+static const qw_tensor *qw_bind_mtp_norm(qwasar_engine *e, const char *name,
+                                         int32_t dim, char *err, size_t errcap) {
+    const qw_tensor *t = qw_table_find(&e->tensors, name);
+    if (!t) {
+        qw_errf(err, errcap, "MTP head is missing %s", name);
+        return NULL;
+    }
+    if (t->ndim != 1 || t->shape[0] != dim) {
+        qw_errf(err, errcap, "%s has shape [%lld], expected [%d]", name,
+                (long long)t->shape[0], dim);
+        return NULL;
+    }
+    e->weight_bytes_mtp += t->nbytes;
+    return t;
+}
+
+static bool qw_load_mtp(qwasar_engine *e, const char *dir, char *err, size_t errcap) {
+    const qw_config *c = &e->config;
+    qw_mtp *m = &e->mtp;
+    char path[1200];
+
+    /* The head's own config is not a load input -- the head is built from the
+     * base model's dimensions -- but block_size lives only there, and reading it
+     * is also the cheapest check that this directory is a head and not, say,
+     * another copy of the model. */
+    snprintf(path, sizeof path, "%s/config.json", dir);
+    qj_doc cfg;
+    if (!qj_parse_file(&cfg, path)) {
+        qw_errf(err, errcap, "cannot read %s", path);
+        return false;
+    }
+    char mt[64] = "";
+    qj_str_copy(&cfg, qj_root(&cfg), "model_type", mt, sizeof mt);
+    if (strcmp(mt, "qwen3_5_mtp")) {
+        qw_errf(err, errcap, "%s declares model_type \"%s\", expected qwen3_5_mtp",
+                path, mt);
+        qj_free(&cfg);
+        return false;
+    }
+    m->block_size = (int32_t)qj_int_or(&cfg, qj_root(&cfg), "block_size", 0);
+    qj_free(&cfg);
+    if (m->block_size < 1) {
+        qw_errf(err, errcap, "MTP head declares no usable block_size");
+        return false;
+    }
+
+    snprintf(path, sizeof path, "%s/model.safetensors", dir);
+    const uint32_t before = e->tensors.count;
+    if (!qw_load_shard(e, path, err, errcap)) return false;
+    if (!qw_table_index(&e->tensors)) { qw_errf(err, errcap, "out of memory"); return false; }
+
+    /* Fifteen tensors, no more and no less.  A head that gained or lost one is
+     * not a head this code understands, and drafting from a partly bound one
+     * would show up only as a mysteriously bad acceptance rate. */
+    const uint32_t added = e->tensors.count - before;
+    if (added != 15) {
+        qw_errf(err, errcap, "MTP head has %u tensors, expected 15", added);
+        return false;
+    }
+
+    const int32_t h  = c->hidden_size;
+    const int32_t qd = c->num_attention_heads * c->head_dim;
+
+    /* q_proj emits query and gate together, exactly as the base model's full
+     * attention layers do (attn_output_gate). */
+    if (!qw_bind_dense(e, &m->fc,        "fc.weight",                          2 * h, h, err, errcap)
+     || !qw_bind_dense(e, &m->q_proj,    "layers.0.self_attn.q_proj.weight",   h, 2 * qd, err, errcap)
+     || !qw_bind_dense(e, &m->k_proj,    "layers.0.self_attn.k_proj.weight",   h, c->num_key_value_heads * c->head_dim, err, errcap)
+     || !qw_bind_dense(e, &m->v_proj,    "layers.0.self_attn.v_proj.weight",   h, c->num_key_value_heads * c->head_dim, err, errcap)
+     || !qw_bind_dense(e, &m->o_proj,    "layers.0.self_attn.o_proj.weight",   qd, h, err, errcap)
+     || !qw_bind_dense(e, &m->gate_proj, "layers.0.mlp.gate_proj.weight",      h, c->intermediate_size, err, errcap)
+     || !qw_bind_dense(e, &m->up_proj,   "layers.0.mlp.up_proj.weight",        h, c->intermediate_size, err, errcap)
+     || !qw_bind_dense(e, &m->down_proj, "layers.0.mlp.down_proj.weight",      c->intermediate_size, h, err, errcap))
+        return false;
+
+    m->pre_fc_norm_hidden    = qw_bind_mtp_norm(e, "pre_fc_norm_hidden.weight", h, err, errcap);
+    m->pre_fc_norm_embedding = qw_bind_mtp_norm(e, "pre_fc_norm_embedding.weight", h, err, errcap);
+    m->norm                  = qw_bind_mtp_norm(e, "norm.weight", h, err, errcap);
+    m->input_layernorm       = qw_bind_mtp_norm(e, "layers.0.input_layernorm.weight", h, err, errcap);
+    m->post_attention_layernorm =
+        qw_bind_mtp_norm(e, "layers.0.post_attention_layernorm.weight", h, err, errcap);
+    m->q_norm = qw_bind_mtp_norm(e, "layers.0.self_attn.q_norm.weight", c->head_dim, err, errcap);
+    m->k_norm = qw_bind_mtp_norm(e, "layers.0.self_attn.k_norm.weight", c->head_dim, err, errcap);
+
+    if (!m->pre_fc_norm_hidden || !m->pre_fc_norm_embedding || !m->norm
+        || !m->input_layernorm || !m->post_attention_layernorm
+        || !m->q_norm || !m->k_norm)
+        return false;
+
+    m->present = true;
+    e->weight_bytes += e->weight_bytes_mtp;
+    return true;
+}
+
 static bool qw_bind_weights(qwasar_engine *e, char *err, size_t errcap) {
     const qw_config *c = &e->config;
     const qw_shape  *s = &e->shape;
@@ -733,6 +865,8 @@ qwasar_engine *qwasar_engine_load(const qwasar_options *opts, char *err, size_t 
     if (!qw_load_shards(e, err, errcap))   goto fail;
     if (!qw_table_index(&e->tensors))      { qw_errf(err, errcap, "out of memory"); goto fail; }
     if (!qw_bind_weights(e, err, errcap))  goto fail;
+    if (opts->mtp_path && *opts->mtp_path
+        && !qw_load_mtp(e, opts->mtp_path, err, errcap)) goto fail;
     return e;
 
 fail:
@@ -760,6 +894,7 @@ const qw_config *qwasar_engine_config(const qwasar_engine *e) { return &e->confi
 const qw_qlinear *qwasar_engine_embed(const qwasar_engine *e) { return &e->embed_tokens; }
 const qw_qlinear *qwasar_engine_head (const qwasar_engine *e) { return &e->lm_head; }
 const qw_tensor  *qwasar_engine_final_norm(const qwasar_engine *e) { return e->final_norm; }
+const qw_mtp     *qwasar_engine_mtp(const qwasar_engine *e) { return &e->mtp; }
 int32_t qwasar_engine_context_size (const qwasar_engine *e) { return e->context_size; }
 int32_t qwasar_engine_prefill_chunk(const qwasar_engine *e) { return e->prefill_chunk; }
 
@@ -836,8 +971,14 @@ void qwasar_engine_print_info(const qwasar_engine *e, FILE *out) {
                 c->vis_temporal_patch_size, c->vis_spatial_merge_size, c->vis_out_hidden_size);
 
     fprintf(out, "\n");
-    fprintf(out, "weights    %.2f GB text + %.2f GB vision = %.2f GB\n",
-            qw_gb(e->weight_bytes_text), qw_gb(e->weight_bytes_vision), qw_gb(e->weight_bytes));
+    if (e->mtp.present)
+        fprintf(out, "mtp head   1 full-attention layer, bf16, drafts %d per round\n",
+                e->mtp.block_size);
+
+    fprintf(out, "weights    %.2f GB text + %.2f GB vision",
+            qw_gb(e->weight_bytes_text), qw_gb(e->weight_bytes_vision));
+    if (e->mtp.present) fprintf(out, " + %.2f GB mtp", qw_gb(e->weight_bytes_mtp));
+    fprintf(out, " = %.2f GB\n", qw_gb(e->weight_bytes));
 
     /* Per-token cache cost.  The hybrid schedule is what makes long context
      * affordable: only the full-attention layers grow with position, and the

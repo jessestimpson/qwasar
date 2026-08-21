@@ -81,6 +81,34 @@ void qw_cpu_rms_norm(float *y, const float *x, const uint16_t *w,
     }
 }
 
+/* The MTP head's fusion step, in the layout `fc` consumes: embedding-normed
+ * half first, hidden-normed half second. */
+void qw_cpu_rms_norm_concat(float *y, const float *e, const uint16_t *we,
+                            const float *h, const uint16_t *wh,
+                            int32_t dim, int32_t rows, float eps) {
+    for (int32_t r = 0; r < rows; r++) {
+        qw_cpu_rms_norm(y + (size_t)r * 2 * dim,       e + (size_t)r * dim, we,
+                        dim, 1, eps, 1.0f);
+        qw_cpu_rms_norm(y + (size_t)r * 2 * dim + dim, h + (size_t)r * dim, wh,
+                        dim, 1, eps, 1.0f);
+    }
+}
+
+/* Dense bf16 matvec: y[r][o] = sum_i w[o][i] * x[r][i]. */
+void qw_cpu_dmv_bf16(float *y, const float *x, const uint16_t *w,
+                     int32_t k, int32_t n, int32_t rows) {
+    for (int32_t r = 0; r < rows; r++) {
+        const float *xv = x + (size_t)r * k;
+        float *yv = y + (size_t)r * n;
+        for (int32_t o = 0; o < n; o++) {
+            const uint16_t *wr = w + (size_t)o * k;
+            float acc = 0.0f;
+            for (int32_t i = 0; i < k; i++) acc += qw_bf16_to_f32_c(wr[i]) * xv[i];
+            yv[o] = acc;
+        }
+    }
+}
+
 void qw_cpu_rms_norm_gated(float *y, const float *x, const uint16_t *w,
                            const float *gate, int32_t dim, int32_t rows,
                            float eps, float out_scale) {

@@ -89,6 +89,11 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
                   int32_t k, int32_t n, int32_t rows);
 
+/* y = x * w^T for an unquantised bf16 weight, blocked like qw_op_qmvb_q4.
+ * Only the MTP draft head is dense. */
+void qw_op_dmat_bf16(qw_cmd c, qw_ref y, qw_ref x, qw_ref w,
+                     int32_t k, int32_t n, int32_t rows);
+
 /* Evaluates `rows` tokens in ceil(rows / QW_QMVB_B) passes over the weights.
  * Correct for any row count; only worth calling below QW_QMM_MIN_ROWS. */
 void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
@@ -164,6 +169,12 @@ void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
  * wants (see metal/norm.metal). */
 void qw_op_rms_norm(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight,
                     int32_t dim, int32_t rows, float eps, float out_scale);
+
+/* Two RMS norms into one [rows, 2 * dim] buffer: norm_e(e) then norm_h(h).
+ * The MTP head's fusion step; the concatenation order is the head's. */
+void qw_op_rms_norm_concat(qw_cmd c, qw_ref y, qw_ref e, qw_ref we,
+                           qw_ref h, qw_ref wh, int32_t dim, int32_t rows,
+                           float eps);
 
 /* rms_norm(x, weight) * silu(gate) -- the gated-delta output norm. */
 void qw_op_rms_norm_gated(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight, qw_ref gate,
