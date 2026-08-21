@@ -266,9 +266,18 @@ feeds back the tokens it generated rather than re-rendering the conversation.
 
 Early numbers, one machine. Everything below was measured on:
 
-> **MacBook Pro, Apple M4** — 10 CPU cores, 10 GPU cores, 32 GB unified memory,
+> **MacBook Air, Apple M4** — 10 CPU cores, 10 GPU cores, 32 GB unified memory,
 > macOS 26.5.1. Metal reports a 25.0 GB working set and an 18.7 GB maximum
 > buffer. Model is `Qwen3.8-27B-MLX-4bit`, 14.95 GB of weights.
+
+**This is a fanless machine**, so it is fair to ask how much of this survives
+sustained load. Measured, over six consecutive matmul benchmark runs — a few
+minutes of near-continuous GPU work — throughput went from 2243.9 to 2212.4
+GFLOP/s. That is a **1.4% drift**, so the figures below are close to sustained
+for runs of this length rather than a cold-start best case.
+
+Longer than a few minutes is untested. A cooled chassis would presumably hold
+the numbers indefinitely, and might start higher.
 
 ## Throughput
 
