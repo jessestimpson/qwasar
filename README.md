@@ -474,11 +474,13 @@ Stated plainly, because a README that only lists what works is not much use:
   top-p and min-p; `qwasar` and `qwasar-agent` are still greedy.
 * **`/v1/responses` and `/v1/completions`**, which ds4-server has. They return
   501. So do concurrent requests: qwasar serves one at a time.
-* **Speculative decoding.** The model ships an MTP draft head, but as a separate
-  shard that is not in this checkpoint.
+* **Speculative decoding.** The model ships a one-layer MTP draft head, but MLX
+  conversions drop its weights, so this checkpoint has none. They can be pulled
+  from the upstream bf16 repo; this is the next milestone, and the one thing
+  that can push decode past its bandwidth roof.
 * **NFC normalisation** in the tokenizer. A no-op for ASCII and already-normalised
   text; decomposed input would tokenize differently from the reference.
-* **Interrupting a running turn** in the agent, and todo tracking.
+* **Todo tracking and a `glob` tool** in the agent.
 * **Multi-GPU, CUDA, distributed inference.** Not planned. This targets one Mac.
 
 ## Known rough edges

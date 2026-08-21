@@ -389,7 +389,7 @@ So correctness is judged on three things instead:
 
 ## 5. Milestones
 
-### Milestone 1 — inference works at all *(the current goal)*
+### Milestone 1 — inference works at all *(done)*
 
 Text-only, greedy, correct. Speed is explicitly not a goal here beyond "not
 absurd".
@@ -530,300 +530,6 @@ precision drop; the per-op tolerance alone would not.
 
 ---
 
-## 3. Design
-
-### 3.1 Build: one `make`, no Python, no Metal toolchain
-
-ds4 concatenates `metal/*.metal` off disk at startup and calls
-`newLibraryWithSource:`. That has the great property of **not requiring the
-Metal toolchain**, but it makes the binary depend on its source tree at runtime.
-
-qwasar keeps the runtime compile and drops the dependency: `make` runs a
-6-line `bin2c` C program over `metal/*.metal` to generate `qwasar_metal_src.inc`
-(a string literal), which is compiled into the binary. At startup we compile that
-embedded source and cache the resulting `MTLBinaryArchive` under
-`~/.cache/qwasar/<sha256-of-source>.metallib`, so only the first run pays.
-
-Result: `cc`, Foundation, Metal. No Xcode component download, no Python, no
-codegen step the user has to know about, and a single relocatable binary.
-`DS4`-style env overrides (`QWASAR_METAL_<FILE>_SOURCE`) stay available for
-kernel iteration without rebuilding.
-
-### 3.2 Files
-
-```
-qwasar.h              public engine boundary (engine + session; no tensor internals)
-qwasar.c              config, safetensors mmap, weight table, tokenizer,
-                      chat template, session lifecycle, graph scheduling
-qwasar_gpu.h          GPU-facing interface used by qwasar.c
-qwasar_metal.m        Metal runtime: device, library, pipelines, buffers, encode
-metal/*.metal         kernels
-qwasar_cli.c          REPL + one-shot CLI
-qwasar_agent.c        agentic loop, tool dispatch, XML tool-call parser
-tests/                unit + golden-vector regression
-tools/                DEV ONLY — not part of the build; generates golden vectors
-                      from the mlx-vlm reference (see §4)
-```
-
-### 3.3 Weight loading
-
-`mmap` each shard `PROT_READ|MAP_PRIVATE`, wrap the whole shard in one
-`newBufferWithBytesNoCopy:` (shards are 5.34 GB, well under the 20.1 GB cap),
-and address every tensor as `(buffer, byte_offset)`. Zero copy, zero eager read;
-the page cache does the work and resident set grows as layers are first touched.
-
-**Alignment, and why one shard is an exception.** Packed 4-bit words are read as
-`uint` and scales as `ushort`, so tensor addresses must be at least 4-byte
-aligned. Every safetensors tensor offset here is 32-byte aligned *relative to
-its shard's data section* — but the data section itself starts right after a
-JSON header of arbitrary length, and nothing makes that aligned. Measured on
-this checkpoint:
-
-| shard | data section starts at | `% 16` | |
-|---|---|---|---|
-| 1 | 104752 | 0 | zero-copy |
-| 2 | 94284 | 12 | zero-copy (4-aligned, enough for `uint`) |
-| 3 | 80323 | 3 | **misaligned — 4.99 GB copied into aligned memory at load** |
-
-No mapping trick fixes this: `mmap` only controls the address modulo the page
-size, so the byte offset within a word is a property of the file. So the loader
-decides per shard — wrap when aligned, copy the data section once when not — and
-`--info` reports the split (currently 9.96 GB mapped, 4.99 GB copied). Load is
-still well under a second warm.
-
-Phase 7's vectorised `uint4` loads will want 16-byte alignment, which shard 2
-also fails. The answer then is a **disk-cached aligned repack** under
-`~/.cache/qwasar` — mapped zero-copy forever after the first run — not more
-resident copies. That repack is also the natural place to hang layout changes
-(interleaving scales with weights, pre-swizzling for the matvec), so it earns
-its keep rather than existing only to fix alignment.
-
-The parsed safetensors header becomes a flat name→`{buffer, offset, dtype,
-shape}` table. Layer weights are resolved once at load into a
-`qwasar_layer[64]` array of direct pointers so the hot path never does a string
-lookup.
-
-### 3.4 Execution model
-
-Whole-model graph, ds4-style: one command buffer encodes every layer for a step,
-committed once. No per-op CPU round-trip, no synchronisation inside a step.
-Scratch activations live in a small ring of reused device buffers sized at load.
-
-Two step shapes:
-- **decode** — `L = 1`. Gated-delta runs its per-token recurrence kernel;
-  attention runs a decode flash kernel against the KV cache.
-- **prefill** — `L = N`. Gated-delta runs the chunked scan; attention runs a
-  causal tiled flash kernel. Chunked to bound scratch memory.
-
-### 3.5 Kernels
-
-| kernel | notes |
-|---|---|
-| `qmv_q4_g64` | 4-bit affine mat-vec. **The** decode kernel — ~90% of decode time |
-| `qmm_q4_g64` | 4-bit affine mat-mul, simdgroup-tiled, for prefill |
-| `get_rows_q4` | embedding lookup with inline dequant |
-| `rms_norm` / `rms_norm_gated` | plain, and the per-head `* silu(z)` variant |
-| `rope_partial_mrope` | rotate first 64 of 256 dims, half-split |
-| `flash_attn_decode` / `flash_attn_prefill` | GQA 24/4, head_dim 256, output-gated |
-| `kv_write` | append K/V to cache |
-| `swiglu` | `silu(a) * b` |
-| `dw_conv1d_causal` | depthwise K=4 over 10240 channels, with state |
-| `gated_delta_step` | fp32 recurrence; grid `(32, Dv, Hv)`, 4 elems/thread |
-| `gated_delta_chunked` | prefill scan (Phase 3) |
-| `sample` | temperature / top-k / top-p / min-p, on-GPU argmax fast path |
-
-`head_dim = 256` is unusually large and will drive flash-attention tiling
-choices; the M4's 32 KB threadgroup memory holds only 32 fp16 K-vectors of that
-width, so the K/V tile is the thing to tune.
-
-### 3.6 Public API
-
-Narrow, ds4-shaped — CLI, agent, and (later) server all sit on it:
-
-```c
-qwasar_engine  *qwasar_engine_load(const qwasar_options *opts);
-qwasar_session *qwasar_session_new(qwasar_engine *e);
-int  qwasar_session_sync(qwasar_session *s, const int *tokens, int n, ...);
-int  qwasar_session_sample(qwasar_session *s, const qwasar_sampling *sp);
-void qwasar_session_free(qwasar_session *s);
-```
-
-`sync` takes a full token prefix and decides for itself whether to reuse, extend,
-or rebuild. Callers never see a tensor.
-
-**Prefix reuse is a hybrid-model design constraint worth stating up front.** A
-pure-attention engine can truncate a KV cache to any prefix length. Here, the 48
-gated-delta layers carry a *recurrent* state with no per-position history — you
-cannot rewind it. So a session can extend its prefix cheaply but **cannot
-rewind** without re-prefilling. Editing an earlier turn is a full re-prefill.
-`qwasar_session_sync` will state this in its contract, and the agent will be
-written to append-only. Checkpointing the SSM state (151 MB, context-independent)
-at turn boundaries is the mitigation, and is cheap — Phase 5.
-
----
-
-## 4. Correctness strategy
-
-Two independent oracles, because a 27B model gives no useful signal from
-eyeballing output:
-
-1. **Per-op CPU reference in C.** Every kernel has a scalar fp32 twin in
-   `qwasar.c` and a test in `tests/` that runs both on random input and compares.
-   This catches packing, indexing, and layout bugs — the overwhelming majority.
-2. **Golden vectors from mlx-vlm.** `tools/` (dev-only, never built by `make`)
-   drives the reference implementation in `reference/mlx-vlm` and dumps hidden
-   states after selected layers plus final logits for fixed prompts. A test
-   replays them through qwasar and asserts agreement. This catches architecture
-   misreadings that a per-op test cannot.
-
-   The venv is already built and working: `reference/mlx-vlm/.venv` (mlx 0.32.1).
-
-Bring-up order is layer-by-layer against oracle 2: embedding → layer 0
-(gated-delta) → layer 3 (full attention) → 4 layers → 64 layers → logits. A
-hybrid model has two very different layer types and diverging early is the
-expected failure mode, so the first gated-delta layer and the first attention
-layer each get their own checkpoint.
-
-**Tolerances, measured rather than guessed.** The reference keeps activations
-in bf16. Running the same 17-token prompt through it batched versus one token at
-a time -- identical arithmetic, different accumulation order -- moves its own
-logits by **7.4e-2** relative L2, and reorders its own top-3. That is the noise
-floor, and it means **logit L2 is a weak signal**: qwasar sits at 4.8e-2 against
-the batched reference, i.e. closer to it than the reference's own stepwise run
-is.
-
-So correctness is judged on three things instead:
-
-1. **argmax and top-5 order** must match exactly. They do.
-2. **The per-layer drift curve must be smooth.** Layer 0 lands at 3.5e-3, about
-   one bf16 rounding (eps = 3.9e-3), and grows to 4.6e-2 by layer 63 with no
-   step change -- and critically no discontinuity between gated-delta layers and
-   attention layers, which are entirely separate code.
-3. **Per-op agreement with the CPU twins**, which is where real tolerances live:
-   fp32 rounding, ~1e-7 to 1e-8.
-
----
-
-## 5. Milestones
-
-### Milestone 1 — inference works at all *(the current goal)*
-
-Text-only, greedy, correct. Speed is explicitly not a goal here beyond "not
-absurd".
-
-- **Phase 0 — foundation.** Makefile + `bin2c` + embedded-source Metal library
-  with on-disk pipeline cache. Safetensors mmap loader, config parser, weight
-  table, no-copy `MTLBuffer` binding. `qwasar --model … --info` prints the
-  parsed architecture and a weight inventory. *Proves the load path and the
-  build story before any math exists.*
-- **Phase 1 — kernels + CPU twins.** All decode-path kernels from §3.5 plus
-  their scalar references and unit tests. `qmv_q4_g64` first and validated
-  hardest — everything downstream is meaningless if dequant is wrong.
-- **Phase 2 — decode graph.** Assemble the 64-layer forward for `L=1`. Validate
-  layer-by-layer against golden vectors. **Prefill is a sequential loop over the
-  decode path** at this stage — correct, slow, and it gets us to end-to-end
-  generation without the chunked scan.
-- **Phase 3 — real prefill.** Chunked gated-delta scan and tiled causal flash
-  attention for `L=N`. Same golden vectors, now at batch. This is where prompt
-  processing stops being unusable.
-- **Phase 4 — usable CLI.** Byte-level BPE tokenizer (hand-written pre-tokenizer
-  state machine over the GPT-4 split regex, with a checked-in Unicode
-  `\p{L}`/`\p{N}` table so the build stays Python-free), the ChatML template
-  including the `<think>` and reasoning-effort behaviour, sampling
-  (temperature/top-k/top-p/min-p; the config's own defaults are
-  `temp 1.0, top_k 20, top_p 0.95`), streaming output with thinking-block
-  handling, and a linenoise REPL.
-
-**Milestone 1 is done when** `./qwasar -m <model> -p "..."` streams a coherent
-answer and the golden-vector test passes end to end.
-
----
-
-### Status
-
-**Milestone 1 is complete.** Phases 0-4 are done; the model takes text and
-returns text:
-
-```
-$ qwasar -m <model> -p "Name three prime numbers, with one sentence on why each is prime."
-2 is prime because its only positive divisors are 1 and itself.
-3 is prime because it cannot be divided evenly by any whole number other than 1 and 3.
-5 is prime because its only positive divisors are 1 and 5.
-```
-
-All seven test suites pass. The golden-vector replay matches the reference's
-**argmax and all five top-5 ranks exactly**, with a smooth per-layer drift curve
-(§4). The tokenizer matches the reference on 24 encode cases and all 6 chat
-template renderings, exactly.
-
-The pre-tokenizer is a hand-written state machine over the model's split
-pattern, with checked-in `\p{L}` / `\p{N}` / `\s` range tables generated once by
-`tools/gen_unicode.py` -- so the build stays Python-free.
-
-**One deliberate divergence from the reference:** `qwasar_encode` never emits
-control tokens, however the input spells them. HF's tokenizer splits input on
-added tokens, which means user text containing `<|im_start|>` becomes a real
-role boundary. The template emits control tokens by id, so message content
-cannot forge one. Known gap in the other direction: the NFC normalizer is not
-applied, which is a no-op for ASCII and already-normalised text.
-
-### Measured performance
-
-Separating one-time costs from steady state, on the M4:
-
-| | |
-|---|---|
-| engine load | 8.6 s — dominated by the 4.99 GB alignment copy (§3.3) |
-| first forward pass | 4.8 s — faulting 9.96 GB of mapped weights in; the CLI now pays this during load so its prefill figure is the steady-state one |
-| **decode** | **5.8 tok/s** steady (0.17 s/token) |
-| **prefill** | **42.6 tok/s** at a 256-token chunk (7.0 before `qmm`) |
-
-Decode landed inside the 5.5-7 band predicted from bandwidth, first try.
-
-**Prefill was the largest single gap; `qw_qmm_q4_g64` closed most of it.**
-`qw_qmv_q4_g64` dispatches one row per token, so an N-token prefill re-read all
-15 GB of weights N times. The tiled matmul stages a 64x64 output block through
-threadgroup memory, so each weight block is fetched and dequantised once and
-reused across the whole token tile. Measured: **7 -> 42.6 tok/s at a 256-token
-chunk, 6.1x.** `qw_op_qmat_q4` picks between the two by row count.
-
-The crossover is not where intuition puts it. The matmul pads its token tile to
-64, so it costs the same for 8 tokens as for 64 -- about 2.0 s through the whole
-model -- while the matvec costs ~0.18 s per token. They cross just under 12, so
-`QW_QMM_MIN_ROWS` is 16. An earlier guess of 6 made 8-token prefills *slower*
-than before.
-
-### Where the remaining prefill headroom is
-
-The first version was register-tiled: a 4x4 accumulator per thread, eight
-threadgroup loads for every sixteen fused multiply-adds. It held **1.2-1.33
-TFLOP/s** on every projection shape and every row count. A pure-FMA kernel
-measures this machine's fp32 peak at **3.33 TFLOP/s**, so that was 39%, and the
-flatness across shapes said the limit was kernel structure rather than any
-shape or tail effect.
-
-Rebalancing the tile did not help, which is what ruled out the load-to-arithmetic
-ratio as something tunable:
-
-| change | result |
-|---|---|
-| `float4` threadgroup loads in the inner loop | 1235 vs 1239 GFLOP/s -- the compiler already vectorised |
-| `BM=128, BN=64, TM=8, TN=4` (ALU:LDS 2.7) | +5% at 256 tokens, but half the throughput at 64 |
-| `BM=BN=64, TM=TN=8` (ALU:LDS 4.0, 64 threads) | 3.9 tok/s -- two simdgroups per threadgroup starves the core |
-| `BM=BN=128, BK=16` | far worse; halving BK doubles the barrier count |
-
-Moving the inner product onto the **8x8 matrix units** did: one
-`simdgroup_multiply_accumulate` performs an entire 8x8x8 product, which removes
-the ratio as a limit instead of tuning around it. **1.83 TFLOP/s, 55% of peak**,
-and prefill went 26 -> 35 tok/s.
-
-Remaining headroom is the other 45%. The next lever is holding the operand tiles
-in `half` rather than `float`: Apple's matrix units run fp16 inputs at a higher
-rate, and halving the tiles would allow `BK=64` at the same 16 KB, halving the
-barrier count too. Both operands are well inside fp16 range -- dequantised
-4-bit weights and post-norm activations -- but it changes the numerics, so it
-needs re-validation against the CPU reference rather than being assumed safe.
-
 ### Milestone 2 — `qwasar-agent` *(working)*
 
 Agentic loop on the same engine, with six tools: `read`, `write`, `edit`,
@@ -913,14 +619,136 @@ prompt differing one token into the prefix must miss, a prompt shorter than the
 checkpoint must miss, and a truncated file must be rejected rather than
 restored as garbage.
 
-### Milestone 3 — vision
+### Milestone 3 — speculative decoding with the MTP head *(next)*
+
+**Why this is next, and why it is ahead of vision.** Decode sits at 5.8 tok/s
+against a measured bandwidth roof of 8.0 (§2): 14.95 GB of weights are read to
+produce one token, and no kernel can be written that reads less. Every item in
+the performance milestone below chases the gap to that roof; speculative
+decoding is the only thing that moves the roof, because it amortises one pass
+over the weights across several accepted tokens. It also needs no new kernels.
+
+#### What the head actually is
+
+Qwen3.8 ships an MTP draft head, DeepSeek-style. The base config already
+declares it -- `mtp_num_hidden_layers: 1`, `mtp_use_dedicated_embeddings:
+false` -- even in the checkpoint that omits the weights. Read from the upstream
+`Qwen/Qwen3.8-27B` index and safetensors header, it is fifteen tensors:
+
+| tensor | shape | what it is |
+|---|---|---|
+| `mtp.pre_fc_norm_hidden` / `..._embedding` | [5120] each | RMSNorm on the two inputs |
+| `mtp.fc` | [5120, 10240] | projects `[norm(h) ; norm(embed(next))]` back to one hidden |
+| `mtp.layers.0.self_attn.{q,k,v,o}_proj` | [12288, 5120], [1024, 5120], [1024, 5120], [5120, 6144] | one **full-attention** layer |
+| `mtp.layers.0.self_attn.{q,k}_norm` | [256] | per-head RMSNorm |
+| `mtp.layers.0.mlp.{gate,up,down}_proj` | [17408, 5120] ×2, [5120, 17408] | SwiGLU |
+| `mtp.layers.0.{input,post_attention}_layernorm`, `mtp.norm` | [5120] | norms |
+
+Those shapes say more than the names do. `q_proj` at 12288 = 24 × 256 × 2 is the
+same query-plus-gate packing the base model's full-attention layers use;
+`k`/`v` at 1024 = 4 × 256 is the same GQA-6. `mtp_use_dedicated_embeddings:
+false` and the absence of any `mtp.embed_tokens` or `mtp.lm_head` mean it reuses
+the base embedding table and the base output head.
+
+**So the draft head is one more full-attention layer of exactly the shape we
+already run sixteen of, and every kernel it needs exists.** The only new op is a
+concat and one matmul. That is the reason this is a smaller build than vision
+despite being worth more.
+
+It is 425M parameters, 849 MB in bf16 -- 5.7% of the weight traffic of a base
+decode step, about 7 ms of bandwidth per drafted token. It carries its own KV
+cache, 4 KB/token, 134 MB at 32K.
+
+#### Getting the weights
+
+They are not in the MLX 4-bit checkpoint: mlx-vlm's `sanitize` drops every
+`mtp.` key, which its own `test_qwen3_5_mtp_sanitize.py` pins as intended
+behaviour, so every MLX conversion downstream of it is missing them.
+
+They are in upstream `Qwen/Qwen3.8-27B`, shard 18 of 18, and -- checked, not
+assumed -- **the fifteen tensors are contiguous**: bytes 2,542,798,560 to
+3,392,197,344, 849 MB, one HTTP range request. The rest of that 3.4 GB shard is
+`lm_head`, which we already have.
+
+`tools/fetch-mtp.sh` (curl, dev-only, no Python) takes the header range and the
+tensor range; `tools/mtp-pack` rebases the offsets into a standalone
+`qwen3.8-27b-mtp.safetensors`. `--mtp <file>` loads it, following ds4's flag of
+the same name. Run it in bf16 first: it avoids writing a quantiser, and 849 MB
+against a 24 GB machine is affordable. Repack to 4-bit only if the draft cost
+shows up in a measurement.
+
+#### The hard part: rewinding a model that cannot be rewound
+
+Speculation means evaluating tokens that may be thrown away. For the sixteen
+full-attention layers that is free -- move the write cursor back. For the
+forty-eight Gated DeltaNet layers it is the central problem of this milestone,
+and it is the same property that shaped the disk cache: the state is advanced in
+place and there is no per-position history. It is not invertible in practice
+either; undoing `S = g·S + outer(delta, k)` means dividing by a decayed `g`.
+
+Snapshot-and-restore would work -- the state is 157 MB (SSM 48 layers × 48 value
+heads × 128 × 128 × fp32 = 151 MB, conv 5.9 MB), about 1.3 ms to copy -- but
+there is a version that costs nothing:
+
+**Ping-pong the state through K+1 slots.** Step *i* of the verify pass reads slot
+*i-1* and writes slot *i*; accepting *j* tokens makes slot *j* live by swapping a
+pointer. The recurrence already reads and writes the entire state on every step,
+so writing it somewhere else is the same traffic. The only new cost is the
+allocation: (K+1) × 157 MB, or 628 MB at K=3.
+
+The disk checkpoint format does not change -- only the live slot is ever
+persisted -- so existing cache entries stay valid.
+
+#### The verify pass
+
+K+1 tokens go through the existing `qmm` path in one pass, so the weights are
+read once. Compute is roughly 23.5 ms per token at prefill's measured rate
+against a 125 ms weight read, which puts the crossover where extra draft tokens
+stop being free at about K+1 = 5. ds4 defaults to `--mtp-draft 2`.
+
+Acceptance:
+
+- **Greedy:** accept while the drafted token equals the argmax. Exact by
+  construction -- and that gives the strongest test available, below.
+- **Sampled:** modified rejection sampling, which preserves the target
+  distribution exactly. Do not ship an "accept if close enough" rule; a sampler
+  that silently changes the distribution is the kind of unexplained drift §6
+  forbids.
+
+ds4 restricts MTP to greedy and adds a confidence gate (`--mtp-margin`) so a
+likely-rejected draft is not paid for. Measure whether that is needed here
+before copying it.
+
+#### How this is tested
+
+The invariant is unusually strong and unusually cheap: **with drafting on, the
+generated token sequence must be identical to greedy decoding with drafting
+off.** Not close -- identical. Any bug in the state slots, the KV rewind, or the
+acceptance rule breaks it immediately. That test is the milestone's real
+acceptance criterion.
+
+Under it: a CPU twin for the concat-and-`fc` step, the only new op; and a slot
+test that accepts *j* of *K* drafts, continues, and compares the resulting state
+against a plain run of the same tokens.
+
+#### What is being claimed, and what is not
+
+At K=3 a step costs about 1.15 base decode steps and can yield up to 4 tokens,
+so the arithmetic ceiling is ~3.5x. The real number is set by acceptance rate,
+which is a property of the trained head that nobody here can predict, so the
+first deliverable is instrumentation -- per-position acceptance and tokens per
+step, printed by `--mtp-timing` -- and the projection stays a projection until
+that prints. ds4 calls its own MTP path an experimental slight speedup, which is
+the honest prior.
+
+### Milestone 4 — vision
 
 Patch embedding, the 27-block SigLIP-style tower with 2D RoPE, spatial-merge
 merger, `<|image_pad|>` scatter into the token embeddings, and — only now
 necessary — **real MRoPE**, since image tokens are what make the three position
 axes diverge. Image loading in C (stb_image, vendored).
 
-### Milestone 4 — performance
+### Milestone 5 — performance
 
 Only after correctness is locked and a benchmark exists. In expected order of
 payoff:
@@ -946,8 +774,9 @@ A `qwasar-bench` binary lands at the start of this milestone, not the end.
 
 ### Later (not planned in detail)
 
-`qwasar-server` (OpenAI/Anthropic-compatible HTTP), speculative decoding via the
-MTP head (needs a shard we do not have), disk KV/SSM checkpoints.
+Todo tracking and a `glob` tool in the agent, `/v1/responses` and
+`/v1/completions` in the server, concurrent requests, NFC normalisation in the
+tokenizer, a disk-cached aligned repack of the misaligned shard (§3.3).
 
 ---
 
