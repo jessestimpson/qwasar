@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <time.h>
@@ -14,6 +15,18 @@
 /* The footer is repainted at most this often.  Streaming can produce hundreds
  * of tokens a second and a footer that fast is unreadable as well as slow. */
 #define TUI_REDRAW_INTERVAL 0.10
+
+/* Bytes held for the output row being built.  A row is at most `cols` cells,
+ * but a cell can cost four bytes of UTF-8 and rows carry SGR sequences that
+ * cost cells nothing, so the buffer is generous rather than exact; appends
+ * that would overflow it force the row out early. */
+#define TUI_ROW_BYTES 4096
+
+/* Messages that may be composed ahead of the model.  A cap exists because each
+ * one commits to a turn whose output nobody has seen yet; when it is reached
+ * the editor simply keeps the text instead of accepting it, so a line is never
+ * taken and then silently dropped. */
+#define TUI_MAX_QUEUED 4
 
 struct qw_tui {
     struct linenoiseState ls;
@@ -29,11 +42,37 @@ struct qw_tui {
     int    rows, cols;
     int    out_bottom;  /* last row of the scrolling output region */
     int    prompt_row;  /* first row of the reserved footer */
-    int    out_col;     /* column the next output byte goes to, 0-based */
+
+    /* The output row under construction, owned outright.
+     *
+     * An earlier version tracked only a column and appended at it, which meant
+     * maintaining a model of where the terminal's cursor was by parsing the
+     * bytes going past.  Every gap in that model desynchronised it permanently
+     * for the rest of the row, and there were several: a tab moved the real
+     * cursor to the next multiple of eight while the model advanced by nothing,
+     * and CJK and emoji occupy two cells while the model counted one.  Streamed
+     * output containing any of them started overwriting itself.
+     *
+     * Keeping the row's bytes instead removes the model.  Every write repaints
+     * the whole row from column one, so the terminal's cursor is irrelevant --
+     * it is told where to be, rather than guessed at. */
+    char   row[TUI_ROW_BYTES];
+    size_t row_len;
+    int    row_cells;   /* display columns the row occupies */
     bool   line_open;   /* output is mid-line, so a newline is owed */
+
+    /* Lines typed and submitted while the model was generating, waiting to be
+     * returned by the next tui_readline calls, oldest first. */
+    char  *queued[TUI_MAX_QUEUED];
+    int    n_queued;
 
     double last_draw;
 };
+
+/* Set from the SIGWINCH handler; a resize invalidates the margin and both
+ * footer rows, and nothing else notices until something is repainted. */
+static volatile sig_atomic_t g_resized;
+static void on_winch(int sig) { (void)sig; g_resized = 1; }
 
 static double now_sec(void) {
     struct timespec ts;
@@ -69,35 +108,128 @@ static bool term_size(int *rows, int *cols) {
 
 /* Output always appends at the bottom row of the scroll region: the terminal
  * scrolls the region itself when a line ends there, so the append point never
- * moves.  Only the column has to be tracked.
+ * moves.  Only the row's contents have to be tracked, and they are tracked
+ * exactly, because they are ours.
  *
- * This replaces an earlier DECSC/DECRC scheme, which was wrong in a way that
- * only a real terminal showed: a saved cursor is an absolute screen cell, and
- * scrolling silently invalidates it, so two turns of output landed on the same
- * line and overwrote each other.
+ * This replaces two earlier schemes, both wrong in ways only a real terminal
+ * showed.  DECSC/DECRC saved an absolute screen cell that scrolling silently
+ * invalidated.  Column counting then replaced it and survived longer, but it
+ * was still a model of the terminal's cursor inferred from a byte stream, and
+ * tabs and double-width characters were enough to break it.
  *
- * The returned column may be `cols`, meaning the row is exactly full.  That is
- * a real terminal state, not an overflow: wrapping is deferred until the next
- * cell is drawn, so the scroll has not happened yet.  tui_out resolves it. */
-static int advance_col(int col, const char *s, size_t n, int cols) {
-    for (size_t i = 0; i < n; i++) {
-        if (s[i] == '\x1b') {                     /* escapes occupy no cells */
+ * ---- display width -------------------------------------------------------
+ *
+ * Only wrapping decisions depend on this, and autowrap is disabled inside the
+ * region (region_install), so a wrong answer costs a row that breaks early or
+ * late rather than a layout that comes apart.  The ranges are the standard
+ * double-width blocks plus the emoji planes. */
+
+static int cell_width(uint32_t cp) {
+    if (cp == 0x200D) return 0;                        /* zero-width joiner */
+    if (cp >= 0x0300 && cp <= 0x036F) return 0;        /* combining marks */
+    if (cp >= 0xFE00 && cp <= 0xFE0F) return 0;        /* variation selectors */
+    if (cp < 0x1100) return 1;
+    if ((cp >= 0x1100 && cp <= 0x115F) ||              /* hangul jamo */
+        (cp >= 0x2E80 && cp <= 0xA4CF) ||              /* CJK */
+        (cp >= 0xAC00 && cp <= 0xD7A3) ||              /* hangul syllables */
+        (cp >= 0xF900 && cp <= 0xFAFF) ||
+        (cp >= 0xFE30 && cp <= 0xFE6F) ||
+        (cp >= 0xFF00 && cp <= 0xFF60) ||              /* fullwidth forms */
+        (cp >= 0xFFE0 && cp <= 0xFFE6) ||
+        (cp >= 0x1F300 && cp <= 0x1FAFF) ||            /* emoji */
+        (cp >= 0x20000 && cp <= 0x3FFFD))              /* CJK ext */
+        return 2;
+    return 1;
+}
+
+/* Decodes one UTF-8 character, returning its byte length.  Malformed input is
+ * consumed one byte at a time as a single cell rather than rejected: this is
+ * whatever a tool printed, and refusing to display it would be worse. */
+static size_t utf8_next(const char *s, size_t n, uint32_t *cp) {
+    unsigned char c = (unsigned char)s[0];
+    size_t len = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2
+               : (c & 0xF0) == 0xE0 ? 3 : (c & 0xF8) == 0xF0 ? 4 : 1;
+    if (len > n) len = 1;
+    if (len == 1) { *cp = c; return 1; }
+    uint32_t v = c & (0xFF >> (len + 1));
+    for (size_t i = 1; i < len; i++) {
+        if (((unsigned char)s[i] & 0xC0) != 0x80) { *cp = c; return 1; }
+        v = (v << 6) | ((unsigned char)s[i] & 0x3F);
+    }
+    *cp = v;
+    return len;
+}
+
+/* Repaints the row from column one and clears whatever used to follow it. */
+static void row_paint(qw_tui *t) {
+    csi_move(t->out_bottom, 1);
+    if (t->row_len) wr(t->row, t->row_len);
+    wrs("\x1b[0m\x1b[0K");
+}
+
+/* Paints the row and scrolls the region, leaving the next row empty. */
+static void row_flush(qw_tui *t) {
+    row_paint(t);
+    wrs("\r\n");
+    t->row_len = 0;
+    t->row_cells = 0;
+}
+
+static void row_add(qw_tui *t, const char *s, size_t n) {
+    if (t->row_len + n > sizeof t->row - 1) return;
+    memcpy(t->row + t->row_len, s, n);
+    t->row_len += n;
+}
+
+/* Appends output to the row, flushing whenever a row is complete.
+ *
+ * Everything that is not printable text or an SGR sequence is dropped.  Tool
+ * output is whatever a command decided to print, and a stray cursor movement or
+ * screen clear from inside it would leave the layout in a state nothing here
+ * could recover from; colour is worth keeping and nothing else is. */
+static void row_write(qw_tui *t, const char *s, size_t n) {
+    for (size_t i = 0; i < n; ) {
+        char c = s[i];
+
+        if (c == '\x1b') {
             size_t j = i + 1;
             if (j < n && s[j] == '[') {
                 j++;
                 while (j < n && !(s[j] >= '@' && s[j] <= '~')) j++;
+                if (j < n && s[j] == 'm') row_add(t, s + i, j - i + 1);
+                i = (j < n) ? j + 1 : n;
+            } else {
+                i = (j < n) ? j + 1 : n;   /* two-byte escape, dropped */
             }
-            i = j;
             continue;
         }
-        if (s[i] == '\n' || s[i] == '\r') { col = 0; continue; }
-        if ((unsigned char)s[i] < 0x20) continue;
-        /* UTF-8 continuation bytes are part of the cell already counted. */
-        if (((unsigned char)s[i] & 0xC0) == 0x80) continue;
-        if (cols > 0 && col >= cols) col = 0;      /* a pending wrap resolves */
-        col++;
+
+        if (c == '\n') { row_flush(t); i++; continue; }
+        if (c == '\r') { t->row_len = 0; t->row_cells = 0; i++; continue; }
+        if (c == '\t') {
+            /* Expanded here so the terminal never sees one.  A tab is the
+             * clearest case of a byte whose width depends on where it lands,
+             * which is exactly what this design refuses to reason about. */
+            int stop = (t->row_cells / 8 + 1) * 8;
+            while (t->row_cells < stop && t->row_cells < t->cols) {
+                row_add(t, " ", 1);
+                t->row_cells++;
+            }
+            i++;
+            if (t->row_cells >= t->cols) row_flush(t);
+            continue;
+        }
+        if ((unsigned char)c < 0x20 || (unsigned char)c == 0x7F) { i++; continue; }
+
+        uint32_t cp = 0;
+        size_t len = utf8_next(s + i, n - i, &cp);
+        int w = cell_width(cp);
+        if (t->row_cells + w > t->cols) row_flush(t);
+        row_add(t, s + i, len);
+        t->row_cells += w;
+        i += len;
+        if (t->row_cells >= t->cols) row_flush(t);
     }
-    return col;
 }
 
 static void region_set_margin(int bottom) {
@@ -119,6 +251,13 @@ static bool region_install(qw_tui *t) {
 
     region_set_margin(t->out_bottom);
 
+    /* Autowrap off, as a guard rather than a mechanism.  Rows are broken here,
+     * at a width this code computes, so the terminal is never asked to wrap
+     * one; turning the feature off means that if that width is ever wrong --
+     * an emoji sequence measured badly, a script written right to left -- the
+     * row is clipped instead of pushing the whole layout down a line. */
+    wrs("\x1b[?7l");
+
     /* Anything already on screen was printed before the region existed.  Open a
      * fresh line at the bottom of the output area rather than assuming the
      * cursor is already there, or the first streamed token overwrites the last
@@ -126,13 +265,14 @@ static bool region_install(qw_tui *t) {
     csi_move(t->out_bottom, 1);
     wrs("\n");
     csi_move(t->out_bottom, 1);
-    t->out_col = 0;
+    t->row_len = 0;
+    t->row_cells = 0;
     return true;
 }
 
 static void region_remove(qw_tui *t) {
     if (!t->region) return;
-    wrs("\x1b[0m\x1b[r");           /* reset attributes, drop the margin */
+    wrs("\x1b[0m\x1b[?7h\x1b[r");   /* attributes, autowrap, margin */
     csi_move(t->rows, 1);
     wrs("\r\x1b[0K");
     t->region = false;
@@ -150,7 +290,11 @@ static void region_resync(qw_tui *t) {
     t->out_bottom = r - TUI_RESERVED;
     t->prompt_row = t->out_bottom + 1;
     region_set_margin(t->out_bottom);
-    t->out_col = 0;
+    wrs("\x1b[?7l");
+    /* The partial row was measured against the old width and the terminal has
+     * already reflowed whatever was on screen.  Sending it out ends the
+     * ambiguity in one line rather than carrying it forward. */
+    if (t->row_len) row_flush(t);
     t->ls.cols = (size_t)c;
     t->ls.oldrows = 0;
     t->ls.oldstatusrows = 0;
@@ -205,13 +349,19 @@ static void footer_enter(qw_tui *t) {
 }
 
 /* Paints the footer and returns the cursor to the output position. */
+/* Paints the footer and leaves the cursor in it.
+ *
+ * The cursor stays on the prompt row rather than being returned to the output
+ * area, which is what lets someone type while the model is generating: the
+ * caret sits where their text is going, and output repaints its own row from
+ * column one so it never needs the cursor to be anywhere in particular. */
 static void footer_repaint(qw_tui *t) {
     footer_clear(t);
     status_paint(t);
     csi_move(t->prompt_row, 1);
     wrs("\x1b[0m");
     linenoiseShow(&t->ls);
-    csi_move(t->out_bottom, t->out_col + 1);   /* back to the append point */
+    t->hidden = false;
 }
 
 /* The status row is painted here rather than handed to linenoise.
@@ -270,12 +420,23 @@ qw_tui *tui_new(void) {
      * avoids the hang without forking linenoise. */
     int r = 0, c = 0;
     t->tty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO) && term_size(&r, &c);
-    if (t->tty) linenoiseSetMultiLine(0);
+    if (t->tty) {
+        linenoiseSetMultiLine(0);
+        /* SA_RESTART so a resize does not turn into a short read somewhere
+         * that is not expecting one; the flag is all the handler needs to
+         * set. */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = on_winch;
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGWINCH, &sa, NULL);
+    }
     return t;
 }
 
 void tui_free(qw_tui *t) {
     if (!t) return;
+    for (int i = 0; i < t->n_queued; i++) linenoiseFree(t->queued[i]);
     if (t->started) {
         tui_hide(t);
         linenoiseEditStop(&t->ls);
@@ -308,6 +469,23 @@ char *tui_readline(qw_tui *t, const char *prompt) {
 
     snprintf(t->prompt, sizeof t->prompt, "%s", prompt);
 
+    /* Composed while the model was still writing, so it is already what the
+     * user asked for next; making them press return again would be asking
+     * twice. */
+    if (t->n_queued > 0) {
+        char *line = t->queued[0];
+        for (int i = 1; i < t->n_queued; i++) t->queued[i - 1] = t->queued[i];
+        t->n_queued--;
+        if (t->region) {
+            row_write(t, prompt, strlen(prompt));
+            row_write(t, line, strlen(line));
+            row_write(t, "\n", 1);
+            row_paint(t);
+            footer_repaint(t);
+        }
+        return line;
+    }
+
     if (!t->started) {
         /* The region goes in first so linenoise's opening draw can be placed
          * deliberately instead of wherever the cursor happened to be. */
@@ -323,7 +501,8 @@ char *tui_readline(qw_tui *t, const char *prompt) {
              * prompt is orphaned in the transcript. */
             csi_move(t->out_bottom, 1);
             wrs("\r\x1b[0K");
-            t->out_col = 0;
+            t->row_len = 0;
+            t->row_cells = 0;
         }
         t->hidden = true;
     } else if (t->region) {
@@ -404,23 +583,27 @@ void tui_out(qw_tui *t, const char *s, size_t n) {
      * end of the previous answer. */
     t->line_open = (s[n - 1] != '\n');
     if (!t->tty || !t->started) { write_plain(s, n); fflush(stdout); return; }
-    if (!t->hidden) tui_hide(t);
-    if (t->region) csi_move(t->out_bottom, t->out_col + 1);
-    wr(s, n);
-    if (t->region) {
-        t->out_col = advance_col(t->out_col, s, n, t->cols);
-        /* A write that ends exactly at the right margin leaves the terminal
-         * with a wrap pending: it has not scrolled yet, and the absolute cursor
-         * move at the head of the next write cancels the pending wrap, so the
-         * continuation lands back on this same row and overwrites it.  Force
-         * the wrap now, while the cursor is still the terminal's own.  Nothing
-         * is owed afterwards -- the cursor sits at the start of a fresh row. */
-        if (t->cols > 0 && t->out_col >= t->cols) {
-            wrs("\r\n");
-            t->out_col = 0;
-            t->line_open = false;
-        }
+    if (!t->region) {
+        /* A terminal too small for a reserved footer: there is no row to own
+         * and no scroll region to protect, so the prompt is taken down for the
+         * write the way it always was. */
+        if (!t->hidden) tui_hide(t);
+        wr(s, n);
+        return;
     }
+
+    if (g_resized) { g_resized = 0; region_resync(t); }
+
+    row_write(t, s, n);
+    row_paint(t);
+    if (!t->row_len) t->line_open = false;   /* the row was flushed */
+
+    /* The footer is never taken down for output any more.  It sits outside the
+     * scroll region, so nothing written above can disturb it, and leaving it up
+     * means the prompt and the caret stay where someone typing expects them. */
+    csi_move(t->prompt_row, 1);
+    linenoiseShow(&t->ls);
+    t->hidden = false;
 }
 
 void tui_puts(qw_tui *t, const char *s) { if (s) tui_out(t, s, strlen(s)); }
@@ -449,45 +632,74 @@ void tui_status_clear(qw_tui *t) { t->status[0] = 0; }
 
 void tui_tick(qw_tui *t) {
     if (!t->tty || !t->started || !t->region) return;
+    if (g_resized) { g_resized = 0; region_resync(t); row_paint(t); }
     if (now_sec() - t->last_draw < TUI_REDRAW_INTERVAL) return;
-    region_resync(t);
     /* The cursor is already stashed, so the footer can be painted and the
      * output position restored without the caller noticing. */
     footer_repaint(t);
     t->last_draw = now_sec();
 }
 
+/* Feeds anything typed during generation straight into the line editor, so a
+ * message can be composed -- and edited, and submitted -- while the model is
+ * still writing.  Typing is echoed as it is entered rather than replayed later,
+ * which is the difference between a prompt that works and one that only looks
+ * like it does.
+ *
+ * A line finished here is held until the next tui_readline asks for one.
+ *
+ * Returns true if ctrl-C was pressed.  Raw mode clears ISIG, so it arrives as a
+ * byte rather than a signal, and polling for it is both necessary and more
+ * reliable than a handler. */
 bool tui_interrupted(qw_tui *t) {
     if (!t->tty || !t->started) return false;
 
     bool hit = false;
     for (;;) {
-        char buf[64];
-        /* The terminal is in raw non-blocking-friendly mode here only because
-         * linenoise put it there; a short read simply means nothing is
-         * pending. */
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(STDIN_FILENO, &fds);
         struct timeval tv = { 0, 0 };
         if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) <= 0) break;
 
+        char buf[256];
         ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
         if (n <= 0) break;
 
-        /* Keep whatever was typed that is not the interrupt, so a user who
-         * starts composing the next message while the model works does not
-         * lose it. */
-        char keep[64];
-        size_t k = 0;
-        for (ssize_t i = 0; i < n; i++) {
-            if (buf[i] == 3) hit = true;
-            else keep[k++] = buf[i];
+        /* Everything available goes into the queue in one go.  linenoise reads
+         * an escape sequence a byte at a time and falls back to the file
+         * descriptor when the queue runs dry, so feeding one byte per call
+         * would block halfway through an arrow key. */
+        if (linenoiseEditQueueInput(&t->ls, buf, (size_t)n) == -1) break;
+
+        while (linenoiseEditQueuedInput(&t->ls) > 0) {
+            /* linenoise redraws relative to the cursor, so it has to be on the
+             * prompt row before it is given a chance to. */
+            if (t->region) csi_move(t->prompt_row, 1);
+            char *line = linenoiseEditFeed(&t->ls);
+            if (line == linenoiseEditMore) continue;
+            if (line == NULL) {
+                /* ctrl-C sets EAGAIN; anything else here is end of input, and
+                 * treating that as an interrupt is the safe reading. */
+                hit = true;
+                linenoiseEditClear(&t->ls);
+                break;
+            }
+            if (t->n_queued < TUI_MAX_QUEUED) {
+                t->queued[t->n_queued++] = line;
+                linenoiseEditClear(&t->ls);
+            } else {
+                /* Leave it in the editor rather than accept and discard it.
+                 * The text stays on the prompt row, which is its own
+                 * explanation. */
+                linenoiseFree(line);
+            }
         }
-        if (k) linenoiseEditQueueInput(&t->ls, keep, k);
     }
     return hit;
 }
+
+bool tui_has_queued_line(const qw_tui *t) { return t && t->n_queued > 0; }
 
 void tui_history_load(qw_tui *t, const char *path) {
     if (t->tty) linenoiseHistoryLoad(path);

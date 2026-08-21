@@ -267,6 +267,12 @@ qwasar-agent. /help for commands, /quit to leave.
 Commands: `/help`, `/new`, `/effort`, `/think`, `/yes`, `/ctx`, `/save`,
 `/quit`. Six tools: `read`, `write`, `edit`, `list`, `grep`, `bash`.
 
+The prompt is pinned to the bottom of the terminal with a status footer under
+it, and stays live while the model writes: **you can type, edit and send the
+next message mid-turn**, and it runs when the current one finishes. Ctrl-C
+interrupts. There is no alternate screen, so the transcript scrolls, copies and
+searches like any other command output.
+
 **Reading runs unattended. Writing files and running commands ask first**,
 unless you pass `--yes`. Tool arguments never reach a shell except for `bash`
 itself — `list` and `grep` pass argv to `execvp` directly. A declined action is
