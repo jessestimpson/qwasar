@@ -13,8 +13,7 @@ self-contained binary, abstractions built for inference rather than for
 supporting many architectures, and an agent shipped in the same tree.
 
 ```
-$ qwasar -m ~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit \
-      -p "Name three prime numbers, with one sentence on why each is prime."
+$ qwasar -p "Name three prime numbers, with one sentence on why each is prime."
 
 2 is prime because its only positive divisors are 1 and itself.
 3 is prime because it cannot be divided evenly by any whole number other than 1 and 3.
@@ -113,7 +112,7 @@ An OpenAI and Anthropic compatible HTTP API, following ds4-server so the same
 clients work against either.
 
 ```
-qwasar-server -m <model-dir> --port 8080
+qwasar-server --port 8080
 ```
 
 ```
@@ -160,27 +159,48 @@ make check-metal   # optional offline kernel lint; needs the Metal Toolchain
 
 ## Weights
 
-qwasar reads the **MLX 4-bit conversion** of Qwen3.8 27B directly. Nothing needs
-converting. If you use LM Studio you likely already have it:
-
 ```
-~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit
+./download_model.sh model
 ```
 
-Otherwise fetch the `lmstudio-community/Qwen3.8-27B-MLX-4bit` repository from
-Hugging Face with whatever you normally use — the `hf` CLI, `git lfs`, or the
-web UI.
-
-The directory needs `config.json`, `tokenizer.json`, and the
-`model-*.safetensors` shards. Start by confirming qwasar agrees with you about
-what it found:
+About 16 GB. It fetches only the six files qwasar reads — `config.json`, the
+safetensors index, the three shards and `tokenizer.json` — checks their sizes,
+and links `./qwasar-model`, which is where every binary looks when `-m` is
+absent. So after it finishes:
 
 ```
-qwasar -m <model-dir> --info
+./qwasar -p "Hello"
+```
+
+Downloads resume; run the same command again after an interruption. Add
+`--verify` to check every file's SHA-256 against the digest Hugging Face
+reports. The repository is pinned to a revision, so a re-run fetches the bytes
+this was tested against rather than whatever `main` has become.
+
+**Already have the model?** qwasar reads the MLX 4-bit conversion directly, so
+an LM Studio copy works as is — point at it with `-m <dir>`, set
+`QWASAR_MODEL`, or link it yourself:
+
+```
+ln -s ~/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit qwasar-model
+```
+
+Binaries look for the model in `$QWASAR_MODEL`, then `./qwasar-model`, then a
+`qwasar-model` beside the executable — so a binary copied onto your `PATH`
+still finds the weights it was downloaded next to.
+
+**4-bit only.** MLX affine, group 64. The kernels are built around that one
+format deliberately (PLAN.md §1.2); an 8-bit or 6-bit conversion of the same
+model will not load.
+
+Start by confirming qwasar agrees with you about what it found:
+
+```
+qwasar --info
 ```
 
 ```
-model      /Users/you/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit
+model      qwasar-model
 device     Apple M4  (working set 25.0 GB, max buffer 18.7 GB)
 shards     3, 2180 tensors  (9.96 GB mapped, 4.99 GB copied for alignment)
 
@@ -199,11 +219,11 @@ ssm state  147 MB, constant in context length
 ## Run
 
 ```
-qwasar -m <model-dir> -p "..."                  # generate
-qwasar -m <model-dir> -p "..." --show-think     # include the reasoning block
-qwasar -m <model-dir> -p "..." --no-think       # skip reasoning entirely
-qwasar -m <model-dir> -s "..." -p "..."         # with a system message
-qwasar -m <model-dir> -p "..." --effort low     # xhigh (default) | medium | low
+qwasar -p "..."                  # generate
+qwasar -p "..." --show-think     # include the reasoning block
+qwasar -p "..." --no-think       # skip reasoning entirely
+qwasar -s "..." -p "..."         # with a system message
+qwasar -p "..." --effort low     # xhigh (default) | medium | low
 ```
 
 **Reasoning is on by default for this model**, and at the default `xhigh`
@@ -216,7 +236,7 @@ tool work.
 ## The agent
 
 ```
-qwasar-agent -m <model-dir> -C ~/src/project "fix the bug in stats.c and rebuild"
+qwasar-agent -C ~/src/project "fix the bug in stats.c and rebuild"
 ```
 
 ```
@@ -231,7 +251,7 @@ maximum. Rebuilt and ran: mean=2.80 max=5.00
 With no task it opens a REPL instead:
 
 ```
-$ qwasar-agent -m <model-dir> -C ~/src/project
+$ qwasar-agent -C ~/src/project
 qwasar-agent. /help for commands, /quit to leave.
 
 > how many lines in words.txt?

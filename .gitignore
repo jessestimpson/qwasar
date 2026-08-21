@@ -14,6 +14,11 @@ tests/test_*
 qwasar_metal_src.inc
 .metal_check.metal
 
+# downloaded weights and the symlinks download_model.sh points at them
+models/
+qwasar-model
+qwasar-mtp
+
 # reference implementations, kept locally for study and for generating
 # golden vectors; not part of this project
 reference/

@@ -1085,9 +1085,9 @@ static void usage(FILE *out) {
     fprintf(out,
         "qwasar-server -- OpenAI and Anthropic compatible HTTP API for Qwen3.8\n"
         "\n"
-        "usage: qwasar-server -m <model-dir> [options]\n"
+        "usage: qwasar-server [-m <model-dir>] [options]\n"
         "\n"
-        "  -m, --model <dir>   model directory\n"
+        "  -m, --model <dir>   model directory; default ./qwasar-model\n"
         "      --host <addr>   bind address (default 127.0.0.1)\n"
         "      --port <n>      port (default 8080)\n"
         "      --ctx <n>       context size in tokens (default 32768)\n"
@@ -1106,6 +1106,20 @@ static void usage(FILE *out) {
         "One request is served at a time: the model's recurrent layers hold a\n"
         "single session that cannot be forked. A client resending a growing\n"
         "conversation continues from wherever that session already is.\n");
+}
+
+static bool resolve_model(qwasar_options *opts, const char *prog) {
+    if (opts->model_path) return true;
+    opts->model_path = qwasar_default_model_path();
+    if (opts->model_path) return true;
+    fprintf(stderr,
+        "%s: no model given and none found.\n"
+        "\n"
+        "Download it once:\n"
+        "    ./download_model.sh model\n"
+        "\n"
+        "or point at an existing copy with -m <dir>, or set QWASAR_MODEL.\n", prog);
+    return false;
 }
 
 int main(int argc, char **argv) {
@@ -1127,11 +1141,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
         else { fprintf(stderr, "qwasar-server: unknown argument '%s'\n\n", a); usage(stderr); return 2; }
     }
-    if (!opts.model_path) {
-        fprintf(stderr, "qwasar-server: -m/--model is required\n\n");
-        usage(stderr);
-        return 2;
-    }
+    if (!resolve_model(&opts, "qwasar-server")) return 2;
 
     /* A client that hangs up mid-stream would otherwise take the server with
      * it; write failures are detected and end the response instead. */

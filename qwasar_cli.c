@@ -11,9 +11,10 @@ static void usage(FILE *out) {
     fprintf(out,
         "qwasar -- Qwen3.8 inference on macOS Metal\n"
         "\n"
-        "usage: qwasar -m <model-dir> [options]\n"
+        "usage: qwasar [-m <model-dir>] [options]\n"
         "\n"
-        "  -m, --model <dir>     model directory (config.json + *.safetensors)\n"
+        "  -m, --model <dir>     model directory (config.json + *.safetensors);\n"
+        "                        default ./qwasar-model, or $QWASAR_MODEL\n"
         "  -c, --context <n>     context size in tokens (default 32768)\n"
         "      --chunk <n>       prefill tokens per forward pass (default 256)\n"
         "      --mtp <dir>       multi-token-prediction draft head directory\n"
@@ -59,6 +60,20 @@ static int32_t argmax(const float *v, int32_t n) {
     int32_t best = 0;
     for (int32_t i = 1; i < n; i++) if (v[i] > v[best]) best = i;
     return best;
+}
+
+static bool resolve_model(qwasar_options *opts, const char *prog) {
+    if (opts->model_path) return true;
+    opts->model_path = qwasar_default_model_path();
+    if (opts->model_path) return true;
+    fprintf(stderr,
+        "%s: no model given and none found.\n"
+        "\n"
+        "Download it once:\n"
+        "    ./download_model.sh model\n"
+        "\n"
+        "or point at an existing copy with -m <dir>, or set QWASAR_MODEL.\n", prog);
+    return false;
 }
 
 int main(int argc, char **argv) {
@@ -109,11 +124,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!opts.model_path) {
-        fprintf(stderr, "qwasar: -m/--model is required\n\n");
-        usage(stderr);
-        return 2;
-    }
+    if (!resolve_model(&opts, "qwasar")) return 2;
 
     char err[512] = "";
     double t0 = now_sec();

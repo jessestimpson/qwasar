@@ -27,6 +27,12 @@ typedef struct {
     bool        verbose;
 } qwasar_options;
 
+/* Where the model is when the caller did not say: $QWASAR_MODEL if set, then a
+ * `qwasar-model` directory beside the working directory or beside the running
+ * binary -- which is what download_model.sh links.  Returns NULL if none of
+ * them is a model directory.  The result points at static storage. */
+const char *qwasar_default_model_path(void);
+
 /* Loads config and binds weights.  Returns NULL and fills `err` on failure. */
 qwasar_engine *qwasar_engine_load(const qwasar_options *opts, char *err, size_t errcap);
 void           qwasar_engine_free(qwasar_engine *e);

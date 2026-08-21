@@ -759,11 +759,11 @@ static void usage(FILE *out) {
     fprintf(out,
         "qwasar-agent -- an agentic loop on Qwen3.8\n"
         "\n"
-        "usage: qwasar-agent -m <model-dir> [options] [task...]\n"
+        "usage: qwasar-agent [-m <model-dir>] [options] [task...]\n"
         "\n"
         "With a task it runs once and exits.  With no task it opens a REPL.\n"
         "\n"
-        "  -m, --model <dir>    model directory\n"
+        "  -m, --model <dir>    model directory; default ./qwasar-model\n"
         "  -C, --chdir <dir>    work in this directory\n"
         "  -c, --context <n>    context size in tokens (default 32768)\n"
         "  -y, --yes            do not ask before writing files or running commands\n"
@@ -779,6 +779,20 @@ static void usage(FILE *out) {
         "writing and running commands ask first unless --yes.\n"
         "If AGENT.md exists in the working directory it is added to the system\n"
         "prompt as project guidance.\n");
+}
+
+static bool resolve_model(qwasar_options *opts, const char *prog) {
+    if (opts->model_path) return true;
+    opts->model_path = qwasar_default_model_path();
+    if (opts->model_path) return true;
+    fprintf(stderr,
+        "%s: no model given and none found.\n"
+        "\n"
+        "Download it once:\n"
+        "    ./download_model.sh model\n"
+        "\n"
+        "or point at an existing copy with -m <dir>, or set QWASAR_MODEL.\n", prog);
+    return false;
 }
 
 int main(int argc, char **argv) {
@@ -807,7 +821,7 @@ int main(int argc, char **argv) {
         else { if (task.len) str_puts(&task, " "); str_puts(&task, arg); }
     }
 
-    if (!opts.model_path) { fprintf(stderr, "qwasar-agent: -m/--model is required\n\n"); usage(stderr); return 2; }
+    if (!resolve_model(&opts, "qwasar-agent")) return 2;
     if (workdir && chdir(workdir) != 0) {
         fprintf(stderr, "qwasar-agent: cannot enter %s: %s\n", workdir, strerror(errno));
         return 1;

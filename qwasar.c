@@ -12,6 +12,7 @@
 #include "qwasar_model.h"
 
 #include <fcntl.h>
+#include <mach-o/dyld.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -836,6 +837,54 @@ static bool qw_bind_weights(qwasar_engine *e, char *err, size_t errcap) {
 
     e->weight_bytes = e->weight_bytes_text + e->weight_bytes_vision;
     return true;
+}
+
+/* ---- finding the model ----------------------------------------------------
+ *
+ * download_model.sh leaves a `qwasar-model` symlink beside the binaries, which
+ * is what makes `./qwasar -p "Hello"` work with no arguments.  Two places are
+ * searched because the two obvious ways to run this disagree about which one is
+ * right: from a checkout the working directory is the project, but a binary
+ * copied onto a PATH is run from anywhere, and only its own directory still
+ * points at the download. */
+
+#define QW_MODEL_LINK "qwasar-model"
+
+static bool qw_is_model_dir(const char *dir) {
+    char probe[1200];
+    struct stat st;
+    snprintf(probe, sizeof probe, "%s/config.json", dir);
+    return stat(probe, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+const char *qwasar_default_model_path(void) {
+    static char buf[1200];
+
+    /* An explicit setting is returned whether or not it exists.  The user said
+     * where the model is; a failure should name their path rather than quietly
+     * fall through and complain about a default they never mentioned. */
+    const char *env = getenv("QWASAR_MODEL");
+    if (env && *env) {
+        snprintf(buf, sizeof buf, "%s", env);
+        return buf;
+    }
+
+    if (qw_is_model_dir(QW_MODEL_LINK)) {
+        snprintf(buf, sizeof buf, "%s", QW_MODEL_LINK);
+        return buf;
+    }
+
+    char exe[1024];
+    uint32_t cap = sizeof exe;
+    if (_NSGetExecutablePath(exe, &cap) == 0) {
+        char *slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = 0;
+            snprintf(buf, sizeof buf, "%s/%s", exe, QW_MODEL_LINK);
+            if (qw_is_model_dir(buf)) return buf;
+        }
+    }
+    return NULL;
 }
 
 /* ---- lifecycle ------------------------------------------------------------ */
