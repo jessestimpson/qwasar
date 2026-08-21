@@ -32,6 +32,14 @@ struct qw_gdn_args {
     uint hk;     /* key heads   */
     uint hv;     /* value heads */
     uint gqa;    /* hv / hk     */
+    /* Speculative verify: the state as it stood after each of the first
+     * `n_snap` timesteps.  A rejected draft has to be undone, and the delta
+     * rule cannot be run backwards -- reversing S = g*S + outer(delta, k)
+     * means dividing by a decayed g -- so the only way back is to have kept
+     * the state on the way past.  The state is register-resident for the whole
+     * call, so this is a store of what is already there. */
+    uint n_snap;
+    uint snap_stride;   /* floats between one timestep's snapshot and the next */
 };
 
 kernel void qw_gated_delta(
@@ -43,6 +51,7 @@ kernel void qw_gated_delta(
     device       float   *state [[buffer(5)]],   /* [hv, DV, DK] fp32, in and out */
     device       float   *y     [[buffer(6)]],   /* [rows, hv, DV] */
     constant qw_gdn_args &a     [[buffer(7)]],
+    device       float   *snap  [[buffer(8)]],   /* [n_snap, hv, DV, DK] fp32 */
     uint3 gid  [[thread_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]])
 {
@@ -96,6 +105,14 @@ kernel void qw_gated_delta(
         }
         out = simd_sum(out);
         if (lane == 0) yp[0] = out;
+
+        if (t < a.n_snap) {
+            device float *dp = snap + (ulong)t * a.snap_stride
+                             + ((ulong)hv_idx * QW_GDN_DV + dv_idx) * QW_GDN_DK
+                             + QW_GDN_PER_LANE * lane;
+#pragma unroll
+            for (uint i = 0; i < QW_GDN_PER_LANE; ++i) dp[i] = st[i];
+        }
 
         qp += q_stride; kp += q_stride;
         vp += v_stride; yp += v_stride;

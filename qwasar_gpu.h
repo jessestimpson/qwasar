@@ -191,9 +191,13 @@ void qw_op_swiglu(qw_cmd c, qw_ref y, qw_ref gate, qw_ref up, int32_t n);
 
 /* Causal depthwise conv over [rows, channels], with silu fused.
  * `state` is [ksize-1, channels] fp32, updated in place to the new tail. */
+/* `snap` receives the state as it stood after each of the first `n_snap`
+ * rows, `snap_stride` floats apart, so a speculative verify can be rewound to
+ * any accepted prefix.  Pass n_snap = 0 to skip it. */
 void qw_op_conv1d_causal_silu(qw_cmd c, qw_ref y, qw_ref x, qw_ref state,
                               qw_ref weight, int32_t channels, int32_t rows,
-                              int32_t ksize);
+                              int32_t ksize, qw_ref snap, int32_t n_snap,
+                              int32_t snap_stride);
 
 /* g = exp(-exp(A_log) * softplus(a + dt_bias)),  beta = sigmoid(b). */
 void qw_op_gdn_gates(qw_cmd c, qw_ref g, qw_ref beta, qw_ref a, qw_ref b,
@@ -201,9 +205,13 @@ void qw_op_gdn_gates(qw_cmd c, qw_ref g, qw_ref beta, qw_ref a, qw_ref b,
 
 /* The delta-rule recurrence.  `state` is [hv, dv, dk] fp32, in and out.
  * q and k must already be l2-normalised. */
+/* `snap` as above: the recurrent state after each of the first `n_snap`
+ * timesteps.  The delta rule cannot be run backwards, so keeping the state on
+ * the way past is the only way to undo a rejected draft. */
 void qw_op_gated_delta(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
                        qw_ref g, qw_ref beta, qw_ref state,
-                       int32_t hk, int32_t hv, int32_t dk, int32_t dv, int32_t rows);
+                       int32_t hk, int32_t hv, int32_t dk, int32_t dv, int32_t rows,
+                       qw_ref snap, int32_t n_snap, int32_t snap_stride);
 
 /* ---- rope, embedding, plumbing -------------------------------------------- */
 

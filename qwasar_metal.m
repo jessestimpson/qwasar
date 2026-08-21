@@ -490,11 +490,12 @@ void qw_op_rms_norm_gated(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight, qw_ref ga
 
 typedef struct { uint32_t n; } qw_binary_args;
 
-typedef struct { uint32_t channels, rows; } qw_conv_args;
+typedef struct { uint32_t channels, rows, n_snap, snap_stride; } qw_conv_args;
 
 void qw_op_conv1d_causal_silu(qw_cmd c, qw_ref y, qw_ref x, qw_ref state,
                               qw_ref weight, int32_t channels, int32_t rows,
-                              int32_t ksize) {
+                              int32_t ksize, qw_ref snap, int32_t n_snap,
+                              int32_t snap_stride) {
     if (!c || !c->enc) return;
     /* The kernel unrolls a fixed 4-tap window (metal/conv1d.metal); refuse
      * rather than silently convolving the wrong support. */
@@ -511,8 +512,12 @@ void qw_op_conv1d_causal_silu(qw_cmd c, qw_ref y, qw_ref x, qw_ref state,
     qw_set(enc, state, 1);
     qw_set(enc, weight, 2);
     qw_set(enc, y, 3);
-    qw_conv_args args = { (uint32_t)channels, (uint32_t)rows };
+    qw_conv_args args = { (uint32_t)channels, (uint32_t)rows,
+                          (uint32_t)n_snap, (uint32_t)snap_stride };
     [enc setBytes:&args length:sizeof args atIndex:4];
+    /* Metal wants every argument bound whether or not the kernel reads it; the
+     * count is what decides, so an unused snapshot aliases the state. */
+    qw_set(enc, n_snap > 0 ? snap : state, 5);
     [enc dispatchThreads:MTLSizeMake((NSUInteger)channels, 1, 1)
    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
@@ -539,11 +544,12 @@ void qw_op_gdn_gates(qw_cmd c, qw_ref g, qw_ref beta, qw_ref a, qw_ref b,
    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
 }
 
-typedef struct { uint32_t rows, hk, hv, gqa; } qw_gdn_args;
+typedef struct { uint32_t rows, hk, hv, gqa, n_snap, snap_stride; } qw_gdn_args;
 
 void qw_op_gated_delta(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
                        qw_ref g, qw_ref beta, qw_ref state,
-                       int32_t hk, int32_t hv, int32_t dk, int32_t dv, int32_t rows) {
+                       int32_t hk, int32_t hv, int32_t dk, int32_t dv, int32_t rows,
+                       qw_ref snap, int32_t n_snap, int32_t snap_stride) {
     if (!c || !c->enc) return;
     /* The per-lane state array is sized at compile time; see the comment at the
      * top of metal/gated_delta.metal. */
@@ -565,8 +571,10 @@ void qw_op_gated_delta(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
     qw_set(enc, state, 5);
     qw_set(enc, y, 6);
     qw_gdn_args args = { (uint32_t)rows, (uint32_t)hk, (uint32_t)hv,
-                         (uint32_t)(hv / hk) };
+                         (uint32_t)(hv / hk), (uint32_t)n_snap,
+                         (uint32_t)snap_stride };
     [enc setBytes:&args length:sizeof args atIndex:7];
+    qw_set(enc, n_snap > 0 ? snap : state, 8);
 
     /* One simdgroup per (head, value row): x spans the key dim, y the value
      * rows, z the heads.  A (32,4,1) threadgroup keeps each simdgroup's 32

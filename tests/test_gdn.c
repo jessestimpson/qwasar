@@ -66,7 +66,8 @@ static void test_conv(const qw_layer *L, const qw_shape *sh, int32_t ksize, int3
 
     qw_cmd c = qw_cmd_begin();
     qw_op_conv1d_causal_silu(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0), qw_ref_at(sb, 0),
-                             qw_tensor_ref(L->conv1d), ch, rows, ksize);
+                             qw_tensor_ref(L->conv1d), ch, rows, ksize,
+                             qw_ref_at(sb, 0), 0, 0);
     qw_cmd_wait(c);
     CHECK(qw_cmd_error(c) == NULL, "conv: %s", qw_cmd_error(c));
     qw_cmd_free(c);
@@ -145,7 +146,8 @@ static void run_gdn(const qw_config *cfg, int32_t rows, const float *q, const fl
     qw_cmd c = qw_cmd_begin();
     qw_op_gated_delta(c, qw_ref_at(yb, 0), qw_ref_at(qb, 0), qw_ref_at(kb, 0),
                       qw_ref_at(vb, 0), qw_ref_at(gb, 0), qw_ref_at(bb, 0),
-                      qw_ref_at(sb, 0), hk, hv, dk, dv, rows);
+                      qw_ref_at(sb, 0), hk, hv, dk, dv, rows,
+                      qw_ref_at(sb, 0), 0, 0);
     qw_cmd_wait(c);
     CHECK(qw_cmd_error(c) == NULL, "gdn: %s", qw_cmd_error(c));
     qw_cmd_free(c);

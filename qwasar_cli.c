@@ -7,6 +7,22 @@
 #include <string.h>
 #include <time.h>
 
+/* Prints one token, honouring the reasoning block.  Factored out because the
+ * speculative path emits several per round and they have to look the same. */
+static void emit_token(const qwasar_tokenizer *tok, int32_t id, bool *in_reasoning,
+                       int32_t think_close, bool show_think) {
+    if (id == think_close && *in_reasoning) {
+        *in_reasoning = false;
+        if (show_think) printf("\n--- answer ---\n");
+        return;
+    }
+    if (*in_reasoning && !show_think) return;
+    size_t len = 0;
+    bool special = false;
+    const char *text = qwasar_token_bytes(tok, id, &len, &special);
+    if (text && len && !special) { fwrite(text, 1, len, stdout); fflush(stdout); }
+}
+
 static void usage(FILE *out) {
     fprintf(out,
         "qwasar -- Qwen3.8 inference on macOS Metal\n"
@@ -18,7 +34,9 @@ static void usage(FILE *out) {
         "  -c, --context <n>     context size in tokens (default 32768)\n"
         "      --chunk <n>       prefill tokens per forward pass (default 256)\n"
         "      --mtp <dir>       multi-token-prediction draft head directory\n"
-        "      --mtp-depth <n>   measure draft acceptance at this depth\n"
+        "      --mtp-depth <n>   draft this many tokens per round\n"
+        "      --spec            decode speculatively; without it, --mtp-depth\n"
+        "                        only measures what the head would have proposed\n"
         "  -n, --predict <n>     tokens to generate (default 512)\n"
         "  -p, --prompt <text>   user message\n"
         "  -s, --system <text>   system message\n"
@@ -86,7 +104,8 @@ int main(int argc, char **argv) {
     const char *effort = "xhigh";
     bool thinking = true, show_think = false;
     int n_predict = 512;   /* xhigh reasoning alone often exceeds 128 */
-    int mtp_depth = 0;     /* 0 = do not measure draft acceptance */
+    int mtp_depth = 0;     /* 0 = no drafting */
+    bool use_spec = false; /* --spec: decode speculatively rather than measure */
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -100,6 +119,8 @@ int main(int argc, char **argv) {
             opts.mtp_path = argv[++i];
         } else if (!strcmp(a, "--mtp-depth") && i + 1 < argc) {
             mtp_depth = atoi(argv[++i]);
+        } else if (!strcmp(a, "--spec")) {
+            use_spec = true;
         } else if ((!strcmp(a, "-n") || !strcmp(a, "--predict")) && i + 1 < argc) {
             n_predict = atoi(argv[++i]);
         } else if ((!strcmp(a, "-p") || !strcmp(a, "--prompt")) && i + 1 < argc) {
@@ -218,16 +239,18 @@ int main(int argc, char **argv) {
     int64_t rounds = 0, round_tokens = 0;
     int32_t n_drafted = 0, draft_at = 0;
     double t_draft = 0.0;
-    const bool measure = mtp_depth > 0 && qwasar_session_has_mtp(s);
-    if (mtp_depth > 0 && !measure)
+    const bool have_mtp = qwasar_session_has_mtp(s);
+    const bool spec    = use_spec && mtp_depth > 0 && have_mtp;
+    const bool measure = !use_spec && mtp_depth > 0 && have_mtp;
+    if (mtp_depth > 0 && !have_mtp)
         fprintf(stderr, "qwasar: --mtp-depth needs --mtp <dir>\n");
 
     /* The generation prompt leaves <think> open, so everything up to </think>
      * is reasoning.  Hidden unless asked for, but always consumed. */
     bool in_reasoning = thinking && !token_spec;
 
-    for (; generated < n_predict; generated++) {
-        int32_t next = argmax(logits, vocab);
+    int32_t next = argmax(logits, vocab);
+    while (generated < n_predict) {
         if (qwasar_is_eos(e, next)) break;
 
         if (measure) {
@@ -252,22 +275,51 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (next == think_close && in_reasoning) {
-            in_reasoning = false;
-            if (show_think) printf("\n--- answer ---\n");
-        } else if (!in_reasoning || show_think) {
-            size_t len = 0;
-            bool special = false;
-            const char *text = qwasar_token_bytes(tok, next, &len, &special);
-            if (text && len && !special) { fwrite(text, 1, len, stdout); fflush(stdout); }
+        emit_token(tok, next, &in_reasoning, think_close, show_think);
+        generated++;
+
+        if (spec) {
+            /* Propose a block, settle all of it in one pass over the weights,
+             * and keep the longest correct prefix.  The last committed token
+             * takes the place `next` had: it is the one this round leaves
+             * undecided, exactly as an ordinary step would. */
+            int32_t blk[1 + QWASAR_MAX_DRAFT], got[1 + QWASAR_MAX_DRAFT];
+            blk[0] = next;
+            double td = now_sec();
+            int32_t nd = qwasar_session_draft(s, next, blk + 1, mtp_depth,
+                                              err, sizeof err);
+            t_draft += now_sec() - td;
+            if (nd < 0) { fprintf(stderr, "\nqwasar: %s\n", err); return 1; }
+
+            double t1 = now_sec();
+            int32_t nc = qwasar_session_verify(s, blk, nd + 1, got, err, sizeof err);
+            t_decode += now_sec() - t1;
+            if (nc < 0) { fprintf(stderr, "\nqwasar: %s\n", err); return 1; }
+            rounds++;
+            round_tokens += nc;
+
+            bool stop = false;
+            for (int32_t i = 0; i + 1 < nc && generated < n_predict; i++) {
+                if (qwasar_is_eos(e, got[i])) { stop = true; break; }
+                emit_token(tok, got[i], &in_reasoning, think_close, show_think);
+                generated++;
+            }
+            if (stop) break;
+            next = got[nc - 1];
+            continue;
         }
 
         double t1 = now_sec();
         logits = qwasar_session_eval(s, &next, 1, err, sizeof err);
         t_decode += now_sec() - t1;
         if (!logits) { fprintf(stderr, "\nqwasar: %s\n", err); return 1; }
+        next = argmax(logits, vocab);
     }
     printf("\n");
+
+    if (spec && rounds > 0)
+        fprintf(stderr, "\nmtp  %lld rounds, %.2f tokens per round, %.1fs drafting\n",
+                (long long)rounds, (double)round_tokens / (double)rounds, t_draft);
 
     if (measure && rounds > 0) {
         fprintf(stderr, "\nmtp  %lld rounds, %.2f tokens per round, %.1fs drafting\n",

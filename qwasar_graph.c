@@ -73,6 +73,16 @@ struct qwasar_session {
      * so a position's hidden state pairs with the NEXT token, and the last
      * position of any forward cannot be committed until that token exists.
      * It waits in row 0 for the following step to supply it. */
+    /* Speculative verify: how many leading rows of the current forward should
+     * have their recurrent state saved, and where.  Zero on every ordinary
+     * pass, so nothing is written and nothing is allocated until a verify
+     * needs it.  Layout is [row][layer], so committing a boundary is one
+     * contiguous copy rather than a walk. */
+    int32_t n_snap;
+    qw_buf  ssm_snap, conv_snap, verify_logits;
+    int32_t snap_capacity;   /* rows the snapshot buffers were sized for */
+    bool    mtp_defer;       /* a verify runs the head upkeep itself, after */
+
     bool    mtp_on;
     qw_buf  mtp_kcache, mtp_vcache;   /* [kv_heads, max_ctx, head_dim] fp16 */
     int32_t mtp_n_past;               /* committed head rows */
@@ -245,6 +255,10 @@ void qwasar_session_free(qwasar_session *s) {
         &s->gq, &s->gk, &s->gv, &s->gdn_y, &s->gdn_norm,
         &s->qg, &s->q, &s->gate, &s->k, &s->v, &s->attn_out,
         &s->mlp_gate, &s->mlp_up, &s->mlp_act, &s->logits,
+        &s->mtp_kcache, &s->mtp_vcache, &s->mtp_hidden, &s->mtp_tokens,
+        &s->mtp_positions, &s->mtp_embed, &s->mtp_fused, &s->mtp_h,
+        &s->mtp_out, &s->mtp_logits,
+        &s->ssm_snap, &s->conv_snap, &s->verify_logits,
     };
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) qw_buf_free(*all[i]);
     qw_buf_free(s->capture);
@@ -436,7 +450,9 @@ static void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
     qw_op_conv1d_causal_silu(c, qw_ref_at(s->qkv, 0), qw_ref_at(s->qkv, 0),
                              qw_off(s->conv_state, conv_stride * li),
                              qw_tensor_ref(L->conv1d), sh->conv_dim, rows,
-                             cfg->linear_conv_kernel_dim);
+                             cfg->linear_conv_kernel_dim,
+                             qw_off(s->conv_snap, conv_stride * li),
+                             s->n_snap, (int32_t)(conv_stride * sh->n_linear_attn_layers));
 
     /* q | k | v are concatenated along the channel axis; de-stride them. */
     qw_op_slice_rows(c, qw_ref_at(s->gq, 0), qw_ref_at(s->qkv, 0), rows, sh->conv_dim,
@@ -460,7 +476,9 @@ static void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
 
     qw_op_gated_delta(c, qw_ref_at(s->gdn_y, 0), qw_ref_at(s->gq, 0), qw_ref_at(s->gk, 0),
                       qw_ref_at(s->gv, 0), qw_ref_at(s->g, 0), qw_ref_at(s->beta, 0),
-                      qw_off(s->ssm_state, ssm_stride * li), hk, hv, dk, dv, rows);
+                      qw_off(s->ssm_state, ssm_stride * li), hk, hv, dk, dv, rows,
+                      qw_off(s->ssm_snap, ssm_stride * li), s->n_snap,
+                      (int32_t)(ssm_stride * sh->n_linear_attn_layers));
 
     /* Output norm is per value head and gated by silu(z). */
     qw_op_rms_norm_gated(c, qw_ref_at(s->gdn_norm, 0), qw_ref_at(s->gdn_y, 0),
@@ -724,14 +742,19 @@ static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wa
                          qw_ref_at(s->hn, 0), rows, cfg->hidden_size,
                          0, cfg->hidden_size);
 
-    /* Only the final token's logits are ever used, and the head is the single
-     * widest matvec in the model, so it runs on one row rather than `rows`.
-     * It goes before the draft head's own pass, which reuses `hn` as scratch. */
-    if (want_logits)
+    /* Ordinarily only the final token's logits are used, and the head is the
+     * single widest matvec in the model, so it runs on one row rather than
+     * `rows`.  A verify wants all of them: that is what makes one pass over the
+     * weights settle several tokens instead of one.  Either way it goes before
+     * the draft head's own pass, which reuses `hn` as scratch. */
+    if (s->mtp_defer)
+        qw_encode_qlinear(c, qwasar_engine_head(e), qw_ref_at(s->verify_logits, 0),
+                          qw_ref_at(s->hn, 0), rows);
+    else if (want_logits)
         qw_encode_qlinear(c, qwasar_engine_head(e), qw_ref_at(s->logits, 0),
                           qw_off(s->hn, (size_t)(rows - 1) * cfg->hidden_size), 1);
 
-    if (s->mtp_on) qw_encode_mtp_upkeep(s, c, rows);
+    if (s->mtp_on && !s->mtp_defer) qw_encode_mtp_upkeep(s, c, rows);
 }
 
 static int32_t qw_argmax(const float *v, int32_t n) {
@@ -800,6 +823,128 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
 
     s->mtp_n_past = committed;
     return n;
+}
+
+/* Sizes the rewind buffers for a verify of `n_draft` drafts, once.
+ *
+ * Deliberately lazy: the recurrent state is 150 MB and a boundary needs a whole
+ * copy of it, so a session that never drafts should not pay for the ability. */
+static bool qw_snap_reserve(qwasar_session *s, int32_t n_draft,
+                            char *err, size_t errcap) {
+    if (s->snap_capacity >= n_draft) return true;
+    const qw_config *c = s->cfg;
+    const qw_shape  *sh = s->shape;
+
+    qw_buf_free(s->ssm_snap);
+    qw_buf_free(s->conv_snap);
+    const size_t ssm_row  = (size_t)c->linear_num_value_heads * c->linear_value_head_dim
+                          * c->linear_key_head_dim * 4 * sh->n_linear_attn_layers;
+    const size_t conv_row = (size_t)(c->linear_conv_kernel_dim - 1) * sh->conv_dim * 4
+                          * sh->n_linear_attn_layers;
+    s->ssm_snap  = qw_buf_alloc(ssm_row  * (size_t)n_draft);
+    s->conv_snap = qw_buf_alloc(conv_row * (size_t)n_draft);
+    if (!s->ssm_snap || !s->conv_snap) {
+        qw_gerrf(err, errcap, "cannot allocate %.0f MB of rewind state for depth %d",
+                 (double)((ssm_row + conv_row) * (size_t)n_draft) / 1e6, n_draft);
+        s->snap_capacity = 0;
+        return false;
+    }
+    s->snap_capacity = n_draft;
+    return true;
+}
+
+int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n_block,
+                              int32_t *out, char *err, size_t errcap) {
+    if (!s || !block || n_block < 2 || !out) {
+        qw_gerrf(err, errcap, "nothing to verify");
+        return -1;
+    }
+    const int32_t n_draft = n_block - 1;
+    if (n_draft > QWASAR_MAX_DRAFT) { qw_gerrf(err, errcap, "draft too deep"); return -1; }
+    if (!qw_snap_reserve(s, n_draft, err, errcap)) return -1;
+    if (n_block > s->max_rows) { qw_gerrf(err, errcap, "draft exceeds the chunk size"); return -1; }
+    if (s->n_past + n_block > s->max_ctx) {
+        qw_gerrf(err, errcap, "context exhausted: %d + %d exceeds %d tokens",
+                 s->n_past, n_block, s->max_ctx);
+        return -1;
+    }
+    if (!s->verify_logits) {
+        s->verify_logits = qw_buf_alloc((size_t)(QWASAR_MAX_DRAFT + 1)
+                                        * (size_t)s->cfg->vocab_size * 4);
+        if (!s->verify_logits) { qw_gerrf(err, errcap, "out of memory"); return -1; }
+    }
+
+    const int32_t base = s->n_past;
+
+    memcpy(qw_buf_contents(s->tokens), block, (size_t)n_block * sizeof *block);
+    int32_t *pos = qw_buf_contents(s->positions);
+    for (int32_t axis = 0; axis < 3; axis++)
+        for (int32_t r = 0; r < n_block; r++) pos[axis * n_block + r] = base + r;
+
+    /* Every boundary but the last: if the whole block is accepted the live
+     * state is already the right one. */
+    s->n_snap = n_draft;
+    s->mtp_defer = true;
+
+    qw_cmd c = qw_cmd_begin();
+    if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return -1; }
+    qw_encode_forward(s, c, n_block, true);
+    qw_cmd_wait(c);
+    const char *cerr = qw_cmd_error(c);
+    s->n_snap = 0;
+    s->mtp_defer = false;
+    if (cerr) {
+        qw_gerrf(err, errcap, "GPU error: %s", cerr);
+        qw_cmd_free(c);
+        return -1;
+    }
+    qw_cmd_free(c);
+
+    /* Row i's logits predict the token after block[i], so they are what
+     * block[i+1] guessed.  Accept while the guesses hold. */
+    const float *lg = qw_buf_contents(s->verify_logits);
+    const int32_t vocab = s->cfg->vocab_size;
+    int32_t j = 0;
+    while (j < n_draft && qw_argmax(lg + (size_t)j * vocab, vocab) == block[j + 1]) j++;
+
+    /* The accepted drafts, plus the token row j predicts.  That last one is
+     * free: the pass computed it whether or not anything was accepted, which is
+     * why even a fully rejected round still advances by one. */
+    for (int32_t i = 0; i < j; i++) out[i] = block[i + 1];
+    out[j] = qw_argmax(lg + (size_t)j * vocab, vocab);
+
+    if (j < n_draft) {
+        /* Undo the rejected rows.  Attention only reads positions below n_past,
+         * so its cache needs no work; the recurrent state was advanced in place
+         * and has to be put back from the boundary the forward saved. */
+        const qw_config *cfg = s->cfg;
+        const qw_shape  *sh  = s->shape;
+        const size_t ssm_row  = (size_t)cfg->linear_num_value_heads
+                              * cfg->linear_value_head_dim * cfg->linear_key_head_dim
+                              * 4 * sh->n_linear_attn_layers;
+        const size_t conv_row = (size_t)(cfg->linear_conv_kernel_dim - 1)
+                              * sh->conv_dim * 4 * sh->n_linear_attn_layers;
+        memcpy(qw_buf_contents(s->ssm_state),
+               (const char *)qw_buf_contents(s->ssm_snap) + ssm_row * (size_t)j, ssm_row);
+        memcpy(qw_buf_contents(s->conv_state),
+               (const char *)qw_buf_contents(s->conv_snap) + conv_row * (size_t)j, conv_row);
+    }
+
+    s->n_past = base + j + 1;
+    if (s->history && s->n_history > s->n_past) s->n_history = s->n_past;
+
+    /* The head's history can only take the confirmed rows, and its own pending
+     * slot has to end up holding the last confirmed hidden state. */
+    if (s->mtp_on) {
+        qw_cmd h = qw_cmd_begin();
+        if (!h) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return -1; }
+        qw_encode_mtp_upkeep(s, h, j + 1);
+        qw_cmd_wait(h);
+        cerr = qw_cmd_error(h);
+        qw_cmd_free(h);
+        if (cerr) { qw_gerrf(err, errcap, "GPU error: %s", cerr); return -1; }
+    }
+    return j + 1;
 }
 
 const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32_t n,

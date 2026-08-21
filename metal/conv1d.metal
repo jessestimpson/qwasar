@@ -16,6 +16,12 @@
 struct qw_conv_args {
     uint channels;
     uint rows;
+    /* Speculative verify: the state as it stood after each of the first
+     * `n_snap` rows, so a rejected draft can be undone.  The window lives in
+     * registers for the whole call, so a snapshot is a store of what is already
+     * there rather than a re-read. */
+    uint n_snap;
+    uint snap_stride;   /* floats between one row's snapshot and the next */
 };
 
 kernel void qw_conv1d_causal_silu(
@@ -24,6 +30,7 @@ kernel void qw_conv1d_causal_silu(
     device const ushort  *w     [[buffer(2)]],  /* [channels, K] bf16, tap 0 oldest */
     device       float   *y     [[buffer(3)]],  /* [rows, channels] */
     constant qw_conv_args &a    [[buffer(4)]],
+    device       float   *snap  [[buffer(5)]],  /* [n_snap, K-1, channels] */
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= a.channels) return;
@@ -52,6 +59,13 @@ kernel void qw_conv1d_causal_silu(
 
 #pragma unroll
         for (uint j = 0; j < QW_CONV_K - 1; ++j) win[j] = win[j + 1];
+
+        if (t < a.n_snap) {
+            device float *sp = snap + (ulong)t * a.snap_stride;
+#pragma unroll
+            for (uint j = 0; j < QW_CONV_K - 1; ++j)
+                sp[(ulong)j * a.channels + gid] = win[j];
+        }
     }
 
 #pragma unroll

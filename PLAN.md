@@ -827,9 +827,9 @@ on the serial path before it is called a regression.
 1. Batched `qmv` for B <= 8, measured against the per-token path. *(done)*
 2. Head load (`--mtp`), bf16, with the concat-and-`fc` CPU twin. *(done)*
 3. Persistent committed-history head cache, and acceptance per position. *(done)*
-4. Per-boundary GDN checkpoints and KV rewind; the token-identity gate.
+4. Per-boundary GDN checkpoints and KV rewind; the token-identity gate. *(done)*
 5. Fixed depth 3, measured end to end against serial on the same thermal
-   footing -- the paired back-to-back method §2 already uses.
+   footing -- the paired back-to-back method §2 already uses. *(done)*
 6. Only then the adaptive schedule, refitting the price constant from qwasar's
    own width curve.
 
@@ -868,7 +868,42 @@ If the verify of four tokens costs ~1.15 decode steps, the round is ~258 ms for
 projection until step 4 exists -- there is no verify yet, only the acceptance it
 would have had.
 
-Steps 4-5 are the rest of the milestone. Step 6 is where the multiple grows.
+#### Measured: end to end, with the verify built
+
+Steps 4 and 5 are done. The rewind is per-boundary state snapshots taken inside
+the two recurrent kernels: both already hold their state in registers for the
+whole call, so saving it after each of the first `n_draft` timesteps is a store
+of what is there rather than a re-read. `tests/test_verify` is the gate, and it
+holds: **the emitted token sequence is identical to greedy decoding at every
+depth 1-4, on both a predictable prompt and open prose.** The prose case rewinds
+23 of 29 rounds, so the identity is evidence about the rewind and not just about
+lucky drafts.
+
+200 tokens of prose, paired against serial on the same machine:
+
+| | tokens/round | verify | drafting | end to end |
+|---|---|---|---|---|
+| serial | -- | -- | -- | 5.4-5.8 tok/s |
+| depth 2 | 2.32 | 29.5 s | 3.3 s | **6.1 tok/s** |
+| depth 3 | 2.60 | 25.6 s | 4.4 s | 6.7 tok/s |
+| depth 4 | 2.83 | 48.0 s | 5.5 s | 3.7 tok/s |
+
+So **about 1.2x**, and the reason it is not more is already written down in
+§3.5: the verify pass costs 1.5 decode steps, not the ~1.05 the weight traffic
+allows, because `qmvb` runs at 59 GB/s against the single-token kernel's 90.
+A verify of three rows measures 288 ms against a 178 ms decode step, which is
+1.52x -- exactly the kernel's own ratio. Closing that gap turns 1.2x into about
+1.8x without touching anything in this milestone.
+
+**Depth 4 is a cliff, and a predicted one.** Verify width 5 needs two `QW_QMVB_B`
+blocks, so the pass costs twice what width 4 costs. The batched matvec's block
+size is therefore a hard cap on useful draft depth, at `QW_QMVB_B - 1 = 3`. This
+is the same shape of finding Layr Labs report at their own width 6, from the
+same cause, and it is the argument for the scheduler knowing the width curve
+rather than a constant.
+
+Step 6 is where the multiple grows: an adaptive depth, and the `qmvb` work
+above, which is now the single largest term.
 
 *Sources for the measured figures in this section: Layr Labs'
 `qwen-3.8-mtp-challenge` (MIT), kept under `reference/`. The numbers are theirs

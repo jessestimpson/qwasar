@@ -170,6 +170,22 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
                              int32_t *drafts, int32_t n_draft,
                              char *err, size_t errcap);
 
+/* Evaluates `block` -- the token already decided, followed by its drafts -- in
+ * one pass over the weights, commits the longest correct prefix, and rewinds
+ * whatever was rejected.  Writes the committed tokens to `out` (at most
+ * n_block of them) and returns how many, or -1 with `err` filled.
+ *
+ * At least one token is always committed: the pass computes the token that
+ * follows the last accepted draft whether or not anything was accepted, so a
+ * fully rejected round costs a forward and still advances like an ordinary
+ * decode step.
+ *
+ * The emitted sequence is identical to greedy decoding without any of this.
+ * That is the property the whole design exists to keep, and tests/test_verify
+ * is what holds it. */
+int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n_block,
+                              int32_t *out, char *err, size_t errcap);
+
 /* ---- sampling ---------------------------------------------------------------
  *
  * Filters apply in a fixed order: temperature, top-k, min-p, top-p.
