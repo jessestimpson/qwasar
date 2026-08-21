@@ -66,6 +66,14 @@ typedef struct {
     const char *role;       /* "system" | "user" | "assistant" | "tool" */
     const char *content;
     const char *reasoning;  /* assistant only; may be NULL */
+    /* Assistant tool calls, already rendered in the model's XML call format.
+     *
+     * A client replaying a conversation sends tool calls back as normalised
+     * JSON, but the model has to see what it originally produced, control
+     * tokens included.  Content goes through the encoder that never emits
+     * control tokens; this field goes through the one that maps them, because
+     * it is reconstructed by the server rather than supplied by a user. */
+    const char *tool_calls;
 } qwasar_message;
 
 typedef struct {
@@ -116,12 +124,46 @@ const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32
 
 int32_t qwasar_session_n_past(const qwasar_session *s);
 
+/* Logits from this session's last eval, or NULL if it has not run one.
+ *
+ * A caller that finds the session already sitting at the end of its prompt has
+ * nothing left to evaluate, and must not re-run the final token: that would
+ * append a duplicate rather than reproduce the step. */
+const float *qwasar_session_logits(const qwasar_session *s);
+
 /* Progress during prefill, reported once per chunk.  Prompt processing is the
  * one part of a turn with no visible output, and on a long prompt it is the
  * longest part, so callers that face a person should show it something.
  * Decoding does not report -- its progress is the text appearing. */
 typedef void (*qwasar_progress_fn)(void *ud, int32_t done, int32_t total);
 void qwasar_session_set_progress(qwasar_session *s, qwasar_progress_fn fn, void *ud);
+
+/* ---- sampling ---------------------------------------------------------------
+ *
+ * Filters apply in a fixed order: temperature, top-k, min-p, top-p.
+ * `temperature = 0` means greedy and is exactly reproducible. */
+typedef struct {
+    float    temperature;
+    int32_t  top_k;        /* 0 = off */
+    float    top_p;        /* 1 = off */
+    float    min_p;        /* 0 = off */
+    uint64_t seed;
+} qwasar_sampling;
+
+/* The model's own generation_config: temp 1.0, top_k 20, top_p 0.95. */
+void    qwasar_sampling_defaults(qwasar_sampling *sp);
+int32_t qwasar_sample(const float *logits, int32_t n, const qwasar_sampling *sp,
+                      uint64_t *rng);
+
+/* How many leading tokens of `tokens` this session has already evaluated.
+ *
+ * A stateless client that resends a longer version of the same conversation can
+ * continue from here instead of prefilling from zero.  Because the recurrent
+ * layers cannot rewind, only a true prefix is reusable: the first differing
+ * token makes everything after it worthless, and the caller must start a fresh
+ * session. */
+int32_t qwasar_session_common_prefix(const qwasar_session *s,
+                                     const int32_t *tokens, int32_t n);
 
 /* ---- disk checkpoints -------------------------------------------------------
  *

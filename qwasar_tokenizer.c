@@ -874,6 +874,10 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
             qw_put_id(&c, c.think_close);
             qw_put_str(&c, "\n\n");
             qw_put_text(&c, m->content + off, len);
+            if (m->tool_calls && *m->tool_calls) {
+                if (len) qw_put_str(&c, "\n\n");
+                qw_put_template(&c, m->tool_calls);
+            }
             qw_put_id(&c, c.im_end);
             qw_put_str(&c, "\n");
         } else if (!strcmp(m->role, "tool")) {

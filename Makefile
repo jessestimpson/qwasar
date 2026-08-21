@@ -21,15 +21,16 @@ LDLIBS   ?= -lm -pthread -framework Foundation -framework Metal
 METAL_SRCS := metal/common.metal \
               $(filter-out metal/common.metal,$(sort $(wildcard metal/*.metal)))
 CORE_OBJS  := qwasar.o qwasar_graph.o qwasar_kvstore.o qwasar_tokenizer.o \
-              qwasar_toolcall.o qwasar_json.o qwasar_cpu.o qwasar_metal.o
+              qwasar_toolcall.o qwasar_sample.o qwasar_json.o qwasar_cpu.o \
+              qwasar_metal.o
 
 .PHONY: all clean test help check-metal
 
-all: qwasar qwasar-agent
+all: qwasar qwasar-agent qwasar-server
 
 help:
 	@echo "qwasar build targets:"
-	@echo "  make          build ./qwasar and ./qwasar-agent"
+	@echo "  make          build ./qwasar, ./qwasar-agent and ./qwasar-server"
 	@echo "  make test     build and run tests"
 	@echo "  make clean    remove build outputs"
 	@echo "  make check-metal  offline kernel syntax check (needs the Metal Toolchain)"
@@ -39,6 +40,11 @@ qwasar: qwasar_cli.o $(CORE_OBJS)
 
 qwasar-agent: qwasar_agent.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+qwasar-server: qwasar_server.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+qwasar_server.o: qwasar_server.c qwasar.h qwasar_json.h qwasar_toolcall.h
 
 qwasar_agent.o: qwasar_agent.c qwasar.h qwasar_toolcall.h linenoise.h
 linenoise.o:    linenoise.c linenoise.h
@@ -57,6 +63,7 @@ qwasar_metal.o: qwasar_metal.m qwasar_gpu.h qwasar_metal_src.inc
 qwasar.o:      qwasar.c qwasar.h qwasar_gpu.h qwasar_json.h qwasar_model.h
 qwasar_graph.o: qwasar_graph.c qwasar.h qwasar_gpu.h qwasar_model.h
 qwasar_kvstore.o: qwasar_kvstore.c qwasar.h qwasar_model.h
+qwasar_sample.o: qwasar_sample.c qwasar.h
 qwasar_tokenizer.o: qwasar_tokenizer.c qwasar.h qwasar_json.h qwasar_unicode.inc
 qwasar_toolcall.o: qwasar_toolcall.c qwasar_toolcall.h
 qwasar_cpu.o:  qwasar_cpu.c qwasar_model.h
@@ -68,7 +75,7 @@ qwasar_cli.o:  qwasar_cli.c qwasar.h qwasar_gpu.h
 
 QWASAR_TEST_MODEL ?= $(HOME)/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX-4bit
 
-TESTS := tests/test_json tests/test_toolcall tests/test_tokenizer tests/test_qmv tests/test_ops \
+TESTS := tests/test_json tests/test_toolcall tests/test_sample tests/test_tokenizer tests/test_qmv tests/test_ops \
          tests/test_gdn tests/test_attn tests/test_kvstore tests/test_forward
 
 tests/test_json: tests/test_json.c qwasar_json.o qwasar_json.h
@@ -98,6 +105,9 @@ tests/test_toolcall: tests/test_toolcall.c qwasar_toolcall.o qwasar_toolcall.h
 tests/test_kvstore: tests/test_kvstore.c $(CORE_OBJS) qwasar.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_kvstore.c $(CORE_OBJS) $(LDLIBS)
 
+tests/test_sample: tests/test_sample.c qwasar_sample.o qwasar.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_sample.c qwasar_sample.o -lm
+
 test: $(TESTS)
 	@for t in $(TESTS); do echo "== $$t"; \
 		QWASAR_TEST_MODEL="$(QWASAR_TEST_MODEL)" ./$$t || exit 1; done
@@ -118,4 +128,4 @@ check-metal:
 	fi
 
 clean:
-	rm -f qwasar *.o tools/bin2c qwasar_metal_src.inc .metal_check.metal $(TESTS) tests/*.o
+	rm -f qwasar qwasar-agent qwasar-server *.o tools/bin2c qwasar_metal_src.inc .metal_check.metal $(TESTS) tests/*.o

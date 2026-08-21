@@ -201,6 +201,10 @@ void qwasar_session_free(qwasar_session *s) {
 
 int32_t qwasar_session_n_past(const qwasar_session *s) { return s ? s->n_past : 0; }
 
+const float *qwasar_session_logits(const qwasar_session *s) {
+    return (s && s->n_past > 0) ? (const float *)qw_buf_contents(s->logits) : NULL;
+}
+
 void qwasar_session_set_progress(qwasar_session *s, qwasar_progress_fn fn, void *ud) {
     if (!s) return;
     s->progress = fn;
@@ -328,6 +332,18 @@ bool qw_session_unpack(qwasar_session *s, const void *src, size_t len,
     s->n_history = n_tokens;
     s->n_past = n_tokens;
     return true;
+}
+
+int32_t qwasar_session_common_prefix(const qwasar_session *s,
+                                     const int32_t *tokens, int32_t n) {
+    if (!s || !s->history || !tokens) return 0;
+    int32_t limit = s->n_history < n ? s->n_history : n;
+    int32_t i = 0;
+    while (i < limit && s->history[i] == tokens[i]) i++;
+    /* Only a match covering the whole history is usable: the recurrent state
+     * reflects every token evaluated, so a partial match cannot be truncated
+     * back to the agreeing prefix. */
+    return i == s->n_history ? i : 0;
 }
 
 const int32_t *qw_session_history(const qwasar_session *s, int32_t *n) {

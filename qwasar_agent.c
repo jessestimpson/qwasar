@@ -486,7 +486,7 @@ static int32_t agent_prefill(agent *a, const int32_t *tokens, int32_t n,
      * negative. */
     int32_t sys_n = 0;
     {
-        qwasar_message sys = { "system", a->guidance, NULL };
+        qwasar_message sys = { "system", a->guidance, NULL, NULL };
         qwasar_chat_options only = a->chat;
         only.add_generation_prompt = false;
         char serr[256];
@@ -758,8 +758,8 @@ int main(int argc, char **argv) {
     /* One-shot task, if given. */
     if (task.len) {
         qwasar_message msgs[2] = {
-            { "system", a.guidance, NULL },
-            { "user",   task.p,     NULL },
+            { "system", a.guidance, NULL, NULL },
+            { "user",   task.p,     NULL, NULL },
         };
         int32_t n = 0;
         int32_t *p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
@@ -806,8 +806,8 @@ int main(int argc, char **argv) {
             int32_t *p;
             if (fresh) {
                 qwasar_message msgs[2] = {
-                    { "system", a.guidance, NULL },
-                    { "user",   line,       NULL },
+                    { "system", a.guidance, NULL, NULL },
+                    { "user",   line,       NULL, NULL },
                 };
                 p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
                 if (p) {

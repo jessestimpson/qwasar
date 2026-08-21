@@ -141,8 +141,8 @@ int main(int argc, char **argv) {
     } else {
         qwasar_message msgs[2];
         int32_t n_msgs = 0;
-        if (system_text) msgs[n_msgs++] = (qwasar_message){ "system", system_text, NULL };
-        msgs[n_msgs++] = (qwasar_message){ "user", prompt_text, NULL };
+        if (system_text) msgs[n_msgs++] = (qwasar_message){ "system", system_text, NULL, NULL };
+        msgs[n_msgs++] = (qwasar_message){ "user", prompt_text, NULL, NULL };
         qwasar_chat_options chat = { .enable_thinking = thinking,
                                      .reasoning_effort = effort,
                                      .add_generation_prompt = true };

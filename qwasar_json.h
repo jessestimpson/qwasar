@@ -60,21 +60,28 @@ static inline const qj_node *qj_at(const qj_doc *d, uint32_t idx) {
     return &d->nodes[idx < d->count ? idx : 0];
 }
 static inline const char *qj_str(const qj_doc *d, const qj_node *n) {
-    return n->type == QJ_STRING ? d->text + n->u.str.off : NULL;
+    return (n && n->type == QJ_STRING) ? d->text + n->u.str.off : NULL;
 }
 static inline uint32_t qj_strlen(const qj_node *n) {
-    return n->type == QJ_STRING ? n->u.str.len : 0;
+    return (n && n->type == QJ_STRING) ? n->u.str.len : 0;
 }
+/* The accessors below all tolerate a NULL node, because the idiomatic use is to
+ * chain them straight off qj_get(), which returns NULL for an absent key:
+ *
+ *     for (c = qj_first(d, qj_get(d, root, "tools")); c; c = qj_next(d, c))
+ *
+ * An absent optional field is ordinary, not an error, so it must not fault. */
 static inline uint32_t qj_count(const qj_node *n) {
+    if (!n) return 0;
     return (n->type == QJ_ARRAY || n->type == QJ_OBJECT) ? n->u.list.count : 0;
 }
 /* First child of an array/object, or NULL.  Walk with qj_next(). */
 static inline const qj_node *qj_first(const qj_doc *d, const qj_node *n) {
-    if (n->type != QJ_ARRAY && n->type != QJ_OBJECT) return NULL;
+    if (!n || (n->type != QJ_ARRAY && n->type != QJ_OBJECT)) return NULL;
     return n->u.list.first ? &d->nodes[n->u.list.first] : NULL;
 }
 static inline const qj_node *qj_next(const qj_doc *d, const qj_node *n) {
-    return n->next ? &d->nodes[n->next] : NULL;
+    return (n && n->next) ? &d->nodes[n->next] : NULL;
 }
 
 /* Object member by name, or NULL. */

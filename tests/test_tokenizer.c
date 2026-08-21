@@ -159,23 +159,23 @@ int main(int argc, char **argv) {
 
     struct { const char *name; qwasar_chat_options o; int n; qwasar_message m[4]; } chats[] = {
         { "simple", { true, "xhigh", true, NULL, 0 }, 1,
-          { { "user", "What is 2+2?", NULL } } },
+          { { "user", "What is 2+2?", NULL, NULL } } },
         { "with_system", { true, "xhigh", true, NULL, 0 }, 2,
-          { { "system", "You are terse.", NULL }, { "user", "Hi", NULL } } },
+          { { "system", "You are terse.", NULL, NULL }, { "user", "Hi", NULL, NULL } } },
         { "no_thinking", { false, "xhigh", true, NULL, 0 }, 1,
-          { { "user", "Hi", NULL } } },
+          { { "user", "Hi", NULL, NULL } } },
         { "low_effort", { true, "low", true, NULL, 0 }, 1,
-          { { "user", "Hi", NULL } } },
+          { { "user", "Hi", NULL, NULL } } },
         { "medium_effort", { true, "medium", true, NULL, 0 }, 1,
-          { { "user", "Hi", NULL } } },
+          { { "user", "Hi", NULL, NULL } } },
         { "with_tools", { true, "xhigh", true, TOOLS, 2 }, 1,
-          { { "user", "Read /tmp/a.txt", NULL } } },
+          { { "user", "Read /tmp/a.txt", NULL, NULL } } },
         { "tools_and_system", { true, "xhigh", true, TOOLS, 2 }, 2,
-          { { "system", "Be careful.", NULL }, { "user", "Read /tmp/a.txt", NULL } } },
+          { { "system", "Be careful.", NULL, NULL }, { "user", "Read /tmp/a.txt", NULL, NULL } } },
         { "multi_turn", { true, "xhigh", true, NULL, 0 }, 3,
-          { { "user", "First question", NULL },
-            { "assistant", "First answer", "thinking here" },
-            { "user", "Second question", NULL } } },
+          { { "user", "First question", NULL, NULL },
+            { "assistant", "First answer", "thinking here", NULL },
+            { "user", "Second question", NULL, NULL } } },
     };
 
     const qj_node *jchats = qj_get(&d, qj_root(&d), "chats");

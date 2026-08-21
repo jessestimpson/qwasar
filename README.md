@@ -107,13 +107,51 @@ binary as source and compiled at startup, so the binary is self-contained and
 builds on a machine that has never opened Xcode. If you happen to have the
 toolchain installed, `make check-metal` will use it as a fast offline lint.
 
+## qwasar-server
+
+An OpenAI and Anthropic compatible HTTP API, following ds4-server so the same
+clients work against either.
+
+```
+qwasar-server -m <model-dir> --port 8080
+```
+
+```
+GET  /health
+GET  /v1/models
+GET  /v1/models/{id}
+POST /v1/chat/completions   OpenAI, streaming and not, with tools
+POST /v1/messages           Anthropic, streaming and not, with tools
+```
+
+Both completion endpoints accept `temperature`, `top_p`, `top_k`, `min_p`,
+`seed`, `max_tokens`, `stream`, and `tools`; reasoning is returned as
+`reasoning_content` on the OpenAI side and as `thinking` blocks on the
+Anthropic side. `--cors` adds `Access-Control-Allow-*` headers for browser
+clients. `--host 0.0.0.0` is required for remote machines to connect.
+
+**One request is served at a time.** ds4-server has `--batched-session` and a
+mixed prefill scheduler; qwasar has no counterpart, because 48 of this model's
+64 layers are recurrent and their state cannot be forked the way a KV cache can.
+
+What does carry over is prefix reuse, which is what matters for agent clients: a
+stateless client resending a growing conversation continues from wherever the
+live session already is. **This only works if the client sends the assistant's
+reasoning back** — as `reasoning_content` or as a `thinking` block. Without it
+the replayed turn cannot match what the session generated, and every request
+prefills from zero. With it, a second turn of a short conversation reused 80 of
+its 98 tokens.
+
+`/v1/responses` and `/v1/completions` are not implemented and return 501.
+
 ## Build
 
 ```
 make
 ```
 
-That is the whole thing. It produces `./qwasar` and `./qwasar-agent`.
+That is the whole thing. It produces `./qwasar`, `./qwasar-agent` and
+`./qwasar-server`.
 
 ```
 make test          # unit and golden-vector suites; needs the model
@@ -412,6 +450,8 @@ qwasar_toolcall.c   tool-call parsing and the line-anchored edit matcher
 qwasar_cpu.c        scalar fp32 reference twins for every kernel
 qwasar_metal.m      Metal runtime: device, library, pipelines, dispatch
 qwasar_agent.c      the agent loop, its tools, and the REPL
+qwasar_server.c     the HTTP API
+qwasar_sample.c     temperature, top-k, top-p and min-p sampling
 metal/*.metal       kernels
 tests/              unit and golden-vector regression
 tools/              build helper; dev-only fixture generators (never built)
@@ -430,10 +470,10 @@ Stated plainly, because a README that only lists what works is not much use:
 * **Vision.** The tower is parsed, sized, and reported by `--info`, and its
   weights are loaded, but it is not executed. Image input does nothing yet. This
   is the largest remaining piece.
-* **Sampling.** Generation is greedy. Temperature, top-k, top-p, and min-p are
-  designed but not wired up; the model's own defaults are `temp 1.0, top_k 20,
-  top_p 0.95`.
-* **An HTTP server.** ds4 has one; qwasar does not.
+* **Sampling in the CLI.** `qwasar-server` samples with temperature, top-k,
+  top-p and min-p; `qwasar` and `qwasar-agent` are still greedy.
+* **`/v1/responses` and `/v1/completions`**, which ds4-server has. They return
+  501. So do concurrent requests: qwasar serves one at a time.
 * **Speculative decoding.** The model ships an MTP draft head, but as a separate
   shard that is not in this checkpoint.
 * **NFC normalisation** in the tokenizer. A no-op for ASCII and already-normalised
