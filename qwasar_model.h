@@ -258,6 +258,29 @@ const qw_tensor  *qwasar_engine_final_norm(const qwasar_engine *e);
 /* The MTP draft head; `present` is false unless --mtp named a head directory. */
 const qw_mtp     *qwasar_engine_mtp(const qwasar_engine *e);
 
+/* An image, already resized, normalised and cut into the patch sequence the
+ * vision tower reads.  `patches` is [n_patches, patch_elems] fp32 in
+ * merge-block order; see the comment at the top of qwasar_image.c. */
+typedef struct {
+    float  *patches;
+    int32_t n_patches;
+    int32_t patch_elems;
+    int32_t grid_t, grid_h, grid_w;   /* in patches */
+    int32_t src_w, src_h;             /* before resizing, for reporting */
+} qw_image;
+
+bool qw_image_load(qw_image *im, const char *path, const qw_config *c,
+                   char *err, size_t errcap);
+void qw_image_free(qw_image *im);
+
+/* Runs the vision tower.  Returns [rows, out_hidden_size] fp32, caller frees;
+ * one row per merged 2x2 block of patches. */
+float *qwasar_encode_image(qwasar_engine *e, const qw_image *im,
+                           int32_t *out_rows, char *err, size_t errcap);
+void qw_verrf(char *err, size_t cap, const char *fmt, ...);
+/* Exposed for tests: the resized dimensions this image would be given. */
+void qw_image_fit(int32_t w, int32_t h, int32_t factor, int32_t *out_w, int32_t *out_h);
+
 /* The vision tower; `present` is false for a text-only checkpoint. */
 const qw_vision  *qwasar_engine_vision(const qwasar_engine *e);
 int32_t qwasar_engine_context_size (const qwasar_engine *e);
@@ -307,6 +330,13 @@ void qw_cpu_rms_norm_gated(float *y, const float *x, const uint16_t *w,
                            const float *gate, int32_t dim, int32_t rows,
                            float eps, float out_scale);
 void qw_cpu_swiglu(float *y, const float *gate, const float *up, int32_t n);
+void qw_cpu_layer_norm(float *y, const float *x, const uint16_t *w,
+                       const uint16_t *b, int32_t dim, int32_t rows, float eps);
+void qw_cpu_gelu_tanh(float *y, int32_t n);
+void qw_cpu_rope_2d(float *x, const float *angles,
+                    int32_t tokens, int32_t heads, int32_t dim, int32_t stride);
+void qw_cpu_vision_attn(float *out, const float *qkv,
+                        int32_t tokens, int32_t heads, int32_t dim, float scale);
 
 void qw_cpu_conv1d_causal_silu(float *y, const float *x, float *state,
                                const uint16_t *w, int32_t channels, int32_t rows,

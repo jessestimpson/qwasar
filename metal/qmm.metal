@@ -29,32 +29,6 @@
  * it cost twice over: a transposing fragment load, and a strided threadgroup
  * write during staging.) */
 
-/* Tiling comes from qwasar_gpu.h, injected as preprocessor macros when the
- * library is compiled, so the host's dispatch geometry cannot drift from the
- * kernel's blocking.  The fallbacks below exist only so `make check-metal` can
- * compile this file standalone; they are never used by the engine. */
-#ifndef QW_QMM_BM
-#define QW_QMM_BM 64
-#define QW_QMM_BN 64
-#define QW_QMM_BK 32
-#define QW_QMM_SG_M 2
-#define QW_QMM_SG_N 4
-#endif
-
-#define QW_QMM_THREADS (QW_QMM_SG_M * QW_QMM_SG_N * 32)
-#define QW_SG_TILE      8                                   /* matrix unit edge */
-#define QW_QMM_FRAG_M  ((QW_QMM_BM / QW_QMM_SG_M) / QW_SG_TILE)
-#define QW_QMM_FRAG_N  ((QW_QMM_BN / QW_QMM_SG_N) / QW_SG_TILE)
-
-/* The pool is the operand tiles during the K loop and the output tile after
- * it, so it has to hold whichever is larger.  Operands are half, so they cost
- * half a float each.  At BM = BN this is always the output tile, which is why
- * the size used to be written as BM * BN -- but a narrow token tile inverts it,
- * and getting that wrong is a threadgroup-memory overrun rather than an error. */
-#define QW_QMM_POOL_HALF (QW_QMM_BK * (QW_QMM_BM + QW_QMM_BN))
-#define QW_QMM_POOL_F    (QW_QMM_POOL_HALF / 2 > QW_QMM_BM * QW_QMM_BN \
-                          ? QW_QMM_POOL_HALF / 2 : QW_QMM_BM * QW_QMM_BN)
-
 kernel void qw_qmm_q4_g64(
     device const uint    *w       [[buffer(0)]],   /* [n, k/8]  packed nibbles */
     device const ushort  *scales  [[buffer(1)]],   /* [n, k/64] bf16 */

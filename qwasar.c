@@ -22,6 +22,15 @@
 
 /* ---- small utilities ----------------------------------------------------- */
 
+/* Shared with the vision tower, which is a separate translation unit. */
+void qw_verrf(char *err, size_t cap, const char *fmt, ...) {
+    if (!err || !cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(err, cap, fmt, ap);
+    va_end(ap);
+}
+
 static void qw_errf(char *err, size_t cap, const char *fmt, ...) {
     if (!err || !cap) return;
     va_list ap;

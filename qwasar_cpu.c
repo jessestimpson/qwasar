@@ -129,6 +129,81 @@ void qw_cpu_rms_norm_gated(float *y, const float *x, const uint16_t *w,
     }
 }
 
+/* ---- vision twins --------------------------------------------------------- */
+
+void qw_cpu_layer_norm(float *y, const float *x, const uint16_t *w,
+                       const uint16_t *b, int32_t dim, int32_t rows, float eps) {
+    for (int32_t r = 0; r < rows; r++) {
+        const float *xr = x + (size_t)r * dim;
+        float *yr = y + (size_t)r * dim;
+        double s = 0.0, ss = 0.0;
+        for (int32_t i = 0; i < dim; i++) { s += xr[i]; ss += (double)xr[i] * xr[i]; }
+        const double mean = s / dim;
+        double var = ss / dim - mean * mean;
+        if (var < 0.0) var = 0.0;
+        const float inv = 1.0f / sqrtf((float)var + eps);
+        for (int32_t i = 0; i < dim; i++)
+            yr[i] = ((xr[i] - (float)mean) * inv) * qw_bf16_to_f32_c(w[i])
+                  + qw_bf16_to_f32_c(b[i]);
+    }
+}
+
+void qw_cpu_gelu_tanh(float *y, int32_t n) {
+    for (int32_t i = 0; i < n; i++) {
+        const float x = y[i];
+        const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+        y[i] = 0.5f * x * (1.0f + tanhf(inner));
+    }
+}
+
+/* Half-split rotation: element i pairs with element i + dim/2, and the angle
+ * for that pair is angles[token][i]. */
+void qw_cpu_rope_2d(float *x, const float *angles,
+                    int32_t tokens, int32_t heads, int32_t dim, int32_t stride) {
+    const int32_t half = dim / 2;
+    for (int32_t t = 0; t < tokens; t++)
+        for (int32_t h = 0; h < heads; h++) {
+            float *v = x + (size_t)t * stride + (size_t)h * dim;
+            for (int32_t i = 0; i < half; i++) {
+                const float a = angles[(size_t)t * half + i];
+                const float c = cosf(a), s = sinf(a);
+                const float lo = v[i], hi = v[i + half];
+                v[i]        = lo * c - hi * s;
+                v[i + half] = hi * c + lo * s;
+            }
+        }
+}
+
+void qw_cpu_vision_attn(float *out, const float *qkv,
+                        int32_t tokens, int32_t heads, int32_t dim, float scale) {
+    float *sc = malloc((size_t)tokens * sizeof *sc);
+    for (int32_t h = 0; h < heads; h++)
+        for (int32_t qi = 0; qi < tokens; qi++) {
+            const float *q = qkv + (((size_t)qi * 3 + 0) * heads + h) * dim;
+            float m = -3.0e38f;
+            for (int32_t kj = 0; kj < tokens; kj++) {
+                const float *k = qkv + (((size_t)kj * 3 + 1) * heads + h) * dim;
+                double d = 0.0;
+                for (int32_t i = 0; i < dim; i++) d += (double)q[i] * k[i];
+                sc[kj] = (float)(d * scale);
+                if (sc[kj] > m) m = sc[kj];
+            }
+            double sum = 0.0;
+            for (int32_t kj = 0; kj < tokens; kj++) {
+                sc[kj] = expf(sc[kj] - m);
+                sum += sc[kj];
+            }
+            float *o = out + ((size_t)qi * heads + h) * dim;
+            for (int32_t i = 0; i < dim; i++) o[i] = 0.0f;
+            for (int32_t kj = 0; kj < tokens; kj++) {
+                const float *v = qkv + (((size_t)kj * 3 + 2) * heads + h) * dim;
+                const float w = (float)(sc[kj] / sum);
+                for (int32_t i = 0; i < dim; i++) o[i] += w * v[i];
+            }
+        }
+    free(sc);
+}
+
 void qw_cpu_swiglu(float *y, const float *gate, const float *up, int32_t n) {
     for (int32_t i = 0; i < n; i++) y[i] = qw_silu_c(gate[i]) * up[i];
 }

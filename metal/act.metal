@@ -79,3 +79,33 @@ kernel void qw_slice_rows(
     if (i >= a.len || r >= a.rows) return;
     dst[(ulong)r * a.len + i] = src[(ulong)r * a.src_stride + a.offset + i];
 }
+
+/* GELU, tanh approximation -- which is the one this model was trained with, so
+ * it is the definition rather than an approximation of anything here:
+ *
+ *     0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
+ *
+ * Applied in place over the vision MLP's intermediate activation. */
+kernel void qw_gelu_tanh(
+    device float *y [[buffer(0)]],
+    constant uint &n [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    const float x = y[gid];
+    const float inner = 0.7978845608028654f * fma(0.044715f * x, x * x, x);
+    y[gid] = 0.5f * x * (1.0f + precise::tanh(inner));
+}
+
+/* Adds a bf16 bias vector to every row.  Every projection in the vision tower
+ * has one and none in the text model does, so this exists rather than being
+ * folded into the matmuls. */
+kernel void qw_add_bias(
+    device       float  *y    [[buffer(0)]],   /* [rows, dim] */
+    device const ushort *bias [[buffer(1)]],   /* [dim] bf16 */
+    constant uint2      &a    [[buffer(2)]],   /* dim, rows */
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= a.x || gid.y >= a.y) return;
+    y[(ulong)gid.y * a.x + gid.x] += qw_bf16_to_f32(bias[gid.x]);
+}

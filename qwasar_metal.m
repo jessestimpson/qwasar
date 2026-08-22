@@ -407,6 +407,31 @@ void qw_op_dmat_bf16(qw_cmd c, qw_ref y, qw_ref x, qw_ref w,
     }
 }
 
+/* Blocks of QW_QMVB_B tokens below the matmul's crossover, tiles above it.
+ * The vision tower is the only caller and is always above it in practice, but
+ * a one-patch image should still work. */
+void qw_op_dmm_bf16(qw_cmd c, qw_ref y, qw_ref x, qw_ref w,
+                    int32_t k, int32_t n, int32_t rows) {
+    if (!c || !c->enc) return;
+    if (rows < QW_QMM_MIN_ROWS || k % QW_QMM_BK != 0) {
+        qw_op_dmat_bf16(c, y, x, w, k, n, rows);
+        return;
+    }
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_dmm_bf16");
+    if (!ps) return;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, w, 0);
+    qw_set(enc, x, 1);
+    qw_set(enc, y, 2);
+    qw_matmul_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)rows };
+    [enc setBytes:&args length:sizeof args atIndex:3];
+    MTLSize grid = MTLSizeMake(((NSUInteger)n + QW_QMM_BN - 1) / QW_QMM_BN,
+                               ((NSUInteger)rows + QW_QMM_BM - 1) / QW_QMM_BM, 1);
+    [enc dispatchThreadgroups:grid
+        threadsPerThreadgroup:MTLSizeMake(QW_QMM_THREADS, 1, 1)];
+}
+
 void qw_op_qmat_q4(qw_cmd c, qw_ref y, qw_ref x,
                    qw_ref w, qw_ref scales, qw_ref biases,
                    int32_t k, int32_t n, int32_t rows) {
@@ -467,6 +492,85 @@ void qw_op_rms_norm_concat(qw_cmd c, qw_ref y, qw_ref e, qw_ref we,
     [enc setBytes:&args length:sizeof args atIndex:5];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
         threadsPerThreadgroup:qw_norm_threads(dim)];
+}
+
+void qw_op_layer_norm(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight, qw_ref bias,
+                      int32_t dim, int32_t rows, float eps) {
+    if (!c || !c->enc) return;
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_layer_norm");
+    if (!ps) return;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, x, 0);
+    qw_set(enc, weight, 1);
+    qw_set(enc, bias, 2);
+    qw_set(enc, y, 3);
+    qw_norm_args args = { (uint32_t)dim, (uint32_t)rows, eps, 1.0f, 1u };
+    [enc setBytes:&args length:sizeof args atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+        threadsPerThreadgroup:qw_norm_threads(dim)];
+}
+
+void qw_op_gelu_tanh(qw_cmd c, qw_ref y, int32_t n) {
+    if (!c || !c->enc) return;
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_gelu_tanh");
+    if (!ps) return;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, y, 0);
+    uint32_t nn = (uint32_t)n;
+    [enc setBytes:&nn length:sizeof nn atIndex:1];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+   threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+void qw_op_add_bias(qw_cmd c, qw_ref y, qw_ref bias, int32_t dim, int32_t rows) {
+    if (!c || !c->enc || !bias.buf) return;
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_add_bias");
+    if (!ps) return;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, y, 0);
+    qw_set(enc, bias, 1);
+    uint32_t args[2] = { (uint32_t)dim, (uint32_t)rows };
+    [enc setBytes:args length:sizeof args atIndex:2];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)dim, (NSUInteger)rows, 1)
+   threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+}
+
+void qw_op_rope_2d(qw_cmd c, qw_ref x, qw_ref angles,
+                   int32_t tokens, int32_t heads, int32_t dim, int32_t stride) {
+    if (!c || !c->enc) return;
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_rope_2d");
+    if (!ps) return;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, x, 0);
+    qw_set(enc, angles, 1);
+    uint32_t args[4] = { (uint32_t)tokens, (uint32_t)heads, (uint32_t)dim,
+                         (uint32_t)stride };
+    [enc setBytes:args length:sizeof args atIndex:2];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)(dim / 2), (NSUInteger)heads,
+                                     (NSUInteger)tokens)
+   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+void qw_op_vision_attn(qw_cmd c, qw_ref out, qw_ref qkv,
+                       int32_t tokens, int32_t heads, int32_t dim, float scale) {
+    if (!c || !c->enc) return;
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_vision_attn");
+    if (!ps) return;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, qkv, 0);
+    qw_set(enc, out, 1);
+    uint32_t args[3] = { (uint32_t)tokens, (uint32_t)heads, (uint32_t)dim };
+    [enc setBytes:args length:sizeof args atIndex:2];
+    [enc setBytes:&scale length:sizeof scale atIndex:3];
+    /* One threadgroup per (query, head); the head dim is small, so a single
+     * simdgroup covers it and the reduction stays inside one shuffle. */
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tokens, (NSUInteger)heads, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
 void qw_op_rms_norm_gated(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight, qw_ref gate,

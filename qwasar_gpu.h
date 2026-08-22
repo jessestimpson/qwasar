@@ -94,6 +94,11 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
 void qw_op_dmat_bf16(qw_cmd c, qw_ref y, qw_ref x, qw_ref w,
                      int32_t k, int32_t n, int32_t rows);
 
+/* Dense bf16, tiled over tokens: the vision tower's shape.  Falls back to the
+ * blocked matvec below the matmul's crossover. */
+void qw_op_dmm_bf16(qw_cmd c, qw_ref y, qw_ref x, qw_ref w,
+                    int32_t k, int32_t n, int32_t rows);
+
 /* Evaluates `rows` tokens in ceil(rows / QW_QMVB_B) passes over the weights.
  * Correct for any row count; only worth calling below QW_QMM_MIN_ROWS. */
 void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
@@ -179,6 +184,32 @@ void qw_op_rms_norm(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight,
 void qw_op_rms_norm_concat(qw_cmd c, qw_ref y, qw_ref e, qw_ref we,
                            qw_ref h, qw_ref wh, int32_t dim, int32_t rows,
                            float eps);
+
+/* ---- vision tower ----------------------------------------------------------
+ *
+ * A second set of primitives: the tower is bf16 with biases and LayerNorm
+ * throughout, where the text model is 4-bit, bias-free and RMSNorm. */
+
+/* LayerNorm -- mean subtracted as well as scaled, unlike RMSNorm. */
+void qw_op_layer_norm(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight, qw_ref bias,
+                      int32_t dim, int32_t rows, float eps);
+
+/* GELU, tanh approximation, in place.  The definition this model trained on. */
+void qw_op_gelu_tanh(qw_cmd c, qw_ref y, int32_t n);
+
+/* Adds a bf16 bias to every row of a [rows, dim] buffer. */
+void qw_op_add_bias(qw_cmd c, qw_ref y, qw_ref bias, int32_t dim, int32_t rows);
+
+/* 2D rotary embedding over [tokens, heads, dim], half-split.  `angles` is
+ * [tokens, dim/2]: a patch's row frequencies followed by its column's.  Shares
+ * nothing with qw_op_rope_partial but the idea. */
+void qw_op_rope_2d(qw_cmd c, qw_ref x, qw_ref angles,
+                   int32_t tokens, int32_t heads, int32_t dim, int32_t stride);
+
+/* Bidirectional attention over an image's patches.  `qkv` is
+ * [tokens, 3, heads, dim] as the fused projection leaves it. */
+void qw_op_vision_attn(qw_cmd c, qw_ref out, qw_ref qkv,
+                       int32_t tokens, int32_t heads, int32_t dim, float scale);
 
 /* rms_norm(x, weight) * silu(gate) -- the gated-delta output norm. */
 void qw_op_rms_norm_gated(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight, qw_ref gate,

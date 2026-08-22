@@ -22,7 +22,7 @@ METAL_SRCS := metal/common.metal \
               $(filter-out metal/common.metal,$(sort $(wildcard metal/*.metal)))
 CORE_OBJS  := qwasar.o qwasar_graph.o qwasar_kvstore.o qwasar_tokenizer.o \
               qwasar_toolcall.o qwasar_sample.o qwasar_json.o qwasar_cpu.o \
-              qwasar_metal.o
+              qwasar_image.o qwasar_vision.o qwasar_metal.o
 
 .PHONY: all clean test help check-metal
 

@@ -148,3 +148,54 @@ kernel void qw_rms_norm_concat(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+/* LayerNorm: subtract the mean, divide by the standard deviation, scale and
+ * shift.  The text model has none of these -- it is RMSNorm throughout, which
+ * skips the mean entirely -- and the vision tower has nothing else.
+ *
+ * Both moments come from one pass: sum and sum of squares reduced together, so
+ * a row is read once rather than twice. */
+kernel void qw_layer_norm(
+    device const float   *x  [[buffer(0)]],   /* [rows, dim] */
+    device const ushort  *w  [[buffer(1)]],   /* [dim] bf16 */
+    device const ushort  *b  [[buffer(2)]],   /* [dim] bf16 */
+    device       float   *y  [[buffer(3)]],   /* [rows, dim] */
+    constant qw_norm_args &a [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint ntg  [[threads_per_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint nsg  [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float partial[64];
+
+    device const float *xr = x + (ulong)tgid * a.dim;
+    device       float *yr = y + (ulong)tgid * a.dim;
+
+    float s = 0.0f, ss = 0.0f;
+    for (uint i = tid; i < a.dim; i += ntg) {
+        const float v = xr[i];
+        s += v;
+        ss = fma(v, v, ss);
+    }
+    s  = simd_sum(s);
+    ss = simd_sum(ss);
+    if (lane == 0) { partial[sgid] = s; partial[32 + sgid] = ss; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0) {
+        float v1 = (lane < nsg) ? partial[lane] : 0.0f;
+        float v2 = (lane < nsg) ? partial[32 + lane] : 0.0f;
+        v1 = simd_sum(v1);
+        v2 = simd_sum(v2);
+        if (lane == 0) { partial[0] = v1; partial[32] = v2; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float mean = partial[0] / float(a.dim);
+    const float var  = partial[32] / float(a.dim) - mean * mean;
+    const float inv  = rsqrt(max(var, 0.0f) + a.eps);
+
+    for (uint i = tid; i < a.dim; i += ntg)
+        yr[i] = fma((xr[i] - mean) * inv, qw_bf16_to_f32(w[i]), qw_bf16_to_f32(b[i]));
+}
