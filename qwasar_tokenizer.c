@@ -773,6 +773,7 @@ int32_t *qwasar_render_tool_result(const qwasar_tokenizer *t, const char *result
 }
 
 int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
+                                 int32_t n_image_tokens,
                                  const qwasar_chat_options *opts, int32_t *out_n) {
     char err[128];
     qw_chat c;
@@ -783,6 +784,11 @@ int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
     qw_put_str(&c, "\n");
     qw_put_id(&c, c.im_start);
     qw_put_str(&c, "user\n");
+    for (int32_t k = 0; k < n_image_tokens; k++) {
+        if (k == 0) qw_put_id(&c, c.vision_start);
+        qw_put_id(&c, c.image_pad);
+        if (k + 1 == n_image_tokens) qw_put_id(&c, c.vision_end);
+    }
     qw_put_str(&c, text);
     qw_put_id(&c, c.im_end);
     qw_put_str(&c, "\n");

@@ -117,6 +117,7 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
 int32_t *qwasar_render_tool_result(const qwasar_tokenizer *t, const char *result,
                                    const qwasar_chat_options *opts, int32_t *out_n);
 int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
+                                 int32_t n_image_tokens,
                                  const qwasar_chat_options *opts, int32_t *out_n);
 
 /* ---- sessions -------------------------------------------------------------
@@ -166,7 +167,21 @@ typedef struct qwasar_image_input {
     const float *rows;                /* [n_rows, hidden], from the tower */
     int32_t      n_rows;
     int32_t      grid_t, grid_h, grid_w;   /* in patches, before the 2x2 merge */
+    int32_t      src_w, src_h, n_patches;  /* for reporting; unused by the model */
 } qwasar_image_input;
+
+/* Loads an image file and runs the vision tower on it.  jpeg, png, bmp, gif.
+ *
+ * `n_rows` is also the number of <|image_pad|> tokens the prompt must carry,
+ * which is why encoding happens before the prompt is rendered rather than
+ * beside the evaluation that uses it. */
+bool qwasar_image_encode(qwasar_engine *e, const char *path,
+                         qwasar_image_input *out, char *err, size_t errcap);
+/* The same, from bytes already in memory: images arrive over HTTP as base64 in
+ * a JSON body and never touch the filesystem. */
+bool qwasar_image_encode_memory(qwasar_engine *e, const void *bytes, size_t len,
+                                qwasar_image_input *out, char *err, size_t errcap);
+void qwasar_image_release(qwasar_image_input *in);
 
 /* Like qwasar_session_eval, but with images to place.  `tokens` must contain
  * exactly the pad tokens the grids account for. */

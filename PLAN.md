@@ -1105,6 +1105,28 @@ axis constant and the row and column axes walking the merged grid. The text
 after an image resumes from one past the largest axis, not from one past the
 token count.
 
+#### The agent and the server take images too
+
+`qwasar-agent --image <path>` for the first turn, `/image <path>` to attach one
+mid-conversation. The server accepts both APIs' shapes -- OpenAI's `image_url`
+data URLs and Anthropic's base64 `source` blocks -- decoded straight from the
+JSON body without touching the filesystem.
+
+**Images defeat prefix reuse, silently, so the server does not attempt it.**
+Two different pictures render to the same run of `<|image_pad|>` tokens, so a
+token-sequence match can say a prompt continues the live session when the pixels
+behind it were something else entirely. A request with images therefore starts
+from a fresh session. Fixing it properly means keying the match on a digest of
+the image bytes as well as the tokens, which is worth doing when someone is
+holding a conversation about a picture.
+
+Wiring this up surfaced a bug that had nothing to do with images: with thinking
+disabled, every answer came back as `reasoning_content` with `content` null.
+The generation prompt normally leaves `<think>` open and the model closes it,
+but when thinking is off the template writes the close itself, so the model
+never emits one and the classifier never left reasoning mode. A valid-looking
+response carrying nothing in the field clients read.
+
 #### 2D RoPE, which is not the text model's
 
 Half-split rather than interleaved, and unrelated to the partial multimodal RoPE

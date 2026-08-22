@@ -217,3 +217,60 @@ float *qwasar_encode_image(qwasar_engine *e, const qw_image *im,
     *out_rows = merged_rows;
     return out;
 }
+
+
+/* ---- the public entry point ------------------------------------------------
+ *
+ * Loading and encoding are one step for callers, because the two are only ever
+ * useful together: the row count an image produces is what the prompt has to
+ * declare, so nothing can be rendered until the tower has run. */
+bool qwasar_image_encode(qwasar_engine *e, const char *path,
+                         qwasar_image_input *out, char *err, size_t errcap) {
+    memset(out, 0, sizeof *out);
+    qw_image im;
+    if (!qw_image_load(&im, path, qwasar_engine_config(e), err, errcap)) return false;
+
+    int32_t rows = 0;
+    float *emb = qwasar_encode_image(e, &im, &rows, err, errcap);
+    if (!emb) { qw_image_free(&im); return false; }
+
+    out->rows      = emb;
+    out->n_rows    = rows;
+    out->grid_t    = im.grid_t;
+    out->grid_h    = im.grid_h;
+    out->grid_w    = im.grid_w;
+    out->src_w     = im.src_w;
+    out->src_h     = im.src_h;
+    out->n_patches = im.n_patches;
+    qw_image_free(&im);
+    return true;
+}
+
+bool qwasar_image_encode_memory(qwasar_engine *e, const void *bytes, size_t len,
+                                qwasar_image_input *out, char *err, size_t errcap) {
+    memset(out, 0, sizeof *out);
+    qw_image im;
+    if (!qw_image_load_memory(&im, bytes, len, qwasar_engine_config(e), err, errcap))
+        return false;
+
+    int32_t rows = 0;
+    float *emb = qwasar_encode_image(e, &im, &rows, err, errcap);
+    if (!emb) { qw_image_free(&im); return false; }
+
+    out->rows      = emb;
+    out->n_rows    = rows;
+    out->grid_t    = im.grid_t;
+    out->grid_h    = im.grid_h;
+    out->grid_w    = im.grid_w;
+    out->src_w     = im.src_w;
+    out->src_h     = im.src_h;
+    out->n_patches = im.n_patches;
+    qw_image_free(&im);
+    return true;
+}
+
+void qwasar_image_release(qwasar_image_input *in) {
+    if (!in) return;
+    free((void *)in->rows);
+    memset(in, 0, sizeof *in);
+}

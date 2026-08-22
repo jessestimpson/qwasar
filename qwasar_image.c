@@ -142,15 +142,9 @@ static void qw_patchify(const float *px, int32_t w, const qw_config *c,
     }
 }
 
-bool qw_image_load(qw_image *im, const char *path, const qw_config *c,
-                   char *err, size_t errcap) {
-    memset(im, 0, sizeof *im);
-    int w = 0, h = 0, comp = 0;
-    unsigned char *rgb = stbi_load(path, &w, &h, &comp, 3);
-    if (!rgb) {
-        snprintf(err, errcap, "cannot read %s: %s", path, stbi_failure_reason());
-        return false;
-    }
+/* Shared by the path and memory entry points; takes ownership of `rgb`. */
+static bool qw_image_finish(qw_image *im, unsigned char *rgb, int w, int h,
+                            const qw_config *c, char *err, size_t errcap) {
 
     const int32_t factor = c->vis_patch_size * c->vis_spatial_merge_size;
     int32_t rw = 0, rh = 0;
@@ -175,6 +169,32 @@ bool qw_image_load(qw_image *im, const char *path, const qw_config *c,
     qw_patchify(px, rw, c, im->grid_h, im->grid_w, im->patches);
     free(px);
     return true;
+}
+
+bool qw_image_load(qw_image *im, const char *path, const qw_config *c,
+                   char *err, size_t errcap) {
+    memset(im, 0, sizeof *im);
+    int w = 0, h = 0, comp = 0;
+    unsigned char *rgb = stbi_load(path, &w, &h, &comp, 3);
+    if (!rgb) {
+        snprintf(err, errcap, "cannot read %s: %s", path, stbi_failure_reason());
+        return false;
+    }
+    return qw_image_finish(im, rgb, w, h, c, err, errcap);
+}
+
+/* Images arriving over HTTP are base64 in a JSON body, so they never touch the
+ * filesystem. */
+bool qw_image_load_memory(qw_image *im, const void *bytes, size_t len,
+                          const qw_config *c, char *err, size_t errcap) {
+    memset(im, 0, sizeof *im);
+    int w = 0, h = 0, comp = 0;
+    unsigned char *rgb = stbi_load_from_memory(bytes, (int)len, &w, &h, &comp, 3);
+    if (!rgb) {
+        snprintf(err, errcap, "cannot decode image: %s", stbi_failure_reason());
+        return false;
+    }
+    return qw_image_finish(im, rgb, w, h, c, err, errcap);
 }
 
 void qw_image_free(qw_image *im) {

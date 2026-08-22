@@ -129,6 +129,11 @@ Both completion endpoints accept `temperature`, `top_p`, `top_k`, `min_p`,
 Anthropic side. `--cors` adds `Access-Control-Allow-*` headers for browser
 clients. `--host 0.0.0.0` is required for remote machines to connect.
 
+A request carrying an image starts from a fresh session rather than reusing a
+prefix. Two different pictures render to the same run of `<|image_pad|>` tokens,
+so a token match can claim a prompt continues the live session when the pixels
+behind it were something else, and nothing downstream would notice.
+
 **One request is served at a time.** ds4-server has `--batched-session` and a
 mixed prefill scheduler; qwasar has no counterpart, because 48 of this model's
 64 layers are recurrent and their state cannot be forked the way a KV cache can.
@@ -223,6 +228,13 @@ $ qwasar --image circle.png --no-think -p "Describe this image in one short sent
 image 224x224 -> 256 patches -> 64 tokens in 2.1s
 A solid blue circle centered on a white background.
 ```
+
+```
+qwasar-agent --image photo.png        # or /image <path> mid-conversation
+```
+
+The server takes them too, in both APIs: OpenAI's `image_url` data URLs and
+Anthropic's base64 `source` blocks, streaming or not.
 
 jpeg, png, bmp and gif, loaded with a vendored stb_image, resized to a multiple
 of 32 and cut into patches. The tower is 27 blocks of bf16 with biases,

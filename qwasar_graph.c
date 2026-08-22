@@ -1199,7 +1199,7 @@ bool qwasar_session_attach_images(qwasar_session *s, const qwasar_image_input *i
     for (int32_t i = 0; i < n_images; i++) total += im[i].n_rows;
 
     s->img_rows = qw_buf_alloc((size_t)total * hidden * sizeof(float));
-    if (!s->img_rows) { qw_gerrf(err, errcap, "out of memory for image rows"); return false; }
+    if (!s->img_rows) { qw_gerrf(err, errcap, "cannot allocate %d image rows", total); return false; }
     float *dst = qw_buf_contents(s->img_rows);
     for (int32_t i = 0; i < n_images; i++) {
         memcpy(dst, im[i].rows, (size_t)im[i].n_rows * hidden * sizeof(float));

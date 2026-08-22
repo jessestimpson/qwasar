@@ -228,8 +228,26 @@ typedef struct {
  * so a session that has evaluated one wrong token is worthless for this prompt
  * and has to be replaced. */
 static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
+                                const qwasar_image_input *images, int32_t n_images,
                                 int32_t *reused, char *err, size_t cap) {
     *reused = 0;
+
+    /* Images defeat prefix reuse, and silently.  Two different pictures render
+     * to the same run of <|image_pad|> tokens, so a token-sequence match can
+     * say a prompt is a prefix of the live session when the pixels behind it
+     * were something else entirely.  Nothing downstream would notice.  A
+     * request carrying images therefore starts from a fresh session, which
+     * costs a prefill and cannot be wrong.
+     *
+     * Fixing this properly means keying the match on a digest of the image
+     * bytes as well as the tokens, which is worth doing when someone is holding
+     * a conversation about a picture. */
+    if (n_images > 0) {
+        if (sv->s) qwasar_session_free(sv->s);
+        sv->s = qwasar_session_new(sv->e, err, cap);
+        if (!sv->s) return NULL;
+        return qwasar_session_eval_images(sv->s, tokens, n, images, n_images, err, cap);
+    }
 
     int32_t live = sv->s ? qwasar_session_common_prefix(sv->s, tokens, n) : 0;
     if (live > 0 && live < n) {
@@ -272,13 +290,19 @@ static void genres_free(genres *g) { str_free(&g->text); str_free(&g->reasoning)
 /* One assistant turn.  Stops at end-of-turn, a completed tool call, or the
  * token budget. */
 static bool srv_generate(server *sv, const float *logits, const qwasar_sampling *sp,
-                         int32_t max_tokens, delta_fn on_delta, void *ud,
+                         int32_t max_tokens, bool thinking,
+                         delta_fn on_delta, void *ud,
                          genres *out, char *err, size_t cap) {
     memset(out, 0, sizeof *out);
     const int32_t vocab = qwasar_vocab_size(sv->e);
     const int32_t think_close = qwasar_token_id(sv->tok, "</think>");
     const int32_t call_open = qwasar_token_id(sv->tok, "<tool_call>");
-    bool reasoning = true;
+    /* The generation prompt leaves <think> open, so output starts as reasoning
+     * and the model closes it.  With thinking disabled the template writes the
+     * close itself, so the model never emits one -- and starting in reasoning
+     * mode meant every answer came back as reasoning_content with content
+     * null, which is a valid-looking response carrying nothing. */
+    bool reasoning = thinking;
 
     for (int32_t i = 0; i < max_tokens; i++) {
         int32_t next = qwasar_sample(logits, vocab, sp, &sv->rng);
@@ -313,6 +337,10 @@ static bool srv_generate(server *sv, const float *logits, const qwasar_sampling 
 /* ---- request shapes -------------------------------------------------------- */
 
 #define QW_MAX_MSGS 256
+/* Images per request.  A cap exists because each one is a tower pass and a few
+ * hundred kilobytes of rows, and because a request that wants more than this
+ * is almost certainly a mistake. */
+#define QW_MAX_IMAGES 8
 
 typedef struct {
     qwasar_message msgs[QW_MAX_MSGS];
@@ -322,6 +350,8 @@ typedef struct {
     str            tools[32];
     const char    *tool_ptr[32];
     int32_t        n_tools;
+    qwasar_image_input images[QW_MAX_IMAGES];
+    int32_t        n_images;
 } request;
 
 static char *req_own(request *r, str *s) {
@@ -334,10 +364,97 @@ static char *req_own(request *r, str *s) {
 static void req_free(request *r) {
     for (int32_t i = 0; i < r->n_owned; i++) str_free(&r->owned[i]);
     for (int32_t i = 0; i < r->n_tools; i++) str_free(&r->tools[i]);
+    for (int32_t i = 0; i < r->n_images; i++) qwasar_image_release(&r->images[i]);
 }
 
 /* Flattens a message `content` field, which both APIs allow to be either a
  * plain string or an array of typed blocks. */
+/* ---- images over the wire --------------------------------------------------
+ *
+ * Both APIs send an image as base64 inside the message content, OpenAI as a
+ * data URL under `image_url` and Anthropic as a `source` block.  Neither ever
+ * touches the filesystem, so this decodes into memory and hands the bytes
+ * straight to the tower.
+ *
+ * A data URL's payload starts after the comma; a bare base64 string has no
+ * comma, and starting at the beginning is the right answer for it. */
+static int b64_value(unsigned char ch) {
+    if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if (ch == '+') return 62;
+    if (ch == '/') return 63;
+    return -1;                      /* padding and whitespace are skipped */
+}
+
+static unsigned char *b64_decode(const char *src, size_t n, size_t *out_len) {
+    unsigned char *out = malloc(n / 4 * 3 + 4);
+    if (!out) return NULL;
+    size_t o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < n; i++) {
+        const int v = b64_value((unsigned char)src[i]);
+        if (v < 0) continue;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; out[o++] = (unsigned char)(acc >> bits); }
+    }
+    *out_len = o;
+    return out;
+}
+
+/* Finds the base64 payload of one content block, whichever API shaped it. */
+static bool block_image_data(const qj_doc *d, const qj_node *b,
+                             const char **data, size_t *len) {
+    const qj_node *src = qj_get(d, b, "source");             /* Anthropic */
+    const qj_node *n = src ? qj_get(d, src, "data") : NULL;
+    if (!n) {                                                /* OpenAI */
+        const qj_node *iu = qj_get(d, b, "image_url");
+        if (iu) n = (iu->type == QJ_STRING) ? iu : qj_get(d, iu, "url");
+    }
+    if (!n || n->type != QJ_STRING) return false;
+    const char *p = d->text + n->u.str.off;
+    size_t l = n->u.str.len;
+    const void *comma = memchr(p, ',', l);
+    if (comma) { l -= (size_t)((const char *)comma - p) + 1; p = (const char *)comma + 1; }
+    *data = p;
+    *len = l;
+    return l > 0;
+}
+
+/* Encodes every image in a content array, appending to the request's list.
+ * Returns the number of <|image_pad|> tokens the message needs. */
+static int32_t content_images(server *sv, request *r, const qj_doc *d,
+                              const qj_node *n, char *err, size_t cap) {
+    if (!n || n->type != QJ_ARRAY) return 0;
+    int32_t tokens = 0;
+    for (const qj_node *b = qj_first(d, n); b; b = qj_next(d, b)) {
+        const qj_node *t = qj_get(d, b, "type");
+        if (!qj_str_eq(d, t, "image") && !qj_str_eq(d, t, "image_url")) continue;
+        if (r->n_images >= QW_MAX_IMAGES) {
+            snprintf(err, cap, "at most %d images per request", QW_MAX_IMAGES);
+            return -1;
+        }
+        const char *data = NULL;
+        size_t len = 0;
+        if (!block_image_data(d, b, &data, &len)) {
+            snprintf(err, cap, "an image block carries no data");
+            return -1;
+        }
+        size_t raw_len = 0;
+        unsigned char *raw = b64_decode(data, len, &raw_len);
+        if (!raw) { snprintf(err, cap, "out of memory"); return -1; }
+        const bool ok = qwasar_image_encode_memory(sv->e, raw, raw_len,
+                                                   &r->images[r->n_images], err, cap);
+        free(raw);
+        if (!ok) return -1;
+        tokens += r->images[r->n_images].n_rows;
+        r->n_images++;
+    }
+    return tokens;
+}
+
 static void content_text(const qj_doc *d, const qj_node *n, str *out) {
     if (!n) return;
     if (n->type == QJ_STRING) { str_add(out, d->text + n->u.str.off, n->u.str.len); return; }
@@ -416,7 +533,8 @@ static void xml_from_anthropic_blocks(str *out, const qj_doc *d, const qj_node *
 
 /* ---- building the prompt ---------------------------------------------------- */
 
-static void collect_openai(request *r, const qj_doc *d, const qj_node *root) {
+static bool collect_openai(server *sv, request *r, const qj_doc *d,
+                           const qj_node *root, char *err, size_t cap) {
     const qj_node *tools = qj_get(d, root, "tools");
     for (const qj_node *t = qj_first(d, tools); t && r->n_tools < 32; t = qj_next(d, t)) {
         str j = { 0 };
@@ -432,7 +550,10 @@ static void collect_openai(request *r, const qj_doc *d, const qj_node *root) {
         if (!role || role->type != QJ_STRING) continue;
 
         str content = { 0 };
-        content_text(d, qj_get(d, m, "content"), &content);
+        const qj_node *cnode = qj_get(d, m, "content");
+        content_text(d, cnode, &content);
+        const int32_t img_tokens = content_images(sv, r, d, cnode, err, cap);
+        if (img_tokens < 0) { str_free(&content); return false; }
 
         const char *rname = "user";
         if (qj_str_eq(d, role, "system")) rname = "system";
@@ -453,15 +574,18 @@ static void collect_openai(request *r, const qj_doc *d, const qj_node *root) {
 
         r->msgs[r->n].role = rname;
         r->msgs[r->n].content = req_own(r, &content);
+        r->msgs[r->n].n_image_tokens = img_tokens;
         r->msgs[r->n].reasoning = reasoning.p ? req_own(r, &reasoning) : NULL;
         str_free(&reasoning);
         r->msgs[r->n].tool_calls = calls.p ? req_own(r, &calls) : NULL;
         str_free(&calls);
         r->n++;
     }
+    return true;
 }
 
-static void collect_anthropic(request *r, const qj_doc *d, const qj_node *root) {
+static bool collect_anthropic(server *sv, request *r, const qj_doc *d,
+                              const qj_node *root, char *err, size_t cap) {
     /* Anthropic tool schemas name the schema differently; rewrap them into the
      * shape the model's template documents. */
     const qj_node *tools = qj_get(d, root, "tools");
@@ -528,14 +652,25 @@ static void collect_anthropic(request *r, const qj_doc *d, const qj_node *root) 
                     str_add(&reasoning, d->text + th->u.str.off, th->u.str.len);
             }
 
+        /* Only a user turn can carry an image; an assistant turn replaying one
+         * would double-count its pad tokens. */
+        const int32_t img_tokens = assistant ? 0
+                                 : content_images(sv, r, d, content, err, cap);
+        if (img_tokens < 0) {
+            str_free(&text); str_free(&reasoning); str_free(&calls);
+            return false;
+        }
+
         r->msgs[r->n].role = assistant ? "assistant" : (is_tool_result ? "tool" : "user");
         r->msgs[r->n].content = req_own(r, &text);
+        r->msgs[r->n].n_image_tokens = img_tokens;
         r->msgs[r->n].reasoning = reasoning.p ? req_own(r, &reasoning) : NULL;
         str_free(&reasoning);
         r->msgs[r->n].tool_calls = calls.p ? req_own(r, &calls) : NULL;
         str_free(&calls);
         r->n++;
     }
+    return true;
 }
 
 /* Sampling knobs, with the model's own generation_config as the floor.  A knob
@@ -675,8 +810,15 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
 
     request req;
     memset(&req, 0, sizeof req);
-    if (anthropic) collect_anthropic(&req, d, root);
-    else           collect_openai(&req, d, root);
+    char cerr[256] = "";
+    const bool collected = anthropic
+        ? collect_anthropic(sv, &req, d, root, cerr, sizeof cerr)
+        : collect_openai(sv, &req, d, root, cerr, sizeof cerr);
+    if (!collected) {
+        http_error(c, 400, "Bad Request", cerr[0] ? cerr : "cannot read the request");
+        req_free(&req);
+        return;
+    }
     if (req.n == 0) {
         http_error(c, 400, "Bad Request", "no messages");
         req_free(&req);
@@ -717,17 +859,23 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
     int32_t n_prompt = 0;
     int32_t *prompt = qwasar_apply_chat_template(sv->tok, req.msgs, req.n, &chat,
                                                  &n_prompt, err, sizeof err);
-    req_free(&req);
-    if (!prompt) { http_error(c, 400, "Bad Request", err); return; }
+    if (!prompt) { req_free(&req); http_error(c, 400, "Bad Request", err); return; }
 
     if (n_prompt >= sv->ctx) {
         free(prompt);
+        req_free(&req);
         http_error(c, 400, "Bad Request", "prompt exceeds the server's context size");
         return;
     }
 
     int32_t reused = 0;
-    const float *logits = srv_prefill(sv, prompt, n_prompt, &reused, err, sizeof err);
+    /* The request outlives the prompt now: rendering turns its text into
+     * tokens, but its image rows are what the prefill scatters in, so freeing
+     * it here -- which is where it used to happen -- released them one call
+     * before they were read. */
+    const float *logits = srv_prefill(sv, prompt, n_prompt, req.images, req.n_images,
+                                      &reused, err, sizeof err);
+    req_free(&req);
     free(prompt);
     if (!logits) { http_error(c, 500, "Internal Server Error", err); return; }
     if (sv->verbose)
@@ -762,7 +910,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
     }
 
     genres g;
-    bool ok = srv_generate(sv, logits, &sp, max_tokens,
+    bool ok = srv_generate(sv, logits, &sp, max_tokens, thinking,
                            stream ? on_delta : NULL, &st, &g, err, sizeof err);
     if (!ok) {
         if (stream) { ant_block_close(&st); sse_end(c); }

@@ -63,6 +63,8 @@ qwasar_metal.o: qwasar_metal.m qwasar_gpu.h qwasar_metal_src.inc
 
 qwasar.o:      qwasar.c qwasar.h qwasar_gpu.h qwasar_json.h qwasar_model.h
 qwasar_graph.o: qwasar_graph.c qwasar.h qwasar_gpu.h qwasar_model.h
+qwasar_image.o: qwasar_image.c qwasar_model.h qwasar.h vendor/stb_image.h
+qwasar_vision.o: qwasar_vision.c qwasar.h qwasar_gpu.h qwasar_model.h
 qwasar_kvstore.o: qwasar_kvstore.c qwasar.h qwasar_model.h
 qwasar_sample.o: qwasar_sample.c qwasar.h
 qwasar_tokenizer.o: qwasar_tokenizer.c qwasar.h qwasar_json.h qwasar_unicode.inc

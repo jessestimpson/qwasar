@@ -386,6 +386,14 @@ typedef struct {
     double               turn_started;
     int32_t              turn_tokens;
     int64_t              spec_rounds, spec_tokens;
+
+    /* An image waiting to be attached to the next turn.  Encoded when it is
+     * named rather than when it is used, because the prompt has to say how
+     * many <|image_pad|> tokens it needs and that is a property of the patch
+     * grid.  Consumed by the first eval of the turn and not by the tool-result
+     * evals that follow it. */
+    qwasar_image_input   img;
+    int32_t              n_img_rows;
     /* Only the prefill start time is kept; the rate is derived from it. */
     double               prefill_started;
     bool                 interrupted;
@@ -570,7 +578,16 @@ static bool generate(agent *a, const int32_t *prompt, int32_t n_prompt,
     memset(out, 0, sizeof *out);
 
     status_set(a, "prefill");
-    const float *logits = qwasar_session_eval(a->s, prompt, n_prompt, err, errcap);
+    const float *logits;
+    if (a->n_img_rows > 0) {
+        logits = qwasar_session_eval_images(a->s, prompt, n_prompt, &a->img, 1,
+                                            err, errcap);
+        /* One turn's worth: the tool results that follow are text. */
+        qwasar_image_release(&a->img);
+        a->n_img_rows = 0;
+    } else {
+        logits = qwasar_session_eval(a->s, prompt, n_prompt, err, errcap);
+    }
     if (!logits) return false;
 
     const int32_t vocab = qwasar_vocab_size(a->e);
@@ -785,6 +802,7 @@ static bool agent_run(agent *a, int32_t *prompt, int32_t n_prompt,
 static void repl_help(agent *a) {
     tui_puts(a->tui,"  /help            this message\n"
            "  /new             start a fresh conversation\n"
+           "  /image <path>    attach an image to the next message\n"
            "  /effort <level>  xhigh, medium or low\n"
            "  /think           show or hide the reasoning block\n"
            "  /yes             toggle asking before writes and commands\n"
@@ -812,6 +830,30 @@ static bool repl_command(agent *a, const char *line, bool *handled) {
             tui_printf(a->tui, "  saved %d tokens\n", qwasar_session_n_past(a->s));
         else
             tui_printf(a->tui, "  not saved: %s\n", serr);
+        return true;
+    }
+    if (!strncmp(line, "/image", 6)) {
+        const char *path = line + 6;
+        while (*path == ' ') path++;
+        if (!*path) {
+            tui_printf(a->tui, "  usage: /image <path>\n");
+            return true;
+        }
+        /* Attaching costs a tower pass now rather than at send time, because
+         * the message cannot be rendered until the token count is known. */
+        qwasar_image_release(&a->img);
+        a->n_img_rows = 0;
+        status_set(a, "looking");
+        tui_tick(a->tui);
+        char ierr[256];
+        if (!qwasar_image_encode(a->e, path, &a->img, ierr, sizeof ierr)) {
+            tui_printf(a->tui, "  %s\n", ierr);
+        } else {
+            a->n_img_rows = a->img.n_rows;
+            tui_printf(a->tui, "  %dx%d -> %d tokens; it goes with your next message\n",
+                       a->img.src_w, a->img.src_h, a->img.n_rows);
+        }
+        status_set(a, "ready");
         return true;
     }
     if (!strcmp(line, "/think")) {
@@ -859,6 +901,7 @@ static void usage(FILE *out) {
         "  -i, --interactive    open the REPL after running the task\n"
         "      --steps <n>      maximum tool calls per task (default 24)\n"
         "  -n, --predict <n>    maximum tokens per turn (default 8192)\n"
+        "      --image <path>   an image for the first turn (jpeg, png, bmp, gif)\n"
         "      --mtp <dir>      draft head; speculative decoding, about 1.4x\n"
         "      --mtp-depth <n>  drafts per round; default adapts, 0 disables\n"
         "      --effort <lvl>   reasoning effort: xhigh (default), medium, low\n"
@@ -888,6 +931,7 @@ static bool resolve_model(qwasar_options *opts, const char *prog) {
 
 int main(int argc, char **argv) {
     qwasar_options opts = { 0 };
+    const char *image_path = NULL;
     agent a = { 0 };
     /* The turn budget bounds a runaway generation; it is not meant to bound
      * ordinary work, and the two failure modes are not symmetric.  Too high
@@ -909,6 +953,7 @@ int main(int argc, char **argv) {
         else if ((!strcmp(arg, "-c") || !strcmp(arg, "--context")) && i + 1 < argc) opts.context_size = atoi(argv[++i]);
         else if (!strcmp(arg, "-y") || !strcmp(arg, "--yes")) a.cfg.yes = true;
         else if (!strcmp(arg, "-i") || !strcmp(arg, "--interactive")) interactive = true;
+        else if (!strcmp(arg, "--image") && i + 1 < argc) image_path = argv[++i];
         else if (!strcmp(arg, "--mtp") && i + 1 < argc) opts.mtp_path = argv[++i];
         else if (!strcmp(arg, "--mtp-depth") && i + 1 < argc) a.cfg.mtp_depth = atoi(argv[++i]);
         else if (!strcmp(arg, "--steps") && i + 1 < argc) a.cfg.max_steps = atoi(argv[++i]);
@@ -965,6 +1010,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "qwasar-agent: %s\n", err);
         return 1;
     }
+    if (image_path) {
+        if (!qwasar_image_encode(a.e, image_path, &a.img, err, sizeof err)) {
+            fprintf(stderr, "qwasar-agent: %s\n", err);
+            return 1;
+        }
+        a.n_img_rows = a.img.n_rows;
+        tui_printf(a.tui, "\x1b[2mimage %dx%d -> %d patches -> %d tokens\x1b[0m\n",
+                   a.img.src_w, a.img.src_h, a.img.n_patches, a.img.n_rows);
+    }
+
     /* Speculation is silent about what it does to the output -- nothing -- but
      * it is not silent about being on, because it changes the memory footprint
      * and the shape of a stall. */
@@ -984,7 +1039,7 @@ int main(int argc, char **argv) {
     if (task.len) {
         qwasar_message msgs[2] = {
             { "system", a.guidance, NULL, NULL },
-            { "user",   task.p,     NULL, NULL },
+            { "user",   task.p,     NULL, NULL, a.n_img_rows },
         };
         int32_t n = 0;
         int32_t *p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
@@ -1052,7 +1107,7 @@ int main(int argc, char **argv) {
             if (fresh) {
                 qwasar_message msgs2[2] = {
                     { "system", a.guidance, NULL, NULL },
-                    { "user",   line,       NULL, NULL },
+                    { "user",   line,       NULL, NULL, a.n_img_rows },
                 };
                 p = qwasar_apply_chat_template(a.tok, msgs2, 2, &a.chat, &n, err, sizeof err);
                 if (p) {
@@ -1063,7 +1118,7 @@ int main(int argc, char **argv) {
                 }
                 fresh = false;
             } else {
-                p = qwasar_render_user_turn(a.tok, line, &a.chat, &n);
+                p = qwasar_render_user_turn(a.tok, line, a.n_img_rows, &a.chat, &n);
                 if (!p) snprintf(err, sizeof err, "cannot render the turn");
             }
             free(line);

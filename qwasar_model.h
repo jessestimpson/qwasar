@@ -271,6 +271,8 @@ typedef struct {
 
 bool qw_image_load(qw_image *im, const char *path, const qw_config *c,
                    char *err, size_t errcap);
+bool qw_image_load_memory(qw_image *im, const void *bytes, size_t len,
+                          const qw_config *c, char *err, size_t errcap);
 void qw_image_free(qw_image *im);
 
 /* Runs the vision tower.  Returns [rows, out_hidden_size] fp32, caller frees;
