@@ -261,7 +261,13 @@ clip becomes many small frames.
 A video is not a taller image. The position grid, the rope angles and the
 attention all repeat per frame rather than spanning the clip; a patch never
 attends outside its own frame, and time is carried by the position axes
-instead. The server takes images but not yet video.
+instead.
+
+The server takes video too, as an OpenAI-shaped `video_url` block. Base64 only
+— never a path or an http URL, because a server that fetched whatever a request
+named would read the machine's filesystem or the network on a stranger's
+behalf. A message may carry images or a video, not both: its placeholders are a
+single run of one token, so a mixture would label some of them wrongly.
 
 ## Run
 

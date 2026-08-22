@@ -144,7 +144,7 @@ int main(int argc, char **argv) {
     int64_t total_rejected = 0;
 
     for (size_t pi = 0; pi < sizeof prompts / sizeof *prompts; pi++) {
-        qwasar_message msg = { "user", prompts[pi], NULL, NULL };
+        qwasar_message msg = { "user", prompts[pi], NULL, NULL, 0, false };
         int32_t n_prompt = 0;
         int32_t *prompt = qwasar_apply_chat_template(tok, &msg, 1, &chat, &n_prompt,
                                                      err, sizeof err);

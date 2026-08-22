@@ -16,6 +16,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Angles for the 2D rotary embedding: for each token, its row's frequencies
  * followed by its column's.
@@ -309,6 +310,68 @@ bool qwasar_video_encode(qwasar_engine *e, const char *path,
     out->n_patches = im.n_patches;
     qw_image_free(&im);
     return true;
+}
+
+/* A video arriving over HTTP is base64 in a JSON body, and AVFoundation reads
+ * assets rather than buffers, so the bytes go to a temporary file first.
+ *
+ * That is a real cost -- a hundred megabytes written and read again -- but the
+ * alternative is a custom AVAssetResourceLoader delegate to serve one in-memory
+ * blob, which is a lot of moving parts to avoid a sequential write.  The file
+ * is unlinked as soon as it is opened, so it has no name anything else can
+ * reach and disappears when the process closes it.
+ *
+ * `ext` matters: AVFoundation picks its demuxer from the file extension, and an
+ * extensionless temporary file is simply reported as having no duration.  The
+ * caller passes whatever the payload said it was -- "mp4", "mov", "webm" -- and
+ * mp4 is the guess when it said nothing. */
+bool qwasar_video_encode_memory(qwasar_engine *e, const void *bytes, size_t len,
+                                const char *ext, qwasar_image_input *out,
+                                char *err, size_t errcap) {
+    memset(out, 0, sizeof *out);
+    if (!ext || !*ext) ext = "mp4";
+    /* The extension goes into a fixed-width slot so mkstemps knows its length,
+     * and anything unexpected is rejected rather than pasted into a path. */
+    char safe[8] = "mp4";
+    size_t el = strlen(ext);
+    if (el > 0 && el < sizeof safe) {
+        size_t k = 0;
+        for (size_t i = 0; i < el; i++)
+            if ((ext[i] >= 'a' && ext[i] <= 'z') || (ext[i] >= '0' && ext[i] <= '9'))
+                safe[k++] = ext[i];
+        safe[k] = 0;
+        if (k == 0) snprintf(safe, sizeof safe, "mp4");
+    }
+
+    const char *tmpdir = getenv("TMPDIR");
+    char path[1200];
+    snprintf(path, sizeof path, "%s%sqwasar-video-XXXXXX.%s",
+             tmpdir && *tmpdir ? tmpdir : "/tmp",
+             tmpdir && *tmpdir && tmpdir[strlen(tmpdir) - 1] == '/' ? "" : "/",
+             safe);
+    int fd = mkstemps(path, (int)strlen(safe) + 1);
+    if (fd < 0) { qw_verrf(err, errcap, "cannot create a temporary file"); return false; }
+
+    bool wrote = true;
+    const char *p = bytes;
+    size_t left = len;
+    while (left > 0) {
+        const ssize_t n = write(fd, p, left);
+        if (n <= 0) { wrote = false; break; }
+        p += n;
+        left -= (size_t)n;
+    }
+    if (!wrote) {
+        close(fd);
+        unlink(path);
+        qw_verrf(err, errcap, "cannot write the video to a temporary file");
+        return false;
+    }
+
+    const bool ok = qwasar_video_encode(e, path, out, err, errcap);
+    close(fd);
+    unlink(path);
+    return ok;
 }
 
 void qwasar_image_release(qwasar_image_input *in) {

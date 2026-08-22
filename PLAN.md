@@ -1165,8 +1165,24 @@ for `grid_t > 1`: four frames of an 8x8 grid are 256 tokens that advance
 position by 8, because the resume point is one past the largest axis and not
 past the token count.
 
-Not done: the server takes images but not video, and there is no frame-level
-timestamp text -- this model's template does not ask for any.
+The server takes video as well, as an OpenAI-shaped `video_url` block. Two
+decisions there worth stating:
+
+* **Base64 only, never a path or an http URL.** A server that fetched whatever
+  a request named would read the machine's filesystem or the network on a
+  stranger's behalf, which is not a feature anyone asked for.
+* **A message carries images or a video, not both.** Its placeholders are a
+  single run of one token, so a mixture would silently label some of them as
+  the wrong kind, and the model was trained to tell them apart. Refusing with a
+  clear message beats a subtly worse answer.
+
+AVFoundation reads assets rather than buffers, so a posted video is written to
+an unlinked temporary file first. The extension is load-bearing: AVFoundation
+picks its demuxer from it, and an extensionless file is reported as having no
+duration rather than as unreadable. The subtype from the data URL supplies it.
+
+There is no frame-level timestamp text; this model's template does not ask for
+any.
 
 #### 2D RoPE, which is not the text model's
 

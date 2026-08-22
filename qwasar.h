@@ -192,6 +192,11 @@ bool qwasar_video_encode(qwasar_engine *e, const char *path,
  * a JSON body and never touch the filesystem. */
 bool qwasar_image_encode_memory(qwasar_engine *e, const void *bytes, size_t len,
                                 qwasar_image_input *out, char *err, size_t errcap);
+/* Video from bytes.  AVFoundation reads assets rather than buffers, so this
+ * writes to an unlinked temporary file; see the comment on the definition. */
+bool qwasar_video_encode_memory(qwasar_engine *e, const void *bytes, size_t len,
+                                const char *ext, qwasar_image_input *out,
+                                char *err, size_t errcap);
 void qwasar_image_release(qwasar_image_input *in);
 
 /* Like qwasar_session_eval, but with images to place.  `tokens` must contain

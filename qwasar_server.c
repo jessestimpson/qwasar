@@ -406,18 +406,34 @@ static unsigned char *b64_decode(const char *src, size_t n, size_t *out_len) {
 
 /* Finds the base64 payload of one content block, whichever API shaped it. */
 static bool block_image_data(const qj_doc *d, const qj_node *b,
-                             const char **data, size_t *len) {
+                             const char **data, size_t *len, char *ext, size_t ecap) {
+    if (ext && ecap) ext[0] = 0;
     const qj_node *src = qj_get(d, b, "source");             /* Anthropic */
     const qj_node *n = src ? qj_get(d, src, "data") : NULL;
     if (!n) {                                                /* OpenAI */
         const qj_node *iu = qj_get(d, b, "image_url");
+        if (!iu) iu = qj_get(d, b, "video_url");
         if (iu) n = (iu->type == QJ_STRING) ? iu : qj_get(d, iu, "url");
     }
     if (!n || n->type != QJ_STRING) return false;
     const char *p = d->text + n->u.str.off;
     size_t l = n->u.str.len;
     const void *comma = memchr(p, ',', l);
-    if (comma) { l -= (size_t)((const char *)comma - p) + 1; p = (const char *)comma + 1; }
+    if (comma) {
+        /* "data:video/mp4;base64," -- the subtype is what AVFoundation needs
+         * to pick a demuxer, so it is carried through rather than dropped. */
+        const char *slash = memchr(p, '/', (size_t)((const char *)comma - p));
+        if (slash && ext && ecap) {
+            size_t k = 0;
+            for (const char *q = slash + 1; q < (const char *)comma && k + 1 < ecap; q++) {
+                if (*q == ';') break;
+                ext[k++] = *q;
+            }
+            ext[k] = 0;
+        }
+        l -= (size_t)((const char *)comma - p) + 1;
+        p = (const char *)comma + 1;
+    }
     *data = p;
     *len = l;
     return l > 0;
@@ -426,32 +442,52 @@ static bool block_image_data(const qj_doc *d, const qj_node *b,
 /* Encodes every image in a content array, appending to the request's list.
  * Returns the number of <|image_pad|> tokens the message needs. */
 static int32_t content_images(server *sv, request *r, const qj_doc *d,
-                              const qj_node *n, char *err, size_t cap) {
+                              const qj_node *n, bool *is_video,
+                              char *err, size_t cap) {
     if (!n || n->type != QJ_ARRAY) return 0;
     int32_t tokens = 0;
+    int32_t n_img = 0, n_vid = 0;
     for (const qj_node *b = qj_first(d, n); b; b = qj_next(d, b)) {
         const qj_node *t = qj_get(d, b, "type");
-        if (!qj_str_eq(d, t, "image") && !qj_str_eq(d, t, "image_url")) continue;
+        const bool video = qj_str_eq(d, t, "video") || qj_str_eq(d, t, "video_url");
+        const bool image = qj_str_eq(d, t, "image") || qj_str_eq(d, t, "image_url");
+        if (!video && !image) continue;
+
+        /* One kind per turn.  A message could carry both, but its placeholders
+         * are a single run of one token, so mixing them would silently label
+         * some of them wrongly -- and the model was trained to tell an image
+         * from a video.  Refusing is the honest answer. */
+        if (video) n_vid++; else n_img++;
+        if (n_img > 0 && n_vid > 0) {
+            snprintf(err, cap, "a message may carry images or a video, not both");
+            return -1;
+        }
         if (r->n_images >= QW_MAX_IMAGES) {
             snprintf(err, cap, "at most %d images per request", QW_MAX_IMAGES);
             return -1;
         }
         const char *data = NULL;
         size_t len = 0;
-        if (!block_image_data(d, b, &data, &len)) {
-            snprintf(err, cap, "an image block carries no data");
+        char ext[16] = "";
+        if (!block_image_data(d, b, &data, &len, ext, sizeof ext)) {
+            snprintf(err, cap, "a %s block carries no base64 data",
+                     video ? "video" : "image");
             return -1;
         }
         size_t raw_len = 0;
         unsigned char *raw = b64_decode(data, len, &raw_len);
         if (!raw) { snprintf(err, cap, "out of memory"); return -1; }
-        const bool ok = qwasar_image_encode_memory(sv->e, raw, raw_len,
-                                                   &r->images[r->n_images], err, cap);
+        const bool ok = video
+            ? qwasar_video_encode_memory(sv->e, raw, raw_len, ext,
+                                         &r->images[r->n_images], err, cap)
+            : qwasar_image_encode_memory(sv->e, raw, raw_len,
+                                         &r->images[r->n_images], err, cap);
         free(raw);
         if (!ok) return -1;
         tokens += r->images[r->n_images].n_rows;
         r->n_images++;
     }
+    if (is_video) *is_video = n_vid > 0;
     return tokens;
 }
 
@@ -552,7 +588,8 @@ static bool collect_openai(server *sv, request *r, const qj_doc *d,
         str content = { 0 };
         const qj_node *cnode = qj_get(d, m, "content");
         content_text(d, cnode, &content);
-        const int32_t img_tokens = content_images(sv, r, d, cnode, err, cap);
+        bool is_video = false;
+        const int32_t img_tokens = content_images(sv, r, d, cnode, &is_video, err, cap);
         if (img_tokens < 0) { str_free(&content); return false; }
 
         const char *rname = "user";
@@ -575,6 +612,7 @@ static bool collect_openai(server *sv, request *r, const qj_doc *d,
         r->msgs[r->n].role = rname;
         r->msgs[r->n].content = req_own(r, &content);
         r->msgs[r->n].n_image_tokens = img_tokens;
+        r->msgs[r->n].vision_is_video = is_video;
         r->msgs[r->n].reasoning = reasoning.p ? req_own(r, &reasoning) : NULL;
         str_free(&reasoning);
         r->msgs[r->n].tool_calls = calls.p ? req_own(r, &calls) : NULL;
@@ -654,8 +692,9 @@ static bool collect_anthropic(server *sv, request *r, const qj_doc *d,
 
         /* Only a user turn can carry an image; an assistant turn replaying one
          * would double-count its pad tokens. */
+        bool is_video = false;
         const int32_t img_tokens = assistant ? 0
-                                 : content_images(sv, r, d, content, err, cap);
+                                 : content_images(sv, r, d, content, &is_video, err, cap);
         if (img_tokens < 0) {
             str_free(&text); str_free(&reasoning); str_free(&calls);
             return false;
@@ -664,6 +703,7 @@ static bool collect_anthropic(server *sv, request *r, const qj_doc *d,
         r->msgs[r->n].role = assistant ? "assistant" : (is_tool_result ? "tool" : "user");
         r->msgs[r->n].content = req_own(r, &text);
         r->msgs[r->n].n_image_tokens = img_tokens;
+        r->msgs[r->n].vision_is_video = is_video;
         r->msgs[r->n].reasoning = reasoning.p ? req_own(r, &reasoning) : NULL;
         str_free(&reasoning);
         r->msgs[r->n].tool_calls = calls.p ? req_own(r, &calls) : NULL;
