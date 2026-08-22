@@ -2,6 +2,7 @@
 
 #include "qwasar.h"
 #include "qwasar_gpu.h"
+#include "qwasar_model.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,7 @@ static void usage(FILE *out) {
         "                        default ./qwasar-model, or $QWASAR_MODEL\n"
         "  -c, --context <n>     context size in tokens (default 32768)\n"
         "      --chunk <n>       prefill tokens per forward pass (default 256)\n"
+        "      --image <path>    an image to look at (jpeg, png, bmp, gif)\n"
         "      --mtp <dir>       multi-token-prediction draft head directory\n"
         "      --mtp-depth <n>   drafts per round; default adapts, 0 disables\n"
         "      --spec            decode speculatively; without it, --mtp-depth\n"
@@ -105,6 +107,7 @@ int main(int argc, char **argv) {
     bool thinking = true, show_think = false;
     int n_predict = 512;   /* xhigh reasoning alone often exceeds 128 */
     int mtp_depth = -1;    /* -1 = adaptive, 0 = off, n = fixed */
+    const char *image_path = NULL;
     bool use_spec = false; /* --spec: decode speculatively rather than measure */
 
     for (int i = 1; i < argc; i++) {
@@ -121,6 +124,8 @@ int main(int argc, char **argv) {
             mtp_depth = atoi(argv[++i]);
         } else if (!strcmp(a, "--spec")) {
             use_spec = true;
+        } else if (!strcmp(a, "--image") && i + 1 < argc) {
+            image_path = argv[++i];
         } else if ((!strcmp(a, "-n") || !strcmp(a, "--predict")) && i + 1 < argc) {
             n_predict = atoi(argv[++i]);
         } else if ((!strcmp(a, "-p") || !strcmp(a, "--prompt")) && i + 1 < argc) {
@@ -157,6 +162,23 @@ int main(int argc, char **argv) {
     if (!e) { fprintf(stderr, "qwasar: %s\n", err); return 1; }
     double t_load = now_sec() - t0;
 
+    /* The image is encoded before any text is rendered, because how many
+     * <|image_pad|> tokens the prompt needs is a property of its patch grid. */
+    qw_image img = { 0 };
+    float *img_rows = NULL;
+    int32_t n_img_rows = 0;
+    if (image_path) {
+        if (!qw_image_load(&img, image_path, qwasar_engine_config(e), err, sizeof err)) {
+            fprintf(stderr, "qwasar: %s\n", err);
+            return 1;
+        }
+        double ti = now_sec();
+        img_rows = qwasar_encode_image(e, &img, &n_img_rows, err, sizeof err);
+        if (!img_rows) { fprintf(stderr, "qwasar: %s\n", err); return 1; }
+        fprintf(stderr, "image %dx%d -> %d patches -> %d tokens in %.2fs\n",
+                img.src_w, img.src_h, img.n_patches, n_img_rows, now_sec() - ti);
+    }
+
     if (want_info) {
         qwasar_engine_print_info(e, stdout);
         qwasar_engine_free(e);
@@ -181,7 +203,7 @@ int main(int argc, char **argv) {
         qwasar_message msgs[2];
         int32_t n_msgs = 0;
         if (system_text) msgs[n_msgs++] = (qwasar_message){ "system", system_text, NULL, NULL };
-        msgs[n_msgs++] = (qwasar_message){ "user", prompt_text, NULL, NULL };
+        msgs[n_msgs++] = (qwasar_message){ "user", prompt_text, NULL, NULL, n_img_rows };
         qwasar_chat_options chat = { .enable_thinking = thinking,
                                      .reasoning_effort = effort,
                                      .add_generation_prompt = true };
@@ -212,7 +234,15 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ready in %.2fs | prompt %d tokens\n", t_load, n_prompt);
 
     t0 = now_sec();
-    const float *logits = qwasar_session_eval(s, prompt, n_prompt, err, sizeof err);
+    const float *logits;
+    if (n_img_rows > 0) {
+        const qwasar_image_input in = { img_rows, n_img_rows,
+                                        img.grid_t, img.grid_h, img.grid_w };
+        logits = qwasar_session_eval_images(s, prompt, n_prompt, &in, 1,
+                                            err, sizeof err);
+    } else {
+        logits = qwasar_session_eval(s, prompt, n_prompt, err, sizeof err);
+    }
     if (!logits) { fprintf(stderr, "qwasar: %s\n", err); return 1; }
     double t_prefill = now_sec() - t0;
 

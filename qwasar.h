@@ -81,6 +81,15 @@ typedef struct {
      * control tokens; this field goes through the one that maps them, because
      * it is reconstructed by the server rather than supplied by a user. */
     const char *tool_calls;
+    /* Image placeholders to emit before the content, for a user turn: one
+     * <|vision_start|>, this many <|image_pad|>, one <|vision_end|>.
+     *
+     * Declared here rather than written into `content` on purpose.  The
+     * content encoder does not honour control tokens -- that is what stops a
+     * user's text from injecting them -- so an image has to be stated as
+     * structure, and the count has to match the rows the vision tower
+     * produced. */
+    int32_t     n_image_tokens;
 } qwasar_message;
 
 typedef struct {
@@ -144,6 +153,26 @@ const float *qwasar_session_logits(const qwasar_session *s);
  * Decoding does not report -- its progress is the text appearing. */
 typedef void (*qwasar_progress_fn)(void *ud, int32_t done, int32_t total);
 void qwasar_session_set_progress(qwasar_session *s, qwasar_progress_fn fn, void *ud);
+
+/* ---- images ----------------------------------------------------------------
+ *
+ * An image is encoded once by the vision tower and then handed to a session
+ * alongside the prompt that references it.  Its rows replace the embeddings of
+ * the prompt's <|image_pad|> tokens, and its grid is what makes the three MRoPE
+ * position axes diverge -- text advances all three together, an image gives its
+ * tokens a frame, a row and a column, and the text after it resumes from one
+ * past the largest. */
+typedef struct qwasar_image_input {
+    const float *rows;                /* [n_rows, hidden], from the tower */
+    int32_t      n_rows;
+    int32_t      grid_t, grid_h, grid_w;   /* in patches, before the 2x2 merge */
+} qwasar_image_input;
+
+/* Like qwasar_session_eval, but with images to place.  `tokens` must contain
+ * exactly the pad tokens the grids account for. */
+const float *qwasar_session_eval_images(qwasar_session *s, const int32_t *tokens,
+                                        int32_t n, const qwasar_image_input *im,
+                                        int32_t n_images, char *err, size_t errcap);
 
 /* ---- speculative drafting -------------------------------------------------
  *

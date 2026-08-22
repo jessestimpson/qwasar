@@ -216,10 +216,28 @@ kv cache   64 KB/token (2.00 GB at 32K)
 ssm state  147 MB, constant in context length
 ```
 
+## Images
+
+```
+$ qwasar --image circle.png --no-think -p "Describe this image in one short sentence."
+image 224x224 -> 256 patches -> 64 tokens in 2.1s
+A solid blue circle centered on a white background.
+```
+
+jpeg, png, bmp and gif, loaded with a vendored stb_image, resized to a multiple
+of 32 and cut into patches. The tower is 27 blocks of bf16 with biases,
+LayerNorm and bidirectional attention — a second set of primitives from the
+text model, which is 4-bit, bias-free and RMSNorm throughout.
+
+Checked against mlx-vlm at **rel l2 5.5e-3** on the same patches, which is
+closer to the reference run in fp32 than the reference's own bf16 path is.
+Video is not implemented.
+
 ## Run
 
 ```
 qwasar -p "..."                  # generate
+qwasar --image <path> -p "..."   # with an image
 qwasar -p "..." --show-think     # include the reasoning block
 qwasar -p "..." --no-think       # skip reasoning entirely
 qwasar -s "..." -p "..."         # with a system message
@@ -534,9 +552,6 @@ linenoise.c         vendored line editing (BSD-2, antirez)
 
 Stated plainly, because a README that only lists what works is not much use:
 
-* **Vision.** The tower is parsed, sized, and reported by `--info`, and its
-  weights are loaded, but it is not executed. Image input does nothing yet. This
-  is the largest remaining piece.
 * **Sampling in the CLI.** `qwasar-server` samples with temperature, top-k,
   top-p and min-p; `qwasar` and `qwasar-agent` are still greedy.
 * **`/v1/responses` and `/v1/completions`**, which ds4-server has. They return

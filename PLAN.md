@@ -1019,7 +1019,7 @@ bill for the same hybrid design that makes this model's disk cache cheap.
 and were measured on an M5 against MLX Swift; every one of them has to be
 re-measured here before it is trusted. The kernel facts are qwasar's own.*
 
-### Milestone 4 — vision *(next)*
+### Milestone 4 — vision *(done)*
 
 The tower is 333 tensors, all **bf16 and all with biases**, which is the first
 thing to notice: nothing in the text model is either. So this milestone is not
@@ -1066,6 +1066,44 @@ stored in.
    embeddings at `<|image_pad|>`, and real MRoPE -- image tokens are what finally
    make the three position axes diverge, which is why it could be deferred until
    now.
+
+#### What it does
+
+```
+$ qwasar --image circle.png --no-think -p "Describe this image in one short sentence."
+A solid blue circle centered on a white background.
+```
+
+224x224 becomes a 16x16 patch grid, 256 patches, 64 tokens after the merge, in
+about 2 s. The same prompt without an image answers "A person is sitting on a
+bench in a park, reading a book", which is the control worth keeping: it shows
+the model is reading pixels rather than guessing from the question.
+
+Against mlx-vlm on the same patches the tower is **rel l2 5.5e-3**, and that
+number had to be calibrated before it meant anything. Promoting the reference's
+own weights to fp32 moves its row norms by up to 1.56e-2, and qwasar sits closer
+to that fp32 result (3.6e-3) than the reference's bf16 path does (3.7e-3). So
+the tower is at least as accurate as what it is checked against. The first
+threshold set here was tighter than the reference's own reproducibility --
+exactly the mistake made with the logits tolerance in milestone 1.
+
+#### Two things a tolerance cannot check
+
+Both are wiring, and wiring produces a confident wrong answer rather than a
+wrong number, so both are asserted structurally instead.
+
+**Image tokens are declared, not written.** The tokenizer deliberately does not
+honour control tokens inside message content -- that is what stops user text
+from injecting them -- so a message carries `n_image_tokens` and the template
+expands the pads itself. Smuggling `<|image_pad|>` through the content string
+silently tokenizes as literal text, which was the first thing tried and the
+first thing that failed.
+
+**MRoPE has an exactly known answer**, so it gets an exact test rather than a
+tolerance: a 16x16 grid is 64 tokens that advance position by 8, with the frame
+axis constant and the row and column axes walking the merged grid. The text
+after an image resumes from one past the largest axis, not from one past the
+token count.
 
 #### 2D RoPE, which is not the text model's
 

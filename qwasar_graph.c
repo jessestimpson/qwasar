@@ -117,6 +117,24 @@ struct qwasar_session {
     qwasar_progress_fn progress;
     void              *progress_ud;
 
+    /* ---- images ---------------------------------------------------------
+     *
+     * An image reaches the text model as a run of already-encoded rows that
+     * replace the embeddings of its <|image_pad|> tokens, and as a stretch of
+     * positions where the three MRoPE axes stop agreeing.  Both are prepared
+     * for a whole prompt at once and consumed a chunk at a time, because the
+     * positions of a later chunk depend on every image before it. */
+    qw_buf   img_rows;        /* [total rows, hidden] fp32, all images */
+    int32_t  n_img_rows;
+    int32_t  img_cursor;      /* rows consumed, so a split run resumes right */
+    int32_t *mrope;           /* [3, n] for the attached prompt, or NULL */
+    int32_t  mrope_len;
+    /* Position bookkeeping only matters once an image has been seen.  Until
+     * then all three axes are the token index and n_past is the whole story,
+     * which is why this could be deferred for three milestones. */
+    bool     mrope_active;
+    int32_t  mrope_next;      /* the position a following text token takes */
+
     /* Every token evaluated, in order.  Needed to key a disk checkpoint and to
      * tell how much of an incoming prompt a checkpoint already covers. */
     int32_t *history;
@@ -275,12 +293,13 @@ void qwasar_session_free(qwasar_session *s) {
         &s->mtp_kcache, &s->mtp_vcache, &s->mtp_hidden, &s->mtp_tokens,
         &s->mtp_positions, &s->mtp_embed, &s->mtp_fused, &s->mtp_h,
         &s->mtp_out, &s->mtp_logits,
-        &s->ssm_snap, &s->conv_snap, &s->verify_logits,
+        &s->ssm_snap, &s->conv_snap, &s->verify_logits, &s->img_rows,
     };
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) qw_buf_free(*all[i]);
     qw_buf_free(s->capture);
     free(s->capture_layers);
     free(s->history);
+    free(s->mrope);
     free(s->kind_index);
     free(s);
 }
@@ -706,6 +725,28 @@ static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wa
                    qw_tensor_ref(qwasar_engine_embed(e)->biases),
                    cfg->hidden_size, rows);
 
+    /* Image rows replace what the embedding table produced for the pad tokens.
+     * They arrive in runs, so this copies spans rather than scattering rows --
+     * a chunk boundary can split a run, which is why the source cursor is
+     * carried on the session rather than recomputed here. */
+    if (s->n_img_rows > 0) {
+        const int32_t *tv = qw_buf_contents(s->tokens);
+        int32_t r = 0;
+        while (r < rows) {
+            if (tv[r] != cfg->image_token_id) { r++; continue; }
+            int32_t run = 0;
+            while (r + run < rows && tv[r + run] == cfg->image_token_id) run++;
+            if (s->img_cursor + run > s->n_img_rows) run = s->n_img_rows - s->img_cursor;
+            if (run > 0)
+                qw_op_slice_rows(c, qw_off(s->h, (size_t)r * cfg->hidden_size),
+                                 qw_off(s->img_rows,
+                                        (size_t)s->img_cursor * cfg->hidden_size),
+                                 run, cfg->hidden_size, 0, cfg->hidden_size);
+            s->img_cursor += run;
+            r += run > 0 ? run : 1;
+        }
+    }
+
     for (int32_t i = 0; i < cfg->num_hidden_layers; i++) {
         const qw_layer *L = qwasar_engine_layer(e, i);
 
@@ -1128,6 +1169,121 @@ static bool qw_mtp_flush_owed(qwasar_session *s, char *err, size_t errcap) {
     return true;
 }
 
+/* ---- images ---------------------------------------------------------------
+ *
+ * Two things have to happen for an image, and they are unrelated to each other
+ * except that both are driven by where its <|image_pad|> tokens sit.
+ *
+ * The embeddings are a substitution: the tower has already produced one row per
+ * merged 2x2 block, and those rows replace what the embedding table produced
+ * for the pad tokens.  Nothing else about the forward pass changes.
+ *
+ * The positions are the part that has been deferred since milestone 1.  Text
+ * advances all three MRoPE axes together, which is why treating them as one
+ * counter has been correct until now.  An image does not: its tokens take a
+ * frame index, a row and a column, and the next text token resumes from one
+ * past the largest of the three.  So a prompt containing an image ends at a
+ * lower position than its token count -- a 16x16 grid is 64 tokens but advances
+ * position by 8 -- and every position after it depends on that. */
+
+bool qwasar_session_attach_images(qwasar_session *s, const qwasar_image_input *im,
+                                  int32_t n_images, char *err, size_t errcap) {
+    if (!s) return false;
+    qw_buf_free(s->img_rows);
+    s->img_rows = 0;
+    s->n_img_rows = 0;
+    if (n_images <= 0) return true;
+
+    const int32_t hidden = s->cfg->hidden_size;
+    int32_t total = 0;
+    for (int32_t i = 0; i < n_images; i++) total += im[i].n_rows;
+
+    s->img_rows = qw_buf_alloc((size_t)total * hidden * sizeof(float));
+    if (!s->img_rows) { qw_gerrf(err, errcap, "out of memory for image rows"); return false; }
+    float *dst = qw_buf_contents(s->img_rows);
+    for (int32_t i = 0; i < n_images; i++) {
+        memcpy(dst, im[i].rows, (size_t)im[i].n_rows * hidden * sizeof(float));
+        dst += (size_t)im[i].n_rows * hidden;
+    }
+    s->n_img_rows = total;
+    s->img_cursor = 0;
+    return true;
+}
+
+/* Position triples for a whole prompt, following the reference's rope index.
+ * Only called when images are attached; without them all three axes are the
+ * running token index and no array is needed. */
+bool qw_mrope_positions(const qw_config *c, const int32_t *tokens, int32_t n,
+                        const qwasar_image_input *im, int32_t n_images,
+                        int32_t start, int32_t *out, int32_t *out_next,
+                        char *err, size_t errcap) {
+    const int32_t merge = c->vis_spatial_merge_size;
+    int32_t pos = start;
+    int32_t at = 0, img = 0;
+
+    while (at < n) {
+        if (img < n_images && tokens[at] == c->image_token_id) {
+            const int32_t gt = im[img].grid_t;
+            const int32_t gh = im[img].grid_h / merge, gw = im[img].grid_w / merge;
+            const int32_t count = gt * gh * gw;
+            if (at + count > n) {
+                qw_gerrf(err, errcap, "image %d needs %d pad tokens, only %d remain",
+                         img, count, n - at);
+                return false;
+            }
+            for (int32_t t = 0; t < gt; t++)
+                for (int32_t y = 0; y < gh; y++)
+                    for (int32_t x = 0; x < gw; x++) {
+                        const int32_t k = at + (t * gh + y) * gw + x;
+                        out[0 * n + k] = pos + t;
+                        out[1 * n + k] = pos + y;
+                        out[2 * n + k] = pos + x;
+                    }
+            int32_t span = gt > gh ? gt : gh;
+            if (gw > span) span = gw;
+            pos += span;
+            at  += count;
+            img++;
+            continue;
+        }
+        for (int a = 0; a < 3; a++) out[a * n + at] = pos;
+        pos++;
+        at++;
+    }
+    *out_next = pos;
+    return true;
+}
+
+static bool qw_build_mrope(qwasar_session *s, const int32_t *tokens, int32_t n,
+                           const qwasar_image_input *im, int32_t n_images,
+                           char *err, size_t errcap) {
+    free(s->mrope);
+    s->mrope = malloc((size_t)3 * n * sizeof *s->mrope);
+    if (!s->mrope) { qw_gerrf(err, errcap, "out of memory"); return false; }
+    s->mrope_len = n;
+
+    /* The prompt starts wherever the session already is; a conversation with
+     * no images before this one counted its tokens one per position. */
+    if (!s->mrope_active) { s->mrope_next = s->n_past; s->mrope_active = true; }
+    return qw_mrope_positions(s->cfg, tokens, n, im, n_images, s->mrope_next,
+                              s->mrope, &s->mrope_next, err, errcap);
+}
+
+const float *qwasar_session_eval_images(qwasar_session *s, const int32_t *tokens,
+                                        int32_t n, const qwasar_image_input *im,
+                                        int32_t n_images, char *err, size_t errcap) {
+    if (n_images > 0) {
+        if (!qwasar_session_attach_images(s, im, n_images, err, errcap)) return NULL;
+        if (!qw_build_mrope(s, tokens, n, im, n_images, err, errcap)) return NULL;
+    }
+    const float *r = qwasar_session_eval(s, tokens, n, err, errcap);
+    /* One prompt's worth: a following decode step is ordinary text again. */
+    free(s->mrope);
+    s->mrope = NULL;
+    s->mrope_len = 0;
+    return r;
+}
+
 const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32_t n,
                                  char *err, size_t errcap) {
     if (!s || !tokens || n <= 0) {
@@ -1161,12 +1317,21 @@ const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32
             }
         }
 
-        /* Text-only positions are identical on all three MRoPE axes; images are
-         * what make them diverge, and that is Milestone 3's business. */
+        /* Text advances all three MRoPE axes together, so the running index is
+         * all three positions.  An image is what makes them diverge, and when
+         * one is attached the whole prompt's triples were computed up front --
+         * a later chunk's positions depend on every image before it. */
         int32_t *pos = qw_buf_contents(s->positions);
+        const bool from_array = s->mrope && done + rows <= s->mrope_len;
+        const int32_t base = s->mrope_active ? s->mrope_next : s->n_past;
         for (int32_t axis = 0; axis < 3; axis++)
             for (int32_t r = 0; r < rows; r++)
-                pos[axis * rows + r] = s->n_past + r;
+                pos[axis * rows + r] = from_array
+                    ? s->mrope[axis * s->mrope_len + done + r]
+                    : base + r;
+        /* The array already accounts for the whole prompt, so only the plain
+         * path advances the counter. */
+        if (!from_array && s->mrope_active) s->mrope_next += rows;
 
         qw_cmd c = qw_cmd_begin();
         if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return NULL; }

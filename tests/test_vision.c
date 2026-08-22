@@ -417,6 +417,63 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* ---- MRoPE ----------------------------------------------------------
+     *
+     * The one part of the image path that is pure index arithmetic, so it has
+     * an exactly known answer rather than a tolerance.  It is also the part
+     * that has been deferred since milestone 1, on the grounds that text
+     * advances all three axes together and only an image makes them differ. */
+    {
+        const int32_t merge = c->vis_spatial_merge_size;
+        const int32_t gh = 16, gw = 16;             /* patches */
+        const int32_t mh = gh / merge, mw = gw / merge;   /* 8 x 8 = 64 tokens */
+        const int32_t n_img = mh * mw;
+        const int32_t pre = 5, post = 4;
+        const int32_t n = pre + n_img + post;
+
+        int32_t *toks = malloc((size_t)n * sizeof *toks);
+        for (int32_t i = 0; i < n; i++) toks[i] = 1000 + i;
+        for (int32_t i = 0; i < n_img; i++) toks[pre + i] = c->image_token_id;
+
+        qwasar_image_input in = { NULL, n_img, 1, gh, gw };
+        int32_t *pos = malloc((size_t)3 * n * sizeof *pos);
+        int32_t next = -1;
+        CHECK(qw_mrope_positions(c, toks, n, &in, 1, 0, pos, &next, err, sizeof err),
+              "mrope: %s", err);
+
+        /* Text before the image: all three axes agree and count up. */
+        for (int32_t i = 0; i < pre; i++)
+            CHECK(pos[i] == i && pos[n + i] == i && pos[2 * n + i] == i,
+                  "text position %d is (%d,%d,%d), expected (%d,%d,%d)",
+                  i, pos[i], pos[n + i], pos[2 * n + i], i, i, i);
+
+        /* The image: frame constant, row and column walking the merged grid,
+         * all offset by where the image starts. */
+        for (int32_t y = 0; y < mh; y++)
+            for (int32_t x = 0; x < mw; x++) {
+                const int32_t k = pre + y * mw + x;
+                CHECK(pos[k] == pre && pos[n + k] == pre + y && pos[2 * n + k] == pre + x,
+                      "image token (%d,%d) is (%d,%d,%d), expected (%d,%d,%d)",
+                      y, x, pos[k], pos[n + k], pos[2 * n + k], pre, pre + y, pre + x);
+            }
+
+        /* And the text after resumes from one past the largest axis, not from
+         * one past the token count.  64 image tokens advance position by 8. */
+        const int32_t resume = pre + mh;
+        for (int32_t i = 0; i < post; i++) {
+            const int32_t k = pre + n_img + i;
+            CHECK(pos[k] == resume + i,
+                  "text after the image is at %d, expected %d", pos[k], resume + i);
+        }
+        CHECK(next == resume + post, "next position is %d, expected %d",
+              next, resume + post);
+        printf("  %-22s %d image tokens advance position by %d\n",
+               "mrope", n_img, mh);
+
+        free(toks);
+        free(pos);
+    }
+
     qwasar_engine_free(e);
     qw_gpu_shutdown();
 

@@ -627,6 +627,7 @@ typedef struct {
     qw_tokvec v;
     bool ok;
     int32_t im_start, im_end, think_open, think_close, tr_open, tr_close;
+    int32_t vision_start, vision_end, image_pad;
 } qw_chat;
 
 static void qw_put_id(qw_chat *c, int32_t id) {
@@ -731,6 +732,11 @@ static bool qw_chat_init(qw_chat *c, const qwasar_tokenizer *t, char *err, size_
     c->think_close = qwasar_token_id(t, "</think>");
     c->tr_open     = qwasar_token_id(t, "<tool_response>");
     c->tr_close    = qwasar_token_id(t, "</tool_response>");
+    /* Absent on a text-only checkpoint, which is fine as long as nothing asks
+     * for image tokens; qw_put_id refuses a negative id. */
+    c->vision_start = qwasar_token_id(t, "<|vision_start|>");
+    c->vision_end   = qwasar_token_id(t, "<|vision_end|>");
+    c->image_pad    = qwasar_token_id(t, "<|image_pad|>");
     if (c->im_start < 0 || c->im_end < 0 || c->think_open < 0 || c->think_close < 0) {
         snprintf(err, errcap, "tokenizer is missing ChatML control tokens");
         return false;
@@ -859,6 +865,16 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
         if (!strcmp(m->role, "user")) {
             qw_put_id(&c, c.im_start);
             qw_put_str(&c, "user\n");
+            /* Images are declared by the caller rather than written into the
+             * content, because the tokenizer deliberately does not honour
+             * control tokens appearing in user text.  The template emits one
+             * <|image_pad|> and the processor expands it; the count is known
+             * here, so it is expanded here. */
+            for (int32_t k = 0; k < m->n_image_tokens; k++) {
+                if (k == 0) qw_put_id(&c, c.vision_start);
+                qw_put_id(&c, c.image_pad);
+                if (k + 1 == m->n_image_tokens) qw_put_id(&c, c.vision_end);
+            }
             qw_put_text(&c, m->content + off, len);
             qw_put_id(&c, c.im_end);
             qw_put_str(&c, "\n");

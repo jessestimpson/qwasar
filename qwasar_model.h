@@ -281,6 +281,15 @@ void qw_verrf(char *err, size_t cap, const char *fmt, ...);
 /* Exposed for tests: the resized dimensions this image would be given. */
 void qw_image_fit(int32_t w, int32_t h, int32_t factor, int32_t *out_w, int32_t *out_h);
 
+/* MRoPE position triples for a prompt: [3, n], axis-major.  Text advances all
+ * three axes together; an image gives its tokens a frame, a row and a column,
+ * and the text after it resumes from one past the largest of the three.
+ * Exposed because it is pure index arithmetic with an exactly known answer. */
+bool qw_mrope_positions(const qw_config *c, const int32_t *tokens, int32_t n,
+                        const struct qwasar_image_input *im, int32_t n_images,
+                        int32_t start, int32_t *out, int32_t *out_next,
+                        char *err, size_t errcap);
+
 /* The vision tower; `present` is false for a text-only checkpoint. */
 const qw_vision  *qwasar_engine_vision(const qwasar_engine *e);
 int32_t qwasar_engine_context_size (const qwasar_engine *e);
