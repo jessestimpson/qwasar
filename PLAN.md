@@ -938,8 +938,53 @@ is the same shape of finding Layr Labs report at their own width 6, from the
 same cause, and it is the argument for the scheduler knowing the width curve
 rather than a constant.
 
-Step 6 is where the multiple grows: an adaptive depth, and the `qmvb` work
-above, which is now the single largest term.
+#### Step 6: the depth adapts
+
+A fixed depth is wrong on one prompt or the other, and measurably so. Costed
+per round on this machine, against a paired serial control:
+
+| depth | prose: tokens/round, rate | primes: tokens/round, rate |
+|---|---|---|
+| 2 | 2.32, 7.63 tok/s | 3.00, 10.34 tok/s |
+| 3 | 2.60, 7.47 tok/s | 3.90, 11.92 tok/s |
+| adaptive | 2.40 (mean depth 2.18) | 3.88 (mean depth 2.94) |
+
+Fixed 3 gives up 2% on prose; fixed 2 gives up 13% on the predictable prompt.
+The rule lands within measurement noise of the better one in both cases without
+being told which it is facing, and the mean depths show it is actually reacting
+rather than averaging.
+
+The rule is expected committed tokens per unit round time, maximised over depth:
+
+* Per-position acceptance as an EMA, alpha 0.15, seeded optimistically at
+  `0.85 * 0.98^i` and capped at 0.95. These are conditional -- position *i* is
+  only an observation when everything before it was accepted -- so they
+  multiply into a reach.
+* A measured price per depth, `QW_DEPTH_COST`, in decode steps: 1.39, 1.58,
+  1.91. Index 0 is a plain decode step at 1.00, and **the step from 0 to 1 is
+  the largest one**, because turning drafting on switches every projection to
+  the batched kernel and starts saving rewind state. That discontinuity is why
+  this beats a constant: a stretch the head keeps getting wrong is genuinely
+  cheaper decoded serially, and the rule will choose that.
+* A cap on the first position from the target's own top-2 logit gap,
+  `sigmoid(margin/2)`. A near-tie is exactly when a draft is about to be wrong,
+  and the target has already computed the evidence. It applies to the first
+  position only: it says nothing about the token after next.
+
+`tests/test_verify` runs the adaptive schedule as one of its depths, which is
+the only case that mixes plain steps in among the rounds -- and therefore the
+only one that exercises flushing head rows a verify left owed. On the prose
+prompt it drops to depth 0 for two thirds of the tokens, and the emitted
+sequence is still identical.
+
+Speedups end to end, against paired serial controls: **1.4x on prose, 2.1x on
+predictable text.** Both are worse on a warm machine, for the reason above.
+
+What is left is not scheduling. Drafting is 17% of a round and would roughly
+halve with a 4-bit head, which is a mechanical change. Beyond that the verify's
+floor is the width-scaling work -- the recurrence stepping four times through
+forty-eight layers -- which is a property of the architecture rather than of
+this code.
 
 *Sources for the measured figures in this section: Layr Labs'
 `qwen-3.8-mtp-challenge` (MIT), kept under `reference/`. The numbers are theirs

@@ -88,6 +88,14 @@ struct qwasar_session {
      * needs token p+1, and after a verify the last of those tokens is the one
      * the verify itself produced -- so the rows the verify could not commit and
      * the row the draft wants are contiguous, with contiguous tokens. */
+    /* Adaptive depth.  `mtp_p[i]` estimates P(draft i accepted | 0..i-1 were),
+     * so these are conditional and multiply into a reach.  `mtp_margin` is the
+     * target's own top-2 logit gap at the boundary, which is evidence about the
+     * very next token that no amount of history has. */
+    double  mtp_p[QWASAR_MAX_DRAFT];
+    double  mtp_margin;
+    bool    mtp_p_seeded;
+
     bool    mtp_after_verify;   /* the owed rows' hidden start at mtp_hidden[1] */
     int32_t mtp_owed;           /* how many of them there are; may be zero */
     int32_t mtp_owed_tokens[QWASAR_MAX_DRAFT + 1];
@@ -772,6 +780,83 @@ static int32_t qw_argmax(const float *v, int32_t n) {
     return best;
 }
 
+/* argmax plus the gap to the runner-up, in one pass.  The gap is what says
+ * whether the target was nearly undecided here, and a near-tie is exactly when
+ * a draft is about to be wrong. */
+static int32_t qw_top2(const float *v, int32_t n, double *margin) {
+    int32_t best = 0;
+    float b = v[0], second = -3.0e38f;
+    for (int32_t i = 1; i < n; i++) {
+        if (v[i] > b) { second = b; b = v[i]; best = i; }
+        else if (v[i] > second) second = v[i];
+    }
+    *margin = (double)b - (double)second;
+    return best;
+}
+
+/* ---- adaptive draft depth --------------------------------------------------
+ *
+ * Cost of one round at each depth, in decode steps, measured on this machine
+ * over 200 tokens of prose against a paired serial control:
+ *
+ *   depth 1  1.39      depth 2  1.58      depth 3  1.91
+ *
+ * Index 0 is not drafting at all, which is a decode step exactly.  The step
+ * from 0 to 1 is much the largest -- turning drafting on switches every
+ * projection from the single-token kernel to the batched one and starts saving
+ * rewind state -- so a round that will not accept its first draft is better off
+ * not asking for one.  That discontinuity is the whole reason this rule beats a
+ * constant.
+ *
+ * These are properties of the kernels, not of the model, and they have to be
+ * re-measured whenever the kernels move.  The comment above QW_QMVB_B says the
+ * same thing about the width curve they come from. */
+static const double QW_DEPTH_COST[QWASAR_MAX_DRAFT + 1] = {
+    1.00, 1.39, 1.58, 1.91, 2.60, 2.90, 3.20, 3.50, 3.80
+};
+
+/* Past depth 3 a verify needs a second batched-matvec block, so the costs above
+ * are extrapolated rather than measured and deliberately pessimistic: the rule
+ * should need convincing to go there. */
+#define QW_DEPTH_MEASURED 3
+
+static void qw_mtp_seed(qwasar_session *s) {
+    if (s->mtp_p_seeded) return;
+    /* Optimistic and decaying, so the first rounds draft rather than spend ten
+     * rounds learning that they could have.  Capped below 1 because uncapped
+     * optimism keeps over-drafting on a prompt that never earns it. */
+    for (int i = 0; i < QWASAR_MAX_DRAFT; i++) {
+        double v = 0.85 * pow(0.98, (double)i);
+        s->mtp_p[i] = v < 0.95 ? v : 0.95;
+    }
+    s->mtp_margin = -1.0;
+    s->mtp_p_seeded = true;
+}
+
+int32_t qwasar_session_draft_depth(qwasar_session *s) {
+    if (!s || !s->mtp_on) return 0;
+    qw_mtp_seed(s);
+
+    /* The top-2 gap caps the first position only: it is evidence about the very
+     * next token, and says nothing about the one after it. */
+    double conf = 1.0;
+    if (s->mtp_margin >= 0.0) conf = 1.0 / (1.0 + exp(-s->mtp_margin / 2.0));
+
+    int32_t best_d = 0;
+    double best_rate = 1.0 / QW_DEPTH_COST[0];
+    double expected = 1.0, reach = 1.0;
+
+    for (int32_t d = 1; d <= QW_DEPTH_MEASURED; d++) {
+        double p = s->mtp_p[d - 1];
+        if (d == 1 && conf < p) p = conf;
+        reach *= p;
+        expected += reach;
+        const double rate = expected / QW_DEPTH_COST[d];
+        if (rate > best_rate) { best_rate = rate; best_d = d; }
+    }
+    return best_d;
+}
+
 bool qwasar_session_has_mtp(const qwasar_session *s) { return s && s->mtp_on; }
 
 int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
@@ -951,7 +1036,16 @@ int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n
      * free: the pass computed it whether or not anything was accepted, which is
      * why even a fully rejected round still advances by one. */
     for (int32_t i = 0; i < j; i++) out[i] = block[i + 1];
-    out[j] = qw_argmax(lg + (size_t)j * vocab, vocab);
+    out[j] = qw_top2(lg + (size_t)j * vocab, vocab, &s->mtp_margin);
+
+    /* Update the acceptance estimates.  Position i was only put to the test if
+     * everything before it was accepted, so only those are observations -- the
+     * rest of the block was never reached and says nothing. */
+    qw_mtp_seed(s);
+    for (int32_t i = 0; i <= j && i < n_draft; i++) {
+        const double hit = (i < j) ? 1.0 : 0.0;
+        s->mtp_p[i] += 0.15 * (hit - s->mtp_p[i]);
+    }
 
     if (j < n_draft) {
         /* Undo the rejected rows.  Attention only reads positions below n_past,

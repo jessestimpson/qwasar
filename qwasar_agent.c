@@ -583,7 +583,7 @@ static bool generate(agent *a, const int32_t *prompt, int32_t n_prompt,
     a->turn_tokens = 0;
     a->interrupted = false;
 
-    const bool spec = a->cfg.mtp_depth > 0 && qwasar_session_has_mtp(a->s);
+    const bool spec = a->cfg.mtp_depth != 0 && qwasar_session_has_mtp(a->s);
     int32_t next = argmax(logits, vocab);
     int i = 0;
 
@@ -607,8 +607,17 @@ static bool generate(agent *a, const int32_t *prompt, int32_t n_prompt,
              * undecided, exactly as an ordinary step would. */
             int32_t blk[1 + QWASAR_MAX_DRAFT], got[1 + QWASAR_MAX_DRAFT];
             blk[0] = next;
-            int32_t nd = qwasar_session_draft(a->s, next, blk + 1,
-                                              a->cfg.mtp_depth, err, errcap);
+            const int32_t want = a->cfg.mtp_depth > 0
+                               ? a->cfg.mtp_depth
+                               : qwasar_session_draft_depth(a->s);
+            if (want == 0) {
+                /* Not worth a round here; take the cheaper plain step. */
+                logits = qwasar_session_eval(a->s, &next, 1, err, errcap);
+                if (!logits) return false;
+                next = argmax(logits, vocab);
+                continue;
+            }
+            int32_t nd = qwasar_session_draft(a->s, next, blk + 1, want, err, errcap);
             if (nd < 0) return false;
             int32_t nc = qwasar_session_verify(a->s, blk, nd + 1, got, err, errcap);
             if (nc < 0) return false;
@@ -851,7 +860,7 @@ static void usage(FILE *out) {
         "      --steps <n>      maximum tool calls per task (default 24)\n"
         "  -n, --predict <n>    maximum tokens per turn (default 8192)\n"
         "      --mtp <dir>      draft head; speculative decoding, about 1.4x\n"
-        "      --mtp-depth <n>  drafts per round (default 3, 0 to disable)\n"
+        "      --mtp-depth <n>  drafts per round; default adapts, 0 disables\n"
         "      --effort <lvl>   reasoning effort: xhigh (default), medium, low\n"
         "      --show-think     print the reasoning block\n"
         "      --no-cache       do not use or write disk checkpoints\n"
@@ -887,7 +896,7 @@ int main(int argc, char **argv) {
      * reasoning block the user never sees, so the truncation arrives with only
      * a few dozen visible tokens on screen.  8192 leaves several turns inside
      * the 32K context. */
-    a.cfg = (agent_cfg){ .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 8192, .mtp_depth = 3 };
+    a.cfg = (agent_cfg){ .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 8192, .mtp_depth = -1 };
     const char *effort = "xhigh";
     const char *workdir = NULL;
     bool interactive = false;
@@ -965,7 +974,7 @@ int main(int argc, char **argv) {
     tui_printf(a.tui, "\x1b[2mloaded in %.1fs  ·  %d tools  ·  %s%s\x1b[0m\n",
                now_sec() - t0, AGENT_N_TOOLS,
                a.cfg.yes ? "not asking before writes" : "asking before writes",
-               spec_on ? "  ·  drafting 3 ahead" : "");
+               spec_on ? "  ·  drafting ahead" : "");
 
     bool fresh = true;   /* the next turn must render the system prompt */
     int rc = 0;

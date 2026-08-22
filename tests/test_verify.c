@@ -74,9 +74,21 @@ static int speculative(qwasar_engine *e, const int32_t *prompt, int32_t n_prompt
         if (qwasar_is_eos(e, next)) break;
         out[n++] = next;
 
+        /* depth 0 asks the session to choose, which includes choosing not to
+         * draft at all -- and a plain step after a verify is its own path: the
+         * head rows that verify left owed have to be flushed before the eval
+         * rather than dropped, or the head's history quietly grows a hole. */
+        int32_t want = depth > 0 ? depth : qwasar_session_draft_depth(s);
+        if (want == 0) {
+            const float *lg = qwasar_session_eval(s, &next, 1, err, sizeof err);
+            if (!lg) { fprintf(stderr, "eval: %s\n", err); qwasar_session_free(s); return -1; }
+            next = argmax(lg, vocab);
+            continue;
+        }
+
         int32_t blk[1 + QWASAR_MAX_DRAFT], got[1 + QWASAR_MAX_DRAFT];
         blk[0] = next;
-        int32_t nd = qwasar_session_draft(s, next, blk + 1, depth, err, sizeof err);
+        int32_t nd = qwasar_session_draft(s, next, blk + 1, want, err, sizeof err);
         if (nd < 0) { fprintf(stderr, "draft: %s\n", err); qwasar_session_free(s); return -1; }
 
         int32_t nc = qwasar_session_verify(s, blk, nd + 1, got, err, sizeof err);
@@ -145,8 +157,10 @@ int main(int argc, char **argv) {
 
         /* Every depth, because each exercises a different rewind: depth 1 can
          * only accept or reject outright, deeper ones have interior boundaries
-         * to land on. */
-        for (int32_t depth = 1; depth <= 4; depth++) {
+         * to land on.  Depth 0 is the adaptive schedule, which mixes plain
+         * steps in among the rounds and is the only case that exercises
+         * flushing owed head rows. */
+        for (int32_t depth = 0; depth <= 4; depth++) {
             int64_t rounds = 0, committed = 0, rejected = 0;
             int n_got = speculative(e, prompt, n_prompt, depth, got, MAX_GEN,
                                     &rounds, &committed, &rejected);
@@ -164,8 +178,10 @@ int main(int argc, char **argv) {
                   first_bad >= 0 ? got[first_bad] : 0,
                   first_bad >= 0 ? want[first_bad] : 0);
 
-            printf("  prompt %zu depth %d: %d tokens identical, %lld rounds, "
-                   "%.2f per round, %lld rewound\n", pi, depth, n_got,
+            printf("  prompt %zu depth %-8s %d tokens identical, %lld rounds, "
+                   "%.2f per round, %lld rewound\n", pi,
+                   depth ? (depth == 1 ? "1:" : depth == 2 ? "2:" : depth == 3 ? "3:" : "4:")
+                         : "adaptive:", n_got,
                    (long long)rounds, rounds ? (double)committed / (double)rounds : 0.0,
                    (long long)rejected);
         }

@@ -375,8 +375,8 @@ qwasar-agent --mtp ./qwasar-mtp        # on by default once the head is given
 ```
 
 Measured over 200 tokens of prose, alternating with a serial control so the two
-share thermal state: **1.3x warm, 1.45x cool**, at 2.60 tokens committed per
-round. The spread is not noise. Speculation trades memory traffic for
+share thermal state: **1.4x on prose and 2.1x on predictable text**, cooler
+being better. The spread is not noise. Speculation trades memory traffic for
 arithmetic — one pass over the weights, four rows of everything else — and
 throttling takes arithmetic away first, so the verify costs 1.45 decode steps on
 a cool machine and 1.70 on a warm one while serial decode barely moves. The head proposes and the target disposes, so this cannot change what
@@ -384,8 +384,20 @@ the model writes, and `tests/test_verify` holds that line exactly: the emitted
 sequence must equal greedy decoding token for token, at every depth, including
 on a prompt where two thirds of the rounds are rewound.
 
-Depth 3 is the useful ceiling. A fourth draft makes the verify five rows wide,
-which needs two batched-matvec blocks and costs twice as much for one more
+**The depth adapts.** How many tokens to draft is chosen per round from the
+acceptance the session has actually seen and a measured price per depth, capped
+by the target's own top-2 logit gap at the boundary — a near-tie is exactly when
+a draft is about to be wrong. It settles around 2.2 on prose and 2.9 on
+predictable text, and it will choose *not* to draft at all on a stretch the head
+keeps getting wrong, because turning drafting on costs a third of a decode step
+before it returns anything.
+
+That beats any constant: fixed depth 2 gives up 13% on predictable text, fixed
+depth 3 gives up 2% on prose. Pass `--mtp-depth <n>` to override, or `0` to
+turn drafting off.
+
+Depth 4 is a hard ceiling regardless. A fourth draft makes the verify five rows
+wide, which needs two batched-matvec blocks and costs twice as much for one more
 token.
 
 Decode holding up across context — 5.71 to 5.21 from 512 to 4096 — is the

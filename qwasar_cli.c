@@ -34,7 +34,7 @@ static void usage(FILE *out) {
         "  -c, --context <n>     context size in tokens (default 32768)\n"
         "      --chunk <n>       prefill tokens per forward pass (default 256)\n"
         "      --mtp <dir>       multi-token-prediction draft head directory\n"
-        "      --mtp-depth <n>   draft this many tokens per round\n"
+        "      --mtp-depth <n>   drafts per round; default adapts, 0 disables\n"
         "      --spec            decode speculatively; without it, --mtp-depth\n"
         "                        only measures what the head would have proposed\n"
         "  -n, --predict <n>     tokens to generate (default 512)\n"
@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
     const char *effort = "xhigh";
     bool thinking = true, show_think = false;
     int n_predict = 512;   /* xhigh reasoning alone often exceeds 128 */
-    int mtp_depth = 0;     /* 0 = no drafting */
+    int mtp_depth = -1;    /* -1 = adaptive, 0 = off, n = fixed */
     bool use_spec = false; /* --spec: decode speculatively rather than measure */
 
     for (int i = 1; i < argc; i++) {
@@ -240,10 +240,11 @@ int main(int argc, char **argv) {
     int32_t n_drafted = 0, draft_at = 0;
     double t_draft = 0.0;
     const bool have_mtp = qwasar_session_has_mtp(s);
-    const bool spec    = use_spec && mtp_depth > 0 && have_mtp;
+    const bool spec    = use_spec && mtp_depth != 0 && have_mtp;
     const bool measure = !use_spec && mtp_depth > 0 && have_mtp;
     if (mtp_depth > 0 && !have_mtp)
         fprintf(stderr, "qwasar: --mtp-depth needs --mtp <dir>\n");
+    int64_t depth_sum = 0;
 
     /* The generation prompt leaves <think> open, so everything up to </think>
      * is reasoning.  Hidden unless asked for, but always consumed. */
@@ -285,8 +286,21 @@ int main(int argc, char **argv) {
              * undecided, exactly as an ordinary step would. */
             int32_t blk[1 + QWASAR_MAX_DRAFT], got[1 + QWASAR_MAX_DRAFT];
             blk[0] = next;
+            const int32_t want = mtp_depth > 0 ? mtp_depth
+                                               : qwasar_session_draft_depth(s);
+            if (want == 0) {
+                /* The head has been wrong often enough that a round would cost
+                 * more than it returns.  A plain step is the cheaper answer. */
+                double t0d = now_sec();
+                logits = qwasar_session_eval(s, &next, 1, err, sizeof err);
+                t_decode += now_sec() - t0d;
+                if (!logits) { fprintf(stderr, "\nqwasar: %s\n", err); return 1; }
+                next = argmax(logits, vocab);
+                continue;
+            }
+            depth_sum += want;
             double td = now_sec();
-            int32_t nd = qwasar_session_draft(s, next, blk + 1, mtp_depth,
+            int32_t nd = qwasar_session_draft(s, next, blk + 1, want,
                                               err, sizeof err);
             t_draft += now_sec() - td;
             if (nd < 0) { fprintf(stderr, "\nqwasar: %s\n", err); return 1; }
@@ -318,8 +332,10 @@ int main(int argc, char **argv) {
     printf("\n");
 
     if (spec && rounds > 0)
-        fprintf(stderr, "\nmtp  %lld rounds, %.2f tokens per round, %.1fs drafting\n",
-                (long long)rounds, (double)round_tokens / (double)rounds, t_draft);
+        fprintf(stderr, "\nmtp  %lld rounds, %.2f tokens per round, mean depth %.2f, "
+                        "%.1fs drafting\n", (long long)rounds,
+                (double)round_tokens / (double)rounds,
+                (double)depth_sum / (double)rounds, t_draft);
 
     if (measure && rounds > 0) {
         fprintf(stderr, "\nmtp  %lld rounds, %.2f tokens per round, %.1fs drafting\n",

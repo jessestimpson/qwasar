@@ -186,6 +186,15 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
 int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n_block,
                               int32_t *out, char *err, size_t errcap);
 
+/* How deep to draft the next round, from the acceptance this session has
+ * actually seen and the measured price of a wider verify.  Returns 0 when
+ * drafting is not worth it, which is a real answer: turning it on at all costs
+ * a third of a decode step, so a stretch the head keeps getting wrong is
+ * cheaper decoded serially.
+ *
+ * Updated by qwasar_session_verify, so it needs no bookkeeping from callers. */
+int32_t qwasar_session_draft_depth(qwasar_session *s);
+
 /* ---- sampling ---------------------------------------------------------------
  *
  * Filters apply in a fixed order: temperature, top-k, min-p, top-p.
