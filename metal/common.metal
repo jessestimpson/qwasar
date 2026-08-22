@@ -30,6 +30,24 @@ inline void qw_unpack8(uint w, thread float *out) {
     for (int j = 0; j < 8; ++j) out[j] = float((w >> (4 * j)) & 0xF);
 }
 
+/* Dequantises one packed word into two float4s, holding nibbles 0,2,4,6 and
+ * 1,3,5,7 respectively -- `even[k]` is element 2k and `odd[k]` is element 2k+1.
+ *
+ * This is the whole quantised inner loop's cost, so it is worth the trick.  The
+ * obvious form shifts, masks, converts and scales each nibble separately: four
+ * operations per weight, thirty-two per word.  Masking the low nibble of every
+ * byte instead leaves a value `unpack_unorm4x8_to_float` can convert four at a
+ * time, and the 1/255 it divides by is folded into the caller's scale rather
+ * than undone -- undoing it would reintroduce a rounding question for the sake
+ * of a multiply.  Seven operations per word, for the same arithmetic.
+ *
+ * `scale255` must be the group's scale times 255. */
+inline void qw_unpack8_affine(uint w, float scale255, float bias,
+                              thread float4 *even, thread float4 *odd) {
+    *even = fma(scale255, unpack_unorm4x8_to_float(w & 0x0F0F0F0Fu), bias);
+    *odd  = fma(scale255, unpack_unorm4x8_to_float((w >> 4) & 0x0F0F0F0Fu), bias);
+}
+
 /* Dot product of 8 dequantised weights against 8 activations. */
 inline float qw_qdot8(uint w, float scale, float bias, const thread float *x) {
     float acc = 0.0f;

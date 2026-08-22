@@ -121,9 +121,10 @@ void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
  * Both numbers are measured, and the sweep is worth recording because the
  * plausible reasoning was wrong.  Arithmetic intensity here is 4B FLOP per
  * weight byte against a machine ratio of 37, which says B = 8 should still be
- * bandwidth-bound; it is not, because half the ALU goes on unpacking nibbles
- * rather than on the dot product.  Measured cost per block of B tokens on
- * gate_proj, best of three, against 0.56 ms for one pass over its weights:
+ * bandwidth-bound.  It was not, and the reason was that half the ALU went on
+ * unpacking nibbles rather than on the dot product.  Measured cost per block of
+ * B tokens on gate_proj, best of three, against 0.53 ms for one pass over its
+ * weights:
  *
  *   B=4 ROWS=4  0.85 ms   <- shipped
  *   B=4 ROWS=2  1.13 ms
@@ -131,13 +132,16 @@ void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
  *   B=8 ROWS=4  1.78 ms
  *   B=4 ROWS=8  1.99 ms
  *
- * So B = 4 costs 0.21 ms per token against the single-token kernel's 0.52, and
- * doing 5 and 8 in one block is slower than doing them in two blocks of 4.
+ * Those are from before qw_unpack8_affine cut the unpacking to a seventh of
+ * what it was (metal/common.metal).  B = 4 now costs 0.61 ms, or 82 GB/s
+ * against the single-token kernel's 94 -- close enough to bandwidth that the
+ * shape of the sweep is unlikely to have changed, though only the winner was
+ * re-measured.
  *
- * ROWS is output rows per simdgroup.  ROWS * B accumulators plus ROWS * 8
- * dequantised weights must stay in registers, which is what caps both: the
- * kernel is at 59 GB/s against the 90 GB/s the single-token path reaches, and
- * the remaining gap is ALU, not bandwidth. */
+ * ROWS is output rows per simdgroup; ROWS * B accumulators have to stay in
+ * registers, which is what caps both.  The tiled matmul was tried here too and
+ * loses: at BM = 8 it costs 1.14 ms for the same work, because a narrow token
+ * tile cannot amortise its threadgroup staging. */
 #define QW_QMVB_B    4
 #define QW_QMVB_ROWS 4
 

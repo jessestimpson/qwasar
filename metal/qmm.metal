@@ -46,6 +46,15 @@
 #define QW_QMM_FRAG_M  ((QW_QMM_BM / QW_QMM_SG_M) / QW_SG_TILE)
 #define QW_QMM_FRAG_N  ((QW_QMM_BN / QW_QMM_SG_N) / QW_SG_TILE)
 
+/* The pool is the operand tiles during the K loop and the output tile after
+ * it, so it has to hold whichever is larger.  Operands are half, so they cost
+ * half a float each.  At BM = BN this is always the output tile, which is why
+ * the size used to be written as BM * BN -- but a narrow token tile inverts it,
+ * and getting that wrong is a threadgroup-memory overrun rather than an error. */
+#define QW_QMM_POOL_HALF (QW_QMM_BK * (QW_QMM_BM + QW_QMM_BN))
+#define QW_QMM_POOL_F    (QW_QMM_POOL_HALF / 2 > QW_QMM_BM * QW_QMM_BN \
+                          ? QW_QMM_POOL_HALF / 2 : QW_QMM_BM * QW_QMM_BN)
+
 kernel void qw_qmm_q4_g64(
     device const uint    *w       [[buffer(0)]],   /* [n, k/8]  packed nibbles */
     device const ushort  *scales  [[buffer(1)]],   /* [n, k/64] bf16 */
@@ -66,7 +75,7 @@ kernel void qw_qmm_q4_g64(
      * where this kernel spends its time.  The matrix units themselves are not
      * meaningfully faster for half on this hardware -- measured 16.5 against
      * 15.6 -- so the win is bandwidth, not arithmetic. */
-    threadgroup float pool[QW_QMM_BM * QW_QMM_BN];
+    threadgroup float pool[QW_QMM_POOL_F];
     threadgroup half *As = (threadgroup half *)pool;                     /* [BM][BK] */
     threadgroup half *Bs = (threadgroup half *)pool + QW_QMM_BK * QW_QMM_BM;
 

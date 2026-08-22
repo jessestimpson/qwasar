@@ -359,12 +359,30 @@ depth.
 | 2048 | 41.1 t/s | 5.53 t/s |
 | 4096 | 36.4 t/s | 5.21 t/s |
 
-**Decode is at the memory bandwidth roof and will not go much faster on this
-machine.** This is a dense 27B: every decoded token reads every weight. At
+**Serial decode is at the memory bandwidth roof and will not go much faster on
+this machine.** This is a dense 27B: every decoded token reads every weight. At
 ~120 GB/s, 14.95 GB per token is an 8.0 t/s ceiling by arithmetic, not by
 implementation quality. Kernel work here is about reaching 6 rather than sitting
-at 2. If you want interactive speed on this model, the lever is a Pro/Max/Ultra
-machine, not a better kernel.
+at 2.
+
+**Speculative decoding is the way past that roof, and it works.** The model
+ships a one-layer MTP draft head, published separately because merging it breaks
+Python loaders; `./download_model.sh mtp-head` fetches it.
+
+```
+qwasar --mtp ./qwasar-mtp --mtp-depth 3 --spec -p "..."
+```
+
+Measured over 200 tokens of prose, paired against serial on the same machine:
+**6.0 t/s serial, 8.6 t/s speculative — about 1.4x**, at 2.60 tokens committed
+per round. The head proposes and the target disposes, so this cannot change what
+the model writes, and `tests/test_verify` holds that line exactly: the emitted
+sequence must equal greedy decoding token for token, at every depth, including
+on a prompt where two thirds of the rounds are rewound.
+
+Depth 3 is the useful ceiling. A fourth draft makes the verify five rows wide,
+which needs two batched-matvec blocks and costs twice as much for one more
+token.
 
 Decode holding up across context — 5.71 to 5.21 from 512 to 4096 — is the
 hybrid schedule earning its keep. Only 16 layers grow with position.
@@ -505,10 +523,6 @@ Stated plainly, because a README that only lists what works is not much use:
   top-p and min-p; `qwasar` and `qwasar-agent` are still greedy.
 * **`/v1/responses` and `/v1/completions`**, which ds4-server has. They return
   501. So do concurrent requests: qwasar serves one at a time.
-* **Speculative decoding.** The model ships a one-layer MTP draft head, but MLX
-  conversions drop its weights, so this checkpoint has none. They can be pulled
-  from the upstream bf16 repo; this is the next milestone, and the one thing
-  that can push decode past its bandwidth roof.
 * **NFC normalisation** in the tokenizer. A no-op for ASCII and already-normalised
   text; decomposed input would tokenize differently from the reference.
 * **Todo tracking and a `glob` tool** in the agent.

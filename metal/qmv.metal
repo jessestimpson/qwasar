@@ -56,7 +56,13 @@ kernel void qw_qmv_q4_g64(
             const uint  ww = w[(ulong)n * words + wi];
             const float sc = qw_bf16_to_f32(scales[(ulong)n * groups + g]);
             const float bi = qw_bf16_to_f32(biases[(ulong)n * groups + g]);
-            acc[r] += qw_qdot8(ww, sc, bi, xs);
+            float4 ev, od;
+            qw_unpack8_affine(ww, sc * 255.0f, bi, &ev, &od);
+#pragma unroll
+            for (uint k = 0; k < 4; ++k) {
+                acc[r] = fma(ev[k], xs[2 * k],     acc[r]);
+                acc[r] = fma(od[k], xs[2 * k + 1], acc[r]);
+            }
         }
     }
 
@@ -148,33 +154,35 @@ kernel void qw_qmvb_q4_g64(
     for (uint wi = lane; wi < words; wi += 32) {
         const uint g = wi / QW_WORDS_PER_GROUP;
 
-        float wd[QW_QMVB_ROWS][QW_QPER_WORD];
-#pragma unroll
-        for (uint r = 0; r < QW_QMVB_ROWS; ++r) {
-            const uint  n  = min(row0 + r, a.n - 1);
-            const uint  ww = w[(ulong)n * words + wi];
-            const float sc = qw_bf16_to_f32(scales[(ulong)n * groups + g]);
-            const float bi = qw_bf16_to_f32(biases[(ulong)n * groups + g]);
-#pragma unroll
-            for (uint j = 0; j < QW_QPER_WORD; ++j)
-                wd[r][j] = fma(sc, float((ww >> (4 * j)) & 0xF), bi);
-        }
-
+        /* Activations first, held across every output row: a token's eight
+         * values are read once and spent against all of them. */
+        float xs[QW_QMVB_B][QW_QPER_WORD];
 #pragma unroll
         for (uint b = 0; b < QW_QMVB_B; ++b) {
             /* A dead token lane re-reads a live token's activations, which is a
              * cache hit, and computes a real dot product that is thrown away. */
             device const float *xv = x + (ulong)min(b, a.rows - 1) * a.k
                                        + wi * QW_QPER_WORD;
-            float xs[QW_QPER_WORD];
 #pragma unroll
-            for (uint j = 0; j < QW_QPER_WORD; ++j) xs[j] = xv[j];
+            for (uint j = 0; j < QW_QPER_WORD; ++j) xs[b][j] = xv[j];
+        }
 
 #pragma unroll
-            for (uint r = 0; r < QW_QMVB_ROWS; ++r)
+        for (uint r = 0; r < QW_QMVB_ROWS; ++r) {
+            const uint  n  = min(row0 + r, a.n - 1);
+            const uint  ww = w[(ulong)n * words + wi];
+            const float sc = qw_bf16_to_f32(scales[(ulong)n * groups + g]);
+            const float bi = qw_bf16_to_f32(biases[(ulong)n * groups + g]);
+            float4 ev, od;
+            qw_unpack8_affine(ww, sc * 255.0f, bi, &ev, &od);
+
 #pragma unroll
-                for (uint j = 0; j < QW_QPER_WORD; ++j)
-                    acc[r][b] = fma(wd[r][j], xs[j], acc[r][b]);
+            for (uint b = 0; b < QW_QMVB_B; ++b)
+#pragma unroll
+                for (uint k = 0; k < 4; ++k) {
+                    acc[r][b] = fma(ev[k], xs[b][2 * k],     acc[r][b]);
+                    acc[r][b] = fma(od[k], xs[b][2 * k + 1], acc[r][b]);
+                }
         }
     }
 

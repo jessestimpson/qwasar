@@ -883,20 +883,35 @@ lucky drafts.
 
 | | tokens/round | verify | drafting | end to end |
 |---|---|---|---|---|
-| serial | -- | -- | -- | 5.4-5.8 tok/s |
-| depth 2 | 2.32 | 29.5 s | 3.3 s | **6.1 tok/s** |
-| depth 3 | 2.60 | 25.6 s | 4.4 s | 6.7 tok/s |
-| depth 4 | 2.83 | 48.0 s | 5.5 s | 3.7 tok/s |
+| serial | -- | -- | -- | 6.0 tok/s |
+| depth 2 | 2.32 | 21.0 s | 3.0 s | 8.4 tok/s |
+| depth 3 | 2.60 | 19.4 s | 4.0 s | **8.6 tok/s** |
 
-So **about 1.2x**, and the reason it is not more is already written down in
-§3.5: the verify pass costs 1.5 decode steps, not the ~1.05 the weight traffic
-allows, because `qmvb` runs at 59 GB/s against the single-token kernel's 90.
-A verify of three rows measures 288 ms against a 178 ms decode step, which is
-1.52x -- exactly the kernel's own ratio. Closing that gap turns 1.2x into about
-1.8x without touching anything in this milestone.
+**About 1.4x**, and serial itself got faster on the way -- 5.8 to 6.0 -- because
+what was holding the verify back was holding decode back too.
+
+The first measurement of this was 1.2x, with a verify costing 1.52 decode steps
+against the ~1.05 its weight traffic allows. That gap was `qmvb` running at 59
+GB/s against the single-token kernel's 90, and the cause was nibble unpacking:
+four operations per weight against eight fused multiply-adds of actual work.
+`qw_unpack8_affine` masks the low nibble of every byte so
+`unpack_unorm4x8_to_float` can convert four at a time, and folds the 1/255 into
+the scale rather than undoing it -- seven operations per word instead of
+thirty-two. `qmvb` went to 82 GB/s and a width-4 verify from 1.52 decode steps
+to 1.15.
+
+It is the same arithmetic: the per-op error floor is unchanged at 1e-8,
+end-to-end logits moved 4.777e-2 to 4.776e-2 against the reference, and top-5
+order and the token-identity gate both hold.
+
+What remains is not the kernel. Drafting is 17% of a round, and two things
+would cut it: quantising the head to 4-bit, which is a published artifact
+rather than a research question, and folding the history upkeep into the first
+draft's rows so the head's weights are read once per round instead of twice.
 
 **Depth 4 is a cliff, and a predicted one.** Verify width 5 needs two `QW_QMVB_B`
-blocks, so the pass costs twice what width 4 costs. The batched matvec's block
+blocks, so the pass costs twice what width 4 costs -- measured at 3.7 tok/s
+before the unpacking work, against depth 3's 6.7. The batched matvec's block
 size is therefore a hard cap on useful draft depth, at `QW_QMVB_B - 1 = 3`. This
 is the same shape of finding Layr Labs report at their own width 6, from the
 same cause, and it is the argument for the scheduler knowing the width curve
