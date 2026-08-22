@@ -80,7 +80,7 @@ QWASAR_TEST_MODEL ?= $(HOME)/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX
 QWASAR_TEST_MTP ?= $(HOME)/.cache/qwasar/mtp/Qwen3.8-27B-MTP-bf16
 
 TESTS := tests/test_json tests/test_toolcall tests/test_sample tests/test_tokenizer tests/test_qmv tests/test_ops \
-         tests/test_gdn tests/test_attn tests/test_kvstore tests/test_mtp tests/test_verify tests/test_forward
+         tests/test_gdn tests/test_attn tests/test_kvstore tests/test_mtp tests/test_verify tests/test_vision tests/test_forward
 
 tests/test_json: tests/test_json.c qwasar_json.o qwasar_json.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_json.c qwasar_json.o $(LDLIBS)
@@ -90,6 +90,9 @@ tests/test_qmv: tests/test_qmv.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model
 
 tests/test_verify: tests/test_verify.c $(CORE_OBJS) qwasar.h qwasar_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_verify.c $(CORE_OBJS) $(LDLIBS)
+
+tests/test_vision: tests/test_vision.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_vision.c $(CORE_OBJS) $(LDLIBS)
 
 tests/test_mtp: tests/test_mtp.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_mtp.c $(CORE_OBJS) $(LDLIBS)

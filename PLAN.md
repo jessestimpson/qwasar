@@ -1019,12 +1019,61 @@ bill for the same hybrid design that makes this model's disk cache cheap.
 and were measured on an M5 against MLX Swift; every one of them has to be
 re-measured here before it is trusted. The kernel facts are qwasar's own.*
 
-### Milestone 4 — vision
+### Milestone 4 — vision *(next)*
 
-Patch embedding, the 27-block SigLIP-style tower with 2D RoPE, spatial-merge
-merger, `<|image_pad|>` scatter into the token embeddings, and — only now
-necessary — **real MRoPE**, since image tokens are what make the three position
-axes diverge. Image loading in C (stb_image, vendored).
+The tower is 333 tensors, all **bf16 and all with biases**, which is the first
+thing to notice: nothing in the text model is either. So this milestone is not
+mostly about vision, it is about a second set of primitives -- LayerNorm rather
+than RMSNorm, dense matmuls with a bias, tanh-GELU, and bidirectional attention
+over a few thousand patches rather than causal attention over a cache.
+
+Read off the weights rather than the docs:
+
+| | |
+|---|---|
+| `patch_embed.proj.weight` | [1152, 2, 16, 16, 3] -- a patch is 2 frames x 16x16 x 3, flattened to 1536 |
+| `pos_embed.weight` | [2304, 1152] -- a learned 48x48 grid, bilinearly interpolated to the image's |
+| 27 x `blocks.N` | `norm1`, `attn.qkv` [3456, 1152], `attn.proj`, `norm2`, `mlp.linear_fc1` [4304, 1152], `mlp.linear_fc2` |
+| `merger` | `norm` [1152], `linear_fc1` [4608, 4608], `linear_fc2` [5120, 4608] |
+
+16 heads of 72, and `deepstack_visual_indexes` is empty, so no deepstack path.
+
+#### The order the patches arrive in
+
+The one detail that will silently produce nonsense. Position embeddings are
+interpolated in row-major grid order and then permuted into **merge-block
+order** -- `(t, h/2, 2, w/2, 2, D)` transposed to put the 2x2 block's four
+patches next to each other -- before being added to the patch embeddings. So
+every token from the patch embedding on lives in merge-block order, which is
+also what makes the merger's reshape to 4608 a contiguous view rather than a
+gather. The preprocessing has to emit patches in that order, and within a patch
+the element order is T, H, W, C, because that is the layout the conv weight was
+stored in.
+
+#### Stages, each with something that can be checked
+
+1. **Config, binding, shapes.** Every tensor asserted against the config's own
+   dimensions at load, the way the MTP head is. Cheap, and it is what catches a
+   checkpoint that is not the one this code was written for.
+2. **Preprocess and embed.** Image loading (stb_image, vendored), resize to a
+   multiple of 32, normalise to [-1, 1], patchify in merge-block order, then the
+   patch projection and the interpolated position embedding. Checked against a
+   golden vector from mlx-vlm, because the patch order is exactly the kind of
+   thing that is wrong in a way arithmetic tolerances do not reveal.
+3. **The tower.** LayerNorm, tanh-GELU, 2D RoPE, bidirectional attention. Each
+   op against a CPU twin, then the 27 blocks against the reference.
+4. **Merger, scatter, MRoPE.** The 2x2 merge into 5120, scattering into the text
+   embeddings at `<|image_pad|>`, and real MRoPE -- image tokens are what finally
+   make the three position axes diverge, which is why it could be deferred until
+   now.
+
+#### 2D RoPE, which is not the text model's
+
+Half-split rather than interleaved, and unrelated to the partial multimodal RoPE
+the text side uses. The frequency table is 18 entries over `head_dim/2`; a
+token's angles are its row's 18 followed by its column's 18, tiled to 72, and
+applied with `rotate_half`. Sharing code with `qw_op_rope_partial` would be a
+mistake -- the two agree on nothing but the name.
 
 ### Milestone 5 — performance
 

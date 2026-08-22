@@ -13,6 +13,7 @@
 
 #define QW_MAX_LAYERS      128
 #define QW_MAX_VIS_BLOCKS   64
+#define QW_MAX_VIS_BLOCKS   64
 #define QW_MAX_SHARDS       16
 #define QW_MAX_DIMS          6
 
@@ -61,9 +62,17 @@ typedef struct {
  * measured (PLAN.md section 5, milestone 3). */
 typedef struct {
     const qw_tensor *weight;    /* BF16 [out_features, in_features] */
+    const qw_tensor *bias;      /* BF16 [out_features], or NULL */
     int32_t in_features;
     int32_t out_features;
 } qw_dense;
+
+/* LayerNorm, which scales and shifts.  The text model has none of these -- it
+ * is RMSNorm throughout -- and the vision tower has nothing else. */
+typedef struct {
+    const qw_tensor *weight;
+    const qw_tensor *bias;
+} qw_lnorm;
 
 typedef struct {
     bool is_linear_attn;   /* gated delta if true, full attention otherwise */
@@ -128,6 +137,35 @@ typedef struct {
      * config.json carries it.  Verify width is one more than this. */
     int32_t block_size;
 } qw_mtp;
+
+/* One block of the vision tower: pre-norm attention, pre-norm MLP, both
+ * residual.  Attention is bidirectional over the image's patches, so there is
+ * no cache and no mask -- the closest thing in the text model is prefill, and
+ * even that is causal. */
+typedef struct {
+    qw_lnorm  norm1, norm2;
+    qw_dense  qkv;              /* [3 * hidden, hidden], q|k|v concatenated */
+    qw_dense  proj;
+    qw_dense  fc1, fc2;         /* tanh-GELU between them */
+} qw_vis_block;
+
+typedef struct {
+    bool present;
+
+    /* A patch is temporal_patch_size x patch x patch x channels, flattened in
+     * that order because that is how the conv weight was stored. */
+    qw_dense  patch_embed;
+    const qw_tensor *pos_embed;   /* BF16 [grid_side^2, hidden], interpolated */
+    int32_t   grid_side;
+
+    qw_vis_block blocks[QW_MAX_VIS_BLOCKS];
+
+    /* The merger takes a 2x2 block of patches -- contiguous, because the token
+     * order is merge-block order from the patch embedding on -- and projects
+     * the concatenation into the text model's width. */
+    qw_lnorm  merger_norm;
+    qw_dense  merger_fc1, merger_fc2;
+} qw_vision;
 
 typedef struct {
     /* text */
@@ -219,6 +257,9 @@ const qw_tensor  *qwasar_engine_final_norm(const qwasar_engine *e);
 
 /* The MTP draft head; `present` is false unless --mtp named a head directory. */
 const qw_mtp     *qwasar_engine_mtp(const qwasar_engine *e);
+
+/* The vision tower; `present` is false for a text-only checkpoint. */
+const qw_vision  *qwasar_engine_vision(const qwasar_engine *e);
 int32_t qwasar_engine_context_size (const qwasar_engine *e);
 int32_t qwasar_engine_prefill_chunk(const qwasar_engine *e);
 

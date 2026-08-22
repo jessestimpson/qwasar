@@ -234,6 +234,7 @@ struct qwasar_engine {
     qw_qlinear embed_tokens, lm_head;
     const qw_tensor *final_norm;
     qw_mtp    mtp;
+    qw_vision vision;
 
     size_t weight_bytes;       /* total bytes of bound tensors */
     size_t weight_bytes_text;
@@ -854,6 +855,144 @@ static bool qw_load_mtp(qwasar_engine *e, const char *dir, char *err, size_t err
     return true;
 }
 
+/* ---- vision tower ---------------------------------------------------------
+ *
+ * Bound whenever the checkpoint has one, whether or not an image is ever
+ * passed: it costs pointer arithmetic, and the shape assertions are what catch
+ * a checkpoint this code was not written against.  The tensors themselves are
+ * already mapped and stay untouched until something asks for them.
+ *
+ * Everything here is bf16 with a bias, which is true of nothing in the text
+ * model.  The binder therefore duplicates rather than shares qw_bind_qlinear:
+ * the two formats have no overlap beyond both being weights. */
+
+/* Total elements, whatever the rank.  The patch projection is stored as the
+ * 5-D convolution kernel it was trained as, [out, T, H, W, C], and is used here
+ * as the [out, T*H*W*C] matrix it is equivalent to. */
+static int64_t qw_tensor_elems(const qw_tensor *t) {
+    int64_t n = 1;
+    for (int i = 0; i < t->ndim; i++) n *= t->shape[i];
+    return n;
+}
+
+static bool qw_bind_vdense(qwasar_engine *e, qw_dense *d, const char *fmt, int idx,
+                           int32_t in_features, int32_t out_features, bool want_bias,
+                           char *err, size_t errcap) {
+    char name[256];
+    snprintf(name, sizeof name, fmt, idx);
+    size_t n = strlen(name);
+    snprintf(name + n, sizeof name - n, ".weight");
+    d->weight = qw_table_find(&e->tensors, name);
+    if (!d->weight) { qw_errf(err, errcap, "missing tensor %s", name); return false; }
+    /* Rank is deliberately not checked: the patch projection is stored as the
+     * 5-D convolution kernel it was trained as and used as the equivalent
+     * matrix.  What has to hold is the output width and the element count. */
+    if (d->weight->dtype != QW_DT_BF16 || d->weight->shape[0] != out_features
+        || qw_tensor_elems(d->weight) != (int64_t)out_features * in_features) {
+        qw_errf(err, errcap, "%s is %s [%lld,...] with %lld elements, "
+                "expected bf16 %d x %d", name, qw_dtype_name(d->weight->dtype),
+                (long long)d->weight->shape[0],
+                (long long)qw_tensor_elems(d->weight), out_features, in_features);
+        return false;
+    }
+
+    d->bias = NULL;
+    if (want_bias) {
+        snprintf(name + n, sizeof name - n, ".bias");
+        d->bias = qw_table_find(&e->tensors, name);
+        if (!d->bias || d->bias->ndim != 1 || d->bias->shape[0] != out_features) {
+            qw_errf(err, errcap, "%s missing or not [%d]", name, out_features);
+            return false;
+        }
+    }
+    d->in_features  = in_features;
+    d->out_features = out_features;
+    return true;
+}
+
+static bool qw_bind_lnorm(qwasar_engine *e, qw_lnorm *n, const char *fmt, int idx,
+                          int32_t dim, char *err, size_t errcap) {
+    char name[256];
+    snprintf(name, sizeof name, fmt, idx);
+    size_t l = strlen(name);
+    snprintf(name + l, sizeof name - l, ".weight");
+    n->weight = qw_table_find(&e->tensors, name);
+    snprintf(name + l, sizeof name - l, ".bias");
+    n->bias = qw_table_find(&e->tensors, name);
+    if (!n->weight || !n->bias) {
+        qw_errf(err, errcap, "layer norm %s is missing a weight or a bias", name);
+        return false;
+    }
+    if (n->weight->shape[0] != dim || n->bias->shape[0] != dim) {
+        qw_errf(err, errcap, "layer norm %s is not [%d]", name, dim);
+        return false;
+    }
+    return true;
+}
+
+static bool qw_bind_vision(qwasar_engine *e, char *err, size_t errcap) {
+    const qw_config *c = &e->config;
+    qw_vision *v = &e->vision;
+    if (!c->has_vision) return true;
+
+    if (c->vis_depth > QW_MAX_VIS_BLOCKS) {
+        qw_errf(err, errcap, "vision tower has %d blocks, the limit is %d",
+                c->vis_depth, QW_MAX_VIS_BLOCKS);
+        return false;
+    }
+
+    /* 2304 learned positions is a 48 x 48 grid, and the interpolation below
+     * assumes it is square.  Check rather than assume. */
+    int32_t side = 1;
+    while (side * side < c->vis_num_position_embeddings) side++;
+    if (side * side != c->vis_num_position_embeddings) {
+        qw_errf(err, errcap, "%d position embeddings is not a square grid",
+                c->vis_num_position_embeddings);
+        return false;
+    }
+    v->grid_side = side;
+
+    const int32_t h = c->vis_hidden_size;
+    const int32_t patch = c->vis_temporal_patch_size * c->vis_patch_size
+                        * c->vis_patch_size * c->vis_in_channels;
+    const int32_t merged = h * c->vis_spatial_merge_size * c->vis_spatial_merge_size;
+
+    if (!qw_bind_vdense(e, &v->patch_embed, "vision_tower.patch_embed.proj", 0,
+                        patch, h, true, err, errcap))
+        return false;
+
+    v->pos_embed = qw_table_find(&e->tensors, "vision_tower.pos_embed.weight");
+    if (!v->pos_embed || v->pos_embed->ndim != 2
+        || v->pos_embed->shape[0] != c->vis_num_position_embeddings
+        || v->pos_embed->shape[1] != h) {
+        qw_errf(err, errcap, "vision_tower.pos_embed.weight is not [%d,%d]",
+                c->vis_num_position_embeddings, h);
+        return false;
+    }
+
+    for (int32_t i = 0; i < c->vis_depth; i++) {
+        qw_vis_block *b = &v->blocks[i];
+        if (!qw_bind_lnorm(e, &b->norm1, "vision_tower.blocks.%d.norm1", i, h, err, errcap)
+         || !qw_bind_lnorm(e, &b->norm2, "vision_tower.blocks.%d.norm2", i, h, err, errcap)
+         || !qw_bind_vdense(e, &b->qkv,  "vision_tower.blocks.%d.attn.qkv",  i, h, 3 * h, true, err, errcap)
+         || !qw_bind_vdense(e, &b->proj, "vision_tower.blocks.%d.attn.proj", i, h, h, true, err, errcap)
+         || !qw_bind_vdense(e, &b->fc1,  "vision_tower.blocks.%d.mlp.linear_fc1", i, h, c->vis_intermediate_size, true, err, errcap)
+         || !qw_bind_vdense(e, &b->fc2,  "vision_tower.blocks.%d.mlp.linear_fc2", i, c->vis_intermediate_size, h, true, err, errcap))
+            return false;
+    }
+
+    /* The merger normalises a single patch and then projects four of them at
+     * once, so its norm is `hidden` wide while its first linear is four times
+     * that.  Those two disagreeing is what a spatial-merge mistake looks like. */
+    if (!qw_bind_lnorm(e, &v->merger_norm, "vision_tower.merger.norm", 0, h, err, errcap)
+     || !qw_bind_vdense(e, &v->merger_fc1, "vision_tower.merger.linear_fc1", 0, merged, merged, true, err, errcap)
+     || !qw_bind_vdense(e, &v->merger_fc2, "vision_tower.merger.linear_fc2", 0, merged, c->vis_out_hidden_size, true, err, errcap))
+        return false;
+
+    v->present = true;
+    return true;
+}
+
 static bool qw_bind_weights(qwasar_engine *e, char *err, size_t errcap) {
     const qw_config *c = &e->config;
     const qw_shape  *s = &e->shape;
@@ -952,7 +1091,7 @@ static bool qw_bind_weights(qwasar_engine *e, char *err, size_t errcap) {
             e->weight_bytes_vision += e->tensors.v[i].nbytes;
 
     e->weight_bytes = e->weight_bytes_text + e->weight_bytes_vision;
-    return true;
+    return qw_bind_vision(e, err, errcap);
 }
 
 /* ---- finding the model ----------------------------------------------------
@@ -1060,6 +1199,7 @@ const qw_qlinear *qwasar_engine_embed(const qwasar_engine *e) { return &e->embed
 const qw_qlinear *qwasar_engine_head (const qwasar_engine *e) { return &e->lm_head; }
 const qw_tensor  *qwasar_engine_final_norm(const qwasar_engine *e) { return e->final_norm; }
 const qw_mtp     *qwasar_engine_mtp(const qwasar_engine *e) { return &e->mtp; }
+const qw_vision  *qwasar_engine_vision(const qwasar_engine *e) { return &e->vision; }
 int32_t qwasar_engine_context_size (const qwasar_engine *e) { return e->context_size; }
 int32_t qwasar_engine_prefill_chunk(const qwasar_engine *e) { return e->prefill_chunk; }
 
