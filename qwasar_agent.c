@@ -156,6 +156,7 @@ typedef struct {
     bool show_think;
     int  max_steps;
     int  max_tokens;
+    int  mtp_depth;    /* 0 = decode serially */
 } agent_cfg;
 
 /* Mutating tools ask before acting.  A refusal is reported back to the model as
@@ -384,6 +385,7 @@ typedef struct {
     int32_t              ctx_max;
     double               turn_started;
     int32_t              turn_tokens;
+    int64_t              spec_rounds, spec_tokens;
     /* Only the prefill start time is kept; the rate is derived from it. */
     double               prefill_started;
     bool                 interrupted;
@@ -515,6 +517,54 @@ static bool agent_open_session(agent *a, char *err, size_t errcap) {
     return true;
 }
 
+/* What ended the consumption of one token. */
+typedef enum { TAKE_GO, TAKE_EOS, TAKE_CALL, TAKE_OOM } take_result;
+
+/* Accumulates one generated token into the turn and shows it.
+ *
+ * Factored out because the speculative path settles several tokens in a single
+ * pass and every one of them has to be treated exactly as a serially decoded
+ * one would be -- the whole guarantee is that speculation changes nothing but
+ * the number of forward passes. */
+static take_result take_token(agent *a, turn *out, int32_t next,
+                              bool *reasoning, bool *in_call,
+                              int32_t think_close, int32_t call_open) {
+    if (qwasar_is_eos(a->e, next)) { out->hit_eos = true; return TAKE_EOS; }
+    if (!turn_push(out, next)) return TAKE_OOM;
+    a->turn_tokens++;
+    if (*reasoning) out->n_think++;
+
+    size_t len = 0;
+    bool special = false;
+    const char *bytes = qwasar_token_bytes(a->tok, next, &len, &special);
+
+    if (next == think_close) {
+        *reasoning = false;
+        if (a->cfg.show_think) tui_puts(a->tui, "\x1b[0m\n");
+    } else if (bytes && len) {
+        /* The call itself is markup, not prose.  It is still accumulated for
+         * the parser, but echoing it would bury any narration the model wrote
+         * first -- and it is told it may narrate before a call. */
+        if (!*reasoning && next == call_open) *in_call = true;
+        str_add(*reasoning ? &out->think : &out->text, bytes, len);
+        if (!special && !*in_call && (!*reasoning || a->cfg.show_think)) {
+            if (*reasoning && tui_is_tty(a->tui) && out->think.len == len)
+                tui_puts(a->tui, "\x1b[2m");
+            tui_out(a->tui, bytes, len);
+        }
+    }
+
+    status_set(a, *reasoning ? "thinking" : (*in_call ? "calling" : "writing"));
+    tui_tick(a->tui);
+
+    if (!*reasoning && qw_tool_call_complete(out->text.p ? out->text.p : "",
+                                             out->text.len)) {
+        out->has_call = true;
+        return TAKE_CALL;
+    }
+    return TAKE_GO;
+}
+
 static bool generate(agent *a, const int32_t *prompt, int32_t n_prompt,
                      turn *out, char *err, size_t errcap) {
     memset(out, 0, sizeof *out);
@@ -533,8 +583,11 @@ static bool generate(agent *a, const int32_t *prompt, int32_t n_prompt,
     a->turn_tokens = 0;
     a->interrupted = false;
 
+    const bool spec = a->cfg.mtp_depth > 0 && qwasar_session_has_mtp(a->s);
+    int32_t next = argmax(logits, vocab);
     int i = 0;
-    for (; i < a->cfg.max_tokens; i++) {
+
+    while (i < a->cfg.max_tokens) {
         if (tui_interrupted(a->tui)) {
             a->interrupted = true;
             tui_newline(a->tui);
@@ -542,47 +595,47 @@ static bool generate(agent *a, const int32_t *prompt, int32_t n_prompt,
             break;
         }
 
-        int32_t next = argmax(logits, vocab);
-        if (qwasar_is_eos(a->e, next)) { out->hit_eos = true; break; }
-        if (!turn_push(out, next)) { snprintf(err, errcap, "out of memory"); return false; }
-        a->turn_tokens++;
-        if (reasoning) out->n_think++;
+        take_result r = take_token(a, out, next, &reasoning, &in_call,
+                                   think_close, call_open);
+        i++;
+        if (r == TAKE_OOM) { snprintf(err, errcap, "out of memory"); return false; }
+        if (r != TAKE_GO) break;
 
-        size_t len = 0;
-        bool special = false;
-        const char *bytes = qwasar_token_bytes(a->tok, next, &len, &special);
+        if (spec) {
+            /* One pass settles the whole drafted block.  The last committed
+             * token takes the place `next` had: it is the one this round leaves
+             * undecided, exactly as an ordinary step would. */
+            int32_t blk[1 + QWASAR_MAX_DRAFT], got[1 + QWASAR_MAX_DRAFT];
+            blk[0] = next;
+            int32_t nd = qwasar_session_draft(a->s, next, blk + 1,
+                                              a->cfg.mtp_depth, err, errcap);
+            if (nd < 0) return false;
+            int32_t nc = qwasar_session_verify(a->s, blk, nd + 1, got, err, errcap);
+            if (nc < 0) return false;
+            a->spec_rounds++;
+            a->spec_tokens += nc;
 
-        if (next == think_close) {
-            reasoning = false;
-            if (a->cfg.show_think) tui_puts(a->tui, "\x1b[0m\n");
-        } else if (bytes && len) {
-            /* The call itself is markup, not prose.  It is still accumulated
-             * for the parser, but echoing it would bury any narration the model
-             * wrote first -- and it is told it may narrate before a call. */
-            if (!reasoning && next == call_open) in_call = true;
-            str_add(reasoning ? &out->think : &out->text, bytes, len);
-            if (!special && !in_call && (!reasoning || a->cfg.show_think)) {
-                if (reasoning && tui_is_tty(a->tui) && out->think.len == len)
-                    tui_puts(a->tui, "\x1b[2m");
-                tui_out(a->tui, bytes, len);
+            bool stop = false;
+            for (int32_t t = 0; t + 1 < nc && i < a->cfg.max_tokens; t++) {
+                r = take_token(a, out, got[t], &reasoning, &in_call,
+                               think_close, call_open);
+                i++;
+                if (r == TAKE_OOM) { snprintf(err, errcap, "out of memory"); return false; }
+                if (r != TAKE_GO) { stop = true; break; }
             }
-        }
-
-        status_set(a, reasoning ? "thinking" : (in_call ? "calling" : "writing"));
-        tui_tick(a->tui);
-
-        if (!reasoning && qw_tool_call_complete(out->text.p ? out->text.p : "",
-                                                out->text.len)) {
-            out->has_call = true;
-            break;
+            if (stop) break;
+            next = got[nc - 1];
+            continue;
         }
 
         logits = qwasar_session_eval(a->s, &next, 1, err, errcap);
         if (!logits) return false;
+        next = argmax(logits, vocab);
     }
+
     /* Reaching the bound is the one way this loop ends with nothing to show for
      * it, so it is recorded rather than inferred from an empty answer. */
-    out->hit_budget  = (i == a->cfg.max_tokens);
+    out->hit_budget  = (i >= a->cfg.max_tokens);
     out->in_reasoning = reasoning;
     if (tui_is_tty(a->tui)) tui_puts(a->tui, "\x1b[0m");
     return true;
@@ -797,6 +850,8 @@ static void usage(FILE *out) {
         "  -i, --interactive    open the REPL after running the task\n"
         "      --steps <n>      maximum tool calls per task (default 24)\n"
         "  -n, --predict <n>    maximum tokens per turn (default 8192)\n"
+        "      --mtp <dir>      draft head; speculative decoding, about 1.4x\n"
+        "      --mtp-depth <n>  drafts per round (default 3, 0 to disable)\n"
         "      --effort <lvl>   reasoning effort: xhigh (default), medium, low\n"
         "      --show-think     print the reasoning block\n"
         "      --no-cache       do not use or write disk checkpoints\n"
@@ -832,7 +887,7 @@ int main(int argc, char **argv) {
      * reasoning block the user never sees, so the truncation arrives with only
      * a few dozen visible tokens on screen.  8192 leaves several turns inside
      * the 32K context. */
-    a.cfg = (agent_cfg){ .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 8192 };
+    a.cfg = (agent_cfg){ .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 8192, .mtp_depth = 3 };
     const char *effort = "xhigh";
     const char *workdir = NULL;
     bool interactive = false;
@@ -845,6 +900,8 @@ int main(int argc, char **argv) {
         else if ((!strcmp(arg, "-c") || !strcmp(arg, "--context")) && i + 1 < argc) opts.context_size = atoi(argv[++i]);
         else if (!strcmp(arg, "-y") || !strcmp(arg, "--yes")) a.cfg.yes = true;
         else if (!strcmp(arg, "-i") || !strcmp(arg, "--interactive")) interactive = true;
+        else if (!strcmp(arg, "--mtp") && i + 1 < argc) opts.mtp_path = argv[++i];
+        else if (!strcmp(arg, "--mtp-depth") && i + 1 < argc) a.cfg.mtp_depth = atoi(argv[++i]);
         else if (!strcmp(arg, "--steps") && i + 1 < argc) a.cfg.max_steps = atoi(argv[++i]);
         else if ((!strcmp(arg, "-n") || !strcmp(arg, "--predict")) && i + 1 < argc) a.cfg.max_tokens = atoi(argv[++i]);
         else if (!strcmp(arg, "--effort") && i + 1 < argc) effort = argv[++i];
@@ -899,9 +956,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "qwasar-agent: %s\n", err);
         return 1;
     }
-    tui_printf(a.tui, "\x1b[2mloaded in %.1fs  ·  %d tools  ·  %s\x1b[0m\n",
+    /* Speculation is silent about what it does to the output -- nothing -- but
+     * it is not silent about being on, because it changes the memory footprint
+     * and the shape of a stall. */
+    const bool spec_on = a.cfg.mtp_depth > 0 && qwasar_session_has_mtp(a.s);
+    if (opts.mtp_path && !spec_on)
+        tui_printf(a.tui, "\x1b[2mmtp head loaded but drafting is off\x1b[0m\n");
+    tui_printf(a.tui, "\x1b[2mloaded in %.1fs  ·  %d tools  ·  %s%s\x1b[0m\n",
                now_sec() - t0, AGENT_N_TOOLS,
-               a.cfg.yes ? "not asking before writes" : "asking before writes");
+               a.cfg.yes ? "not asking before writes" : "asking before writes",
+               spec_on ? "  ·  drafting 3 ahead" : "");
 
     bool fresh = true;   /* the next turn must render the system prompt */
     int rc = 0;

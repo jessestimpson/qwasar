@@ -881,14 +881,21 @@ lucky drafts.
 
 200 tokens of prose, paired against serial on the same machine:
 
-| | tokens/round | verify | drafting | end to end |
-|---|---|---|---|---|
-| serial | -- | -- | -- | 6.0 tok/s |
-| depth 2 | 2.32 | 21.0 s | 3.0 s | 8.4 tok/s |
-| depth 3 | 2.60 | 19.4 s | 4.0 s | **8.6 tok/s** |
+200 tokens of prose, alternating with a serial control so the two share thermal
+state:
 
-**About 1.4x**, and serial itself got faster on the way -- 5.8 to 6.0 -- because
-what was holding the verify back was holding decode back too.
+| pair | serial | speculative (depth 3) | ratio |
+|---|---|---|---|
+| 1 | 5.95 tok/s | 7.70 tok/s | 1.29x |
+| 2 | 5.48 | 7.03 | 1.28x |
+| 3 | 5.19 | 6.97 | 1.34x |
+
+**About 1.3x.** The serial control falling 5.95 to 5.19 across three pairs is
+worth noticing on its own: §2's 1.4% thermal drift was measured on a fresh
+machine, and this one had been benchmarking for an hour. An unpaired
+measurement earlier in the same session read 1.42x, and that number was
+flattered by exactly this -- which is the argument for pairing, not for the
+higher number.
 
 The first measurement of this was 1.2x, with a verify costing 1.52 decode steps
 against the ~1.05 its weight traffic allows. That gap was `qmvb` running at 59

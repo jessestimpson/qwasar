@@ -371,11 +371,15 @@ Python loaders; `./download_model.sh mtp-head` fetches it.
 
 ```
 qwasar --mtp ./qwasar-mtp --mtp-depth 3 --spec -p "..."
+qwasar-agent --mtp ./qwasar-mtp        # on by default once the head is given
 ```
 
-Measured over 200 tokens of prose, paired against serial on the same machine:
-**6.0 t/s serial, 8.6 t/s speculative — about 1.4x**, at 2.60 tokens committed
-per round. The head proposes and the target disposes, so this cannot change what
+Measured over 200 tokens of prose, alternating with a serial control so the two
+share thermal state: **about 1.3x**, at 2.60 tokens committed per round. Three
+pairs gave 1.29x, 1.28x, 1.34x, over a serial control that itself fell from 5.95
+to 5.19 t/s across them — this machine drifts more than the 1.4% above once it
+has been working for a while, which is why the ratio is quoted and the absolute
+numbers are not. The head proposes and the target disposes, so this cannot change what
 the model writes, and `tests/test_verify` holds that line exactly: the emitted
 sequence must equal greedy decoding token for token, at every depth, including
 on a prompt where two thirds of the rounds are rewound.

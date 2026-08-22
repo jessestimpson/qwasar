@@ -81,7 +81,16 @@ struct qwasar_session {
     int32_t n_snap;
     qw_buf  ssm_snap, conv_snap, verify_logits;
     int32_t snap_capacity;   /* rows the snapshot buffers were sized for */
-    bool    mtp_defer;       /* a verify runs the head upkeep itself, after */
+    bool    mtp_defer;       /* a verify hands its head upkeep to the next draft */
+
+    /* Committed head rows a verify left owed, carried to the next draft so the
+     * two become one pass over the head's weights instead of two.  Head row p
+     * needs token p+1, and after a verify the last of those tokens is the one
+     * the verify itself produced -- so the rows the verify could not commit and
+     * the row the draft wants are contiguous, with contiguous tokens. */
+    bool    mtp_after_verify;   /* the owed rows' hidden start at mtp_hidden[1] */
+    int32_t mtp_owed;           /* how many of them there are; may be zero */
+    int32_t mtp_owed_tokens[QWASAR_MAX_DRAFT + 1];
 
     bool    mtp_on;
     qw_buf  mtp_kcache, mtp_vcache;   /* [kv_heads, max_ctx, head_dim] fp16 */
@@ -769,27 +778,44 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
                              int32_t *drafts, int32_t n_draft,
                              char *err, size_t errcap) {
     if (!s || !s->mtp_on) { qw_gerrf(err, errcap, "no MTP draft head"); return -1; }
-    if (!s->mtp_pending)  { qw_gerrf(err, errcap, "nothing to draft from"); return -1; }
+    if (!s->mtp_pending && !s->mtp_after_verify) {
+        qw_gerrf(err, errcap, "nothing to draft from");
+        return -1;
+    }
     if (n_draft < 1) return 0;
     if (n_draft > QWASAR_MAX_DRAFT) n_draft = QWASAR_MAX_DRAFT;
 
     const qw_config  *cfg   = s->cfg;
     const qw_qlinear *embed = qwasar_engine_embed(s->e);
 
-    /* The first row completes the pending position and is therefore committed:
-     * both of its inputs -- the backbone's hidden state and the token just
-     * emitted -- are real.  Every row after it is built on a token the head
-     * only guessed, so those rows are speculative and are dropped at the end by
-     * rewinding the write cursor. */
-    const int32_t committed = s->mtp_n_past + 1;
+    /* Rows a verify left owed go in front of the first draft: same weights, one
+     * pass instead of two.  They are contiguous with it by construction -- the
+     * verify's own hidden states, and tokens the verify confirmed -- so the
+     * whole thing is one run of rows starting at mtp_hidden row 1.  Without a
+     * verify in front there is nothing owed and the draft reads the pending
+     * slot, row 0, as it always did. */
+    const bool    after_verify = s->mtp_after_verify;
+    const int32_t lead  = after_verify ? s->mtp_owed : 0;
+    const int32_t first = after_verify ? 1 : 0;
+    s->mtp_after_verify = false;
+    s->mtp_owed = 0;
+
+    /* The first drafted row completes the pending position and is therefore
+     * committed too: both of its inputs -- the backbone's hidden state and the
+     * token just emitted -- are real.  Every row after it is built on a token
+     * the head only guessed, so those are speculative and are dropped at the
+     * end by rewinding the write cursor. */
+    const int32_t committed = s->mtp_n_past + lead + 1;
     int32_t token  = emitted;
-    qw_ref  hidden = qw_ref_at(s->mtp_hidden, 0);
+    qw_ref  hidden = qw_off(s->mtp_hidden, (size_t)first * cfg->hidden_size);
     int32_t n = 0;
 
     for (; n < n_draft; n++) {
+        const int32_t rows = (n == 0) ? lead + 1 : 1;
         int32_t *tv = qw_buf_contents(s->mtp_tokens);
-        tv[0] = token;
-        qw_mtp_positions(s, s->mtp_n_past, 1);
+        for (int32_t i = 0; i < lead && n == 0; i++) tv[i] = s->mtp_owed_tokens[i];
+        tv[rows - 1] = token;
+        qw_mtp_positions(s, s->mtp_n_past, rows);
 
         /* A round trip per draft, because the next row needs this row's token
          * id on the CPU to look up its embedding.  Chaining the whole block in
@@ -800,10 +826,21 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
         if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return -1; }
         qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_ref_at(s->mtp_tokens, 0),
                        qw_tensor_ref(embed->weight), qw_tensor_ref(embed->scales),
-                       qw_tensor_ref(embed->biases), cfg->hidden_size, 1);
-        qw_encode_mtp_rows(s, c, hidden, 1);
+                       qw_tensor_ref(embed->biases), cfg->hidden_size, rows);
+        qw_encode_mtp_rows(s, c, hidden, rows);
+        /* The pending slot has to end up holding the last CONFIRMED hidden
+         * state, which is the one the drafted row was built from.  It is
+         * refilled after the rows above have read it, not before -- row 0 is
+         * both the first owed row's input and the slot being overwritten. */
+        if (n == 0 && after_verify)
+            qw_op_slice_rows(c, qw_ref_at(s->mtp_hidden, 0),
+                             qw_off(s->mtp_hidden,
+                                    (size_t)(first + rows - 1) * cfg->hidden_size),
+                             1, cfg->hidden_size, 0, cfg->hidden_size);
+        /* Only the last row is a proposal; the ones in front of it are history
+         * being caught up, and their outputs go nowhere. */
         qw_encode_qlinear(c, qwasar_engine_head(s->e), qw_ref_at(s->mtp_logits, 0),
-                          qw_ref_at(s->mtp_out, 0), 1);
+                          qw_off(s->mtp_out, (size_t)(rows - 1) * cfg->hidden_size), 1);
         qw_cmd_wait(c);
         const char *cerr = qw_cmd_error(c);
         if (cerr) {
@@ -813,12 +850,15 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
         }
         qw_cmd_free(c);
 
-        s->mtp_n_past++;
-        if (n == 0) s->mtp_pending = false;
+        s->mtp_n_past += rows;
+        /* Row 0 was just refilled when there were owed rows, so it still holds
+         * a hidden state waiting for its token.  Without them nothing refills
+         * it, and the next eval's upkeep is what will. */
+        if (n == 0) s->mtp_pending = after_verify;
 
         token = qw_argmax(qw_buf_contents(s->mtp_logits), cfg->vocab_size);
         drafts[n] = token;
-        hidden = qw_ref_at(s->mtp_out, 0);
+        hidden = qw_off(s->mtp_out, (size_t)(rows - 1) * cfg->hidden_size);
     }
 
     s->mtp_n_past = committed;
@@ -933,18 +973,70 @@ int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n
     s->n_past = base + j + 1;
     if (s->history && s->n_history > s->n_past) s->n_history = s->n_past;
 
-    /* The head's history can only take the confirmed rows, and its own pending
-     * slot has to end up holding the last confirmed hidden state. */
+    /* The head's history can only take the confirmed rows.  Running that here
+     * would be a second pass over the head's weights in the same round, so it
+     * is handed to the next draft instead, which needs a pass anyway and can
+     * put these rows in front of its own. */
     if (s->mtp_on) {
-        qw_cmd h = qw_cmd_begin();
-        if (!h) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return -1; }
-        qw_encode_mtp_upkeep(s, h, j + 1);
-        qw_cmd_wait(h);
-        cerr = qw_cmd_error(h);
-        qw_cmd_free(h);
-        if (cerr) { qw_gerrf(err, errcap, "GPU error: %s", cerr); return -1; }
+        /* Head row p pairs hidden_p with token_{p+1}.  The row for the position
+         * before this block was already committed by the draft that produced
+         * it, so what is owed is the accepted drafts' own rows -- positions
+         * base..base+j-1, taking tokens block[1..j].  Their hidden states are
+         * this pass's, which start at mtp_hidden row 1. */
+        s->mtp_after_verify = true;
+        s->mtp_owed = j;
+        for (int32_t i = 0; i < j; i++) s->mtp_owed_tokens[i] = block[i + 1];
     }
     return j + 1;
+}
+
+/* Commits head rows a verify left owed, when something other than a draft comes
+ * next -- a tool result, a new turn.  Dropping them would leave a hole in the
+ * head's history, which costs acceptance and reports nothing. */
+static bool qw_mtp_flush_owed(qwasar_session *s, char *err, size_t errcap) {
+    if (!s->mtp_on || !s->mtp_after_verify) return true;
+    const qw_config  *cfg   = s->cfg;
+    const qw_qlinear *embed = qwasar_engine_embed(s->e);
+    const int32_t rows = s->mtp_owed;
+    s->mtp_after_verify = false;
+    s->mtp_owed = 0;
+    if (rows == 0) {
+        /* Nothing owed, but the pending slot still holds the state from before
+         * the verify.  What belongs there is the verify's own last confirmed
+         * hidden, which is row 1. */
+        qw_cmd c0 = qw_cmd_begin();
+        if (!c0) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return false; }
+        qw_op_slice_rows(c0, qw_ref_at(s->mtp_hidden, 0),
+                         qw_off(s->mtp_hidden, (size_t)cfg->hidden_size),
+                         1, cfg->hidden_size, 0, cfg->hidden_size);
+        qw_cmd_wait(c0);
+        const char *e0 = qw_cmd_error(c0);
+        qw_cmd_free(c0);
+        if (e0) { qw_gerrf(err, errcap, "GPU error: %s", e0); return false; }
+        s->mtp_pending = true;
+        return true;
+    }
+
+    int32_t *tv = qw_buf_contents(s->mtp_tokens);
+    for (int32_t i = 0; i < rows; i++) tv[i] = s->mtp_owed_tokens[i];
+    qw_mtp_positions(s, s->mtp_n_past, rows);
+
+    qw_cmd c = qw_cmd_begin();
+    if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return false; }
+    qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_ref_at(s->mtp_tokens, 0),
+                   qw_tensor_ref(embed->weight), qw_tensor_ref(embed->scales),
+                   qw_tensor_ref(embed->biases), cfg->hidden_size, rows);
+    qw_encode_mtp_rows(s, c, qw_off(s->mtp_hidden, (size_t)cfg->hidden_size), rows);
+    qw_op_slice_rows(c, qw_ref_at(s->mtp_hidden, 0),
+                     qw_off(s->mtp_hidden, (size_t)(rows + 1) * cfg->hidden_size),
+                     1, cfg->hidden_size, 0, cfg->hidden_size);
+    qw_cmd_wait(c);
+    const char *cerr = qw_cmd_error(c);
+    qw_cmd_free(c);
+    if (cerr) { qw_gerrf(err, errcap, "GPU error: %s", cerr); return false; }
+    s->mtp_n_past += rows;
+    s->mtp_pending = true;
+    return true;
 }
 
 const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32_t n,
@@ -958,6 +1050,7 @@ const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32
                  s->n_past, n, s->max_ctx);
         return NULL;
     }
+    if (!qw_mtp_flush_owed(s, err, errcap)) return NULL;
 
     /* Only worth reporting when there is a prompt to grind through; a
      * single-token decode step would just flicker. */
