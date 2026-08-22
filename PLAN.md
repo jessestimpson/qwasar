@@ -884,18 +884,32 @@ lucky drafts.
 200 tokens of prose, alternating with a serial control so the two share thermal
 state:
 
-| pair | serial | speculative (depth 3) | ratio |
-|---|---|---|---|
-| 1 | 5.95 tok/s | 7.70 tok/s | 1.29x |
-| 2 | 5.48 | 7.03 | 1.28x |
-| 3 | 5.19 | 6.97 | 1.34x |
+| pair | serial | speculative (depth 3) | ratio | verify, in decode steps |
+|---|---|---|---|---|
+| 1 (cool) | 6.13 tok/s | 8.92 tok/s | **1.46x** | 1.45 |
+| 2 | 6.01 | 7.66 | 1.28x | 1.70 |
+| 3 | 5.48 | 7.10 | 1.30x | 1.69 |
 
-**About 1.3x.** The serial control falling 5.95 to 5.19 across three pairs is
-worth noticing on its own: §2's 1.4% thermal drift was measured on a fresh
-machine, and this one had been benchmarking for an hour. An unpaired
-measurement earlier in the same session read 1.42x, and that number was
-flattered by exactly this -- which is the argument for pairing, not for the
-higher number.
+**1.3x on a warm machine, 1.45x on a cool one**, and the spread is not noise:
+the verify costs 1.45 decode steps cool and 1.70 warm, while serial decode moves
+much less. Speculation trades memory traffic for arithmetic -- one pass over the
+weights, four rows of everything else -- and arithmetic is what throttling takes
+away first. So the ALU in the verify path is worth more than its steady-state
+share suggests: it is also the part that evaporates under sustained load.
+
+(An unpaired measurement earlier in the same session read 1.42x. It was
+flattered by measuring serial while cool and speculative while warm, which is
+the argument for pairing rather than for the higher number.)
+
+Where the verify's time goes, measured rather than modelled: **98% of it is
+GPU.** Over 78 rounds, the CPU side is 0.12 s of argmax over the block's logits
+and 0.29 s of rewind across 51 rewinds -- the 144 MB state copy costs 5.7 ms and
+happens on two rounds in three. The remaining gap between 1.45 decode steps and
+the 1.15 the batched matvec alone would cost is everything that scales with
+width rather than with weights: attention reading the cache four times, and the
+recurrence stepping four times through 48 layers. That last one is inherent to
+speculating on a hybrid model, and is the reason a verify here cannot get as
+close to one decode step as it would on a pure-attention architecture.
 
 The first measurement of this was 1.2x, with a verify costing 1.52 decode steps
 against the ~1.05 its weight traffic allows. That gap was `qmvb` running at 59
