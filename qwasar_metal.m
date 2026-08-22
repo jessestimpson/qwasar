@@ -555,8 +555,8 @@ void qw_op_rope_2d(qw_cmd c, qw_ref x, qw_ref angles,
    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 }
 
-void qw_op_vision_attn(qw_cmd c, qw_ref out, qw_ref qkv,
-                       int32_t tokens, int32_t heads, int32_t dim, float scale) {
+void qw_op_vision_attn(qw_cmd c, qw_ref out, qw_ref qkv, int32_t tokens,
+                       int32_t heads, int32_t dim, int32_t segment, float scale) {
     if (!c || !c->enc) return;
     id<MTLComputePipelineState> ps = qw_pipeline(@"qw_vision_attn");
     if (!ps) return;
@@ -564,7 +564,8 @@ void qw_op_vision_attn(qw_cmd c, qw_ref out, qw_ref qkv,
     [enc setComputePipelineState:ps];
     qw_set(enc, qkv, 0);
     qw_set(enc, out, 1);
-    uint32_t args[3] = { (uint32_t)tokens, (uint32_t)heads, (uint32_t)dim };
+    uint32_t args[4] = { (uint32_t)tokens, (uint32_t)heads, (uint32_t)dim,
+                         (uint32_t)segment };
     [enc setBytes:args length:sizeof args atIndex:2];
     [enc setBytes:&scale length:sizeof scale atIndex:3];
     /* One threadgroup per (query, head); the head dim is small, so a single

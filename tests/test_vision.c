@@ -79,6 +79,15 @@ static const float VIS_GOLDEN_NORMS[64] = {
     48.15721f, 17.03474f, 62.36465f, 72.22750f
 };
 
+/* Four synthetic frames through the tower, from mlx-vlm.  Multi-frame input
+ * exercises two things a single image cannot: the position grid and the rope
+ * angles repeating per frame group, and -- the one that actually broke --
+ * attention being confined to a frame rather than spanning the whole clip. */
+static const float VID_GOLDEN_NORMS[8] = {
+    66.63660f, 82.05787f, 78.02918f, 61.70744f,
+    99.64078f, 38.79922f, 122.50375f, 72.80956f
+};
+
 static const float VIS_GOLDEN_ROW0[16] = {
     0.678459f, 0.002669f, 0.031700f, -0.555264f, -1.219867f, -0.302966f,
     0.450130f, 0.235568f, -0.043961f, 0.776728f, -0.630046f, 0.536313f,
@@ -337,12 +346,12 @@ int main(int argc, char **argv) {
 
         qw_cmd c5 = qw_cmd_begin();
         qw_op_vision_attn(c5, qw_ref_at(ob, 0), qw_ref_at(qb, 0),
-                          tokens, heads, hd, 1.0f / sqrtf((float)hd));
+                          tokens, heads, hd, 0, 1.0f / sqrtf((float)hd));
         qw_cmd_wait(c5);
         CHECK(qw_cmd_error(c5) == NULL, "vision attn: %s", qw_cmd_error(c5));
         qw_cmd_free(c5);
         float *aref = malloc((size_t)tokens * dim * sizeof *aref);
-        qw_cpu_vision_attn(aref, qw_buf_contents(qb), tokens, heads, hd,
+        qw_cpu_vision_attn(aref, qw_buf_contents(qb), tokens, heads, hd, 0,
                            1.0f / sqrtf((float)hd));
         compare("vision attention", qw_buf_contents(ob), aref, (size_t)tokens * dim, 5e-6);
 
@@ -417,6 +426,61 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* ---- the tower on several frames -------------------------------------
+     *
+     * The same frames vidtest builds, so the golden above is comparable.  A
+     * video is not a taller image: every frame gets the same position grid and
+     * the same rope angles, and a patch attends only within its own frame. */
+    {
+        const int32_t W = 64, H = 64, N = 4;
+        unsigned char *fr[4];
+        for (int32_t i = 0; i < N; i++) {
+            fr[i] = malloc((size_t)W * H * 3);
+            for (int32_t y = 0; y < H; y++)
+                for (int32_t x = 0; x < W; x++) {
+                    unsigned char *p = fr[i] + ((size_t)y * W + x) * 3;
+                    p[0] = (unsigned char)((x * 4 + i * 37) % 256);
+                    p[1] = (unsigned char)((y * 4 + i * 11) % 256);
+                    p[2] = (unsigned char)(((x ^ y) * 3 + i * 61) % 256);
+                }
+        }
+        qw_image im;
+        if (!qw_image_from_frames(&im, fr, N, W, H, c, err, sizeof err)) {
+            CHECK(false, "frames: %s", err);
+        } else {
+            CHECK(im.grid_t == 2, "4 frames should be 2 frame groups, got %d", im.grid_t);
+            CHECK(im.n_patches == im.grid_t * im.grid_h * im.grid_w,
+                  "patch count does not match the grid");
+            int32_t rows = 0;
+            float *emb = qwasar_encode_image(e, &im, &rows, err, sizeof err);
+            if (!emb) {
+                CHECK(false, "encode: %s", err);
+            } else {
+                CHECK(rows == 8, "expected 8 merged rows, got %d", rows);
+                double worst = 0.0;
+                for (int32_t r = 0; r < rows && r < 8; r++) {
+                    double ss = 0.0;
+                    for (int32_t i = 0; i < c->vis_out_hidden_size; i++) {
+                        const double vv = emb[(size_t)r * c->vis_out_hidden_size + i];
+                        ss += vv * vv;
+                    }
+                    const double rel = fabs(sqrt(ss) - VID_GOLDEN_NORMS[r])
+                                     / VID_GOLDEN_NORMS[r];
+                    if (rel > worst) worst = rel;
+                }
+                /* Looser than the image case, and measured the same way: at
+                 * sixteen patches a frame the reference disagrees with its own
+                 * fp32 self by 1.4e-2 here, where qwasar sits at 1.7e-3. */
+                CHECK(worst < 3e-2, "multi-frame row norm differs by %.3g", worst);
+                printf("  %-22s worst row norm %.2e vs mlx-vlm\n",
+                       "tower golden (4 frames)", worst);
+                free(emb);
+            }
+            qw_image_free(&im);
+        }
+        for (int32_t i = 0; i < N; i++) free(fr[i]);
+    }
+
     /* ---- MRoPE ----------------------------------------------------------
      *
      * The one part of the image path that is pure index arithmetic, so it has
@@ -435,7 +499,7 @@ int main(int argc, char **argv) {
         for (int32_t i = 0; i < n; i++) toks[i] = 1000 + i;
         for (int32_t i = 0; i < n_img; i++) toks[pre + i] = c->image_token_id;
 
-        qwasar_image_input in = { NULL, n_img, 1, gh, gw };
+        qwasar_image_input in = { NULL, n_img, 1, gh, gw, 0, 0, 0 };
         int32_t *pos = malloc((size_t)3 * n * sizeof *pos);
         int32_t next = -1;
         CHECK(qw_mrope_positions(c, toks, n, &in, 1, 0, pos, &next, err, sizeof err),
@@ -472,6 +536,40 @@ int main(int argc, char **argv) {
 
         free(toks);
         free(pos);
+
+        /* And with several frames, where the temporal axis finally does
+         * something: it counts frame groups while the spatial axes repeat. */
+        const int32_t gt = 4;
+        const int32_t n_vid = gt * mh * mw;
+        const int32_t nv = pre + n_vid + post;
+        int32_t *vt = malloc((size_t)nv * sizeof *vt);
+        for (int32_t i = 0; i < nv; i++) vt[i] = 1000 + i;
+        for (int32_t i = 0; i < n_vid; i++) vt[pre + i] = c->video_token_id;
+
+        qwasar_image_input vin = { NULL, n_vid, gt, gh, gw, 0, 0, 0 };
+        int32_t *vp = malloc((size_t)3 * nv * sizeof *vp);
+        int32_t vnext = -1;
+        CHECK(qw_mrope_positions(c, vt, nv, &vin, 1, 0, vp, &vnext, err, sizeof err),
+              "mrope video: %s", err);
+
+        for (int32_t t = 0; t < gt; t++)
+            for (int32_t y = 0; y < mh; y++)
+                for (int32_t x = 0; x < mw; x++) {
+                    const int32_t k = pre + (t * mh + y) * mw + x;
+                    CHECK(vp[k] == pre + t && vp[nv + k] == pre + y
+                          && vp[2 * nv + k] == pre + x,
+                          "video token (%d,%d,%d) is (%d,%d,%d)", t, y, x,
+                          vp[k], vp[nv + k], vp[2 * nv + k]);
+                }
+        /* The resume point is one past the LARGEST axis, so four frames of an
+         * 8x8 grid still only advance by 8 -- not by 4, and not by 256. */
+        const int32_t vresume = pre + (mh > gt ? mh : gt);
+        CHECK(vp[pre + n_vid] == vresume,
+              "text after the video is at %d, expected %d", vp[pre + n_vid], vresume);
+        printf("  %-22s %d frames x %dx%d = %d tokens advance position by %d\n",
+               "mrope video", gt, mh, mw, n_vid, vresume - pre);
+        free(vt);
+        free(vp);
     }
 
     qwasar_engine_free(e);

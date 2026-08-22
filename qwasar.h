@@ -90,6 +90,10 @@ typedef struct {
      * structure, and the count has to match the rows the vision tower
      * produced. */
     int32_t     n_image_tokens;
+    /* Whether those placeholders are <|video_pad|> rather than <|image_pad|>.
+     * The two are different tokens and the model was trained to tell them
+     * apart, so a video announced as an image is a quietly worse answer. */
+    bool        vision_is_video;
 } qwasar_message;
 
 typedef struct {
@@ -117,7 +121,7 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
 int32_t *qwasar_render_tool_result(const qwasar_tokenizer *t, const char *result,
                                    const qwasar_chat_options *opts, int32_t *out_n);
 int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
-                                 int32_t n_image_tokens,
+                                 int32_t n_image_tokens, bool is_video,
                                  const qwasar_chat_options *opts, int32_t *out_n);
 
 /* ---- sessions -------------------------------------------------------------
@@ -176,6 +180,13 @@ typedef struct qwasar_image_input {
  * which is why encoding happens before the prompt is rendered rather than
  * beside the evaluation that uses it. */
 bool qwasar_image_encode(qwasar_engine *e, const char *path,
+                         qwasar_image_input *out, char *err, size_t errcap);
+
+/* The same for a video file, decoded with the platform's own decoder and
+ * sampled at the rate the model's preprocessor config asks for.  `grid_t` comes
+ * back greater than one, which is what makes the position axes diverge in time
+ * as well as space. */
+bool qwasar_video_encode(qwasar_engine *e, const char *path,
                          qwasar_image_input *out, char *err, size_t errcap);
 /* The same, from bytes already in memory: images arrive over HTTP as base64 in
  * a JSON body and never touch the filesystem. */

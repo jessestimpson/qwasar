@@ -45,6 +45,10 @@
  * rather than in either dimension, because what the tower costs is patches. */
 #define QW_IMG_MIN_PIXELS  (65536)
 #define QW_IMG_MAX_PIXELS  (16777216)
+/* Video has its own budget, and it counts every frame: a long clip is many
+ * small frames rather than a few large ones. */
+#define QW_VID_MIN_PIXELS  (4096)
+#define QW_VID_MAX_PIXELS  (25165824)
 
 /* Rounds a dimension to a multiple of `factor`, at least one factor. */
 static int32_t qw_round_to(double v, int32_t factor) {
@@ -118,26 +122,34 @@ static void qw_resample(const unsigned char *src, int32_t sw, int32_t sh,
     }
 }
 
-/* Lays the normalised pixels out as patches, in the two orders above. */
-static void qw_patchify(const float *px, int32_t w, const qw_config *c,
-                        int32_t grid_h, int32_t grid_w, float *out) {
+/* Lays the normalised pixels out as patches, in the two orders above.
+ *
+ * `frames` holds grid_t * temporal_patch_size normalised images of the same
+ * size; a still picture passes the same one twice, which is what a temporal
+ * patch size of two means for a single frame.  The outer loop is over grid_t
+ * because the token order is (frame group, block row, block column, then the
+ * block's own row and column). */
+static void qw_patchify(const float *const *frames, int32_t w, const qw_config *c,
+                        int32_t grid_t, int32_t grid_h, int32_t grid_w, float *out) {
     const int32_t P = c->vis_patch_size, T = c->vis_temporal_patch_size;
     const int32_t M = c->vis_spatial_merge_size, C = c->vis_in_channels;
     const int32_t elems = T * P * P * C;
     int32_t n = 0;
 
+    for (int32_t gt = 0; gt < grid_t; gt++)
     for (int32_t by = 0; by < grid_h / M; by++)
     for (int32_t bx = 0; bx < grid_w / M; bx++)
     for (int32_t my = 0; my < M; my++)
     for (int32_t mx = 0; mx < M; mx++) {
         const int32_t py = by * M + my, pxx = bx * M + mx;
         float *dst = out + (size_t)n++ * elems;
-        for (int32_t t = 0; t < T; t++)
-        for (int32_t dy = 0; dy < P; dy++)
-        for (int32_t dx = 0; dx < P; dx++) {
-            /* A still image repeats itself along the temporal axis. */
-            const float *s = px + (((size_t)(py * P + dy) * w) + (pxx * P + dx)) * 3;
-            for (int32_t ch = 0; ch < C; ch++) *dst++ = s[ch];
+        for (int32_t t = 0; t < T; t++) {
+            const float *px = frames[gt * T + t];
+            for (int32_t dy = 0; dy < P; dy++)
+            for (int32_t dx = 0; dx < P; dx++) {
+                const float *sp = px + (((size_t)(py * P + dy) * w) + (pxx * P + dx)) * 3;
+                for (int32_t ch = 0; ch < C; ch++) *dst++ = sp[ch];
+            }
         }
     }
 }
@@ -166,8 +178,85 @@ static bool qw_image_finish(qw_image *im, unsigned char *rgb, int w, int h,
 
     im->patches = malloc((size_t)im->n_patches * im->patch_elems * sizeof *im->patches);
     if (!im->patches) { free(px); snprintf(err, errcap, "out of memory"); return false; }
-    qw_patchify(px, rw, c, im->grid_h, im->grid_w, im->patches);
+    const float *pair[2] = { px, px };
+    qw_patchify(pair, rw, c, 1, im->grid_h, im->grid_w, im->patches);
     free(px);
+    return true;
+}
+
+/* ---- video ------------------------------------------------------------------
+ *
+ * The same thing with a real temporal axis.  Frames are paired into patches, so
+ * the count is padded up to an even number by repeating the last one, and the
+ * resolution budget is shared across all of them: a long clip gets small
+ * frames, because what the tower costs is patches and there are grid_t times
+ * as many of them. */
+void qw_video_fit(int32_t n_frames, int32_t w, int32_t h, int32_t factor,
+                  int32_t *out_w, int32_t *out_h) {
+    int32_t bw = qw_round_to(w, factor), bh = qw_round_to(h, factor);
+    const int32_t t_bar = (n_frames + 1) / 2 * 2;
+    const double area = (double)t_bar * bw * bh;
+    const double all = (double)n_frames * w * h;
+
+    if (area > (double)QW_VID_MAX_PIXELS) {
+        const double beta = sqrt(all / (double)QW_VID_MAX_PIXELS);
+        bw = (int32_t)floor(w / beta / factor) * factor;
+        bh = (int32_t)floor(h / beta / factor) * factor;
+        if (bw < factor) bw = factor;
+        if (bh < factor) bh = factor;
+    } else if (area < (double)QW_VID_MIN_PIXELS) {
+        const double beta = sqrt((double)QW_VID_MIN_PIXELS / all);
+        bw = (int32_t)ceil(w * beta / factor) * factor;
+        bh = (int32_t)ceil(h * beta / factor) * factor;
+    }
+    *out_w = bw;
+    *out_h = bh;
+}
+
+bool qw_image_from_frames(qw_image *im, unsigned char *const *frames,
+                          int32_t n_frames, int32_t w, int32_t h,
+                          const qw_config *c, char *err, size_t errcap) {
+    memset(im, 0, sizeof *im);
+    if (n_frames < 1) { snprintf(err, errcap, "no frames"); return false; }
+
+    const int32_t T = c->vis_temporal_patch_size;
+    const int32_t factor = c->vis_patch_size * c->vis_spatial_merge_size;
+    int32_t rw = 0, rh = 0;
+    qw_video_fit(n_frames, w, h, factor, &rw, &rh);
+
+    /* Padded to a whole number of temporal patches by repeating the last
+     * frame, which is what the reference processor does. */
+    const int32_t padded = (n_frames + T - 1) / T * T;
+
+    float **norm = calloc((size_t)padded, sizeof *norm);
+    if (!norm) { snprintf(err, errcap, "out of memory"); return false; }
+    for (int32_t i = 0; i < padded; i++) {
+        if (i >= n_frames) { norm[i] = norm[n_frames - 1]; continue; }
+        norm[i] = malloc((size_t)rw * rh * 3 * sizeof **norm);
+        if (!norm[i]) {
+            for (int32_t k = 0; k < i; k++) free(norm[k]);
+            free(norm);
+            snprintf(err, errcap, "out of memory resizing frame %d", i);
+            return false;
+        }
+        qw_resample(frames[i], w, h, norm[i], rw, rh);
+    }
+
+    im->grid_t = padded / T;
+    im->grid_h = rh / c->vis_patch_size;
+    im->grid_w = rw / c->vis_patch_size;
+    im->n_patches = im->grid_t * im->grid_h * im->grid_w;
+    im->patch_elems = T * c->vis_patch_size * c->vis_patch_size * c->vis_in_channels;
+    im->src_w = w;
+    im->src_h = h;
+
+    im->patches = malloc((size_t)im->n_patches * im->patch_elems * sizeof *im->patches);
+    if (im->patches)
+        qw_patchify((const float *const *)norm, rw, c,
+                    im->grid_t, im->grid_h, im->grid_w, im->patches);
+    for (int32_t i = 0; i < n_frames; i++) free(norm[i]);
+    free(norm);
+    if (!im->patches) { snprintf(err, errcap, "out of memory"); return false; }
     return true;
 }
 

@@ -1127,6 +1127,47 @@ but when thinking is off the template writes the close itself, so the model
 never emits one and the classifier never left reasoning mode. A valid-looking
 response carrying nothing in the field clients read.
 
+#### Video
+
+```
+$ qwasar --video digits.mp4 --no-think -p "List every digit you see, in order."
+video 224x224 -> 4 frame groups -> 784 patches -> 196 tokens in 3.1s
+1, 2, 3, 4
+```
+
+Frames come from **AVFoundation**, which is the platform's own decoder and
+therefore already knows every container the machine can play. Shelling out to
+ffmpeg would have traded "one make, no dependencies" for a binary the user has
+to install. Sampling is the model's own policy, from its video preprocessor
+config: two frames a second, at least four, at most 768, with the resolution
+budget shared across all of them -- a long clip is many small frames, because
+what the tower costs is patches.
+
+Frames pair into temporal patches, so the count is padded up to even by
+repeating the last one, and `grid_t` is half the frame count.
+
+**A video is not a taller image, and getting that wrong is subtle.** Three
+things repeat per frame rather than spanning the clip: the interpolated
+position grid, the rope angles, and -- the one that actually broke -- the
+attention. The reference builds `cu_seqlens` by repeating `h * w` once per
+frame group, so a patch never attends outside its own frame; time is carried by
+MRoPE on the text side instead. An image is the single-segment case of that,
+which is why the mistake was invisible until there was a second frame:
+**grid_t = 1 matched the reference at 4.5e-4 while grid_t = 2 was off by 0.45.**
+
+Once fixed, four frames land at 1.2e-2 -- and the calibration matters again.
+At sixteen patches a frame the reference disagrees with its own fp32 self by
+**1.38e-2**, while qwasar sits at **1.65e-3** against that fp32 result. Closer
+to the reference than the reference is to itself, for the second time.
+
+`tests/test_vision` now carries a four-frame golden and an exact MRoPE check
+for `grid_t > 1`: four frames of an 8x8 grid are 256 tokens that advance
+position by 8, because the resume point is one past the largest axis and not
+past the token count.
+
+Not done: the server takes images but not video, and there is no frame-level
+timestamp text -- this model's template does not ask for any.
+
 #### 2D RoPE, which is not the text model's
 
 Half-split rather than interleaved, and unrelated to the partial multimodal RoPE

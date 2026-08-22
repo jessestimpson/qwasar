@@ -269,11 +269,31 @@ typedef struct {
     int32_t src_w, src_h;             /* before resizing, for reporting */
 } qw_image;
 
+/* Frames decoded from a video file, all at the same size, tightly packed RGB8.
+ * Sampling policy is the model's own: see qwasar_video.m. */
+typedef struct {
+    unsigned char **frames;
+    int32_t         n_frames;
+    int             width, height;
+    double          seconds;
+} qw_video;
+
+bool qw_video_load(qw_video *v, const char *path, double fps,
+                   int32_t min_frames, int32_t max_frames,
+                   char *err, size_t errcap);
+void qw_video_free(qw_video *v);
+
 bool qw_image_load(qw_image *im, const char *path, const qw_config *c,
                    char *err, size_t errcap);
 bool qw_image_load_memory(qw_image *im, const void *bytes, size_t len,
                           const qw_config *c, char *err, size_t errcap);
 void qw_image_free(qw_image *im);
+/* The video path: frames already decoded, all the same size. */
+bool qw_image_from_frames(qw_image *im, unsigned char *const *frames,
+                          int32_t n_frames, int32_t w, int32_t h,
+                          const qw_config *c, char *err, size_t errcap);
+void qw_video_fit(int32_t n_frames, int32_t w, int32_t h, int32_t factor,
+                  int32_t *out_w, int32_t *out_h);
 
 /* Runs the vision tower.  Returns [rows, out_hidden_size] fp32, caller frees;
  * one row per merged 2x2 block of patches. */
@@ -346,8 +366,8 @@ void qw_cpu_layer_norm(float *y, const float *x, const uint16_t *w,
 void qw_cpu_gelu_tanh(float *y, int32_t n);
 void qw_cpu_rope_2d(float *x, const float *angles,
                     int32_t tokens, int32_t heads, int32_t dim, int32_t stride);
-void qw_cpu_vision_attn(float *out, const float *qkv,
-                        int32_t tokens, int32_t heads, int32_t dim, float scale);
+void qw_cpu_vision_attn(float *out, const float *qkv, int32_t tokens,
+                        int32_t heads, int32_t dim, int32_t segment, float scale);
 
 void qw_cpu_conv1d_causal_silu(float *y, const float *x, float *state,
                                const uint16_t *w, int32_t channels, int32_t rows,

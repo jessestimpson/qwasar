@@ -24,7 +24,7 @@
  * position in the patch grid has to be reconstructed from its index rather than
  * read off it -- which is the whole reason this is computed here rather than
  * being a running counter. */
-static void qw_vis_angles(float *out, const qw_config *c,
+static void qw_vis_angles(float *out, const qw_config *c, int32_t grid_t,
                           int32_t grid_h, int32_t grid_w, int32_t n_tokens) {
     const int32_t head_dim = c->vis_hidden_size / c->vis_num_heads;
     const int32_t nf = head_dim / 4;          /* frequencies per axis */
@@ -34,7 +34,12 @@ static void qw_vis_angles(float *out, const qw_config *c,
     for (int32_t i = 0; i < nf; i++)
         inv[i] = 1.0f / powf(10000.0f, (float)(2 * i) / (float)(head_dim / 2));
 
+    /* The temporal axis carries no frequency here: a frame's patches get the
+     * same row and column angles as every other frame's, and time is encoded
+     * on the text side by MRoPE.  So this repeats per frame group rather than
+     * varying with it. */
     int32_t n = 0;
+    for (int32_t gt = 0; gt < grid_t && n < n_tokens; gt++)
     for (int32_t by = 0; by < grid_h / M && n < n_tokens; by++)
     for (int32_t bx = 0; bx < grid_w / M && n < n_tokens; bx++)
     for (int32_t my = 0; my < M; my++)
@@ -54,12 +59,14 @@ static void qw_vis_angles(float *out, const qw_config *c,
  * which is nothing next to a single block of the tower, and it keeps the
  * awkward index arithmetic somewhere it can be read. */
 static void qw_vis_pos_embed(float *out, const qw_vision *v, const qw_config *c,
-                             int32_t grid_h, int32_t grid_w) {
+                             int32_t grid_t, int32_t grid_h, int32_t grid_w) {
     const int32_t H = c->vis_hidden_size, side = v->grid_side, M = c->vis_spatial_merge_size;
     const uint16_t *table = qw_tensor_data(v->pos_embed);
 
     /* Row-major first, because that is the order the interpolation is defined
-     * in; the permutation into merge-block order happens on the way out. */
+     * in; the permutation into merge-block order happens on the way out.  The
+     * same spatial grid is used for every frame, so the whole thing repeats
+     * per frame group. */
     for (int32_t by = 0; by < grid_h / M; by++)
     for (int32_t bx = 0; bx < grid_w / M; bx++)
     for (int32_t my = 0; my < M; my++)
@@ -81,10 +88,13 @@ static void qw_vis_pos_embed(float *out, const qw_vision *v, const qw_config *c,
         const uint16_t *r11 = table + (size_t)(y1 * side + x1) * H;
 
         const int32_t idx = ((by * (grid_w / M) + bx) * M + my) * M + mx;
+        const int32_t per_frame = (grid_h / M) * (grid_w / M) * M * M;
         float *o = out + (size_t)idx * H;
         for (int32_t i = 0; i < H; i++)
             o[i] = w00 * qw_bf16_to_f32_c(r00[i]) + w01 * qw_bf16_to_f32_c(r01[i])
                  + w10 * qw_bf16_to_f32_c(r10[i]) + w11 * qw_bf16_to_f32_c(r11[i]);
+        for (int32_t gt = 1; gt < grid_t; gt++)
+            memcpy(out + ((size_t)gt * per_frame + idx) * H, o, (size_t)H * sizeof *o);
     }
 }
 
@@ -144,8 +154,8 @@ float *qwasar_encode_image(qwasar_engine *e, const qw_image *im,
     }
     memcpy(qw_buf_contents(patches), im->patches,
            (size_t)n * im->patch_elems * sizeof(float));
-    qw_vis_angles(qw_buf_contents(r.angles), c, im->grid_h, im->grid_w, n);
-    qw_vis_pos_embed(qw_buf_contents(r.pos), v, c, im->grid_h, im->grid_w);
+    qw_vis_angles(qw_buf_contents(r.angles), c, im->grid_t, im->grid_h, im->grid_w, n);
+    qw_vis_pos_embed(qw_buf_contents(r.pos), v, c, im->grid_t, im->grid_h, im->grid_w);
 
     qw_cmd cmd = qw_cmd_begin();
     if (!cmd) {
@@ -174,7 +184,8 @@ float *qwasar_encode_image(qwasar_engine *e, const qw_image *im,
                       n, heads, hd, 3 * H);
 
         qw_op_vision_attn(cmd, qw_ref_at(r.attn, 0), qw_ref_at(r.qkv, 0),
-                          n, heads, hd, 1.0f / sqrtf((float)hd));
+                          n, heads, hd, im->grid_h * im->grid_w,
+                          1.0f / sqrtf((float)hd));
         qw_encode_vlinear(cmd, &blk->proj, qw_ref_at(r.hn, 0), qw_ref_at(r.attn, 0), n);
         qw_op_add_inplace(cmd, qw_ref_at(r.h, 0), qw_ref_at(r.hn, 0), n * H);
 
@@ -252,6 +263,37 @@ bool qwasar_image_encode_memory(qwasar_engine *e, const void *bytes, size_t len,
     qw_image im;
     if (!qw_image_load_memory(&im, bytes, len, qwasar_engine_config(e), err, errcap))
         return false;
+
+    int32_t rows = 0;
+    float *emb = qwasar_encode_image(e, &im, &rows, err, errcap);
+    if (!emb) { qw_image_free(&im); return false; }
+
+    out->rows      = emb;
+    out->n_rows    = rows;
+    out->grid_t    = im.grid_t;
+    out->grid_h    = im.grid_h;
+    out->grid_w    = im.grid_w;
+    out->src_w     = im.src_w;
+    out->src_h     = im.src_h;
+    out->n_patches = im.n_patches;
+    qw_image_free(&im);
+    return true;
+}
+
+bool qwasar_video_encode(qwasar_engine *e, const char *path,
+                         qwasar_image_input *out, char *err, size_t errcap) {
+    memset(out, 0, sizeof *out);
+    /* The sampling policy is the model's, from its video_preprocessor config:
+     * two frames a second, never fewer than four, never more than 768. */
+    qw_video vid;
+    if (!qw_video_load(&vid, path, 2.0, 4, 768, err, errcap)) return false;
+
+    qw_image im;
+    const bool framed = qw_image_from_frames(&im, vid.frames, vid.n_frames,
+                                             vid.width, vid.height,
+                                             qwasar_engine_config(e), err, errcap);
+    qw_video_free(&vid);
+    if (!framed) return false;
 
     int32_t rows = 0;
     float *emb = qwasar_encode_image(e, &im, &rows, err, errcap);

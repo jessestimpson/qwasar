@@ -29,20 +29,26 @@ kernel void qw_rope_2d(
     h[gid.x + half_dim] = hi * c + lo * s;
 }
 
-/* Bidirectional attention over an image's patches.
+/* Bidirectional attention over a frame's patches.
  *
- * Every patch attends to every other one: no cache, no mask, no causality.
- * That makes it the simplest attention in the engine and also the only
- * quadratic one, so a threadgroup owns one (query, head) pair and streams the
- * keys past it, keeping the running softmax in registers rather than
- * materialising a row of scores.
+ * Every patch attends to every other one in the same frame: no cache, no mask,
+ * no causality.  That makes it the simplest attention in the engine and also
+ * the only quadratic one, so a threadgroup owns one (query, head) pair and
+ * streams the keys past it, keeping the running softmax in registers rather
+ * than materialising a row of scores.
+ *
+ * A VIDEO IS SEVERAL SEGMENTS, NOT ONE LONG ONE.  The reference builds
+ * cu_seqlens by repeating h * w once per frame group, so a patch never attends
+ * outside its own frame; time is carried by MRoPE on the text side instead.
+ * An image is the single-segment case of that, which is why getting this wrong
+ * showed up only once there was a second frame.
  *
  * q, k and v arrive as one [tokens, 3, heads, dim] block, which is the layout
  * the fused qkv projection already produces. */
 kernel void qw_vision_attn(
     device const float *qkv [[buffer(0)]],   /* [tokens, 3, heads, dim] */
     device       float *out [[buffer(1)]],   /* [tokens, heads, dim] */
-    constant uint3     &a   [[buffer(2)]],   /* tokens, heads, dim */
+    constant uint4     &a   [[buffer(2)]],   /* tokens, heads, dim, segment */
     constant float     &scale [[buffer(3)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tid2 [[thread_position_in_threadgroup]],
@@ -66,7 +72,10 @@ kernel void qw_vision_attn(
     if (tid == 0) { st[0] = -3.0e38f; st[1] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint kj = 0; kj < tokens; kj++) {
+    const uint seg  = a.w ? a.w : tokens;
+    const uint kb   = (qi / seg) * seg;
+    const uint ke   = min(kb + seg, tokens);
+    for (uint kj = kb; kj < ke; kj++) {
         const ulong kbase = ((ulong)kj * 3 + 1) * heads * dim + (ulong)hi * dim;
         float dot = 0.0f;
         for (uint i = tid; i < dim; i += ntg) dot = fma(qs[i], qkv[kbase + i], dot);

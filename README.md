@@ -243,7 +243,25 @@ text model, which is 4-bit, bias-free and RMSNorm throughout.
 
 Checked against mlx-vlm at **rel l2 5.5e-3** on the same patches, which is
 closer to the reference run in fp32 than the reference's own bf16 path is.
-Video is not implemented.
+
+## Video
+
+```
+$ qwasar --video digits.mp4 --no-think -p "List every digit you see, in order."
+video 224x224 -> 4 frame groups -> 784 patches -> 196 tokens in 3.1s
+1, 2, 3, 4
+```
+
+`--video` on `qwasar` and `qwasar-agent`, `/video <path>` in the agent's REPL.
+Frames come from AVFoundation, so any container the Mac can play works and
+nothing has to be installed. Sampling is the model's own: two frames a second,
+at least four, at most 768, with the pixel budget shared across them — a long
+clip becomes many small frames.
+
+A video is not a taller image. The position grid, the rope angles and the
+attention all repeat per frame rather than spanning the clip; a patch never
+attends outside its own frame, and time is carried by the position axes
+instead. The server takes images but not yet video.
 
 ## Run
 

@@ -206,10 +206,12 @@ void qw_op_add_bias(qw_cmd c, qw_ref y, qw_ref bias, int32_t dim, int32_t rows);
 void qw_op_rope_2d(qw_cmd c, qw_ref x, qw_ref angles,
                    int32_t tokens, int32_t heads, int32_t dim, int32_t stride);
 
-/* Bidirectional attention over an image's patches.  `qkv` is
- * [tokens, 3, heads, dim] as the fused projection leaves it. */
-void qw_op_vision_attn(qw_cmd c, qw_ref out, qw_ref qkv,
-                       int32_t tokens, int32_t heads, int32_t dim, float scale);
+/* Bidirectional attention over the patches of one frame.  `qkv` is
+ * [tokens, 3, heads, dim] as the fused projection leaves it.  `segment` is how
+ * many tokens a frame has: a patch never attends outside its own frame, and an
+ * image is simply the one-segment case. */
+void qw_op_vision_attn(qw_cmd c, qw_ref out, qw_ref qkv, int32_t tokens,
+                       int32_t heads, int32_t dim, int32_t segment, float scale);
 
 /* rms_norm(x, weight) * silu(gate) -- the gated-delta output norm. */
 void qw_op_rms_norm_gated(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight, qw_ref gate,

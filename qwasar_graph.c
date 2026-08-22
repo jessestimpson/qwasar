@@ -733,9 +733,12 @@ static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wa
         const int32_t *tv = qw_buf_contents(s->tokens);
         int32_t r = 0;
         while (r < rows) {
-            if (tv[r] != cfg->image_token_id) { r++; continue; }
+            const bool pad = tv[r] == cfg->image_token_id
+                          || tv[r] == cfg->video_token_id;
+            if (!pad) { r++; continue; }
             int32_t run = 0;
-            while (r + run < rows && tv[r + run] == cfg->image_token_id) run++;
+            while (r + run < rows && (tv[r + run] == cfg->image_token_id
+                                   || tv[r + run] == cfg->video_token_id)) run++;
             if (s->img_cursor + run > s->n_img_rows) run = s->n_img_rows - s->img_cursor;
             if (run > 0)
                 qw_op_slice_rows(c, qw_off(s->h, (size_t)r * cfg->hidden_size),
@@ -1222,7 +1225,9 @@ bool qw_mrope_positions(const qw_config *c, const int32_t *tokens, int32_t n,
     int32_t at = 0, img = 0;
 
     while (at < n) {
-        if (img < n_images && tokens[at] == c->image_token_id) {
+        const bool is_pad = tokens[at] == c->image_token_id
+                         || tokens[at] == c->video_token_id;
+        if (img < n_images && is_pad) {
             const int32_t gt = im[img].grid_t;
             const int32_t gh = im[img].grid_h / merge, gw = im[img].grid_w / merge;
             const int32_t count = gt * gh * gw;

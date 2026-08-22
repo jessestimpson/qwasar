@@ -627,7 +627,7 @@ typedef struct {
     qw_tokvec v;
     bool ok;
     int32_t im_start, im_end, think_open, think_close, tr_open, tr_close;
-    int32_t vision_start, vision_end, image_pad;
+    int32_t vision_start, vision_end, image_pad, video_pad;
 } qw_chat;
 
 static void qw_put_id(qw_chat *c, int32_t id) {
@@ -737,6 +737,7 @@ static bool qw_chat_init(qw_chat *c, const qwasar_tokenizer *t, char *err, size_
     c->vision_start = qwasar_token_id(t, "<|vision_start|>");
     c->vision_end   = qwasar_token_id(t, "<|vision_end|>");
     c->image_pad    = qwasar_token_id(t, "<|image_pad|>");
+    c->video_pad    = qwasar_token_id(t, "<|video_pad|>");
     if (c->im_start < 0 || c->im_end < 0 || c->think_open < 0 || c->think_close < 0) {
         snprintf(err, errcap, "tokenizer is missing ChatML control tokens");
         return false;
@@ -773,7 +774,7 @@ int32_t *qwasar_render_tool_result(const qwasar_tokenizer *t, const char *result
 }
 
 int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
-                                 int32_t n_image_tokens,
+                                 int32_t n_image_tokens, bool is_video,
                                  const qwasar_chat_options *opts, int32_t *out_n) {
     char err[128];
     qw_chat c;
@@ -784,9 +785,10 @@ int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
     qw_put_str(&c, "\n");
     qw_put_id(&c, c.im_start);
     qw_put_str(&c, "user\n");
+    const int32_t pad = is_video ? c.video_pad : c.image_pad;
     for (int32_t k = 0; k < n_image_tokens; k++) {
         if (k == 0) qw_put_id(&c, c.vision_start);
-        qw_put_id(&c, c.image_pad);
+        qw_put_id(&c, pad);
         if (k + 1 == n_image_tokens) qw_put_id(&c, c.vision_end);
     }
     qw_put_str(&c, text);
@@ -876,9 +878,10 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
              * control tokens appearing in user text.  The template emits one
              * <|image_pad|> and the processor expands it; the count is known
              * here, so it is expanded here. */
+            const int32_t pad = m->vision_is_video ? c.video_pad : c.image_pad;
             for (int32_t k = 0; k < m->n_image_tokens; k++) {
                 if (k == 0) qw_put_id(&c, c.vision_start);
-                qw_put_id(&c, c.image_pad);
+                qw_put_id(&c, pad);
                 if (k + 1 == m->n_image_tokens) qw_put_id(&c, c.vision_end);
             }
             qw_put_text(&c, m->content + off, len);

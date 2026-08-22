@@ -174,14 +174,17 @@ void qw_cpu_rope_2d(float *x, const float *angles,
         }
 }
 
-void qw_cpu_vision_attn(float *out, const float *qkv,
-                        int32_t tokens, int32_t heads, int32_t dim, float scale) {
+void qw_cpu_vision_attn(float *out, const float *qkv, int32_t tokens,
+                        int32_t heads, int32_t dim, int32_t segment, float scale) {
+    const int32_t seg = segment > 0 ? segment : tokens;
     float *sc = malloc((size_t)tokens * sizeof *sc);
     for (int32_t h = 0; h < heads; h++)
         for (int32_t qi = 0; qi < tokens; qi++) {
             const float *q = qkv + (((size_t)qi * 3 + 0) * heads + h) * dim;
+            const int32_t kb = (qi / seg) * seg;
+            const int32_t ke = kb + seg < tokens ? kb + seg : tokens;
             float m = -3.0e38f;
-            for (int32_t kj = 0; kj < tokens; kj++) {
+            for (int32_t kj = kb; kj < ke; kj++) {
                 const float *k = qkv + (((size_t)kj * 3 + 1) * heads + h) * dim;
                 double d = 0.0;
                 for (int32_t i = 0; i < dim; i++) d += (double)q[i] * k[i];
@@ -189,13 +192,13 @@ void qw_cpu_vision_attn(float *out, const float *qkv,
                 if (sc[kj] > m) m = sc[kj];
             }
             double sum = 0.0;
-            for (int32_t kj = 0; kj < tokens; kj++) {
+            for (int32_t kj = kb; kj < ke; kj++) {
                 sc[kj] = expf(sc[kj] - m);
                 sum += sc[kj];
             }
             float *o = out + ((size_t)qi * heads + h) * dim;
             for (int32_t i = 0; i < dim; i++) o[i] = 0.0f;
-            for (int32_t kj = 0; kj < tokens; kj++) {
+            for (int32_t kj = kb; kj < ke; kj++) {
                 const float *v = qkv + (((size_t)kj * 3 + 2) * heads + h) * dim;
                 const float w = (float)(sc[kj] / sum);
                 for (int32_t i = 0; i < dim; i++) o[i] += w * v[i];

@@ -394,6 +394,7 @@ typedef struct {
      * evals that follow it. */
     qwasar_image_input   img;
     int32_t              n_img_rows;
+    bool                 img_is_video;
     /* Only the prefill start time is kept; the rate is derived from it. */
     double               prefill_started;
     bool                 interrupted;
@@ -803,6 +804,7 @@ static void repl_help(agent *a) {
     tui_puts(a->tui,"  /help            this message\n"
            "  /new             start a fresh conversation\n"
            "  /image <path>    attach an image to the next message\n"
+           "  /video <path>    attach a video, sampled at 2 fps\n"
            "  /effort <level>  xhigh, medium or low\n"
            "  /think           show or hide the reasoning block\n"
            "  /yes             toggle asking before writes and commands\n"
@@ -832,26 +834,33 @@ static bool repl_command(agent *a, const char *line, bool *handled) {
             tui_printf(a->tui, "  not saved: %s\n", serr);
         return true;
     }
-    if (!strncmp(line, "/image", 6)) {
+    if (!strncmp(line, "/image", 6) || !strncmp(line, "/video", 6)) {
+        const bool as_video = line[1] == 'v';
         const char *path = line + 6;
         while (*path == ' ') path++;
         if (!*path) {
-            tui_printf(a->tui, "  usage: /image <path>\n");
+            tui_printf(a->tui, "  usage: %s <path>\n", as_video ? "/video" : "/image");
             return true;
         }
         /* Attaching costs a tower pass now rather than at send time, because
          * the message cannot be rendered until the token count is known. */
         qwasar_image_release(&a->img);
         a->n_img_rows = 0;
+        a->img_is_video = false;
         status_set(a, "looking");
         tui_tick(a->tui);
         char ierr[256];
-        if (!qwasar_image_encode(a->e, path, &a->img, ierr, sizeof ierr)) {
+        const bool ok = as_video
+            ? qwasar_video_encode(a->e, path, &a->img, ierr, sizeof ierr)
+            : qwasar_image_encode(a->e, path, &a->img, ierr, sizeof ierr);
+        if (!ok) {
             tui_printf(a->tui, "  %s\n", ierr);
         } else {
             a->n_img_rows = a->img.n_rows;
-            tui_printf(a->tui, "  %dx%d -> %d tokens; it goes with your next message\n",
-                       a->img.src_w, a->img.src_h, a->img.n_rows);
+            a->img_is_video = as_video;
+            tui_printf(a->tui, "  %dx%d%s -> %d tokens; it goes with your next message\n",
+                       a->img.src_w, a->img.src_h,
+                       a->img.grid_t > 1 ? ", multiple frames" : "", a->img.n_rows);
         }
         status_set(a, "ready");
         return true;
@@ -902,6 +911,7 @@ static void usage(FILE *out) {
         "      --steps <n>      maximum tool calls per task (default 24)\n"
         "  -n, --predict <n>    maximum tokens per turn (default 8192)\n"
         "      --image <path>   an image for the first turn (jpeg, png, bmp, gif)\n"
+        "      --video <path>   a video for the first turn, sampled at 2 fps\n"
         "      --mtp <dir>      draft head; speculative decoding, about 1.4x\n"
         "      --mtp-depth <n>  drafts per round; default adapts, 0 disables\n"
         "      --effort <lvl>   reasoning effort: xhigh (default), medium, low\n"
@@ -954,6 +964,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(arg, "-y") || !strcmp(arg, "--yes")) a.cfg.yes = true;
         else if (!strcmp(arg, "-i") || !strcmp(arg, "--interactive")) interactive = true;
         else if (!strcmp(arg, "--image") && i + 1 < argc) image_path = argv[++i];
+        else if (!strcmp(arg, "--video") && i + 1 < argc) { image_path = argv[++i]; a.img_is_video = true; }
         else if (!strcmp(arg, "--mtp") && i + 1 < argc) opts.mtp_path = argv[++i];
         else if (!strcmp(arg, "--mtp-depth") && i + 1 < argc) a.cfg.mtp_depth = atoi(argv[++i]);
         else if (!strcmp(arg, "--steps") && i + 1 < argc) a.cfg.max_steps = atoi(argv[++i]);
@@ -1011,13 +1022,15 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (image_path) {
-        if (!qwasar_image_encode(a.e, image_path, &a.img, err, sizeof err)) {
-            fprintf(stderr, "qwasar-agent: %s\n", err);
-            return 1;
-        }
+        const bool ok = a.img_is_video
+            ? qwasar_video_encode(a.e, image_path, &a.img, err, sizeof err)
+            : qwasar_image_encode(a.e, image_path, &a.img, err, sizeof err);
+        if (!ok) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
         a.n_img_rows = a.img.n_rows;
-        tui_printf(a.tui, "\x1b[2mimage %dx%d -> %d patches -> %d tokens\x1b[0m\n",
-                   a.img.src_w, a.img.src_h, a.img.n_patches, a.img.n_rows);
+        tui_printf(a.tui, "\x1b[2m%s %dx%d%s -> %d patches -> %d tokens\x1b[0m\n",
+                   a.img_is_video ? "video" : "image", a.img.src_w, a.img.src_h,
+                   a.img.grid_t > 1 ? " (multiple frames)" : "",
+                   a.img.n_patches, a.img.n_rows);
     }
 
     /* Speculation is silent about what it does to the output -- nothing -- but
@@ -1039,7 +1052,7 @@ int main(int argc, char **argv) {
     if (task.len) {
         qwasar_message msgs[2] = {
             { "system", a.guidance, NULL, NULL },
-            { "user",   task.p,     NULL, NULL, a.n_img_rows },
+            { "user",   task.p,     NULL, NULL, a.n_img_rows, a.img_is_video },
         };
         int32_t n = 0;
         int32_t *p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
@@ -1107,7 +1120,7 @@ int main(int argc, char **argv) {
             if (fresh) {
                 qwasar_message msgs2[2] = {
                     { "system", a.guidance, NULL, NULL },
-                    { "user",   line,       NULL, NULL, a.n_img_rows },
+                    { "user",   line,       NULL, NULL, a.n_img_rows, a.img_is_video },
                 };
                 p = qwasar_apply_chat_template(a.tok, msgs2, 2, &a.chat, &n, err, sizeof err);
                 if (p) {
@@ -1118,7 +1131,8 @@ int main(int argc, char **argv) {
                 }
                 fresh = false;
             } else {
-                p = qwasar_render_user_turn(a.tok, line, a.n_img_rows, &a.chat, &n);
+                p = qwasar_render_user_turn(a.tok, line, a.n_img_rows, a.img_is_video,
+                                            &a.chat, &n);
                 if (!p) snprintf(err, sizeof err, "cannot render the turn");
             }
             free(line);
