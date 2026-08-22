@@ -16,6 +16,7 @@
 #include "qwasar_model.h"
 
 #include <math.h>
+float qw_bf16_to_f32_c(uint16_t v);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -134,7 +135,85 @@ int main(int argc, char **argv) {
                     m->fc.in_features, m->fc.out_features, rows);
 
     compare("concat", qw_buf_contents(fb), want_f, (size_t)rows * 2 * h, 1e-6);
-    compare("fc", qw_buf_contents(yb), want_y, (size_t)rows * h, 1e-5);
+    compare("fc bf16", qw_buf_contents(yb), want_y, (size_t)rows * h, 1e-5);
+
+    /* The head is quantised at load and the bf16 weights are only the
+     * quantiser's input, so what actually runs is the 4-bit path.  Checking it
+     * against the bf16 one is the only test the quantiser has: nothing else can
+     * catch a mis-packed nibble, because the head only proposes and a badly
+     * quantised head simply drafts worse. */
+    CHECK(m->quantised, "head was not quantised");
+    CHECK(m->q_fc.in_features == m->fc.in_features &&
+          m->q_fc.out_features == m->fc.out_features,
+          "quantised fc is [%d -> %d], bf16 is [%d -> %d]",
+          m->q_fc.in_features, m->q_fc.out_features,
+          m->fc.in_features, m->fc.out_features);
+
+    qw_buf yq = qw_buf_alloc((size_t)rows * h * sizeof(float));
+    CHECK(yq != NULL, "buffer allocation failed");
+    if (yq) {
+        memset(qw_buf_contents(yq), 0xCD, (size_t)rows * h * sizeof(float));
+        qw_cmd c2 = qw_cmd_begin();
+        qw_op_qmat_q4(c2, qw_ref_at(yq, 0), qw_ref_at(fb, 0),
+                      qw_tensor_ref(m->q_fc.weight), qw_tensor_ref(m->q_fc.scales),
+                      qw_tensor_ref(m->q_fc.biases),
+                      m->q_fc.in_features, m->q_fc.out_features, rows);
+        qw_cmd_wait(c2);
+        CHECK(qw_cmd_error(c2) == NULL, "GPU error: %s", qw_cmd_error(c2));
+        qw_cmd_free(c2);
+
+        /* Four bits over a group of 64 costs on the order of ten percent of
+         * relative error in a matvec -- the step is about 0.3 standard
+         * deviations and the error is uniform across it, so this is what the
+         * format costs rather than a defect.  A loose bound here is therefore
+         * a weak test, and it is kept only to prove the quantised path is
+         * wired to the right tensors at all; the tight check is below. */
+        compare("fc 4-bit vs bf16", qw_buf_contents(yq), qw_buf_contents(yb),
+                (size_t)rows * h, 0.25);
+        qw_buf_free(yq);
+    }
+
+    /* The real check on the quantiser: every weight must come back within half
+     * a quantisation step of where it started.  That bound is structural -- it
+     * holds for any correct affine quantisation and fails immediately for a
+     * nibble packed at the wrong offset, a group stride off by one, or a scale
+     * paired with the wrong row -- whereas an output-error threshold would
+     * absorb all three. */
+    {
+        const uint32_t *qw = qw_tensor_data(m->q_fc.weight);
+        const uint16_t *qs = qw_tensor_data(m->q_fc.scales);
+        const uint16_t *qb = qw_tensor_data(m->q_fc.biases);
+        const uint16_t *orig = qw_tensor_data(m->fc.weight);
+        const int32_t in = m->q_fc.in_features, groups = in / 64;
+        float *deq = malloc((size_t)in * sizeof(float));
+
+        double worst_ratio = 0.0;
+        int32_t worst_row = -1;
+        /* A spread of rows, including the first and last, because an indexing
+         * mistake usually shows at an edge. */
+        for (int step = 0; step < 12; step++) {
+            const int32_t row = step == 0 ? 0
+                              : step == 1 ? m->q_fc.out_features - 1
+                              : (int32_t)((int64_t)m->q_fc.out_features * step / 12);
+            qw_cpu_dequant_row(deq, qw, qs, qb, in, row);
+            for (int32_t i = 0; i < in; i++) {
+                const float want = qw_bf16_to_f32_c(orig[(size_t)row * in + i]);
+                const float step_sz = qw_bf16_to_f32_c(qs[(size_t)row * groups + i / 64]);
+                const double tol = 0.5 * step_sz + 1e-6;
+                const double ratio = tol > 0.0 ? fabs(want - deq[i]) / tol
+                                               : fabs(want - deq[i]);
+                if (ratio > worst_ratio) { worst_ratio = ratio; worst_row = row; }
+            }
+        }
+        /* Slightly over one because the scale and bias are themselves rounded
+         * to bf16, which widens the step a little either side. */
+        CHECK(worst_ratio < 1.05,
+              "quantised weight is %.3f half-steps from the original (row %d)",
+              worst_ratio, worst_row);
+        printf("  %-28s worst %.3f of a half-step\n", "quantiser round-trip",
+               worst_ratio);
+        free(deq);
+    }
 
     /* The halves must not be interchangeable, or the test above would pass on a
      * head fused backwards.  Swapping the two norm weights has to move the

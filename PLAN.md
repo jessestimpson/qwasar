@@ -980,11 +980,39 @@ sequence is still identical.
 Speedups end to end, against paired serial controls: **1.4x on prose, 2.1x on
 predictable text.** Both are worse on a warm machine, for the reason above.
 
-What is left is not scheduling. Drafting is 17% of a round and would roughly
-halve with a 4-bit head, which is a mechanical change. Beyond that the verify's
-floor is the width-scaling work -- the recurrence stepping four times through
-forty-eight layers -- which is a property of the architecture rather than of
-this code.
+#### The head is quantised at load
+
+A drafted token was reading 810 MB of bf16 head beside 715 MB of the base
+model's output head. The head only proposes, so precision there is purely an
+efficiency question -- quantisation error can change which token it suggests,
+never which one is emitted. It is now converted to the same MLX affine 4-bit
+format as the rest of the model at load: **810 MB to 228 MB**, about a second of
+startup, and drafting fell from 4.0 s to 2.1 s over 200 tokens.
+
+It cost nothing measurable in acceptance. Tokens per round is **identical to the
+digit** across all ten configurations `tests/test_verify` runs -- an argmax over
+248,320 rows is not close enough to be moved by four-bit noise except on
+near-ties, and near-ties are the rounds that were going to be rejected anyway.
+
+The quantiser needed a test of its own, because nothing else can catch it: a
+badly quantised head does not fail, it drafts worse. Comparing its output
+against the bf16 path is too weak -- four bits over a group of 64 costs about
+14% relative error in a matvec, which swamps most mistakes. The check is
+structural instead: **every weight must come back within half a quantisation
+step of where it started**, which holds for any correct affine quantisation and
+fails immediately for a nibble packed at the wrong offset, a group stride off by
+one, or a scale paired with the wrong row. Measured worst case: 1.000 half-steps.
+
+The bf16 matmul kernel stays, as the reference that check runs against.
+
+#### Where the floor is now
+
+The verify's remaining cost above one decode step is work that scales with
+width rather than with weights -- attention reading its cache four times, and
+the recurrence stepping four times through forty-eight layers. The second is a
+property of the architecture, not of this code: a pure-attention model of the
+same size would get its verify much closer to a single decode step. That is the
+bill for the same hybrid design that makes this model's disk cache cheap.
 
 *Sources for the measured figures in this section: Layr Labs'
 `qwen-3.8-mtp-challenge` (MIT), kept under `reference/`. The numbers are theirs

@@ -115,6 +115,13 @@ typedef struct {
     const qw_tensor *q_norm, *k_norm;
     qw_dense gate_proj, up_proj, down_proj;
 
+    /* The same eight matrices in 4-bit, which is what actually runs.  The bf16
+     * originals above are only the quantiser's input. */
+    bool     quantised;
+    qw_buf   q4;
+    qw_tensor  q4t[24];                /* three per matrix, backing the qlinears */
+    qw_qlinear q_fc, q_q, q_k, q_v, q_o, q_gate, q_up, q_down;
+
     const qw_tensor *norm;             /* final norm, before the base lm_head */
 
     /* Draft tokens the head was trained to produce in one round; the head's own

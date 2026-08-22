@@ -553,22 +553,17 @@ static void qw_encode_attention_layer(qwasar_session *s, qw_cmd c,
 /* Encodes one chunk of `rows` tokens. */
 /* ---- MTP draft head -------------------------------------------------------
  *
- * One full-attention layer, dense bf16, with its own KV cache.  Structurally it
- * is qw_encode_attention_layer above -- the same gated output, the same q and k
- * norms, the same partial RoPE -- differing only in reading unquantised weights
- * and its own cache.
+ * One full-attention layer with its own KV cache.  Structurally it is
+ * qw_encode_attention_layer above -- the same gated output, the same q and k
+ * norms, the same partial RoPE -- differing only in its own cache.  It arrives
+ * bf16 and is quantised at load to the format the rest of the model uses, so it
+ * runs on the same kernels (see qw_quantise_mtp).
  *
  * The head only PROPOSES.  Nothing it computes reaches an emitted token except
  * through the target's verification, so none of this sits on the exactness
  * surface: a bug here costs acceptance rate, not correctness.  Which is also
  * why it has to be measured.  There is no wrong answer for it to produce, only
  * a worse one, and nothing will report it. */
-
-static void qw_encode_dense(qw_cmd c, const qw_dense *d, qw_ref out, qw_ref in,
-                            int32_t rows) {
-    qw_op_dmat_bf16(c, out, in, qw_tensor_ref(d->weight),
-                    d->in_features, d->out_features, rows);
-}
 
 /* Fuses `rows` (hidden, next-token) pairs, runs them through the head's layer,
  * and appends their keys and values to the head cache at `mtp_n_past`.
@@ -592,15 +587,15 @@ static void qw_encode_mtp_rows(qwasar_session *s, qw_cmd c, qw_ref hidden,
                           qw_tensor_ref(m->pre_fc_norm_embedding),
                           hidden, qw_tensor_ref(m->pre_fc_norm_hidden),
                           cfg->hidden_size, rows, cfg->rms_norm_eps);
-    qw_encode_dense(c, &m->fc, qw_ref_at(s->mtp_h, 0), qw_ref_at(s->mtp_fused, 0), rows);
+    qw_encode_qlinear(c, &m->q_fc, qw_ref_at(s->mtp_h, 0), qw_ref_at(s->mtp_fused, 0), rows);
 
     qw_op_rms_norm(c, qw_ref_at(s->hn, 0), qw_ref_at(s->mtp_h, 0),
                    qw_tensor_ref(m->input_layernorm),
                    cfg->hidden_size, rows, cfg->rms_norm_eps, 1.0f);
 
-    qw_encode_dense(c, &m->q_proj, qw_ref_at(s->qg, 0), qw_ref_at(s->hn, 0), rows);
-    qw_encode_dense(c, &m->k_proj, qw_ref_at(s->k, 0),  qw_ref_at(s->hn, 0), rows);
-    qw_encode_dense(c, &m->v_proj, qw_ref_at(s->v, 0),  qw_ref_at(s->hn, 0), rows);
+    qw_encode_qlinear(c, &m->q_q, qw_ref_at(s->qg, 0), qw_ref_at(s->hn, 0), rows);
+    qw_encode_qlinear(c, &m->q_k, qw_ref_at(s->k, 0),  qw_ref_at(s->hn, 0), rows);
+    qw_encode_qlinear(c, &m->q_v, qw_ref_at(s->v, 0),  qw_ref_at(s->hn, 0), rows);
 
     qw_op_split_heads2(c, qw_ref_at(s->q, 0), qw_ref_at(s->gate, 0), qw_ref_at(s->qg, 0),
                        rows, cfg->num_attention_heads, hd);
@@ -625,18 +620,18 @@ static void qw_encode_mtp_rows(qwasar_session *s, qw_cmd c, qw_ref hidden,
                       hd, s->max_ctx, s->mtp_n_past, 1.0f / sqrtf((float)hd));
     qw_op_mul_sigmoid(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->gate, 0),
                       rows * sh->q_dim);
-    qw_encode_dense(c, &m->o_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->attn_out, 0), rows);
+    qw_encode_qlinear(c, &m->q_o, qw_ref_at(s->hn2, 0), qw_ref_at(s->attn_out, 0), rows);
     qw_op_add_inplace(c, qw_ref_at(s->mtp_h, 0), qw_ref_at(s->hn2, 0),
                       rows * cfg->hidden_size);
 
     qw_op_rms_norm(c, qw_ref_at(s->hn, 0), qw_ref_at(s->mtp_h, 0),
                    qw_tensor_ref(m->post_attention_layernorm),
                    cfg->hidden_size, rows, cfg->rms_norm_eps, 1.0f);
-    qw_encode_dense(c, &m->gate_proj, qw_ref_at(s->mlp_gate, 0), qw_ref_at(s->hn, 0), rows);
-    qw_encode_dense(c, &m->up_proj,   qw_ref_at(s->mlp_up, 0),   qw_ref_at(s->hn, 0), rows);
+    qw_encode_qlinear(c, &m->q_gate, qw_ref_at(s->mlp_gate, 0), qw_ref_at(s->hn, 0), rows);
+    qw_encode_qlinear(c, &m->q_up,   qw_ref_at(s->mlp_up, 0),   qw_ref_at(s->hn, 0), rows);
     qw_op_swiglu(c, qw_ref_at(s->mlp_act, 0), qw_ref_at(s->mlp_gate, 0),
                  qw_ref_at(s->mlp_up, 0), rows * cfg->intermediate_size);
-    qw_encode_dense(c, &m->down_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->mlp_act, 0), rows);
+    qw_encode_qlinear(c, &m->q_down, qw_ref_at(s->hn2, 0), qw_ref_at(s->mlp_act, 0), rows);
     qw_op_add_inplace(c, qw_ref_at(s->mtp_h, 0), qw_ref_at(s->hn2, 0),
                       rows * cfg->hidden_size);
 

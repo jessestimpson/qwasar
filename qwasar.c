@@ -238,6 +238,7 @@ struct qwasar_engine {
     size_t weight_bytes;       /* total bytes of bound tensors */
     size_t weight_bytes_text;
     size_t weight_bytes_mtp;
+    size_t weight_bytes_mtp_q4;
     size_t weight_bytes_vision;
     size_t bytes_mapped;       /* zero-copy, file-backed */
     size_t bytes_copied;       /* materialized for alignment */
@@ -660,6 +661,117 @@ static const qw_tensor *qw_bind_mtp_norm(qwasar_engine *e, const char *name,
     return t;
 }
 
+/* ---- quantising the head --------------------------------------------------
+ *
+ * The head ships in bf16 and every drafted token reads all 849 MB of it, next
+ * to the 715 MB of the base model's output head.  Converting it to the same
+ * MLX affine 4-bit format the rest of the model uses cuts that to 239 MB, and
+ * costs nothing that matters: the head only proposes, so quantisation error can
+ * change which token it suggests but never which one is emitted.  It is the one
+ * place in this engine where precision is purely an efficiency question.
+ *
+ * The format is described at the top of qwasar_gpu.h.  Groups are 64 wide along
+ * the input dimension, the scale and bias are stored bf16, and the nibble is
+ * unsigned -- so the bias carries the group's minimum rather than a zero point.
+ *
+ * Scale and bias are rounded to bf16 BEFORE the nibbles are chosen.  Choosing
+ * them against the full-precision scale and then storing a rounded one would
+ * bias every weight in the group by whatever the rounding moved. */
+
+static uint16_t qw_f32_to_bf16_c(float v) {
+    uint32_t u;
+    memcpy(&u, &v, sizeof u);
+    return (uint16_t)((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+}
+
+static void qw_quant_row(const uint16_t *src, int32_t in_features,
+                         uint32_t *w_out, uint16_t *sc_out, uint16_t *bi_out) {
+    const int32_t groups = in_features / 64;
+    for (int32_t g = 0; g < groups; g++) {
+        const uint16_t *v = src + (size_t)g * 64;
+        float lo = qw_bf16_to_f32_c(v[0]), hi = lo;
+        for (int j = 1; j < 64; j++) {
+            const float x = qw_bf16_to_f32_c(v[j]);
+            if (x < lo) lo = x;
+            if (x > hi) hi = x;
+        }
+        const uint16_t bi_b = qw_f32_to_bf16_c(lo);
+        const float    bi   = qw_bf16_to_f32_c(bi_b);
+        const uint16_t sc_b = qw_f32_to_bf16_c((hi - lo) / 15.0f);
+        const float    sc   = qw_bf16_to_f32_c(sc_b);
+        sc_out[g] = sc_b;
+        bi_out[g] = bi_b;
+
+        const float inv = sc > 0.0f ? 1.0f / sc : 0.0f;
+        for (int j = 0; j < 64; j += 8) {
+            uint32_t word = 0;
+            for (int t = 0; t < 8; t++) {
+                float q = (qw_bf16_to_f32_c(v[j + t]) - bi) * inv + 0.5f;
+                int32_t n = (int32_t)q;
+                if (n < 0) n = 0;
+                if (n > 15) n = 15;
+                word |= (uint32_t)n << (4 * t);
+            }
+            w_out[(g * 64 + j) / 8] = word;
+        }
+    }
+}
+
+/* Fills `ql` from `d`, writing into the arena at `*off` and advancing it. */
+static void qw_quant_dense(qwasar_engine *e, qw_qlinear *ql, const qw_dense *d,
+                           qw_tensor *slots, qw_buf buf, size_t *off) {
+    const int32_t in = d->in_features, out = d->out_features;
+    const int32_t words = in / 8, groups = in / 64;
+    const size_t w_bytes  = (size_t)out * words  * 4;
+    const size_t sb_bytes = (size_t)out * groups * 2;
+
+    char *base = qw_buf_contents(buf);
+    qw_tensor *tw = &slots[0], *ts = &slots[1], *tb = &slots[2];
+    *tw = (qw_tensor){ "mtp.weight", buf, *off,            w_bytes,  QW_DT_U32,  2, { out, words } };
+    *ts = (qw_tensor){ "mtp.scales", buf, *off + w_bytes,  sb_bytes, QW_DT_BF16, 2, { out, groups } };
+    *tb = (qw_tensor){ "mtp.biases", buf, *off + w_bytes + sb_bytes, sb_bytes, QW_DT_BF16, 2, { out, groups } };
+
+    const uint16_t *src = qw_tensor_data(d->weight);
+    uint32_t *w  = (uint32_t *)(base + tw->offset);
+    uint16_t *sc = (uint16_t *)(base + ts->offset);
+    uint16_t *bi = (uint16_t *)(base + tb->offset);
+    for (int32_t r = 0; r < out; r++)
+        qw_quant_row(src + (size_t)r * in, in,
+                     w + (size_t)r * words, sc + (size_t)r * groups,
+                     bi + (size_t)r * groups);
+
+    ql->weight = tw; ql->scales = ts; ql->biases = tb;
+    ql->in_features = in; ql->out_features = out;
+    *off += w_bytes + 2 * sb_bytes;
+    e->weight_bytes_mtp_q4 += w_bytes + 2 * sb_bytes;
+}
+
+static bool qw_quantise_mtp(qwasar_engine *e, char *err, size_t errcap) {
+    qw_mtp *m = &e->mtp;
+    qw_dense *dense[8] = { &m->fc, &m->q_proj, &m->k_proj, &m->v_proj,
+                           &m->o_proj, &m->gate_proj, &m->up_proj, &m->down_proj };
+    qw_qlinear *out[8] = { &m->q_fc, &m->q_q, &m->q_k, &m->q_v,
+                           &m->q_o, &m->q_gate, &m->q_up, &m->q_down };
+
+    size_t total = 0;
+    for (int i = 0; i < 8; i++) {
+        const int32_t in = dense[i]->in_features, o = dense[i]->out_features;
+        total += (size_t)o * (in / 8) * 4 + 2 * (size_t)o * (in / 64) * 2;
+    }
+    m->q4 = qw_buf_alloc(total);
+    if (!m->q4) {
+        qw_errf(err, errcap, "cannot allocate %.0f MB for the quantised MTP head",
+                (double)total / 1e6);
+        return false;
+    }
+
+    size_t off = 0;
+    for (int i = 0; i < 8; i++)
+        qw_quant_dense(e, out[i], dense[i], &m->q4t[i * 3], m->q4, &off);
+    m->quantised = true;
+    return true;
+}
+
 static bool qw_load_mtp(qwasar_engine *e, const char *dir, char *err, size_t errcap) {
     const qw_config *c = &e->config;
     qw_mtp *m = &e->mtp;
@@ -733,8 +845,12 @@ static bool qw_load_mtp(qwasar_engine *e, const char *dir, char *err, size_t err
         || !m->q_norm || !m->k_norm)
         return false;
 
+    if (!qw_quantise_mtp(e, err, errcap)) return false;
+
     m->present = true;
-    e->weight_bytes += e->weight_bytes_mtp;
+    /* The bf16 originals stay mapped but are never touched again, so the
+     * quantised copy is what the footprint should report. */
+    e->weight_bytes += e->weight_bytes_mtp_q4;
     return true;
 }
 
@@ -1021,12 +1137,14 @@ void qwasar_engine_print_info(const qwasar_engine *e, FILE *out) {
 
     fprintf(out, "\n");
     if (e->mtp.present)
-        fprintf(out, "mtp head   1 full-attention layer, bf16, drafts %d per round\n",
-                e->mtp.block_size);
+        fprintf(out, "mtp head   1 full-attention layer, %.0f MB bf16 quantised to "
+                     "%.0f MB 4-bit\n",
+                qw_gb(e->weight_bytes_mtp) * 1024.0,
+                qw_gb(e->weight_bytes_mtp_q4) * 1024.0);
 
     fprintf(out, "weights    %.2f GB text + %.2f GB vision",
             qw_gb(e->weight_bytes_text), qw_gb(e->weight_bytes_vision));
-    if (e->mtp.present) fprintf(out, " + %.2f GB mtp", qw_gb(e->weight_bytes_mtp));
+    if (e->mtp.present) fprintf(out, " + %.2f GB mtp", qw_gb(e->weight_bytes_mtp_q4));
     fprintf(out, " = %.2f GB\n", qw_gb(e->weight_bytes));
 
     /* Per-token cache cost.  The hybrid schedule is what makes long context

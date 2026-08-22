@@ -367,7 +367,9 @@ at 2.
 
 **Speculative decoding is the way past that roof, and it works.** The model
 ships a one-layer MTP draft head, published separately because merging it breaks
-Python loaders; `./download_model.sh mtp-head` fetches it.
+Python loaders; `./download_model.sh mtp-head` fetches it. It arrives in bf16 and
+is quantised to 4-bit at load — 810 MB to 228 MB, for no measurable change in
+how often its drafts are accepted.
 
 ```
 qwasar --mtp ./qwasar-mtp --mtp-depth 3 --spec -p "..."

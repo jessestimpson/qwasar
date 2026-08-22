@@ -1,9 +1,15 @@
 /* Dense bf16 matvec: the MTP draft head's eight projections.
  *
- * The base model is 4-bit throughout, so nothing else in the engine needs
- * this.  The draft head ships from its own repository in bf16 and stays that
- * way until its cost has been measured against the acceptance rate it buys --
- * quantising it first would be optimising a path whose price is not known.
+ * The base model is 4-bit throughout and so, now, is the draft head: it is
+ * quantised at load, because a drafted token was reading 810 MB of head next to
+ * 715 MB of output head and the head only proposes, so precision there is
+ * purely an efficiency question.  Quantising cost nothing measurable --
+ * acceptance is unchanged to the digit across ten configurations.
+ *
+ * This kernel is what remains, and it is not dead: it is the reference the
+ * quantised head is checked against in tests/test_mtp, which is the only thing
+ * that can catch a bad quantisation.  A head quantised wrongly does not fail,
+ * it drafts worse.
  *
  * The blocking is qw_qmvb_q4_g64's, minus the dequantisation: one threadgroup
  * per block of output rows, a block of QW_QMVB_B tokens carried in registers,
