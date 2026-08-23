@@ -170,9 +170,39 @@ private struct ChangeRow: View {
 
 // MARK: - The git crossing (spec 7.4a)
 
+/// One command, its purpose, and a copy button -- the unit the crossing
+/// sheet guides with.
+private struct CommandRow: View {
+    let label: String
+    let command: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label)
+                .font(.caption).foregroundStyle(.secondary)
+                .frame(width: 92, alignment: .trailing)
+            Text(command)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .padding(.horizontal, 6).padding(.vertical, 3)
+                .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5)))
+                .lineLimit(1)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(command, forType: .string)
+            } label: { Image(systemName: "doc.on.doc") }
+            .buttonStyle(.borderless)
+            .help("Copy")
+            Spacer(minLength: 0)
+        }
+    }
+}
+
 /// The result of a crossing: a real branch in the user's real repo. The
 /// destructive step -- changing files -- belongs to their own `git merge`,
-/// so this sheet informs and hands over rather than asking permission.
+/// so this sheet informs, then WALKS THE INTEGRATION: review, pick a way to
+/// bring the work in, handle a conflict if one appears, clean up. Every step
+/// is the exact command, copyable, run in the project directory.
 struct GitCrossingSheet: View {
     @Bindable var state: AppState
 
@@ -187,42 +217,61 @@ struct GitCrossingSheet: View {
                 } else {
                     Text("\(x.objectCount) objects verified and written; nothing outside "
                          + "`.git/objects` and this one ref was touched. Your files "
-                         + "change only when you merge.")
+                         + "change only when you merge. Run these in the project "
+                         + "directory:")
                         .font(.caption).foregroundStyle(.secondary)
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ForEach(Array(x.commits.enumerated()), id: \.offset) { _, c in
-                                HStack(alignment: .top, spacing: 6) {
-                                    Text(c.sha.prefix(8))
-                                        .font(.caption.monospaced()).foregroundStyle(.tertiary)
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(c.message).font(.caption)
-                                        Text(c.author).font(.caption2).foregroundStyle(.tertiary)
+
+                    if !x.commits.isEmpty {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(Array(x.commits.enumerated()), id: \.offset) { _, c in
+                                    HStack(alignment: .top, spacing: 6) {
+                                        Text(c.sha.prefix(8))
+                                            .font(.caption.monospaced()).foregroundStyle(.tertiary)
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text(c.message).font(.caption)
+                                            Text(c.author).font(.caption2).foregroundStyle(.tertiary)
+                                        }
                                     }
                                 }
-                            }
-                        }.frame(maxWidth: .infinity, alignment: .leading)
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(minHeight: 40, maxHeight: 120)
                     }
-                    .frame(minHeight: 60, maxHeight: 180)
-                    HStack(spacing: 6) {
-                        Text("git merge \(x.branch)")
-                            .font(.callout.monospaced())
-                            .padding(6)
-                            .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5)))
-                        Button {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString("git merge \(x.branch)", forType: .string)
-                        } label: { Image(systemName: "doc.on.doc") }
-                        .buttonStyle(.borderless)
-                        .help("Copy. Review first with `git log -p \(x.branch)`; conflicts "
-                              + "resolve with your own mergetool, line by line.")
-                    }
+
+                    Divider()
+                    Text("1 · Review what the agent did").font(.caption.bold())
+                    CommandRow(label: "the diff",
+                               command: "git diff HEAD...\(x.branch)")
+                    CommandRow(label: "by commit",
+                               command: "git log -p HEAD..\(x.branch)")
+
+                    Text("2 · Bring it in — one of these").font(.caption.bold())
+                    CommandRow(label: "keep the series",
+                               command: "git merge \(x.branch)")
+                    CommandRow(label: "as one commit",
+                               command: "git merge --squash \(x.branch) && git commit")
+                    CommandRow(label: "just part of it",
+                               command: "git cherry-pick <sha from the list above>")
+
+                    Text("3 · If git reports conflicts").font(.caption.bold())
+                    Text("Resolve the <<<<<<< markers with your own editor or "
+                         + "mergetool, then:")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                    CommandRow(label: "finish",
+                               command: "git add -A && git commit")
+                    CommandRow(label: "or back out",
+                               command: "git merge --abort")
+
+                    Text("4 · When you are done with the branch").font(.caption.bold())
+                    CommandRow(label: "clean up",
+                               command: "git branch -D \(x.branch)")
                 }
             }
             HStack { Spacer(); Button("Done") { state.showingGitCrossing = false } }
         }
         .padding(16)
-        .frame(width: 460)
+        .frame(width: 520)
     }
 }
 
