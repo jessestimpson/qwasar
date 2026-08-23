@@ -139,7 +139,21 @@ into workspace's `mod.run(args)` under a timeout, marshal the return. A tool tha
 throws returns its exception and stacktrace as the tool result. A tool that
 hangs is killed at the timeout and says so.
 
-### 7.4a Leaning into git — the crossing as an object exchange
+### 7.4a Leaning into git — the crossing as an object exchange *(built)*
+
+*Built 2026-08-23, to this section's design: `Warden.Git` exports
+base-bounded objects over the vsock (the base is recorded by init before any
+agent runs, so the host has everything at or below it by construction);
+`GitImport` verifies each object against its own name and writes it loose —
+zlib framed by hand over Apple's raw DEFLATE — then points
+`refs/heads/crucible/<slug>`. The dirty-tree question is asked exactly as
+specified, once per session, re-applied per boot because seeding re-syncs.
+The agent is briefed to commit as it goes. `GitImportSuite` replays this
+section's original verification with real git on every `make test`: fsck
+--strict, log, a clean merge applying edit+add+delete, a tampered object
+refused by name, and the concurrent edit landing as a line-level conflict
+with markers. §7.4's sheet remains, demoted to the non-git fallback; gutting
+its now-redundant drift machinery is recorded cleanup, not a blocker.*
 
 §7.4 below describes what M5 built: a baseline manifest, per-file SHAs, drift
 detection, size caps, and a host that writes bytes under approval. It works, and

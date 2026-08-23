@@ -26,6 +26,7 @@ struct TestMain {
         print("== delegation");  failures += EscalationSuite.run()
         print("== store");      failures += StoreSuite.run()
         print("== materialise"); failures += MaterialiseSuite.run()
+        print("== gitimport");  failures += GitImportSuite.run()
         print("== guestimage"); failures += GuestImageSuite.run()
         print("== utf8");       failures += UTF8Suite.run()
         print("== toolparse");  failures += ToolParserSuite.run()

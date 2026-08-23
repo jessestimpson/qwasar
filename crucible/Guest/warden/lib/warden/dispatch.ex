@@ -121,6 +121,15 @@ defmodule Warden.Dispatch do
   def run(%{"op" => "propose"}), do: Warden.Materialise.propose()
   def run(%{"op" => "accept_baseline"}), do: Warden.Materialise.accept()
 
+  # ---- the git crossing (spec 7.4a) ----------------------------------------
+  #
+  # Host-only ops, like propose: the model does not put its own work forward.
+  def run(%{"op" => "git_info"}), do: Warden.Git.info()
+  def run(%{"op" => "git_include_local"}), do: Warden.Git.include_local()
+  def run(%{"op" => "git_exclude_local"}), do: Warden.Git.exclude_local()
+  def run(%{"op" => "git_export"}), do: Warden.Git.export()
+  def run(%{"op" => "git_objects", "args" => %{"shas" => shas}}), do: Warden.Git.objects(shas)
+
   # Deliberately available: the only honest way to test that a workspace crash
   # is survivable is to cause one. It kills the agent's node, never warden's.
   def run(%{"op" => "workspace_kill"}) do

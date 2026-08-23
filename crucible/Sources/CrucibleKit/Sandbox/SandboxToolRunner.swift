@@ -63,6 +63,8 @@ public struct SandboxToolRunner: ToolExecuting {
 
         Work directly. Make the change, then verify it by reading the file back or running a command. Do not ask permission to edit a file or run something -- that is what the sandbox is for.
 
+        If /work is a git repository, COMMIT YOUR WORK with git as you go, in small reviewable commits with real messages: your commits become a branch in the user's own repository, and a good series is what makes your work mergeable, cherry-pickable, and reviewable. Anything you leave uncommitted is swept into a single catch-all commit at proposal time.
+
         You can also extend yourself: `define` compiles and hot-loads an Elixir module, and one implementing the Crucible.Skill behaviour becomes a SKILL -- invokable through `invoke`, listed by `skills`, and owned by the project, so every session here has it. Worth doing for something you will need repeatedly; not worth it for one-off work, since writing a module costs far more than doing the task by hand.
 
         Paths are relative to the project root.

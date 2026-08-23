@@ -68,6 +68,21 @@ final class AppState {
     var approvedPaths: Set<String> = []
     var lastUndoDirectory: URL?
 
+    // The git crossing (spec 7.4a): work leaves the sandbox as objects and a
+    // ref, and the user merges a real branch. Presented when non-nil.
+    struct GitCrossing {
+        var branch: String
+        var tip: String
+        var commits: [(sha: String, author: String, message: String)]
+        var objectCount: Int
+    }
+    var gitCrossing: GitCrossing?
+    var showingGitCrossing = false
+    /// The dirty-tree question (spec 7.4a), blocking a session's first boot
+    /// on a dirty git project until the user picks a base.
+    var showingDirtyPrompt = false
+    private var dirtyChoice: CheckedContinuation<String, Never>?
+
     private let engine = EngineHost()
     private let access = ModelAccess()
     /// The MTP draft head, granted separately. Under App Sandbox `~` is the
@@ -720,6 +735,7 @@ final class AppState {
                             // 7.2): what one session defined, every sibling
                             // has from its first token.
                             await replaySkillLibrary(p, channel: ready.channel)
+                            await applyDirtyPolicy(rec, channel: ready.channel)
                         } catch {
                             sandboxStatus = "read-only — the sandbox did not start"
                         }
@@ -922,6 +938,108 @@ final class AppState {
         }
     }
 
+    // MARK: The git crossing (spec 7.4a)
+
+    private func askDirtyChoice() async -> String {
+        await withCheckedContinuation { c in
+            dirtyChoice = c
+            showingDirtyPrompt = true
+        }
+    }
+
+    func resolveDirtyChoice(_ choice: String) {
+        showingDirtyPrompt = false
+        dirtyChoice?.resume(returning: choice)
+        dirtyChoice = nil
+    }
+
+    /// On every boot of a git project: if the seeded copy is dirty, apply the
+    /// session's stored answer -- asking the user first if there is none.
+    /// Re-applied per boot because seeding re-syncs from the host (spec 7.4a).
+    private func applyDirtyPolicy(_ rec: SessionRecord, channel: VsockChannel) async {
+        guard let info = try? await channel.send(op: "git_info", timeout: 30),
+              let s = info.result, s.contains("repo=true"), s.contains("dirty=true")
+        else { return }
+        var choice = rec.gitLocalChoice
+        if choice == nil {
+            choice = await askDirtyChoice()
+            if let i = sessions.firstIndex(where: { $0.id == rec.id }) {
+                sessions[i].gitLocalChoice = choice
+                store?.save(sessions[i])
+            }
+        }
+        let op = choice == "exclude" ? "git_exclude_local" : "git_include_local"
+        _ = try? await channel.send(op: op, timeout: 60)
+    }
+
+    private func slug(_ rec: SessionRecord) -> String {
+        let base = rec.title.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" }
+        let trimmed = String(base).split(separator: "-").joined(separator: "-").prefix(32)
+        let short = rec.id.uuidString.prefix(6).lowercased()
+        return trimmed.isEmpty ? String(short) : "\(trimmed)-\(short)"
+    }
+
+    /// The crossing: export from the guest, verify-and-write loose objects,
+    /// point one ref. Additive by construction -- never HEAD, never the
+    /// index, never a working file (spec 7.4a).
+    private func gitCross(_ rec: SessionRecord, root: URL, channel: VsockChannel) async {
+        do {
+            let importer = try GitImport(repoRoot: root)
+            guard let exp = try? await channel.send(op: "git_export", timeout: 180),
+                  exp.ok == true, let manifest = exp.result else {
+                engineNote = "export failed: \((try? await channel.send(op: "git_export", timeout: 5))?.error ?? "the guest gave no reason")"
+                return
+            }
+            var parts = manifest.split(separator: " ").map(String.init)
+            guard parts.count >= 2 else { engineNote = "export returned nothing"; return }
+            let tip = parts[1]
+            let shas = Array(parts.dropFirst(2))
+            if shas.isEmpty {
+                gitCrossing = GitCrossing(branch: "crucible/\(slug(rec))", tip: tip,
+                                          commits: [], objectCount: 0)
+                showingGitCrossing = true
+                return
+            }
+
+            var commits: [(String, String, String)] = []
+            var written = 0
+            var batch = shas
+            while !batch.isEmpty {
+                let take = Array(batch.prefix(16))
+                batch = Array(batch.dropFirst(16))
+                let r = try await channel.send(op: "git_objects",
+                                               args: ["shas": .string(take.joined(separator: " "))],
+                                               timeout: 120)
+                guard r.ok == true, let body = r.result else {
+                    engineNote = "object transfer failed: \(r.error ?? "?")"
+                    return
+                }
+                for line in body.split(separator: "\n") {
+                    let f = line.split(separator: " ")
+                    guard f.count == 3, let data = Data(base64Encoded: String(f[2])) else {
+                        if f.count == 2, f[1] == "missing" { continue }
+                        engineNote = "undecodable object line"; return
+                    }
+                    let sha = String(f[0]), type = String(f[1])
+                    try importer.write(sha: sha, type: type, content: data)
+                    written += 1
+                    if type == "commit", let sum = GitImport.commitSummary(data) {
+                        commits.append((sha, sum.author, sum.message))
+                    }
+                }
+            }
+            let branch = "crucible/\(slug(rec))"
+            try importer.updateRef(branch: branch, to: tip)
+            gitCrossing = GitCrossing(branch: branch, tip: tip,
+                                      commits: commits, objectCount: written)
+            showingGitCrossing = true
+        } catch {
+            // The hash refusal lands here too: nothing was written past the
+            // object that failed, and nothing references what was.
+            engineNote = "git crossing refused: \(error)"
+        }
+    }
+
     // MARK: Materialisation
 
     /// Whether there is a sandbox to ask. Reviewing changes is meaningless
@@ -936,6 +1054,25 @@ final class AppState {
               let root = root(of: rec),
               let channel = sandboxes?.channel(for: rec.id) else { return }
 
+        // A git project crosses as a branch (spec 7.4a); the byte-copy sheet
+        // is the fallback for everything else.
+        var isGitDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: root.appendingPathComponent(".git").path,
+                                          isDirectory: &isGitDir), isGitDir.boolValue {
+            Task {
+                if let info = try? await channel.send(op: "git_info", timeout: 30),
+                   (info.result ?? "").contains("repo=true") {
+                    await gitCross(rec, root: root, channel: channel)
+                } else {
+                    reviewChangesFallback(rec: rec, root: root, channel: channel)
+                }
+            }
+            return
+        }
+        reviewChangesFallback(rec: rec, root: root, channel: channel)
+    }
+
+    private func reviewChangesFallback(rec: SessionRecord, root: URL, channel: VsockChannel) {
         proposal = nil
         proposalError = nil
         approvedPaths = []

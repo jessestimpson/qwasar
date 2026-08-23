@@ -25,11 +25,15 @@ The design lives in [the spec](spec/README.md), one topic per file; the measurem
 > works against *that copy* — it will tell you, accurately, that it edited a
 > file, and your file will be byte-identical.
 
-Work crosses back through **Review Changes…** in the session header: the
-sandbox is diffed against its boot baseline, every file is shown with its
-diff, and nothing is written until you tick it and apply (overwritten files
-are copied aside first). There is deliberately no "apply all and don't ask
-again" — the whole architecture exists to put a person at this one point.
+Work crosses back through **Review Changes…** in the session header. For a
+git project it crosses as git: the agent's commits arrive as verified
+objects plus one branch — `crucible/<session>` — and nothing else in your
+repository is touched; your files change only when *you* `git merge`, with
+your own tools and your own conflict resolution. (A dirty tree at session
+start gets one question: include your uncommitted changes, or work from
+HEAD.) Non-git projects keep the per-file approval sheet: every file shown
+with its diff, nothing written until you tick and apply. Either way the
+architecture puts a person at this one point.
 
 The guest has **no network device at all** — an absence, not a firewall rule.
 It gets a copy-on-write clone of the guest disk per session, the read-only
@@ -57,9 +61,10 @@ off. The reasoning is spec §8.3.
 
 **Status:** milestones 0–5 built and gated, plus markdown with syntax
 highlighting, session parking with verified warm/cold indicators, delegation
-(remote sub-agents under a budget), the config project, and project-owned
-skills. Not yet built: `crucible-cli` and the inspector (M6 remainder),
-vision (M7), and the git crossing (spec §7.4a). The full map is
+(remote sub-agents under a budget), the config project, project-owned
+skills, and the git crossing (agent work arrives as a real branch you
+merge). Not yet built: `crucible-cli` and the inspector (M6 remainder), and
+vision (M7). The full map is
 [spec/12-roadmap.md](spec/12-roadmap.md).
 
 ## Requirements

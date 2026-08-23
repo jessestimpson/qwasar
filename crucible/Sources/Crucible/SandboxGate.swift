@@ -297,6 +297,22 @@ enum SandboxGate {
         check("shell", sh.ok == true && inWork,
               (sh.result ?? sh.error ?? "?").replacingOccurrences(of: "\n", with: " "))
 
+        // The git crossing's guest half (spec 7.4a): the ops answer, and the
+        // export refuses in bounded, stated ways rather than guessing.
+        let gi = try await channel.send(op: "git_info", timeout: 15)
+        check("git_info (no repo)", (gi.result ?? "").contains("repo=false"),
+              gi.result ?? gi.error ?? "?")
+        _ = try await channel.send(op: "shell",
+                                   args: ["command": .string("cd /work && git init -q -b main && git add -A && git -c user.name=t -c user.email=t@t commit -qm base")],
+                                   timeout: 30)
+        let gi2 = try await channel.send(op: "git_info", timeout: 15)
+        check("git_info (repo)", (gi2.result ?? "").contains("repo=true"),
+              gi2.result ?? gi2.error ?? "?")
+        let ge = try await channel.send(op: "git_export", timeout: 30)
+        check("git_export refuses without a boot base",
+              (ge.error ?? "").contains("no base commit"),
+              ge.result ?? ge.error ?? "?")
+
         // And the baked-in BEAM is actually usable by the agent.
         let elixir = try await channel.send(op: "shell",
                                             args: ["command": .string("elixir -e 'IO.puts(:erlang.system_info(:otp_release))'")],

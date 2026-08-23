@@ -166,3 +166,91 @@ private struct ChangeRow: View {
         }
     }
 }
+
+
+// MARK: - The git crossing (spec 7.4a)
+
+/// The result of a crossing: a real branch in the user's real repo. The
+/// destructive step -- changing files -- belongs to their own `git merge`,
+/// so this sheet informs and hands over rather than asking permission.
+struct GitCrossingSheet: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let x = state.gitCrossing {
+                Label("Branch updated: \(x.branch)", systemImage: "arrow.triangle.branch")
+                    .font(.headline)
+                if x.commits.isEmpty && x.objectCount == 0 {
+                    Text("Nothing new to cross — the sandbox matches the base.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("\(x.objectCount) objects verified and written; nothing outside "
+                         + "`.git/objects` and this one ref was touched. Your files "
+                         + "change only when you merge.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(x.commits.enumerated()), id: \.offset) { _, c in
+                                HStack(alignment: .top, spacing: 6) {
+                                    Text(c.sha.prefix(8))
+                                        .font(.caption.monospaced()).foregroundStyle(.tertiary)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(c.message).font(.caption)
+                                        Text(c.author).font(.caption2).foregroundStyle(.tertiary)
+                                    }
+                                }
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(minHeight: 60, maxHeight: 180)
+                    HStack(spacing: 6) {
+                        Text("git merge \(x.branch)")
+                            .font(.callout.monospaced())
+                            .padding(6)
+                            .background(RoundedRectangle(cornerRadius: 4).fill(.quaternary.opacity(0.5)))
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString("git merge \(x.branch)", forType: .string)
+                        } label: { Image(systemName: "doc.on.doc") }
+                        .buttonStyle(.borderless)
+                        .help("Copy. Review first with `git log -p \(x.branch)`; conflicts "
+                              + "resolve with your own mergetool, line by line.")
+                    }
+                }
+            }
+            HStack { Spacer(); Button("Done") { state.showingGitCrossing = false } }
+        }
+        .padding(16)
+        .frame(width: 460)
+    }
+}
+
+/// Spec 7.4a's session-start question, asked only when the tree is actually
+/// dirty: should the agent see your uncommitted work at all?
+struct DirtyPromptSheet: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("This project has uncommitted changes", systemImage: "pencil.line")
+                .font(.headline)
+            Text("The sandbox received a copy of the tree as it stands. Should "
+                 + "this session work on your uncommitted changes, or from the "
+                 + "last commit?")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("From last commit") { state.resolveDirtyChoice("exclude") }
+                    .help("The copy is reset to HEAD; your uncommitted work never "
+                          + "enters the sandbox.")
+                Button("Include my changes") { state.resolveDirtyChoice("include") }
+                    .keyboardShortcut(.defaultAction)
+                    .help("Your changes are committed first, visibly yours, so a "
+                          + "merge never buries them under the agent's name.")
+            }
+        }
+        .padding(16)
+        .frame(width: 440)
+    }
+}

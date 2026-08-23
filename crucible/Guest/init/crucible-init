@@ -66,6 +66,14 @@ done
 . /sbin/seed-work
 seed_work
 
+# The base of the git crossing (spec 7.4a): the commit /work arrived with,
+# recorded before any agent runs. Every export is bounded by it, and the
+# host by construction has everything at or below it.
+mkdir -p /run 2>/dev/null || true
+git -C /work rev-parse HEAD > /run/crucible-base-head 2>/dev/null \
+    && log "git base $(cat /run/crucible-base-head | cut -c1-12)" \
+    || : > /run/crucible-base-head
+
 # Loopback, and only loopback.
 #
 # Erlang distribution runs over TCP even when both nodes are on the same

@@ -68,6 +68,12 @@ struct SessionView: View {
         .sheet(isPresented: $state.showingDelegateSheet) {
             DelegateSheet(state: state)
         }
+        .sheet(isPresented: $state.showingGitCrossing) {
+            GitCrossingSheet(state: state)
+        }
+        .sheet(isPresented: $state.showingDirtyPrompt) {
+            DirtyPromptSheet(state: state).interactiveDismissDisabled()
+        }
     }
 }
 

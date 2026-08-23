@@ -430,6 +430,13 @@ def install_local(rootfs, guest_dir, vsock_port, warden_build):
     shutil.copytree(os.path.join(guest_dir, "warden/lib"), os.path.join(warden, "lib"))
     shutil.copy(os.path.join(guest_dir, "warden/mix.exs"), warden)
 
+    # The agent commits its work (spec 7.4a), and git refuses to commit
+    # without an identity; the answer must not depend on the model
+    # remembering to configure one.
+    with open(os.path.join(rootfs, "root/.gitconfig"), "w") as f:
+        f.write("[user]\n\tname = Crucible Agent\n\temail = agent@crucible.invalid\n"
+                "[safe]\n\tdirectory = /work\n")
+
     # The one apk trigger this build cares about, done by hand: a shell at
     # /bin/sh so crucible-init can start at all. crucible-init's first act is
     # `/bin/busybox --install -s`, which builds the rest of the applet farm.
