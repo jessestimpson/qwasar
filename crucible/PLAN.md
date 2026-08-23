@@ -1854,6 +1854,54 @@ the folder disappears between launches, fail with a clear message and a picker,
 not a crash — `qwasar_engine_load` returning `NULL` with a filled `err` is a
 normal, expected outcome and the UI should treat it as one.
 
+### 8.5 Sandbox configuration: three layers, and the config project
+
+Sandbox settings — the network allowlist (§8.3), guest memory and CPUs, the
+tool-call timeout, the fetch cap — apply at three layers: **global**
+(`sandbox.json` in the store), **per-project** (`Project.sandbox`), and
+**per-session** (`SessionRecord.sandbox`). Every layer is the same
+`SandboxOverlay` shape with every field optional, and there is exactly one
+resolution rule: **field-wise, most specific non-nil wins** — session, then
+project, then global, then the built-in default.
+
+Two consequences of that rule are load-bearing and are pinned by
+`SandboxOverlaySuite`:
+
+- **Replace, never merge.** A session that sets `network_allowlist` replaces
+  the project's list rather than adding to it, because "replace" is a rule a
+  person can predict from the value they typed and "merge" is a rule they
+  have to go and check.
+- **Empty is an opinion; nil is silence.** An empty network list at the
+  session layer turns network OFF over a global grant — which is how a
+  confidential session opts out of a permissive global without touching it.
+  Provenance (which layer decided each field) is part of the API, so
+  `config_show` can say where a value came from rather than leaving the user
+  to reverse-engineer it from behaviour.
+
+Settings are resolved once, at session open, and fixed for the boot — the
+tool surface is the system turn (§2.2), so a live session keeps what it was
+prefilled with and changes apply at the next open.
+
+**The config project.** A built-in project (fixed id, synthesized at launch,
+not removable) named *Crucible Config*, whose sessions manage this
+configuration conversationally. Its tools run on the HOST with no sandbox —
+but *unsandboxed is not unbounded*: the surface is three purpose-built
+operations, `config_show` / `config_set` / `config_clear`, not a shell.
+There is no path from a config session to the filesystem, the network, or
+another project's files; the blast radius of the special project is the
+configuration itself, which is precisely its job. Mutations go through the
+same main-actor write path the UI uses, so a running config session, the
+sidebar and the store can never disagree.
+
+One deliberate asymmetry: the config session **can grow a project's network
+allowlist**, which §8.3 says only a person may do. The chain is still a
+person — a config session acts only on what the user typed into it, and its
+transcript shows every change — but text a user pastes into a config session
+is trusted the way text typed into the sheet is, so the same social-
+engineering caution applies. The config project itself has no sandbox and no
+fetch: nothing a *project's* compromised agent produces can reach a config
+session's input except through the user choosing to paste it.
+
 ---
 
 ## 9. Deterministic simulation testing with `eta` — ended

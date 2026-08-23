@@ -36,6 +36,14 @@ project copy, and one vsock channel to the host. So a prompt injection in a
 file the model reads degrades from *arbitrary code execution on your laptop*
 to *a bad edit inside a VM you can throw away*.
 
+**Sandbox settings overlay in three layers** — global, per-project,
+per-session; field-wise, the most specific value wins, replace not merge
+(PLAN.md 8.5). The built-in **Crucible Config** project manages them
+conversationally: its sessions run host-side config tools (`config_show`,
+`config_set`, `config_clear`) with no sandbox — and no shell, no file
+access, no network; the special project's whole reach is the configuration
+itself.
+
 **Network is opt-in, per project, and never touches the guest.** Right-click
 a project → **Network…** to grant a host allowlist; the model then gets a
 `fetch` tool (HTTPS GET only, capped, logged in the transcript) that the

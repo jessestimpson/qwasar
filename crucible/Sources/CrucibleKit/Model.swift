@@ -43,18 +43,28 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
     // vectors keep comparing like with like.
     public var effort: ReasoningEffort { defaultEffort ?? .medium }
 
-    /// Hosts `fetch` may reach, per PLAN.md 8.3. Empty (or absent, for
-    /// records written before this existed) means network OFF: the tool is
-    /// not advertised and the project keeps the no-egress guarantees exactly.
-    /// Optional so older stores still decode; `network` resolves the absence.
+    /// The pre-overlay network field, kept so records written between M5 and
+    /// the overlay model still decode; `overlay` folds it in. Never written
+    /// any more.
     public var networkAllowlist: [String]?
+    /// This project's layer of sandbox configuration (PLAN.md 8.5).
+    public var sandbox: SandboxOverlay?
 
-    public var network: [String] { networkAllowlist ?? [] }
+    /// The project layer as resolution sees it: the overlay, with the legacy
+    /// network field standing in where the overlay is silent.
+    public var overlay: SandboxOverlay {
+        var o = sandbox ?? SandboxOverlay()
+        if o.networkAllowlist == nil, let legacy = networkAllowlist, !legacy.isEmpty {
+            o.networkAllowlist = legacy
+        }
+        return o
+    }
 
     public init(id: UUID = UUID(), name: String, rootBookmark: Data,
                 resolvedRoot: URL? = nil, systemPrompt: String = Project.defaultSystem,
                 defaultEffort: ReasoningEffort? = nil,
-                networkAllowlist: [String]? = nil) {
+                networkAllowlist: [String]? = nil,
+                sandbox: SandboxOverlay? = nil) {
         self.id = id
         self.name = name
         self.rootBookmark = rootBookmark
@@ -62,10 +72,30 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
         self.systemPrompt = systemPrompt
         self.defaultEffort = defaultEffort
         self.networkAllowlist = networkAllowlist
+        self.sandbox = sandbox
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, rootBookmark, systemPrompt, defaultEffort, networkAllowlist
+        case id, name, rootBookmark, systemPrompt, defaultEffort, networkAllowlist, sandbox
+    }
+
+    // MARK: The config project (PLAN.md 8.5)
+
+    /// A fixed id, so the special project is the same one across launches and
+    /// its sessions persist like any other's.
+    public static let configProjectID = UUID(uuidString: "C0F16000-0000-4000-8000-000000000001")!
+
+    public var isConfig: Bool { id == Project.configProjectID }
+
+    /// The built-in project whose sessions manage Crucible itself: host-side
+    /// config tools, no folder, no sandbox to boot.
+    public static func configProject() -> Project {
+        Project(id: configProjectID, name: "Crucible Config", rootBookmark: Data(),
+                systemPrompt: """
+                You manage Crucible's configuration through the config tools. \
+                Show the current state before changing it, change only what was \
+                asked, and state what you changed and at which layer.
+                """)
     }
 
     /// The project's own instructions. NOT a description of the environment --
@@ -119,6 +149,9 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
     /// re-prefilling the entire conversation, so it is settable only before the
     /// first message and inherited from the project after that.
     public var storedEffort: ReasoningEffort?
+    /// This session's layer of sandbox configuration (PLAN.md 8.5): the most
+    /// specific overlay, consulted first. Optional so old records decode.
+    public var sandbox: SandboxOverlay?
 
     public var effort: ReasoningEffort { storedEffort ?? .medium }
 
@@ -126,7 +159,7 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
                 workingSubpath: String = "", createdAt: Date = Date(),
                 state: SessionState = .closed, contextSize: Int32,
                 tokenCount: Int = 0, ancestorID: UUID? = nil, successorID: UUID? = nil,
-                storedEffort: ReasoningEffort? = nil) {
+                storedEffort: ReasoningEffort? = nil, sandbox: SandboxOverlay? = nil) {
         self.id = id
         self.projectID = projectID
         self.title = title
@@ -138,6 +171,7 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
         self.ancestorID = ancestorID
         self.successorID = successorID
         self.storedEffort = storedEffort
+        self.sandbox = sandbox
     }
 }
 

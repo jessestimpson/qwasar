@@ -136,7 +136,7 @@ struct NetworkSheet: View {
         }
         .padding(16)
         .frame(width: 440)
-        .onAppear { text = project.network.joined(separator: "\n") }
+        .onAppear { text = (project.overlay.networkAllowlist ?? []).joined(separator: "\n") }
     }
 }
 
@@ -172,16 +172,24 @@ struct Sidebar: View {
                     HStack {
                         Text(project.name)
                         Spacer()
-                        if project.resolvedRoot == nil {
+                        if project.isConfig {
+                            Image(systemName: "gearshape")
+                                .foregroundStyle(.secondary)
+                                .help("Built in. Sessions here manage Crucible's "
+                                      + "configuration with host-side tools — no "
+                                      + "folder, no sandbox.")
+                        } else if project.resolvedRoot == nil {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .foregroundStyle(.orange)
                                 .help("This folder is no longer reachable. Re-add the project.")
                         }
                     }
                     .contextMenu {
-                        Button("Network…") { state.networkEditing = project }
-                        Button("Remove Project", role: .destructive) {
-                            state.removeProject(project)
+                        if !project.isConfig {
+                            Button("Network…") { state.networkEditing = project }
+                            Button("Remove Project", role: .destructive) {
+                                state.removeProject(project)
+                            }
                         }
                     }
                 }

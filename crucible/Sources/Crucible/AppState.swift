@@ -75,7 +75,7 @@ final class AppState {
     /// app can open -- it needs its own picker and its own bookmark, exactly
     /// like the model.
     private let draftAccess = ModelAccess(defaultsKey: "dev.crucible.mtpBookmark")
-    private var store: Store?
+    private(set) var store: Store?
     /// One guest per session, booted lazily (PLAN.md 6.5). Absent until the
     /// image has been built, in which case the session falls back to the
     /// read-only host tools and the UI says so.
@@ -84,6 +84,9 @@ final class AppState {
     /// The project whose network allowlist is being edited, when the sheet is
     /// up. Set only from the UI -- no tool result or model output can reach it.
     var networkEditing: Project?
+    /// The global sandbox layer (PLAN.md 8.5), loaded once and written only
+    /// through performConfig -- the config session's single mutation path.
+    var globalSandbox: SandboxOverlay?
     /// Set while the app is quitting and the guests are being flushed.
     var shuttingDown = false
     /// Something the ENGINE has to say, which can happen with no session open:
@@ -112,6 +115,12 @@ final class AppState {
         }
         projects = store?.loadProjects() ?? []
         sessions = store?.loadSessions() ?? []
+        globalSandbox = store?.loadGlobalOverlay()
+        // The config project (PLAN.md 8.5): built in, fixed id, synthesized
+        // when absent so it exists on first launch and after any store reset.
+        if !projects.contains(where: \.isConfig) {
+            projects.append(Project.configProject())
+        }
         migrateSystemPrompts()
         resolveProjectRoots()
         // The draft head's grant has to come back BEFORE the model loads: a
@@ -264,11 +273,15 @@ final class AppState {
     /// surface it was prefilled with, because the tool list is the system turn.
     func setNetworkAllowlist(_ p: Project, hosts: [String]) {
         guard let i = projects.firstIndex(where: { $0.id == p.id }) else { return }
-        projects[i].networkAllowlist = hosts.isEmpty ? nil : hosts
+        var o = projects[i].overlay
+        o.networkAllowlist = hosts.isEmpty ? nil : hosts
+        projects[i].sandbox = o.isEmpty ? nil : o
+        projects[i].networkAllowlist = nil   // legacy field, folded in
         store?.saveProjects(projects)
     }
 
     func removeProject(_ p: Project) {
+        guard !p.isConfig else { return }   // the config project is part of the app
         for s in sessions where s.projectID == p.id { store?.delete(s.id) }
         sessions.removeAll { $0.projectID == p.id }
         projectAccess[p.id]?.stopAccessingSecurityScopedResource()
@@ -290,7 +303,7 @@ final class AppState {
     }
 
     private func resolveProjectRoots() {
-        for i in projects.indices {
+        for i in projects.indices where !projects[i].isConfig {
             var stale = false
             guard let u = try? URL(resolvingBookmarkData: projects[i].rootBookmark,
                                    options: .withSecurityScope, relativeTo: nil,
@@ -414,11 +427,14 @@ final class AppState {
 
     func send() {
         guard case .ready = phase, let rec = selectedSession else { return }
-        guard let root = root(of: rec) else {
+        guard let p = project(of: rec) else { return }
+        // The config project has no folder; its tools are the host's own
+        // (PLAN.md 8.5). Every other project needs its root back.
+        let root = root(of: rec)
+        if root == nil && !p.isConfig {
             phase = .failed("this project's folder is no longer reachable — re-add it")
             return
         }
-        guard let p = project(of: rec) else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         draft = ""
@@ -441,27 +457,48 @@ final class AppState {
                 // image the session still works, read-only, against the real
                 // tree -- and the header says which world it is in, because
                 // "can this change my files" is not a detail to leave implicit.
-                var runner: ToolExecuting = ToolRunner(root: root)
-                if let sandboxes, sandboxes.isAvailable {
-                    do {
-                        let ready = try await sandboxes.start(session: rec.id, projectRoot: root)
-                        runner = SandboxToolRunner(channel: ready.channel)
-                        sandboxStatus = String(format: "sandboxed · booted in %.1fs",
-                                               ready.bootSeconds)
-                    } catch {
-                        sandboxStatus = "read-only — the sandbox did not start"
-                    }
+                var runner: ToolExecuting
+                if p.isConfig {
+                    // The config project (PLAN.md 8.5): host-side config
+                    // tools, no folder, no VM, no network wrapper.
+                    runner = configToolRunner()
+                    sandboxStatus = "config session — host config tools, no sandbox"
                 } else {
-                    sandboxStatus = "read-only — no guest image (run `make guest`)"
-                }
-                // Network, when this project granted any (PLAN.md 8.3). The
-                // fetch tool is the HOST's -- the wrapper answers it itself
-                // and delegates everything else -- so the guest stays exactly
-                // as network-less as the line above left it.
-                if !p.network.isEmpty {
-                    runner = NetworkToolRunner(inner: runner,
-                                               policy: NetworkPolicy(allowlist: p.network))
-                    sandboxStatus = (sandboxStatus ?? "") + " · net: \(p.network.count) host\(p.network.count == 1 ? "" : "s")"
+                    let root = root!    // guarded at the top of send()
+                    // The settings this session runs with: session over
+                    // project over global over the defaults (PLAN.md 8.5),
+                    // resolved once at open and fixed for the boot.
+                    let settings = SandboxSettings.resolve(global: globalSandbox,
+                                                           project: p.overlay,
+                                                           session: rec.sandbox)
+                    runner = ToolRunner(root: root)
+                    if let sandboxes, sandboxes.isAvailable {
+                        do {
+                            let ready = try await sandboxes.start(session: rec.id,
+                                                                  projectRoot: root,
+                                                                  settings: settings)
+                            runner = SandboxToolRunner(channel: ready.channel,
+                                                       timeout: settings.toolTimeoutSeconds)
+                            sandboxStatus = String(format: "sandboxed · booted in %.1fs",
+                                                   ready.bootSeconds)
+                        } catch {
+                            sandboxStatus = "read-only — the sandbox did not start"
+                        }
+                    } else {
+                        sandboxStatus = "read-only — no guest image (run `make guest`)"
+                    }
+                    // Network, when the resolved settings grant any (PLAN.md
+                    // 8.3). The fetch tool is the HOST's -- the wrapper
+                    // answers it itself and delegates everything else -- so
+                    // the guest stays exactly as network-less as before.
+                    let net = settings.networkAllowlist
+                    if !net.isEmpty {
+                        runner = NetworkToolRunner(
+                            inner: runner,
+                            policy: NetworkPolicy(allowlist: net,
+                                                  maxResponseBytes: settings.fetchMaxKB * 1024))
+                        sandboxStatus = (sandboxStatus ?? "") + " · net: \(net.count) host\(net.count == 1 ? "" : "s")"
+                    }
                 }
 
                 for await ev in engine.openSession(id: rec.id, runner: runner,

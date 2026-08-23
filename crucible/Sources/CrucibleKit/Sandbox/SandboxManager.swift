@@ -47,7 +47,8 @@ public final class SandboxManager {
     ///
     /// The guest copies that share into `/work` and unmounts it, so the tools
     /// operate on the copy and the user's tree is never writable from inside.
-    public func start(session id: UUID, projectRoot: URL) async throws -> Ready {
+    public func start(session id: UUID, projectRoot: URL,
+                      settings: SandboxSettings = .defaults) async throws -> Ready {
         if let existing = live[id] {
             return Ready(channel: existing.channel, bootSeconds: 0, cloneMethod: .copyOnWrite)
         }
@@ -81,8 +82,10 @@ public final class SandboxManager {
                                    initramfs: guestDir.appendingPathComponent("initramfs"),
                                    consoleLog: scratch.appendingPathComponent("console.log"),
                                    baseDirectory: projectRoot)
-        config.memoryBytes = 2 * 1024 * 1024 * 1024
-        config.cpuCount = 2
+        // From the resolved sandbox settings (PLAN.md 8.5): session over
+        // project over global over the defaults these used to hard-code.
+        config.memoryBytes = UInt64(settings.guestMemoryMB) * 1024 * 1024
+        config.cpuCount = settings.guestCPUs
 
         let host = SandboxHost(config: config)
         let t0 = Date()
