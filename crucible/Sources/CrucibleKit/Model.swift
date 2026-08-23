@@ -49,6 +49,11 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
     public var networkAllowlist: [String]?
     /// This project's layer of sandbox configuration (PLAN.md 8.5).
     public var sandbox: SandboxOverlay?
+    /// The project's tool library (spec 7.2): every module the agent has
+    /// defined, in definition order, replayed into every session's guest at
+    /// open. A tool written once belongs to the project, not to the VM that
+    /// happened to compile it first.
+    public var toolLibrary: [DefinedTool]?
 
     /// The project layer as resolution sees it: the overlay, with the legacy
     /// network field standing in where the overlay is silent.
@@ -76,7 +81,23 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, rootBookmark, systemPrompt, defaultEffort, networkAllowlist, sandbox
+        case id, name, rootBookmark, systemPrompt, defaultEffort, networkAllowlist,
+             sandbox, toolLibrary
+    }
+
+    /// Upsert by module, preserving first-definition order -- later modules
+    /// may reference earlier ones, and definition order is the only ordering
+    /// information there is (the same rule the warden's own replay follows).
+    public mutating func recordDefine(module: String, toolName: String?, source: String) {
+        var lib = toolLibrary ?? []
+        if let i = lib.firstIndex(where: { $0.module == module }) {
+            lib[i].source = source
+            lib[i].toolName = toolName
+        } else {
+            lib.append(DefinedTool(module: module, toolName: toolName,
+                                   source: source, definedAt: Date()))
+        }
+        toolLibrary = lib
     }
 
     // MARK: The config project (PLAN.md 8.5)
@@ -120,6 +141,25 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
         before answering rather than guessing, and quote what you found.
         """
     ]
+}
+
+/// One agent-defined module (spec 7.2), stored at the PROJECT level so the
+/// work survives the VM that compiled it and reaches every sibling session.
+public struct DefinedTool: Codable, Sendable, Hashable {
+    public var module: String
+    /// The invoke name, when the module registered as a Crucible.Tool; nil
+    /// for helper modules, which are kept for the same reason the warden's
+    /// manifest keeps them -- later modules may depend on them.
+    public var toolName: String?
+    public var source: String
+    public var definedAt: Date
+
+    public init(module: String, toolName: String?, source: String, definedAt: Date) {
+        self.module = module
+        self.toolName = toolName
+        self.source = source
+        self.definedAt = definedAt
+    }
 }
 
 public enum SessionState: String, Codable, Sendable {

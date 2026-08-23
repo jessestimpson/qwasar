@@ -127,6 +127,10 @@ final class AppState {
     /// The call currently being written, if any. Replaced by a real ToolCard
     /// the moment the call parses.
     var pendingCall: (name: String?, keys: [String], tokens: Int)?
+    /// The source of the define whose result has not landed yet (tools run
+    /// one at a time, so one slot suffices). Captured from the CALL, because
+    /// the result reports what loaded but not what was sent.
+    private var pendingDefineSource: String?
     private var projectAccess: [UUID: URL] = [:]
     private var cancelFlag = CancelFlag()
     /// Items produced by the turn in flight, appended to the log when it ends.
@@ -458,11 +462,21 @@ final class AppState {
         case .cost(let usd):
             liveDelegation?.costUSD = usd
         case .toolCall(let name, let args):
+            if name == "define",
+               let d = args.data(using: .utf8),
+               let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+               let src = obj["source"] as? String {
+                pendingDefineSource = src
+            }
             // Compact: the card is a window, not a full transcript; the
             // arguments are truncated the way the local pending-call row is.
             let brief = args.count > 120 ? String(args.prefix(120)) + "…" : args
             liveDelegation?.log += "\n\n`→ \(name) \(brief)`\n"
         case .toolResult(let name, let result):
+            if name == "define", let src = pendingDefineSource {
+                pendingDefineSource = nil
+                recordDefine(source: src, result: result)
+            }
             let first = result.split(separator: "\n").first.map(String.init) ?? ""
             let brief = first.count > 160 ? String(first.prefix(160)) + "…" : first
             liveDelegation?.log += "`← \(name): \(brief)`\n\n"
@@ -702,6 +716,10 @@ final class AppState {
                                                        timeout: settings.toolTimeoutSeconds)
                             sandboxStatus = String(format: "sandboxed · booted in %.1fs",
                                                    ready.bootSeconds)
+                            // The project's tools, into this guest (spec
+                            // 7.2): what one session defined, every sibling
+                            // has from its first token.
+                            await replayToolLibrary(p, channel: ready.channel)
                         } catch {
                             sandboxStatus = "read-only — the sandbox did not start"
                         }
@@ -808,6 +826,52 @@ final class AppState {
     }
 
     func interrupt() { cancelFlag.set() }
+
+    // MARK: The project tool library (spec 7.2)
+
+    /// A successful define becomes project property: source keyed by module,
+    /// replayed into every sibling session's guest at open. Helper modules
+    /// are kept too, for the warden's own reason -- later modules may depend
+    /// on them.
+    private func recordDefine(source: String, result: String) {
+        guard !result.hasPrefix("error:") else { return }
+        let first = result.split(separator: "\n").first.map(String.init) ?? ""
+        guard let colon = first.firstIndex(of: ":"), first.contains("exports") else { return }
+        let module = String(first[..<colon])
+        var toolName: String?
+        if let r = result.range(of: #"registered as the tool \"([^\"]+)\""#,
+                                options: .regularExpression) {
+            toolName = String(result[r]).split(separator: "\"").dropFirst().first.map(String.init)
+        }
+        guard let rec = selectedSession,
+              let i = projects.firstIndex(where: { $0.id == rec.projectID }),
+              !projects[i].isConfig else { return }
+        projects[i].recordDefine(module: module, toolName: toolName, source: source)
+        store?.saveProjects(projects)
+    }
+
+    /// Replays the project's library into a freshly booted guest, in
+    /// definition order. Failures are noted, not fatal: a module that no
+    /// longer compiles should not hold the session hostage.
+    private func replayToolLibrary(_ p: Project, channel: VsockChannel) async {
+        guard let lib = p.toolLibrary, !lib.isEmpty else { return }
+        var loaded = 0, failed = 0
+        for tool in lib {
+            do {
+                let r = try await channel.send(op: "define",
+                                               args: ["source": .string(tool.source),
+                                                      "force": .string("true")],
+                                               timeout: 60)
+                if r.ok == true { loaded += 1 } else { failed += 1 }
+            } catch { failed += 1 }
+        }
+        if loaded > 0 {
+            sandboxStatus = (sandboxStatus ?? "") + " · \(loaded) tool\(loaded == 1 ? "" : "s")"
+        }
+        if failed > 0 {
+            engineNote = "\(failed) library module\(failed == 1 ? "" : "s") failed to reload; define again to update"
+        }
+    }
 
     // MARK: Parking (spec 4.4)
 
@@ -1008,8 +1072,13 @@ final class AppState {
             pendingCall = (name, keys, n)
         case .toolCall(let c):
             pendingCall = nil
+            if c.name == "define" { pendingDefineSource = c.arguments["source"] }
             appendItem(TranscriptItem(.tool(name: c.name, arguments: c.arguments, result: nil)))
         case .toolResult(let name, let r):
+            if name == "define", let src = pendingDefineSource {
+                pendingDefineSource = nil
+                recordDefine(source: src, result: r)
+            }
             // Fill the open card rather than adding a second item.
             if let i = transcript.lastIndex(where: {
                 if case .tool(let n, _, let res) = $0.kind { return n == name && res == nil }

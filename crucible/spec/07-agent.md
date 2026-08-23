@@ -110,10 +110,20 @@ So:
   N modules were reloaded; process state was lost.* The agent is told the truth
   and can recover. That sentence is a promise, and the unit suite plus the
   sandbox gate are how it is kept (§10 lists the invariants).
-- **The manifest is the durable artefact.** It is sent to the host on every
-  change and stored in `SessionRecord.moduleManifest`. That is what makes
-  self-modification survive parking, a VM crash, and an app relaunch. A session
-  resumed tomorrow has the tools it wrote today.
+- **The library is the durable artefact, and it belongs to the PROJECT.**
+  The host captures every successful `define` from its own event stream --
+  the call carries the source, the result names the module -- and stores it
+  as `Project.toolLibrary`: source keyed by module, first-definition order
+  preserved (later modules may reference earlier ones), helper modules kept
+  for the warden's own reason. At every session open, the library replays
+  into the freshly booted guest before the first token, so a tool written
+  once reaches every sibling session and survives parking, a VM stop, and an
+  app relaunch. An earlier draft scoped this to `SessionRecord` -- but a tool
+  is project knowledge, not VM state: the session whose guest happened to
+  compile it first has no better claim to it than its siblings. Defines made
+  by a delegated remote agent are captured the same way; a module that no
+  longer compiles on replay is noted and skipped, never fatal. Removing or
+  editing a library entry is a future config-project operation.
 
 `invoke(name, args)` is a warden call: look up the name in the registry, `erpc`
 into workspace's `mod.run(args)` under a timeout, marshal the return. A tool that
