@@ -428,7 +428,8 @@ final class AppState {
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated { self.handleDelegation(ev, session: sid) }
                 }
-            })
+            },
+            logProvider: makeLogProvider())
         var args = ["task": brief]
         if let model { args["model"] = model }
         Task.detached {
@@ -774,7 +775,8 @@ final class AppState {
                                         self.handleDelegation(ev, session: sid)
                                     }
                                 }
-                            })
+                            },
+                            logProvider: makeLogProvider())
                         sandboxStatus = (sandboxStatus ?? "")
                             + String(format: " · delegate: $%.2f", remaining)
                     }
@@ -842,6 +844,29 @@ final class AppState {
     }
 
     func interrupt() { cancelFlag.set() }
+
+    /// Completed delegations of the SELECTED session, newest first, for the
+    /// local model's delegation_log tool (spec 15.2). Reads the live
+    /// transcript, so a delegation finished a moment ago is inspectable in
+    /// the same turn.
+    private func delegationRecord(_ nth: Int) -> DelegationRecord? {
+        let all = transcript.compactMap { item -> DelegationRecord? in
+            if case .delegation(let m, let t, let l, _, let e) = item.kind {
+                return DelegationRecord(model: m, task: t, log: l, ended: e)
+            }
+            return nil
+        }
+        guard nth >= 1, nth <= all.count else { return nil }
+        return all[all.count - nth]
+    }
+
+    private func makeLogProvider() -> @Sendable (Int) -> DelegationRecord? {
+        { nth in
+            DispatchQueue.main.sync {
+                MainActor.assumeIsolated { self.delegationRecord(nth) }
+            }
+        }
+    }
 
     // MARK: The project skill library (spec 7.2)
 

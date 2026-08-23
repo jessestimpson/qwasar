@@ -125,7 +125,8 @@ enum EscalationSuite {
                        remaining: Double = 1.0, turn: Double = 1.0,
                        grace: Double = 0.05, log: CallLog? = nil,
                        events: Events, mailbox: DelegationMailbox,
-                       key: String? = "SECRET-KEY") -> DelegateToolRunner {
+                       key: String? = "SECRET-KEY",
+                       records: (@Sendable (Int) -> DelegationRecord?)? = nil) -> DelegateToolRunner {
         DelegateToolRunner(inner: Inner(log: log),
                            policy: EscalationPolicy(models: models,
                                                     sessionRemainingUSD: remaining,
@@ -134,7 +135,12 @@ enum EscalationSuite {
                            mailbox: mailbox,
                            emit: { events.add($0) },
                            baseURL: URL(string: "https://stub.invalid/api/v1")!,
-                           keyProvider: { key })
+                           keyProvider: { key },
+                           logProvider: records)
+    }
+
+    static func handoff(_ summary: String, cost: Double = 0.0) -> Stub.Reply {
+        .toolCall(name: "handoff", args: "{\"summary\": \"\(summary)\"}", cost: cost)
     }
 
     static func run() -> Int {
@@ -149,14 +155,22 @@ enum EscalationSuite {
             ToolCall(name: "delegate", arguments: args)
         }
 
-        // A single consult: one response, then silence ends it.
-        Stub.script = .init(responses: [.text(["Hello", " there"], cost: 0.01)])
+        // The delegate's ONLY self-exit is handoff (spec 15.2): it cedes
+        // with a summary, and the summary -- not a transcript -- is what the
+        // local model receives.
+        Stub.script = .init(responses: [handoff("done; detail in notes.txt", cost: 0.01)])
         var ev = Events(); var mb = DelegationMailbox()
         var out = runner(events: ev, mailbox: mb).run(call(["task": "greet"]))
-        f += TestMain.check(out.contains("Hello there"), "the answer comes back")
+        f += TestMain.check(out.contains("detail in notes.txt"), "the handoff comes back")
         f += TestMain.check(out.contains("$0.0100"), "the header carries the cost")
-        f += TestMain.check(ev.endedReason == "the remote model finished",
-                            "silence after the grace window ends it")
+        f += TestMain.check(ev.endedReason == "the delegate ceded control",
+                            "handoff is the exit, and says so")
+        let req1 = Stub.lock.withLock { Stub.script.requests.first }
+        let toolNames = (req1?["tools"] as? [[String: Any]])?.compactMap {
+            ($0["function"] as? [String: Any])?["name"] as? String
+        } ?? []
+        f += TestMain.check(toolNames.contains("handoff"),
+                            "the delegate is offered its handoff tool")
         f += TestMain.check(!out.contains("SECRET-KEY"),
                             "the key is not in the tool result")
         f += TestMain.check(Stub.script.authSeen == ["Bearer SECRET-KEY"],
@@ -165,17 +179,39 @@ enum EscalationSuite {
             if case .delta(let s) = ev { return s.contains("SECRET") } else { return false }
         }, "the key is in no event")
 
-        // A queued user message continues the conversation; the second answer
-        // is the one that returns; costs sum.
-        Stub.script = .init(responses: [.text(["first"], cost: 0.01), .text(["second"], cost: 0.02)])
+        // Stopping WITHOUT handoff means waiting on the user -- unbounded:
+        // a reply posted long after any old grace window continues it, and
+        // the eventual handoff carries the cost of both turns.
+        Stub.script = .init(responses: [.text(["which file?"], cost: 0.01),
+                                        handoff("done", cost: 0.02)])
         ev = Events(); mb = DelegationMailbox()
-        mb.post("go deeper")
+        let late = mb
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.4)
+            late.post("the main one")
+        }
         out = runner(events: ev, mailbox: mb).run(call(["task": "t"]))
-        f += TestMain.check(out.contains("second") && !out.hasSuffix("first"),
-                            "the user's message continued the conversation")
+        f += TestMain.check(ev.all.contains { if case .waiting = $0 { return true } else { return false } },
+                            "the card is told the delegate is waiting")
+        f += TestMain.check(out.contains("done") && ev.endedReason == "the delegate ceded control",
+                            "the reply continued it and the handoff ended it")
         f += TestMain.check(out.contains("$0.0300"), "costs sum across turns")
         f += TestMain.check(ev.all.contains { if case .userTurn = $0 { return true } else { return false } },
                             "the user turn is an event the card can render")
+
+        // Finish without a handoff: the last message stands in, marked.
+        Stub.script = .init(responses: [.text(["half an answer"], cost: 0.0)])
+        ev = Events(); mb = DelegationMailbox()
+        let fin = mb
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.2)
+            fin.stop()
+        }
+        out = runner(events: ev, mailbox: mb).run(call(["task": "t"]))
+        f += TestMain.check(ev.endedReason == "the user finished it"
+                            && out.contains("no handoff was given")
+                            && out.contains("half an answer"),
+                            "Finish substitutes the last message, marked as such")
 
         // The budget stops the NEXT request: with the cap under the first
         // response's cost and a message queued, exactly one request is sent.
@@ -183,18 +219,19 @@ enum EscalationSuite {
         ev = Events(); mb = DelegationMailbox()
         mb.post("continue!")
         out = runner(turn: 0.005, events: ev, mailbox: mb).run(call(["task": "t"]))
-        f += TestMain.check(out.contains("partial") && !out.contains("never"),
+        f += TestMain.check(out.contains("partial") && !out.contains("never")
+                            && out.contains("no handoff was given"),
                             "the budget declined the next request, not the one in flight")
         f += TestMain.check(ev.endedReason == "the budget tripped", "and said so")
         f += TestMain.check(Stub.lock.withLock { Stub.script.responses.count } == 1,
                             "exactly one request reached the provider")
 
-        // Stop ends it after the current response.
+        // Finish queued before the first response still ends it.
         Stub.script = .init(responses: [.text(["answer"], cost: 0.01), .text(["never"], cost: 0.01)])
         ev = Events(); mb = DelegationMailbox()
         mb.stop()
         out = runner(events: ev, mailbox: mb).run(call(["task": "t"]))
-        f += TestMain.check(ev.endedReason == "the user ended it", "stop ends it")
+        f += TestMain.check(ev.endedReason == "the user finished it", "Finish ends it")
 
         // Refusals, each for its stated reason.
         ev = Events(); mb = DelegationMailbox()
@@ -218,25 +255,26 @@ enum EscalationSuite {
                 session: SandboxOverlay(agentModels: [])).agentModels.isEmpty,
             "a session's empty agent_models turns escalation OFF over a global grant")
 
-        // Typing holds the grace window: with hold set, a message posted well
-        // after the grace period still lands; without it, the same delay
-        // would have missed the window (the first test above proves silence
-        // closes it).
-        Stub.script = .init(responses: [.text(["draft answer"], cost: 0.0),
-                                        .text(["revised"], cost: 0.0)])
+        // delegation_log (spec 15.2): the local model pulls detail on demand
+        // rather than having the transcript pushed at it.
+        let record = DelegationRecord(model: "stub/model-a", task: "count things",
+                                      log: "line one\nline two\nfindme here\nline four",
+                                      ended: "the delegate ceded control")
         ev = Events(); mb = DelegationMailbox()
-        mb.hold(true)
-        let late = mb
-        Thread.detachNewThread {
-            Thread.sleep(forTimeInterval: 0.4)   // 8x the 0.05s grace
-            late.hold(false)
-            late.post("revise it")
-        }
-        out = runner(events: ev, mailbox: mb).run(call(["task": "t"]))
-        f += TestMain.check(out.contains("revised"),
-                            "a held window accepts a message the grace period would have missed")
-        f += TestMain.check(ev.all.contains { if case .waiting = $0 { return true } else { return false } },
-                            "the card is told the window is open")
+        let r = runner(events: ev, mailbox: mb,
+                       records: { nth in nth == 1 ? record : nil })
+        out = r.run(ToolCall(name: "delegation_log", arguments: [:]))
+        f += TestMain.check(out.contains("1: line one") && out.contains("4: line four"),
+                            "the log reads numbered")
+        out = r.run(ToolCall(name: "delegation_log", arguments: ["grep": "findme"]))
+        f += TestMain.check(out.contains("3: findme here") && !out.contains("line two"),
+                            "grep narrows to matching lines")
+        out = r.run(ToolCall(name: "delegation_log", arguments: ["nth": "2"]))
+        f += TestMain.check(out.contains("no delegation #2"), "a missing delegation is named")
+        f += TestMain.check(r.schemas.contains { $0.contains("\"delegation_log\"") },
+                            "delegation_log is advertised with a provider")
+        f += TestMain.check(!r.schemas.contains { $0.contains("\"handoff\"") },
+                            "handoff is never advertised to the LOCAL model")
 
         // ---- E2: the remote agent works the sandbox by proxy ------------
 
@@ -246,7 +284,7 @@ enum EscalationSuite {
             .toolCall(name: "write",
                       args: #"{"path": "notes.txt", "content": "hi"}"#,
                       cost: 0.01),
-            .text(["wrote it"], cost: 0.01),
+            handoff("wrote notes.txt; read it there", cost: 0.01),
         ])
         ev = Events(); mb = DelegationMailbox()
         let log = CallLog()
@@ -254,7 +292,8 @@ enum EscalationSuite {
         f += TestMain.check(log.all == [ToolCall(name: "write",
                                                  arguments: ["path": "notes.txt", "content": "hi"])],
                             "the remote tool call reached the inner executor, arguments decoded")
-        f += TestMain.check(out.contains("wrote it"), "and the model finished after it")
+        f += TestMain.check(out.contains("wrote notes.txt; read it there"),
+                            "and the handoff references the file rather than the content")
         f += TestMain.check(out.contains("write×1") && out.contains("re-read"),
                             "the result header tallies the tools so the local model knows /work moved")
         let second = Stub.lock.withLock { Stub.script.requests.last }
@@ -265,16 +304,16 @@ enum EscalationSuite {
                             && (toolMsg?["tool_call_id"] as? String) == "call_9",
                             "the tool result went back, correlated by id")
         let sentTools = Stub.lock.withLock { Stub.script.requests.first?["tools"] as? [[String: Any]] }
-        f += TestMain.check(sentTools?.count == 1
-                            && ((sentTools?.first?["function"] as? [String: Any])?["name"] as? String) == "write",
-                            "the remote model was offered the inner surface, and only it")
+        let sentNames = (sentTools ?? []).compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
+        f += TestMain.check(Set(sentNames) == ["write", "handoff"],
+                            "the remote model was offered the inner surface plus its handoff, and only those")
         f += TestMain.check(ev.all.contains { if case .toolCall(let n, _) = $0 { return n == "write" } else { return false } },
                             "the card hears the tool call")
 
         // Nested escalation is refused as a tool result, not executed.
         Stub.script = .init(responses: [
             .toolCall(name: "delegate", args: #"{"task": "recurse"}"#, cost: 0.0),
-            .text(["fine"], cost: 0.0),
+            handoff("fine", cost: 0.0),
         ])
         ev = Events(); mb = DelegationMailbox()
         _ = runner(events: ev, mailbox: mb).run(call(["task": "t"]))
@@ -288,29 +327,31 @@ enum EscalationSuite {
             .toolCall(name: "write", args: #"{"path": "a", "content": "x"}"#, cost: 0.0),
             .toolCall(name: "write", args: #"{"path": "b", "content": "x"}"#, cost: 0.0),
             .toolCall(name: "write", args: #"{"path": "c", "content": "x"}"#, cost: 0.0),
-            .text(["stopping"], cost: 0.0),
+            handoff("three files written", cost: 0.0),
         ])
         ev = Events(); mb = DelegationMailbox()
         let log2 = CallLog()
         out = runner(log: log2, events: ev, mailbox: mb).run(call(["task": "t"]))
-        f += TestMain.check(log2.all.count == 3 && out.contains("stopping"),
+        f += TestMain.check(log2.all.count == 3 && out.contains("three files written"),
                             "no step ceiling: a long tool run goes to completion")
         // Mid-work stop still cuts a long horizon short.
+        // Deterministic mid-flight Finish: two tool rounds, then the delegate
+        // stalls (plain text, no handoff) -- Finish lands during the wait.
         Stub.script = .init(responses: [
             .toolCall(name: "write", args: #"{"path": "a", "content": "x"}"#, cost: 0.0),
             .toolCall(name: "write", args: #"{"path": "b", "content": "x"}"#, cost: 0.0),
-            .text(["never"], cost: 0.0),
+            .text(["thinking..."], cost: 0.0),
         ])
         ev = Events(); mb = DelegationMailbox()
         let log3 = CallLog()
         let stopper = mb
         Thread.detachNewThread {
-            Thread.sleep(forTimeInterval: 0.02)
+            Thread.sleep(forTimeInterval: 0.3)
             stopper.stop()
         }
         _ = runner(log: log3, events: ev, mailbox: mb).run(call(["task": "t"]))
-        f += TestMain.check(ev.endedReason == "the user ended it",
-                            "Stop still ends a long-horizon delegation mid-work")
+        f += TestMain.check(ev.endedReason == "the user finished it" && log3.all.count == 2,
+                            "Finish ends a stalled long-horizon delegation after real work")
 
         return f
     }

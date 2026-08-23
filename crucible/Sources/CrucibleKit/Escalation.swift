@@ -35,7 +35,8 @@ public struct EscalationPolicy: Sendable {
     /// spent; the caller derives it from the overlay budget and the record.
     public var sessionRemainingUSD: Double
     public var turnBudgetUSD: Double
-    /// Seconds the conversation stays open for the user after each response.
+    /// Poll interval while the delegate waits on the user; the wait itself
+    /// is unbounded -- only handoff, Finish, or the budget end a delegation.
     public var graceSeconds: Double
 
     public init(models: [String], sessionRemainingUSD: Double,
@@ -60,8 +61,9 @@ public enum DelegationEvent: Sendable {
     case userTurn(String)
     /// Cumulative cost for this delegation, USD.
     case cost(Double)
-    /// The conversation is open for steering: the remote model has finished a
-    /// response and the grace window is running. Typing holds it open.
+    /// The delegate stopped generating WITHOUT ceding control (spec 15.2):
+    /// it is waiting on the user -- a follow-up question, a stall -- and the
+    /// conversation stays open until a reply, a handoff, or Finish.
     case waiting
     /// The remote model called a tool (E2); the result follows when it lands.
     case toolCall(name: String, arguments: String)
@@ -113,6 +115,24 @@ public final class DelegationMailbox: @unchecked Sendable {
     }
 }
 
+/// A completed delegation, as the inspection tool sees it (spec 15.2): the
+/// local model gets the handoff summary in the tool result and reads the
+/// detail on demand through `delegation_log` rather than having the whole
+/// sub-transcript pushed into its context.
+public struct DelegationRecord: Sendable {
+    public var model: String
+    public var task: String
+    public var log: String
+    public var ended: String
+
+    public init(model: String, task: String, log: String, ended: String) {
+        self.model = model
+        self.task = task
+        self.log = log
+        self.ended = ended
+    }
+}
+
 // MARK: - The runner
 
 public struct DelegateToolRunner: ToolExecuting {
@@ -125,21 +145,30 @@ public struct DelegateToolRunner: ToolExecuting {
     /// value.
     let baseURL: URL
     let keyProvider: @Sendable () -> String?
+    /// Completed delegations of this session, newest first (1-based), for
+    /// `delegation_log`. Nil disables the inspection tool.
+    let logProvider: (@Sendable (Int) -> DelegationRecord?)?
 
     public init(inner: ToolExecuting, policy: EscalationPolicy,
                 mailbox: DelegationMailbox,
                 emit: @escaping @Sendable (DelegationEvent) -> Void,
                 baseURL: URL = URL(string: "https://openrouter.ai/api/v1")!,
-                keyProvider: @escaping @Sendable () -> String? = { KeychainAccess.key() }) {
+                keyProvider: @escaping @Sendable () -> String? = { KeychainAccess.key() },
+                logProvider: (@Sendable (Int) -> DelegationRecord?)? = nil) {
         self.inner = inner
         self.policy = policy
         self.mailbox = mailbox
         self.emit = emit
         self.baseURL = baseURL
         self.keyProvider = keyProvider
+        self.logProvider = logProvider
     }
 
-    public var schemas: [String] { inner.schemas + [Self.schema(policy: policy)] }
+    public var schemas: [String] {
+        var out = inner.schemas + [Self.schema(policy: policy)]
+        if logProvider != nil { out.append(Self.logSchema) }
+        return out
+    }
 
     /// Built per session rather than frozen: the models, their availability
     /// and the remaining budget are facts the local model cannot weigh
@@ -156,7 +185,12 @@ public struct DelegateToolRunner: ToolExecuting {
             + "Budget: $\(String(format: "%.2f", policy.turnBudgetUSD)) per delegation, "
             + "$\(String(format: "%.2f", policy.sessionRemainingUSD)) remaining this session; "
             + "a delegation that trips its budget returns a partial answer marked as such. "
-            + "The user can watch and steer the remote model while it works. "
+            + "The user can watch and steer the remote model while it works, and the "
+            + "delegation ends only when the remote model CEDES CONTROL with its handoff "
+            + "tool (or the user or budget ends it). The result you receive is its "
+            + "HANDOFF SUMMARY, which references files in /work rather than restating "
+            + "them -- read those files, and use delegation_log if you need the detail "
+            + "of what it did. "
             + "WHEN TO USE IT: a problem you have genuinely failed at (not merely found long), "
             + "a design question with real stakes, or a review before something irreversible. "
             + "Escalating work you could do yourself spends the user's money for nothing: "
@@ -179,6 +213,18 @@ public struct DelegateToolRunner: ToolExecuting {
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// The delegate's own exit (spec 15.2): the ONLY way it ends its run.
+    /// Remote-facing only -- never advertised to the local model.
+    public static let handoffSchema = #"""
+    {"type": "function", "function": {"name": "handoff", "description": "Cede control back to the session that delegated to you. You MUST call this to finish -- stopping without it means you are waiting on the user, and the conversation stays open. The summary is what the local model continues from, so make it complete and cheap to act on: what you did and found, what remains, and REFERENCE FILES IN /work BY PATH (write your detailed findings into files if they do not fit a summary) rather than restating content -- the local model will read the files, and duplicated prose is duplicated work.", "parameters": {"type": "object", "properties": {"summary": {"type": "string", "description": "The handoff: outcomes, remaining work, open questions, and the /work paths that carry the detail."}}, "required": ["summary"]}}}
+    """#
+
+    /// The local model's window into a finished delegation (spec 15.2): the
+    /// transcript is not pushed into its context; it pulls what it needs.
+    public static let logSchema = #"""
+    {"type": "function", "function": {"name": "delegation_log", "description": "Inspect a completed delegation's transcript. You receive only the handoff summary when a delegation ends; use this when you need the detail -- what the delegate actually said, tried, or was told. Lines are numbered; narrow with grep first, then read ranges.", "parameters": {"type": "object", "properties": {"nth": {"type": "string", "description": "Which delegation, counting back: 1 = most recent (default)."}, "grep": {"type": "string", "description": "Return only lines matching this pattern, with their numbers."}, "start": {"type": "string", "description": "First line to return (1-based)."}, "lines": {"type": "string", "description": "How many lines (default 60)."}}, "required": []}}}
+    """#
+
     public var environmentDescription: String {
         inner.environmentDescription + """
 
@@ -188,6 +234,7 @@ public struct DelegateToolRunner: ToolExecuting {
     }
 
     public func run(_ call: ToolCall) -> String {
+        if call.name == "delegation_log" { return inspectLog(call) }
         guard call.name == "delegate" else { return inner.run(call) }
         guard let task = call.arguments["task"], !task.isEmpty else {
             return "error: delegate requires a task"
@@ -222,6 +269,30 @@ public struct DelegateToolRunner: ToolExecuting {
         return box.get()
     }
 
+    private func inspectLog(_ call: ToolCall) -> String {
+        guard let provider = logProvider else { return "error: no delegations to inspect" }
+        let nth = Int(call.arguments["nth"] ?? "1") ?? 1
+        guard let rec = provider(nth) else {
+            return "error: there is no delegation #\(nth) in this session"
+        }
+        let all = rec.log.split(separator: "\n", omittingEmptySubsequences: false)
+        let numbered = all.enumerated().map { "\($0.offset + 1): \($0.element)" }
+        var picked = numbered
+        if let pat = call.arguments["grep"], !pat.isEmpty {
+            picked = numbered.filter { $0.range(of: pat, options: [.regularExpression, .caseInsensitive]) != nil }
+            if picked.isEmpty { picked = ["(no lines match \(pat))"] }
+        } else {
+            let start = max(1, Int(call.arguments["start"] ?? "1") ?? 1)
+            let count = max(1, min(400, Int(call.arguments["lines"] ?? "60") ?? 60))
+            guard start <= numbered.count else {
+                return "delegation #\(nth) (\(rec.model), \(rec.ended)): \(numbered.count) lines; start \(start) is past the end"
+            }
+            picked = Array(numbered[(start - 1)..<min(numbered.count, start - 1 + count)])
+        }
+        let head = "delegation #\(nth) · \(rec.model) · \(rec.ended) · \(numbered.count) lines\ntask: \(rec.task.prefix(200))\n\n"
+        return head + picked.joined(separator: "\n")
+    }
+
     // MARK: The conversation loop
 
     private func converse(model: String, brief: String, key: String) async -> String {
@@ -231,16 +302,21 @@ public struct DelegateToolRunner: ToolExecuting {
         var toolSteps = 0
         var toolTally: [String: Int] = [:]
         var lastAnswer = ""
-        var reason = "the remote model finished"
+        var handoff: String?
+        var reason = "the delegate ceded control"
         let turnCap = min(policy.turnBudgetUSD, policy.sessionRemainingUSD)
 
-        // E2: the remote model works with the SAME surface the local one has.
-        // The inner schemas are already OpenAI function schemas; `delegate`
-        // is not among them because the wrapper appends itself after inner --
-        // which is exactly the "nested escalation refused" rule.
-        let tools: [[String: Any]] = inner.schemas.compactMap {
+        // E2: the remote model works with the SAME surface the local one has
+        // -- plus `handoff`, its unique exit (spec 15.2). `delegate` is not
+        // among them because the wrapper appends itself after inner -- which
+        // is exactly the "nested escalation refused" rule.
+        var tools: [[String: Any]] = inner.schemas.compactMap {
             guard let d = $0.data(using: .utf8) else { return nil }
             return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+        }
+        if let d = Self.handoffSchema.data(using: .utf8),
+           let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+            tools.append(obj)
         }
 
         loop: while true {
@@ -263,7 +339,9 @@ public struct DelegateToolRunner: ToolExecuting {
             if !r.toolCalls.isEmpty {
                 // The remote model is working. Execute through the inner
                 // chain -- the same vsock, the same guest, the same /work --
-                // and feed the results back.
+                // and feed the results back. `handoff` is terminal: it is
+                // the delegate CEDING CONTROL (spec 15.2), so nothing after
+                // it in the same round runs.
                 var assistant: [String: Any] = ["role": "assistant",
                                                 "content": r.text]
                 assistant["tool_calls"] = r.toolCalls.map { tc in
@@ -271,11 +349,14 @@ public struct DelegateToolRunner: ToolExecuting {
                      "function": ["name": tc.name, "arguments": tc.arguments]]
                 }
                 messages.append(assistant)
-                // No step ceiling, deliberately (spec §15.2): a delegation is
-                // long-horizon by design, and its governors are the DOLLAR
-                // budgets and the user's Stop -- both visible in the card,
-                // where a looping agent is watched rather than guessed at.
+                // No step ceiling, deliberately: a delegation is long-horizon
+                // by design, and its governors are the DOLLAR budgets, the
+                // handoff, and the user's Finish.
                 for tc in r.toolCalls {
+                    if tc.name == "handoff" {
+                        handoff = Self.arguments(from: tc.arguments)["summary"] ?? ""
+                        break
+                    }
                     toolSteps += 1
                     toolTally[tc.name, default: 0] += 1
                     emit(.toolCall(name: tc.name, arguments: tc.arguments))
@@ -290,10 +371,11 @@ public struct DelegateToolRunner: ToolExecuting {
                     messages.append(["role": "tool", "tool_call_id": tc.id,
                                      "content": result])
                 }
-                // Steering lands between steps too -- no grace wait while the
-                // model is mid-work, just a drain.
+                if handoff != nil { break }
+                // Steering lands between steps too -- just a drain, no wait
+                // while the model is mid-work.
                 let (queued, stopped) = mailbox.drain()
-                if stopped { reason = "the user ended it"; break }
+                if stopped { reason = "the user finished it"; break }
                 for m in queued {
                     emit(.userTurn(m))
                     messages.append(["role": "user", "content": m])
@@ -304,25 +386,20 @@ public struct DelegateToolRunner: ToolExecuting {
             lastAnswer = r.text
             messages.append(["role": "assistant", "content": r.text])
 
-            // The grace window: the conversation stays open briefly so the
-            // user can continue it; a queued message continues, stop or
-            // silence ends. While the user is TYPING the window does not
-            // close -- a countdown that expires mid-sentence is worse than no
-            // window -- bounded so an abandoned draft cannot hold the local
-            // turn forever.
+            // The delegate stopped WITHOUT ceding (spec 15.2): it is waiting
+            // on the user -- a follow-up question, a stall. The conversation
+            // stays open, unbounded, until a reply, Finish, or the budget;
+            // an explicit handoff is the only self-exit the delegate has.
             var (queued, stopped) = mailbox.drain()
             if queued.isEmpty && !stopped {
                 emit(.waiting)
-                let deadline = Date().addingTimeInterval(180)
                 while true {
-                    mailbox.wait(seconds: policy.graceSeconds)
+                    mailbox.wait(seconds: max(0.05, policy.graceSeconds))
                     (queued, stopped) = mailbox.drain()
                     if !queued.isEmpty || stopped { break }
-                    if !mailbox.isHeld || Date() > deadline { break }
                 }
             }
-            if stopped { reason = "the user ended it"; break }
-            if queued.isEmpty { break }
+            if stopped { reason = "the user finished it"; break }
             for m in queued {
                 emit(.userTurn(m))
                 messages.append(["role": "user", "content": m])
@@ -338,7 +415,13 @@ public struct DelegateToolRunner: ToolExecuting {
                 .map { "\($0.key)×\($0.value)" }.joined(separator: ", ")
             header += " · it used tools on /work: \(tally) -- re-read anything you depend on"
         }
-        return header + "\n\n" + lastAnswer
+        // The local model gets the HANDOFF, not the transcript (spec 15.2);
+        // detail is a delegation_log call away. A delegation ended without
+        // one falls back to the last answer, marked as what it is.
+        let body = handoff
+            ?? (lastAnswer.isEmpty ? "(the delegate produced no handoff)"
+                                   : "(no handoff was given; its last message:)\n\n" + lastAnswer)
+        return header + "\n\n" + body
     }
 
     /// OpenAI tool arguments arrive as a JSON object in a string; ToolCall

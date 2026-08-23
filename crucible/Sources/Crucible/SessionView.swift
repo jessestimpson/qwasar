@@ -700,8 +700,10 @@ struct DelegationCard: View {
                     .help("What this delegation has cost so far. The budget "
                           + "stops the next request, never the one in flight.")
                 if ended == nil, let state {
-                    Button("Stop") { state.stopDelegation() }
+                    Button("Finish") { state.stopDelegation() }
                         .controlSize(.small)
+                        .help("End the delegation now. Without a handoff from the "
+                              + "delegate, its last message stands in for one.")
                 }
             }
             Text(task).font(.caption).foregroundStyle(.secondary).lineLimit(3)
@@ -717,7 +719,8 @@ struct DelegationCard: View {
                     .font(.caption2).foregroundStyle(.tertiary)
             } else if let state {
                 if waiting {
-                    Label("open for steering — closes in a few seconds unless you type",
+                    Label("the delegate is waiting on you — reply below, or Finish to "
+                          + "end the delegation",
                           systemImage: "hourglass")
                         .font(.caption2).foregroundStyle(.orange)
                 }
