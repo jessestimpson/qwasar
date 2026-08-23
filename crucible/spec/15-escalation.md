@@ -177,8 +177,23 @@ with a dollar figure on it.
 
 Open questions, recorded now: whether `delegate` should be callable by the
 remote agent (nested escalation — priced trees of models; deferred, refused
-in E1/E2); whether the user needs an "escalate this" affordance of their own
-(probably, cheaply, once E1 exists); and whether budget exhaustion should
-park the session or merely disable the tool (disable, initially — a session
-that stops mid-thought because money ran out is worse than one that says
-so and continues locally).
+in E1/E2); and whether budget exhaustion should park the session or merely
+disable the tool (disable, initially — a session that stops mid-thought
+because money ran out is worse than one that says so and continues locally).
+
+**"Escalate this" — the user's own affordance, built.** A header button, live
+whenever the session could escalate — including *mid-turn*, which is the
+design driver: a model visibly stuck in a bad line of reasoning is exactly
+when the person watching knows before the model does. Escalating then
+interrupts the turn (the button says so). The sheet takes the brief, a model
+pick, and — on by default — the conversation tail: the last user message and
+everything the local model produced since, *reasoning included*, because
+"here is what it tried" is most of what the expert needs. The delegation runs
+in the same card with the same steering and the same budget accounting; it
+is **consult-only** (no remote tools — the session's tool chain belongs to
+the local turn, whose state mid-interrupt is exactly what should not be
+driven around). The answer then rides along with the user's next message —
+shown as a discardable chip above the composer, attached to the prompt but
+not duplicated in the display — so the local model sees it as context, which
+closes the loop: the user escalates, the expert answers, the local model
+continues with the answer in hand.

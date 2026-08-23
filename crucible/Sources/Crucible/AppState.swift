@@ -104,6 +104,11 @@ final class AppState {
     var liveDelegation: LiveDelegation?
     var delegationDraft = ""
     var showingAPIKeySheet = false
+    /// The user-initiated escalation sheet (spec §15: "escalate this").
+    var showingEscalateSheet = false
+    /// A finished user-initiated delegation's answer, waiting to ride along
+    /// with the user's next message so the local model sees it. Discardable.
+    var pendingHandoff: String?
     private var delegationMailbox: DelegationMailbox?
     /// Set while the app is quitting and the guests are being flushed.
     var shuttingDown = false
@@ -324,6 +329,92 @@ final class AppState {
 
     func stopDelegation() { delegationMailbox?.stop() }
 
+    /// Whether the selected session could escalate right now: models granted,
+    /// a key present, budget remaining, and no delegation already live.
+    var canEscalate: Bool {
+        guard liveDelegation == nil, hasAPIKey,
+              let rec = selectedSession, let p = project(of: rec), !p.isConfig
+        else { return false }
+        let s = SandboxSettings.resolve(global: globalSandbox, project: p.overlay,
+                                        session: rec.sandbox)
+        return !s.agentModels.isEmpty
+            && max(0, s.agentBudgetUSD - (rec.spentUSD ?? 0)) > 0
+    }
+
+    var escalationModels: [String] {
+        guard let rec = selectedSession, let p = project(of: rec) else { return [] }
+        return SandboxSettings.resolve(global: globalSandbox, project: p.overlay,
+                                       session: rec.sandbox).agentModels
+    }
+
+    /// "Escalate this" (spec §15): the user pushes the problem up without
+    /// waiting for the local model to decide. Interrupts a running turn --
+    /// which is the point, since a model visibly stuck mid-reasoning is the
+    /// case this exists for. Consult-only (no remote tools) by design: the
+    /// session's tool chain belongs to the local turn.
+    func startEscalation(task: String, model: String?, includeContext: Bool) {
+        guard canEscalate, let rec = selectedSession, let p = project(of: rec),
+              !task.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        if case .generating = phase { interrupt() }
+
+        let settings = SandboxSettings.resolve(global: globalSandbox, project: p.overlay,
+                                               session: rec.sandbox)
+        let remaining = max(0, settings.agentBudgetUSD - (rec.spentUSD ?? 0))
+        var brief = task
+        if includeContext {
+            let ctx = recentContext()
+            if !ctx.isEmpty {
+                brief += "\n\n---\n\nRecent conversation, for context:\n\n" + ctx
+            }
+        }
+        let mailbox = DelegationMailbox()
+        delegationMailbox = mailbox
+        let sid = rec.id
+        let runner = DelegateToolRunner(
+            inner: ConsultOnly(),
+            policy: EscalationPolicy(models: settings.agentModels,
+                                     sessionRemainingUSD: remaining,
+                                     turnBudgetUSD: settings.agentTurnBudgetUSD),
+            mailbox: mailbox,
+            emit: { ev in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self.handleDelegation(ev, session: sid) }
+                }
+            })
+        var args = ["task": brief]
+        if let model { args["model"] = model }
+        Task.detached {
+            let out = runner.run(ToolCall(name: "delegate", arguments: args))
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    if !out.hasPrefix("error:") { self.pendingHandoff = out }
+                }
+            }
+        }
+    }
+
+    /// The tail of the conversation, for the escalation brief: the last user
+    /// message and everything the local model produced after it -- which,
+    /// when it is stuck, is exactly the reasoning worth showing the expert.
+    private func recentContext(cap: Int = 6000) -> String {
+        var parts: [String] = []
+        for item in transcript.reversed() {
+            switch item.kind {
+            case .user(let t):
+                parts.append("USER: \(t)")
+                return String(parts.reversed().joined(separator: "\n\n").suffix(cap))
+            case .assistant(let t): parts.append("LOCAL MODEL: \(t)")
+            case .reasoning(let t): parts.append("LOCAL MODEL (reasoning): \(t)")
+            case .tool(let n, _, let r):
+                parts.append("TOOL \(n): \((r ?? "").prefix(400))")
+            default: break
+            }
+        }
+        return String(parts.reversed().joined(separator: "\n\n").suffix(cap))
+    }
+
+    func pendingItemsAppend(_ i: TranscriptItem) { pendingItems.append(i) }
+
     private func handleDelegation(_ ev: DelegationEvent, session sid: UUID) {
         switch ev {
         case .started(let model, let task):
@@ -351,9 +442,15 @@ final class AppState {
             // replays it readable (spec §15.2), and the spend persists so the
             // budget survives a relaunch (spec §15.3).
             if let live = liveDelegation {
-                appendItem(TranscriptItem(.delegation(model: live.model, task: live.task,
+                let item = TranscriptItem(.delegation(model: live.model, task: live.task,
                                                       log: live.log, costUSD: usd,
-                                                      ended: reason)))
+                                                      ended: reason))
+                // A tool-driven delegation ends inside a turn and rides that
+                // turn's persistence; a user-driven one can end while idle,
+                // where pendingItems would be wiped before the next persist.
+                transcript.append(item)
+                if case .generating = phase { pendingItemsAppend(item) }
+                else { store?.appendTranscript(sid, [item]) }
             }
             if let i = sessions.firstIndex(where: { $0.id == sid }) {
                 sessions[i].spentUSD = (sessions[i].spentUSD ?? 0) + usd
@@ -640,10 +737,19 @@ final class AppState {
             prefillDone = 0; prefillTotal = 0
             pendingItems = []
 
+            var promptText = text
+            if let handoff = pendingHandoff {
+                // The delegation card above already shows the full answer;
+                // the model gets it in the prompt, the transcript gets a note.
+                promptText = "The user escalated to a remote model; its answer follows.\n\n"
+                           + handoff + "\n\n---\n\n" + text
+                pendingHandoff = nil
+                appendItem(TranscriptItem(.note("the delegation result was attached to this message")))
+            }
             appendItem(TranscriptItem(.user(text)))
 
             let flag = cancelFlag
-            for await ev in engine.send(rec.id, text: text, cancelled: { flag.isSet }) {
+            for await ev in engine.send(rec.id, text: promptText, cancelled: { flag.isSet }) {
                 apply(ev)
             }
 
@@ -870,4 +976,15 @@ final class CancelFlag: @unchecked Sendable {
     var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
     func set() { lock.lock(); value = true; lock.unlock() }
     func clear() { lock.lock(); value = false; lock.unlock() }
+}
+
+
+/// The user-initiated escalation is consult-only: no schemas, and a runner
+/// that refuses anything the remote model invents.
+private struct ConsultOnly: ToolExecuting {
+    var schemas: [String] { [] }
+    var environmentDescription: String { "" }
+    func run(_ call: ToolCall) -> String {
+        "error: tools are not available in a user-initiated consultation"
+    }
 }

@@ -44,10 +44,29 @@ struct SessionView: View {
                 }
             }
             Divider()
+            if state.pendingHandoff != nil {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.down.forward.circle")
+                    Text("the delegation's answer will accompany your next message")
+                        .font(.caption)
+                    Spacer()
+                    Button { state.pendingHandoff = nil } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Discard: the local model will not see the answer")
+                }
+                .padding(.horizontal, 20).padding(.vertical, 6)
+                .foregroundStyle(.secondary)
+                .background(Color.accentColor.opacity(0.06))
+            }
             Composer(state: state)
         }
         .sheet(isPresented: $state.showingApproval) {
             ApprovalSheet(state: state)
+        }
+        .sheet(isPresented: $state.showingEscalateSheet) {
+            EscalateSheet(state: state)
         }
     }
 }
@@ -65,6 +84,20 @@ struct SessionHeader: View {
                     }
                 }
                 Spacer()
+                if state.canEscalate {
+                    Button {
+                        state.showingEscalateSheet = true
+                    } label: {
+                        Label(state.phase == .generating ? "Escalate (stops the turn)…"
+                                                         : "Escalate…",
+                              systemImage: "arrow.up.forward.circle")
+                    }
+                    .help("Hand this problem to a more capable remote model, under "
+                          + "the session's budget. If the local model is mid-turn -- "
+                          + "stuck in a bad line of reasoning, say -- escalating "
+                          + "interrupts it. The result rides along with your next "
+                          + "message.")
+                }
                 if state.canReviewChanges {
                     Button {
                         state.reviewChanges()
@@ -701,5 +734,64 @@ struct DelegationCard: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.06)))
         .overlay(RoundedRectangle(cornerRadius: 8)
             .stroke(ended == nil ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.2)))
+    }
+}
+
+
+// MARK: - Escalate this (spec §15)
+
+/// The user pushes a problem up without waiting for the local model to
+/// decide. Consult-only; the answer rides along with the next message.
+struct EscalateSheet: View {
+    @Bindable var state: AppState
+    @State private var task = ""
+    @State private var model: String = ""
+    @State private var includeContext = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Escalate to a remote model").font(.headline)
+            if state.phase == .generating {
+                Label("the local model is mid-turn; escalating interrupts it",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            TextEditor(text: $task)
+                .font(.body)
+                .frame(minHeight: 90)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(.quaternary))
+                .overlay(alignment: .topLeading) {
+                    if task.isEmpty {
+                        Text("What should the remote model figure out?")
+                            .foregroundStyle(.tertiary).padding(6)
+                            .allowsHitTesting(false)
+                    }
+                }
+            Toggle("Include the recent conversation — the last message and "
+                   + "everything the local model produced since, reasoning included",
+                   isOn: $includeContext)
+                .font(.caption)
+            Picker("Model", selection: $model) {
+                ForEach(state.escalationModels, id: \.self) { Text($0).tag($0) }
+            }
+            .pickerStyle(.menu)
+            Text("You can watch and steer it while it works; its answer is "
+                 + "attached to your next message so the local model sees it.")
+                .font(.caption2).foregroundStyle(.tertiary)
+            HStack {
+                Spacer()
+                Button("Cancel") { state.showingEscalateSheet = false }
+                Button("Escalate") {
+                    state.startEscalation(task: task, model: model.isEmpty ? nil : model,
+                                          includeContext: includeContext)
+                    state.showingEscalateSheet = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(task.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 480)
+        .onAppear { model = state.escalationModels.first ?? "" }
     }
 }
