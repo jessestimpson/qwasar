@@ -32,6 +32,7 @@ all: qwasar qwasar-agent qwasar-server
 help:
 	@echo "qwasar build targets:"
 	@echo "  make          build ./qwasar, ./qwasar-agent and ./qwasar-server"
+	@echo "  make libqwasar.a  static library for embedders (crucible/)"
 	@echo "  make test     build and run tests"
 	@echo "  make clean    remove build outputs"
 	@echo "  make check-metal  offline kernel syntax check (needs the Metal Toolchain)"
@@ -44,6 +45,14 @@ qwasar-agent: qwasar_agent.o qwasar_tui.o linenoise.o $(CORE_OBJS)
 
 qwasar-server: qwasar_server.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# The engine as a static library, for embedders that are not one of the three
+# front ends -- currently the Crucible macOS app under crucible/, which links it
+# into an .app and calls qwasar.h from Swift.  Deliberately CORE_OBJS only: the
+# CLI, agent, server, TUI and linenoise objects are front ends, and an embedder
+# pulling one in has made a mistake rather than found a dependency.
+libqwasar.a: $(CORE_OBJS)
+	$(AR) rcs $@ $^
 
 qwasar_server.o: qwasar_server.c qwasar.h qwasar_json.h qwasar_toolcall.h
 
@@ -149,4 +158,4 @@ check-metal:
 	fi
 
 clean:
-	rm -f qwasar qwasar-agent qwasar-server *.o tools/bin2c qwasar_metal_src.inc .metal_check.metal $(TESTS) tests/*.o
+	rm -f qwasar qwasar-agent qwasar-server libqwasar.a *.o tools/bin2c qwasar_metal_src.inc .metal_check.metal $(TESTS) tests/*.o

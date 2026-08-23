@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- TEST ONLY.  Not what ships.
+         The shipping app reaches the model through a user-selected folder and a
+         security-scoped bookmark (CrucibleKit/ModelAccess.swift), which needs a
+         person to click a panel.  The M0 gate has to be provable from a
+         terminal, so this variant adds a read-only temporary exception for the
+         model directory and nothing else.  Everything above it is identical to
+         Crucible.entitlements, which is the point: the only difference between
+         a passing gate and the real app is HOW the folder was granted. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <key>com.apple.security.virtualization</key>
+    <true/>
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.bookmarks.app-scope</key>
+    <true/>
+    <key>com.apple.security.temporary-exception.files.absolute-path.read-only</key>
+    <array>
+        <string>/Users/jstimpson/.lmstudio/models/</string>
+        <!-- and a real tree for the agent loop to read, so `make agent` can
+             exercise read/list/grep from a terminal. -->
+        <string>/Users/jstimpson/dev/qwasar/</string>
+    </array>
+</dict>
+</plist>

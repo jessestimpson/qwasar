@@ -1,6 +1,7 @@
 # build outputs
 qwasar
 qwasar-agent
+qwasar-server
 qwasar-bench
 *.o
 *.dSYM/
@@ -24,3 +25,13 @@ qwasar-mtp
 reference/
 
 .DS_Store
+
+# Crucible app build products
+libqwasar.a
+crucible/build/
+
+# Elixir build artefacts. The guest image is built in Docker, which fetches
+# deps itself; these only appear when the warden suites are run on the host.
+# mix.lock is NOT ignored -- it pins what Docker resolves.
+crucible/Guest/warden/_build/
+crucible/Guest/warden/deps/

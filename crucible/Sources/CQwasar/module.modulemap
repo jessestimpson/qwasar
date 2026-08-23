@@ -1,0 +1,15 @@
+/* The C runtime, as narrowly as it can be exposed.
+ *
+ * Two headers, deliberately.  qwasar_gpu.h, qwasar_model.h and qwasar_json.h
+ * are NOT here and must not be added: Swift that needs to know what a tensor
+ * looks like is doing something wrong, and Swift that wants to parse JSON has
+ * Codable.  If the app needs a fact that only the engine has, the answer is a
+ * new narrow function in qwasar.h -- not a wider module map.
+ *
+ * Paths are relative to this file, which sits at crucible/Sources/CQwasar/,
+ * so ../../.. is the repository root where the engine lives. */
+module CQwasar {
+    header "../../../qwasar.h"
+    header "../../../qwasar_toolcall.h"
+    export *
+}
