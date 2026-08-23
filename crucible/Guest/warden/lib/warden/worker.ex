@@ -2,18 +2,17 @@ defmodule Warden.Worker do
   @moduledoc """
   Where a request actually runs, so that the bridge never has to wait for one.
 
-  PLAN.md 9.2, invariant 6: *warden never blocks on the workspace — the bridge
+  spec 10, invariant 6: *warden never blocks on the workspace — the bridge
   remains responsive to a cancel while an invoke is outstanding.* At M2 there is
   no workspace yet, but the shape has to be right now: `Warden.Bridge` used to
   call `Warden.Dispatch.run/1` inline, which meant a single slow op stalled the
   whole control channel — and no amount of testing would have found that,
   because every op it had was instant.
 
-  A long-lived process rather than a task per request, deliberately. eta's
-  scheduler controls a fixed set of processes (`processes/1` in the harness), so
-  a design that spawned per request would be a design the simulator cannot see.
-  M4's `invoke` gets its concurrency from the workspace node on the far side of
-  distribution, not from spawning here.
+  A long-lived process rather than a task per request, deliberately: one
+  process with one mailbox is a design whose ordering can be reasoned about
+  and tested. `invoke` gets its concurrency from the workspace node on the
+  far side of distribution, not from spawning here.
   """
   use GenServer
 
@@ -21,7 +20,7 @@ defmodule Warden.Worker do
 
   def start_link(opts \\ []), do: start_named(__MODULE__, opts)
 
-  # `name: nil` means "do not register", which is what a simulation needs: each
+  # `name: nil` means "do not register", which is what a test needs: each
   # seed starts a fresh instance, and a module-name registration would make the
   # second one fail with {:error, {:already_started, _}}. Omitting :name keeps
   # the ordinary singleton behaviour the supervisor relies on.
@@ -58,7 +57,7 @@ defmodule Warden.Worker do
       # bridge inside handle_cast, and the request that caused it got NO
       # response -- invariant 1 broken by a shape rather than by a race.
       #
-      # The simulation did not catch it, because generate/2 only ever produced
+      # No test caught it, because nothing had ever produced
       # well-formed ops. A harness can only find what its generator can express,
       # so the generator now expresses this.
       %{"op" => "bad_reply", "args" => %{"shape" => shape}} ->

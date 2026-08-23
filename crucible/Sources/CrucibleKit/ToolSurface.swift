@@ -5,7 +5,7 @@
 // after this point re-prefills every session in the application. Ten tools, and
 // one of them is `invoke` -- which is how the agent gets an unbounded number of
 // its own without any of this changing. (It was twelve: `simulate` and `replay`
-// went with the eta experiment, PLAN.md §9, whose removal was the one sanctioned
+// went with a retired experiment (spec 12), whose removal was the one sanctioned
 // change to a frozen list -- and it cost exactly the re-prefill the freeze
 // exists to prevent, once, on the next session of each project.)
 //

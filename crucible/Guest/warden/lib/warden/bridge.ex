@@ -31,16 +31,16 @@ defmodule Warden.Bridge do
             # ids reported timed out. A reply arriving after this must be
             # dropped, not delivered as success (invariant 2).
             expired: MapSet.new(),
-            # What was written, when there is no real port. Simulation only.
+            # What was written, when there is no real port. Tests only.
             written: []
 
   # ---- api -----------------------------------------------------------------
 
   def start_link(opts \\ []), do: start_named(__MODULE__, opts)
 
-  # `name: nil` means "do not register", which is what a simulation needs: each
-  # seed starts a fresh instance, and a module-name registration would make the
-  # second one fail with {:error, {:already_started, _}}. Omitting :name keeps
+  # `name: nil` means "do not register", which is what a test needs: each one
+  # starts a fresh instance, and a module-name registration would make the
+  # second fail with {:error, {:already_started, _}}. Omitting :name keeps
   # the ordinary singleton behaviour the supervisor relies on.
   defp start_named(module, opts) do
     case Keyword.fetch(opts, :name) do
@@ -51,7 +51,7 @@ defmodule Warden.Bridge do
   end
 
 
-  @doc "Injects a frame as though it arrived from the host. Simulation only."
+  @doc "Injects a frame as though it arrived from the host. Tests only."
   def deliver(server, frame), do: Kernel.send(server, {:frame, frame})
 
   # ---- callbacks -----------------------------------------------------------
@@ -79,7 +79,7 @@ defmodule Warden.Bridge do
   def handle_info({port, {:data, frame}}, %{port: port} = state),
     do: {:noreply, handle_frame(frame, state)}
 
-  # A frame injected by a simulation, with no real port behind it.
+  # A frame injected by a test, with no real port behind it.
   def handle_info({:frame, frame}, state), do: {:noreply, handle_frame(frame, state)}
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
@@ -124,7 +124,7 @@ defmodule Warden.Bridge do
 
   # ---- the contract --------------------------------------------------------
 
-  # PLAN.md 9.2, invariant 1: every id receives exactly one terminal response.
+  # spec 10, invariant 1: every id receives exactly one terminal response.
   # Never zero — an op this warden does not understand is ANSWERED, because
   # silence would leave the host waiting out a timeout for a mistake it could
   # have been told about at once. Never two — which is what `answered` and the
@@ -134,7 +134,7 @@ defmodule Warden.Bridge do
       {:ok, %{"id" => id, "op" => "cancel", "args" => %{"target" => target}}}
       when is_integer(id) and is_integer(target) ->
         # Cancelling is itself a request and gets its own response, which is how
-        # a simulation proves the channel stayed responsive while something else
+        # a test proves the channel stayed responsive while something else
         # was outstanding.
         state = cancel(state, target)
         start(state, id, %{"op" => "__cancel_ack"})

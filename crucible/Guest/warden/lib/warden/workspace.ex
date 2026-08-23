@@ -221,7 +221,7 @@ defmodule Warden.Workspace do
 
   # Replay in definition order: a module defined later may call one defined
   # earlier, and compilation order is the only ordering information there is
-  # (PLAN.md 9.2, invariant 4).
+  # (spec 10, invariant 4).
   defp replay(state) do
     sources = Warden.Registry.manifest()
 

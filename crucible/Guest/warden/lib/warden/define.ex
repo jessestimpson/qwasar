@@ -141,7 +141,7 @@ defmodule Warden.Define do
   end
 
   # erpc that reports a dead node as a tool result rather than raising through
-  # the bridge. PLAN.md 9.2 invariant 6: warden never blocks on the workspace,
+  # the bridge. spec 10 invariant 6: warden never blocks on the workspace,
   # and never dies with it either.
   defp erpc(node, mod, fun, args, timeout) do
     :erpc.call(node, mod, fun, args, timeout)

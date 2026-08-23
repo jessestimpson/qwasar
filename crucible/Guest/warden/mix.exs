@@ -5,7 +5,7 @@ defmodule Warden.MixProject do
   #
   # PLAN.md 7.3: warden owns the wire and is the one thing in the guest the
   # agent cannot modify. It once carried a deterministic-simulation build
-  # (eta, PLAN.md §9); that experiment ended and was removed exactly the way
+  # (spec 12, retired); that experiment ended and was removed exactly the way
   # its seam promised -- by deleting the dependency.
   def project do
     [

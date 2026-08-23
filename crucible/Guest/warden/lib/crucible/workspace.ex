@@ -12,9 +12,9 @@ defmodule Crucible.Workspace do
   lifecycle has to be right before there is anything valuable running on it,
   and `Warden.Workspace` is what proves it comes back.
 
-  It blocks on a plain `receive` with no `after`. A timer here would be a
-  real-clock wait that eta cannot virtualize, and this process is meant to do
-  precisely nothing until someone `erpc`s into it.
+  It blocks on a plain `receive` with no `after`: this process is meant to
+  do precisely nothing until someone `erpc`s into it, and a timer would be a
+  wait with no purpose.
   """
 
   def main do

@@ -15,7 +15,7 @@ Two things make it different, and they come from the same idea:
   needs, it writes in Elixir, hot-loads into a live node, and calls. The blast
   radius of that freedom is one virtual machine with no network device.
 
-The design, measurements, and decisions are in [PLAN.md](PLAN.md).
+The design lives in [the spec](spec/README.md), one topic per file; the measurements that shaped it are in the git history.
 
 ## The one thing to understand first
 
@@ -38,7 +38,7 @@ to *a bad edit inside a VM you can throw away*.
 
 **Sandbox settings overlay in three layers** — global, per-project,
 per-session; field-wise, the most specific value wins, replace not merge
-(PLAN.md 8.5). The built-in **Crucible Config** project manages them
+(spec §8.5). The built-in **Crucible Config** project manages them
 conversationally: its sessions run host-side config tools (`config_show`,
 `config_set`, `config_clear`) with no sandbox — and no shell, no file
 access, no network; the special project's whole reach is the configuration
@@ -52,12 +52,12 @@ Stated plainly, because it is the one real trade in this design: with any
 host granted, code sandboxing is unchanged, but *confidentiality* is not —
 a prompt injection could encode project contents into request URLs to an
 allowed host. The default is off, and for confidential work it should stay
-off. The reasoning is PLAN.md 8.3.
+off. The reasoning is spec §8.3.
 
 **Status:** milestones 0–5 built and gated, plus markdown rendering with
 syntax highlighting. Not yet built: session parking to explicit checkpoints
 (M6), vision and speculative decoding (M7), and replacing the file-copy
-patch-back with a real git branch you can merge (PLAN.md 7.4a).
+patch-back with a real git branch you can merge (spec §7.4a).
 
 ## Requirements
 
@@ -94,7 +94,7 @@ Then, on first launch:
 1. **Choose Model…** in the toolbar — the directory holding `config.json` and
    the safetensors shards. Binding takes ~9 s, after which the toolbar shows
    the context and live-session budget derived from your machine (e.g.
-   `90112 ctx · 1 live`; see PLAN.md §2.3).
+   `90112 ctx · 1 live`; see spec §2.3).
 2. **Add Project…** at the foot of the sidebar. That folder is the only thing
    a session can see; a session is created automatically.
 3. Type, and **⌘↵**.
@@ -122,7 +122,7 @@ The session header should say **`sandboxed · booted in 0.6s`**. If it says
   greedy decoding. With a draft head loaded, speculation runs under sampling
   too: the engine verifies drafts by rejection sampling, so the output is
   distributed exactly as serial sampling would produce. The headless gates
-  pin temperature 0 so runs stay comparable. Design: PLAN.md 7.5.
+  pin temperature 0 so runs stay comparable. Design: spec §7.5.
 * **⌘.** stops a turn at the next token.
 * **Switching sessions is not free.** Only one session is live at a time on a
   32 GB machine; switching re-prefills (helped by the engine's LRU cache).
@@ -157,13 +157,13 @@ and adding a project go through `NSOpenPanel`, which cannot be driven from a
 terminal. What is confirmed is that the app launches, lays out, creates its
 store, finds the staged guest image, and logs no faults.
 
-Everything else here was measured rather than assumed; the numbers are in
-[PLAN.md](PLAN.md).
+Everything else here was measured rather than assumed; the numbers live with
+the designs they justified, in [the spec](spec/README.md) and the git history.
 
 ## AI disclosure
 
 Like the engine it sits on, this was written almost entirely by Claude Opus 5,
 working from direction and review by the human author. Where a measurement
 contradicted an assumption, the code and the notes follow the measurement;
-PLAN.md records several such cases, including ones where the first answer was
+the git history records several such cases, including ones where the first answer was
 wrong.

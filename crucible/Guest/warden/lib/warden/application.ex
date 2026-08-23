@@ -24,7 +24,7 @@ defmodule Warden.Application do
       if Application.get_env(:warden, :start_bridge, true) do
         [Warden.Worker, Warden.Registry, Warden.Workspace, Warden.Bridge]
       else
-        # The simulation starts its own bridge with its own port, so the
+        # Tests start their own bridge with their own port, so the
         # application must not race it to the vsock.
         []
       end

@@ -7,7 +7,7 @@ defmodule Warden.Registry do
   node that crashes, and a registry stored there would vanish with exactly the
   code it was meant to make recoverable.
 
-  Two invariants it exists to hold (PLAN.md 9.2, 3 and 4):
+  Two invariants it exists to hold (spec 10, invariants 3 and 4):
 
     * **No two modules claim the same tool name.** A second `define` for an
       existing name replaces it and bumps a version; two *different* modules
