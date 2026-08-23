@@ -1,7 +1,7 @@
 ## 15. Escalation: remote sub-agents, embedded and budgeted
 
-*E1 built 2026-08-23; E2/E3 not started. This section is the design; the
-milestones are at the end of it.*
+*E1 and E2 built 2026-08-23; E3 not started. This section is the design;
+the milestones are at the end of it.*
 
 The premise: the local model is cheap, private, and always available, and it
 is a 27B. Some problems deserve more model than that. So a session can
@@ -56,9 +56,9 @@ own input field.
   head down the wrong alley with no way to intervene is the failure this
   exists to prevent.
 - **The remote agent gets the same sandbox, by proxy.** Its tool calls
-  (OpenAI tool-calling, the same ten schemas translated) are executed by the
-  host through the same vsock channel into the same guest, against the same
-  `/work`. The sandbox already contains the blast radius of an untrusted
+  (OpenAI tool-calling, the local agent's own schemas passed through) are
+  executed by the host through the same vsock channel into the same guest,
+  against the same `/work`. The sandbox already contains the blast radius of an untrusted
   agent — that argument does not care which model the agent is. Tool access
   is serialised with the local agent's by construction, since the local turn
   is blocked inside `delegate`.
@@ -149,10 +149,22 @@ with a dollar figure on it.
   a queued user message continues it, stop or silence ends it — because
   "ends the instant the model stops" and "waits forever" both fail the
   person mid-sentence.
-- **E2 — the remote agent works.** The ten-tool surface proxied to the
-  remote model; serialisation with the local turn; tool cards inside the
-  sub-session card. Gate: the remote model edits a file in `/work` and the
-  local model reads the edit back.
+- **E2 — the remote agent works.** *Built.* The inner executor's surface
+  proxied to the remote model -- its schemas are already OpenAI function
+  schemas, so the proxy is a translation loop: streamed tool-call fragments
+  assembled, executed through the same chain into the same `/work`, results
+  fed back correlated by id. Three decisions E2 settled: the remote model
+  gets the *whole* inner surface, not just the guest ten -- if the project
+  granted `fetch`, the remote agent fetches under the same allowlist,
+  because "the same rules as the local agent" is the statement a person can
+  reason about; nested `delegate` is refused as a tool result (the wrapper
+  appends itself after inner, so it is never advertised, and a model that
+  guesses the name is told no); and a **tool-step ceiling** (32) backstops
+  the budget against a cheap looping agent. Steering drains between tool
+  steps too -- no grace wait while the model is mid-work. All pinned by
+  `EscalationSuite` against the scripted provider, including the E2 gate
+  shape: the remote model writes a file and its result returns in the next
+  request.
 - **E3 — judgment.** Prompt-fragment tuning for when to escalate, spend
   reporting in `config_show`, and a measured week of use: delegations that
   paid vs. delegations the local model could have done, with dollar figures.

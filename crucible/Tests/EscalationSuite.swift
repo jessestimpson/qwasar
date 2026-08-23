@@ -19,10 +19,18 @@ enum EscalationSuite {
     // MARK: the scripted provider
 
     final class Stub: URLProtocol {
+        enum Reply: @unchecked Sendable {
+            case text([String], cost: Double)
+            /// A streamed tool call: the name in one fragment, the arguments
+            /// split across two, the id in the first -- the shape providers
+            /// actually send.
+            case toolCall(name: String, args: String, cost: Double)
+        }
         struct Script: @unchecked Sendable {
-            /// Each entry answers one request: SSE deltas + a cost.
-            var responses: [(deltas: [String], cost: Double)]
+            var responses: [Reply]
             var authSeen: [String] = []
+            /// Decoded request bodies, so tests can assert what went back.
+            var requests: [[String: Any]] = []
         }
         nonisolated(unsafe) static var script = Script(responses: [])
         static let lock = NSLock()
@@ -35,8 +43,24 @@ enum EscalationSuite {
             if let auth = request.value(forHTTPHeaderField: "Authorization") {
                 Self.script.authSeen.append(auth)
             }
-            let entry = Self.script.responses.isEmpty
-                ? (deltas: ["[script exhausted]"], cost: 0.0)
+            // URLProtocol surfaces the body as a stream.
+            if let stream = request.httpBodyStream {
+                stream.open()
+                var data = Data()
+                let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 65536)
+                while stream.hasBytesAvailable {
+                    let n = stream.read(buf, maxLength: 65536)
+                    if n <= 0 { break }
+                    data.append(buf, count: n)
+                }
+                buf.deallocate()
+                stream.close()
+                if let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                    Self.script.requests.append(obj)
+                }
+            }
+            let entry: Reply = Self.script.responses.isEmpty
+                ? .text(["[script exhausted]"], cost: 0.0)
                 : Self.script.responses.removeFirst()
             Self.lock.unlock()
 
@@ -45,10 +69,20 @@ enum EscalationSuite {
                                        headerFields: ["Content-Type": "text/event-stream"])!
             client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
             var body = ""
-            for d in entry.deltas {
-                body += "data: {\"choices\":[{\"delta\":{\"content\":\"\(d)\"}}]}\n\n"
+            switch entry {
+            case .text(let deltas, let cost):
+                for d in deltas {
+                    body += "data: {\"choices\":[{\"delta\":{\"content\":\"\(d)\"}}]}\n\n"
+                }
+                body += "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"cost\":\(cost)}}\n\n"
+            case .toolCall(let name, let args, let cost):
+                let mid = args.index(args.startIndex, offsetBy: args.count / 2)
+                let a1 = String(args[..<mid]).replacingOccurrences(of: "\"", with: "\\\"")
+                let a2 = String(args[mid...]).replacingOccurrences(of: "\"", with: "\\\"")
+                body += "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"function\":{\"name\":\"\(name)\",\"arguments\":\"\(a1)\"}}]}}]}\n\n"
+                body += "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\(a2)\"}}]}}]}\n\n"
+                body += "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"cost\":\(cost)}}\n\n"
             }
-            body += "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"cost\":\(entry.cost)}}\n\n"
             body += "data: [DONE]\n\n"
             client?.urlProtocol(self, didLoad: Data(body.utf8))
             client?.urlProtocolDidFinishLoading(self)
@@ -68,22 +102,36 @@ enum EscalationSuite {
         }
     }
 
+    final class CallLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var list: [ToolCall] = []
+        func add(_ c: ToolCall) { lock.withLock { list.append(c) } }
+        var all: [ToolCall] { lock.withLock { list } }
+    }
+
     struct Inner: ToolExecuting {
-        var schemas: [String] { [] }
+        var log: CallLog? = nil
+        var schemas: [String] {
+            [#"{"type": "function", "function": {"name": "write", "description": "w", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}}"#]
+        }
         var environmentDescription: String { "inner." }
-        func run(_ call: ToolCall) -> String { "inner: \(call.name)" }
+        func run(_ call: ToolCall) -> String {
+            log?.add(call)
+            return "ok: \(call.name) \(call.arguments["path"] ?? "")"
+        }
     }
 
     static func runner(models: [String] = ["stub/model-a", "stub/model-b"],
                        remaining: Double = 1.0, turn: Double = 1.0,
-                       grace: Double = 0.05,
+                       grace: Double = 0.05, steps: Int = 32, log: CallLog? = nil,
                        events: Events, mailbox: DelegationMailbox,
                        key: String? = "SECRET-KEY") -> DelegateToolRunner {
-        DelegateToolRunner(inner: Inner(),
+        DelegateToolRunner(inner: Inner(log: log),
                            policy: EscalationPolicy(models: models,
                                                     sessionRemainingUSD: remaining,
                                                     turnBudgetUSD: turn,
-                                                    graceSeconds: grace),
+                                                    graceSeconds: grace,
+                                                    maxToolSteps: steps),
                            mailbox: mailbox,
                            emit: { events.add($0) },
                            baseURL: URL(string: "https://stub.invalid/api/v1")!,
@@ -103,7 +151,7 @@ enum EscalationSuite {
         }
 
         // A single consult: one response, then silence ends it.
-        Stub.script = .init(responses: [(["Hello", " there"], 0.01)])
+        Stub.script = .init(responses: [.text(["Hello", " there"], cost: 0.01)])
         var ev = Events(); var mb = DelegationMailbox()
         var out = runner(events: ev, mailbox: mb).run(call(["task": "greet"]))
         f += TestMain.check(out.contains("Hello there"), "the answer comes back")
@@ -120,7 +168,7 @@ enum EscalationSuite {
 
         // A queued user message continues the conversation; the second answer
         // is the one that returns; costs sum.
-        Stub.script = .init(responses: [(["first"], 0.01), (["second"], 0.02)])
+        Stub.script = .init(responses: [.text(["first"], cost: 0.01), .text(["second"], cost: 0.02)])
         ev = Events(); mb = DelegationMailbox()
         mb.post("go deeper")
         out = runner(events: ev, mailbox: mb).run(call(["task": "t"]))
@@ -132,7 +180,7 @@ enum EscalationSuite {
 
         // The budget stops the NEXT request: with the cap under the first
         // response's cost and a message queued, exactly one request is sent.
-        Stub.script = .init(responses: [(["partial"], 0.01), (["never"], 0.01)])
+        Stub.script = .init(responses: [.text(["partial"], cost: 0.01), .text(["never"], cost: 0.01)])
         ev = Events(); mb = DelegationMailbox()
         mb.post("continue!")
         out = runner(turn: 0.005, events: ev, mailbox: mb).run(call(["task": "t"]))
@@ -143,7 +191,7 @@ enum EscalationSuite {
                             "exactly one request reached the provider")
 
         // Stop ends it after the current response.
-        Stub.script = .init(responses: [(["answer"], 0.01), (["never"], 0.01)])
+        Stub.script = .init(responses: [.text(["answer"], cost: 0.01), .text(["never"], cost: 0.01)])
         ev = Events(); mb = DelegationMailbox()
         mb.stop()
         out = runner(events: ev, mailbox: mb).run(call(["task": "t"]))
@@ -170,6 +218,64 @@ enum EscalationSuite {
                 project: nil,
                 session: SandboxOverlay(agentModels: [])).agentModels.isEmpty,
             "a session's empty agent_models turns escalation OFF over a global grant")
+
+        // ---- E2: the remote agent works the sandbox by proxy ------------
+
+        // The gate shape from spec §15.6: the remote model edits a file and
+        // the result of that edit feeds back into its next request.
+        Stub.script = .init(responses: [
+            .toolCall(name: "write",
+                      args: #"{"path": "notes.txt", "content": "hi"}"#,
+                      cost: 0.01),
+            .text(["wrote it"], cost: 0.01),
+        ])
+        ev = Events(); mb = DelegationMailbox()
+        let log = CallLog()
+        out = runner(log: log, events: ev, mailbox: mb).run(call(["task": "edit the file"]))
+        f += TestMain.check(log.all == [ToolCall(name: "write",
+                                                 arguments: ["path": "notes.txt", "content": "hi"])],
+                            "the remote tool call reached the inner executor, arguments decoded")
+        f += TestMain.check(out.contains("wrote it"), "and the model finished after it")
+        let second = Stub.lock.withLock { Stub.script.requests.last }
+        let toolMsg = (second?["messages"] as? [[String: Any]])?.first {
+            ($0["role"] as? String) == "tool"
+        }
+        f += TestMain.check((toolMsg?["content"] as? String) == "ok: write notes.txt"
+                            && (toolMsg?["tool_call_id"] as? String) == "call_9",
+                            "the tool result went back, correlated by id")
+        let sentTools = Stub.lock.withLock { Stub.script.requests.first?["tools"] as? [[String: Any]] }
+        f += TestMain.check(sentTools?.count == 1
+                            && ((sentTools?.first?["function"] as? [String: Any])?["name"] as? String) == "write",
+                            "the remote model was offered the inner surface, and only it")
+        f += TestMain.check(ev.all.contains { if case .toolCall(let n, _) = $0 { return n == "write" } else { return false } },
+                            "the card hears the tool call")
+
+        // Nested escalation is refused as a tool result, not executed.
+        Stub.script = .init(responses: [
+            .toolCall(name: "delegate", args: #"{"task": "recurse"}"#, cost: 0.0),
+            .text(["fine"], cost: 0.0),
+        ])
+        ev = Events(); mb = DelegationMailbox()
+        _ = runner(events: ev, mailbox: mb).run(call(["task": "t"]))
+        f += TestMain.check(ev.all.contains { ev in
+            if case .toolResult(_, let r) = ev { return r.contains("nested escalation") } else { return false }
+        }, "nested escalation is refused")
+
+        // The step ceiling stops a looping remote agent.
+        Stub.script = .init(responses: [
+            .toolCall(name: "write", args: #"{"path": "a", "content": "x"}"#, cost: 0.0),
+            .toolCall(name: "write", args: #"{"path": "b", "content": "x"}"#, cost: 0.0),
+            .toolCall(name: "write", args: #"{"path": "c", "content": "x"}"#, cost: 0.0),
+            .text(["stopping"], cost: 0.0),
+        ])
+        ev = Events(); mb = DelegationMailbox()
+        let log2 = CallLog()
+        _ = runner(steps: 2, log: log2, events: ev, mailbox: mb).run(call(["task": "t"]))
+        f += TestMain.check(log2.all.count == 2,
+                            "the step ceiling stops execution at the cap")
+        f += TestMain.check(ev.all.contains { ev in
+            if case .toolResult(_, let r) = ev { return r.contains("ceiling") } else { return false }
+        }, "and the remote model is told so")
 
         return f
     }

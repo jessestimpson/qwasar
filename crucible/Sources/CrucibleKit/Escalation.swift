@@ -1,10 +1,14 @@
 // Escalation.swift -- `delegate`: a remote sub-agent, embedded and budgeted.
 //
-// Spec §15, milestone E1: text-in/text-out consultation against an
-// OpenAI-compatible streaming API (OpenRouter is the reference), executed by
-// the HOST like `fetch` -- the guest is not in the loop and stays
-// network-less. The local turn blocks inside the tool call, which is the
-// truthful state: the local model is waiting on the expensive one.
+// Spec §15, milestones E1+E2: a remote sub-agent over an OpenAI-compatible
+// streaming API (OpenRouter is the reference), executed by the HOST like
+// `fetch`. E2's addition: the remote model gets the SAME tool surface the
+// local one has (minus `delegate` itself -- nested escalation is refused),
+// because the inner executor's schemas are already OpenAI function schemas
+// and `ToolExecuting` already abstracts the guest: a remote tool call is
+// translated, run through the same vsock into the same /work, and its
+// result sent back. Serialisation with the local agent is by construction --
+// the local turn blocks inside this tool call.
 //
 // The embedded-session contract: deltas, cost and completion stream out
 // through an emit closure while the user's messages and stop requests come
@@ -33,13 +37,18 @@ public struct EscalationPolicy: Sendable {
     public var turnBudgetUSD: Double
     /// Seconds the conversation stays open for the user after each response.
     public var graceSeconds: Double
+    /// Ceiling on remote tool calls per delegation, so a looping remote
+    /// agent runs into a wall the budget might take too long to provide.
+    public var maxToolSteps: Int
 
     public init(models: [String], sessionRemainingUSD: Double,
-                turnBudgetUSD: Double, graceSeconds: Double = 10) {
+                turnBudgetUSD: Double, graceSeconds: Double = 10,
+                maxToolSteps: Int = 32) {
         self.models = models
         self.sessionRemainingUSD = sessionRemainingUSD
         self.turnBudgetUSD = turnBudgetUSD
         self.graceSeconds = graceSeconds
+        self.maxToolSteps = maxToolSteps
     }
 
     public var isEnabled: Bool {
@@ -56,6 +65,9 @@ public enum DelegationEvent: Sendable {
     case userTurn(String)
     /// Cumulative cost for this delegation, USD.
     case cost(Double)
+    /// The remote model called a tool (E2); the result follows when it lands.
+    case toolCall(name: String, arguments: String)
+    case toolResult(name: String, result: String)
     case ended(reason: String, costUSD: Double)
 }
 
@@ -201,20 +213,31 @@ public struct DelegateToolRunner: ToolExecuting {
 
     private func converse(model: String, brief: String, key: String) async -> String {
         emit(.started(model: model, task: brief))
-        var messages: [[String: String]] = [["role": "user", "content": brief]]
+        var messages: [[String: Any]] = [["role": "user", "content": brief]]
         var cost = 0.0
+        var toolSteps = 0
         var lastAnswer = ""
         var reason = "the remote model finished"
         let turnCap = min(policy.turnBudgetUSD, policy.sessionRemainingUSD)
+
+        // E2: the remote model works with the SAME surface the local one has.
+        // The inner schemas are already OpenAI function schemas; `delegate`
+        // is not among them because the wrapper appends itself after inner --
+        // which is exactly the "nested escalation refused" rule.
+        let tools: [[String: Any]] = inner.schemas.compactMap {
+            guard let d = $0.data(using: .utf8) else { return nil }
+            return (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+        }
 
         loop: while true {
             // Spec §15.3: the ceiling is enforced by declining the NEXT
             // request; what is in flight is paid for.
             if cost >= turnCap { reason = "the budget tripped"; break }
-            let (text, spent, err) = await streamOnce(model: model, messages: messages, key: key)
-            cost += spent
+            let r = await streamOnce(model: model, messages: messages,
+                                     tools: tools, key: key)
+            cost += r.cost
             emit(.cost(cost))
-            if let err {
+            if let err = r.error {
                 if lastAnswer.isEmpty {
                     emit(.ended(reason: "failed: \(err)", costUSD: cost))
                     return "error: delegation failed: \(err)"
@@ -222,8 +245,49 @@ public struct DelegateToolRunner: ToolExecuting {
                 reason = "the request failed (\(err)); the last complete answer stands"
                 break
             }
-            lastAnswer = text
-            messages.append(["role": "assistant", "content": text])
+
+            if !r.toolCalls.isEmpty {
+                // The remote model is working. Execute through the inner
+                // chain -- the same vsock, the same guest, the same /work --
+                // and feed the results back.
+                var assistant: [String: Any] = ["role": "assistant",
+                                                "content": r.text]
+                assistant["tool_calls"] = r.toolCalls.map { tc in
+                    ["id": tc.id, "type": "function",
+                     "function": ["name": tc.name, "arguments": tc.arguments]]
+                }
+                messages.append(assistant)
+                for tc in r.toolCalls {
+                    toolSteps += 1
+                    emit(.toolCall(name: tc.name, arguments: tc.arguments))
+                    let result: String
+                    if toolSteps > policy.maxToolSteps {
+                        result = "error: this delegation's tool-step ceiling "
+                               + "(\(policy.maxToolSteps)) is reached; finish with what you have"
+                    } else if tc.name == "delegate" {
+                        result = "error: nested escalation is not available"
+                    } else {
+                        result = inner.run(ToolCall(name: tc.name,
+                                                    arguments: Self.arguments(from: tc.arguments)))
+                    }
+                    emit(.toolResult(name: tc.name, result: result))
+                    messages.append(["role": "tool", "tool_call_id": tc.id,
+                                     "content": result])
+                }
+                if toolSteps > policy.maxToolSteps { reason = "the tool-step ceiling"; }
+                // Steering lands between steps too -- no grace wait while the
+                // model is mid-work, just a drain.
+                let (queued, stopped) = mailbox.drain()
+                if stopped { reason = "the user ended it"; break }
+                for m in queued {
+                    emit(.userTurn(m))
+                    messages.append(["role": "user", "content": m])
+                }
+                continue
+            }
+
+            lastAnswer = r.text
+            messages.append(["role": "assistant", "content": r.text])
 
             // The grace window: the conversation stays open briefly so the
             // user can continue it; a queued message continues, stop or
@@ -246,33 +310,61 @@ public struct DelegateToolRunner: ToolExecuting {
         return header + "\n\n" + lastAnswer
     }
 
-    /// One streaming completion. Returns the text, the cost the provider
-    /// reported, and an error if the request failed.
-    private func streamOnce(model: String, messages: [[String: String]],
-                            key: String) async -> (String, Double, String?) {
+    /// OpenAI tool arguments arrive as a JSON object in a string; ToolCall
+    /// carries [String: String]. Non-string values are re-encoded, which is
+    /// the same convention the guest's own dispatch applies.
+    static func arguments(from json: String) -> [String: String] {
+        guard let d = json.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+        else { return ["input": json] }
+        var out: [String: String] = [:]
+        for (k, v) in obj {
+            if let s = v as? String { out[k] = s }
+            else if let dd = try? JSONSerialization.data(withJSONObject: v,
+                                                         options: [.fragmentsAllowed]) {
+                out[k] = String(decoding: dd, as: UTF8.self)
+            }
+        }
+        return out
+    }
+
+    struct StreamResult {
+        var text = ""
+        var toolCalls: [(id: String, name: String, arguments: String)] = []
+        var cost = 0.0
+        var error: String?
+    }
+
+    /// One streaming completion: text deltas, streamed tool-call fragments
+    /// assembled by index, and the provider's cost from the final chunk.
+    private func streamOnce(model: String, messages: [[String: Any]],
+                            tools: [[String: Any]], key: String) async -> StreamResult {
         var req = URLRequest(url: baseURL.appendingPathComponent("chat/completions"))
         req.httpMethod = "POST"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.timeoutInterval = 300
-        let body: [String: Any] = ["model": model, "messages": messages,
+        var body: [String: Any] = ["model": model, "messages": messages,
                                    "stream": true,
                                    "usage": ["include": true]]
+        if !tools.isEmpty { body["tools"] = tools }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        var text = ""
-        var cost = 0.0
+        var r = StreamResult()
+        // index -> (id, name, argument fragments); OpenAI streams a call's
+        // name once and its arguments as pieces.
+        var calls: [Int: (id: String, name: String, args: String)] = [:]
         do {
             let (bytes, response) = try await session().bytes(for: req)
             guard let http = response as? HTTPURLResponse else {
-                return ("", 0, "not an HTTP response")
+                r.error = "not an HTTP response"; return r
             }
             guard http.statusCode == 200 else {
                 // The body may explain; read a little of it, never log the
                 // request (it carries the Authorization header).
                 var detail = ""
                 for try await line in bytes.lines { detail += line; if detail.count > 300 { break } }
-                return ("", 0, "HTTP \(http.statusCode): \(detail.prefix(300))")
+                r.error = "HTTP \(http.statusCode): \(detail.prefix(300))"; return r
             }
             for try await line in bytes.lines {
                 guard line.hasPrefix("data:") else { continue }
@@ -282,19 +374,35 @@ public struct DelegateToolRunner: ToolExecuting {
                       let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any]
                 else { continue }
                 if let choices = obj["choices"] as? [[String: Any]],
-                   let delta = choices.first?["delta"] as? [String: Any],
-                   let piece = delta["content"] as? String, !piece.isEmpty {
-                    text += piece
-                    emit(.delta(piece))
+                   let delta = choices.first?["delta"] as? [String: Any] {
+                    if let piece = delta["content"] as? String, !piece.isEmpty {
+                        r.text += piece
+                        emit(.delta(piece))
+                    }
+                    for tc in (delta["tool_calls"] as? [[String: Any]]) ?? [] {
+                        let idx = tc["index"] as? Int ?? 0
+                        var cur = calls[idx] ?? (id: "", name: "", args: "")
+                        if let id = tc["id"] as? String { cur.id = id }
+                        if let fn = tc["function"] as? [String: Any] {
+                            if let n = fn["name"] as? String { cur.name += n }
+                            if let a = fn["arguments"] as? String { cur.args += a }
+                        }
+                        calls[idx] = cur
+                    }
                 }
                 if let usage = obj["usage"] as? [String: Any],
                    let c = usage["cost"] as? Double {
-                    cost = c
+                    r.cost = c
                 }
             }
-            return (text, cost, nil)
+            r.toolCalls = calls.sorted { $0.key < $1.key }.map {
+                (id: $0.value.id.isEmpty ? "call_\($0.key)" : $0.value.id,
+                 name: $0.value.name, arguments: $0.value.args)
+            }
+            return r
         } catch {
-            return (text, cost, (error as NSError).localizedDescription)
+            r.error = (error as NSError).localizedDescription
+            return r
         }
     }
 

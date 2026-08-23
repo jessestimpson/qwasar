@@ -318,6 +318,15 @@ final class AppState {
             liveDelegation?.log += "\n\n**you:** \(text)\n\n"
         case .cost(let usd):
             liveDelegation?.costUSD = usd
+        case .toolCall(let name, let args):
+            // Compact: the card is a window, not a full transcript; the
+            // arguments are truncated the way the local pending-call row is.
+            let brief = args.count > 120 ? String(args.prefix(120)) + "…" : args
+            liveDelegation?.log += "\n\n`→ \(name) \(brief)`\n"
+        case .toolResult(let name, let result):
+            let first = result.split(separator: "\n").first.map(String.init) ?? ""
+            let brief = first.count > 160 ? String(first.prefix(160)) + "…" : first
+            liveDelegation?.log += "`← \(name): \(brief)`\n\n"
         case .ended(let reason, let usd):
             // The sub-session becomes a transcript item so a parked session
             // replays it readable (spec §15.2), and the spend persists so the
