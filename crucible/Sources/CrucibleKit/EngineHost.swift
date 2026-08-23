@@ -240,6 +240,34 @@ public final class EngineHost: @unchecked Sendable {
         }
     }
 
+    /// Checkpoints a session WITHOUT closing it -- the idle autosave
+    /// (spec 4.4): the user walked away; make the eventual resume a read.
+    /// The Session's own lastCheckpoint guard makes a repeat free.
+    public func checkpointLive(_ id: UUID) async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            queue.async {
+                Self.assertOnEngineQueue()
+                self.sessions[id]?.checkpoint()
+                c.resume()
+            }
+        }
+    }
+
+    /// How many leading tokens of `tokens` a checkpoint on disk covers RIGHT
+    /// NOW (spec 4.4: the warm/cold indicator claims nothing it has not just
+    /// verified -- the cache is LRU and evicts).
+    public func cachedPrefix(of tokens: [Int32]) async -> Int {
+        await withCheckedContinuation { cont in
+            queue.async {
+                guard let e = self.engine, !tokens.isEmpty else { cont.resume(returning: 0); return }
+                let n = tokens.withUnsafeBufferPointer { p in
+                    Int(qwasar_kv_probe(e, p.baseAddress, Int32(p.count)))
+                }
+                cont.resume(returning: n)
+            }
+        }
+    }
+
     public func isOpen(_ id: UUID) async -> Bool {
         await withCheckedContinuation { cont in
             queue.async { cont.resume(returning: self.sessions[id] != nil) }

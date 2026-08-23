@@ -20,13 +20,13 @@ What a spec needs is the map: what exists, and what is next.
 | — | host-mediated network: `fetch` under a per-project allowlist (§8.3) |
 | — | sandbox configuration in three layers + the config project (§8.5) |
 | — | delegation E1+E2: budgeted, embedded, steerable; the remote agent drives the sandbox by proxy; one feature under one name, user- or model-initiated (§15) |
+| — | session parking: boundary autosave, Park, verified warm/cold indicators (§4.4) |
 
 ## Next
 
-- **M6 — session parking.** Checkpoints so switching sessions restores
-  instead of re-prefilling — the UX is settled ahead of the build (§4.4: no
-  save verb, boundary-moment autosave, a Park action, warm/cold indicators
-  with time estimates); `crucible-cli` for headless end-to-end runs; the
+- **M6 — remainder.** Parking is built (§4.4: boundary-moment autosave, the
+  Park action, verified warm/cold indicators over `qwasar_kv_probe`); still
+  open from M6: `crucible-cli` for headless end-to-end runs, and the
   inspector.
 - **M7 — vision, and speculation in the app's gates.** Images into the
   session (§2's mrope machinery is already in the engine); `gate-mtp`

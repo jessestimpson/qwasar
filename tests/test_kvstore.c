@@ -101,6 +101,14 @@ int main(int argc, char **argv) {
     qwasar_session *b = qwasar_session_new(e, err, sizeof err);
     int32_t covered = qwasar_session_restore(b, e, prompt, n);
     CHECK(covered == n, "restored %d tokens, expected %d", covered, n);
+
+    /* The probe must agree with the restore it predicts: same scan, same
+     * validation, no load.  And it must say 0 for tokens nothing covers --
+     * a UI trusts this to claim "resumes from checkpoint" (spec 4.4). */
+    CHECK(qwasar_kv_probe(e, prompt, n) == n,
+          "probe disagrees with the restore it predicts");
+    int32_t bogus[4] = { 9, 9, 9, 9 };
+    CHECK(qwasar_kv_probe(e, bogus, 4) == 0, "probe matched tokens it should not");
     CHECK(qwasar_session_n_past(b) == n, "restored n_past %d", qwasar_session_n_past(b));
 
     const float *lb = qwasar_session_eval(b, &probe, 1, err, sizeof err);

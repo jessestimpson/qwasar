@@ -343,6 +343,12 @@ int32_t qwasar_session_restore(qwasar_session *s, const qwasar_engine *e,
                                const int32_t *tokens, int32_t n);
 void    qwasar_kv_cache_stats(uint64_t *bytes, int *entries);
 
+/* How many leading tokens of `tokens` a checkpoint on disk covers RIGHT NOW,
+ * without loading it: qwasar_session_restore's own scan and validation, minus
+ * the unpack.  For a UI that claims "resumes from checkpoint" only when the
+ * file verifiably exists -- the cache is LRU and evicts. */
+int32_t qwasar_kv_probe(const qwasar_engine *e, const int32_t *tokens, int32_t n);
+
 /* Diagnostic: record the residual stream for the final token after each of the
  * given layers, so a divergence can be located rather than just detected.
  * Pass n = 0 to turn off.  Returns false if the capture buffer cannot be sized. */

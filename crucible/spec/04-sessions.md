@@ -309,7 +309,8 @@ only slower, which is exactly how the staircase above went unnoticed.
 
 #### The UX, settled: there is no save verb
 
-*Designed 2026-08-23, ahead of M6 building it.*
+*Designed 2026-08-23; built the same day. What follows is both the design and
+the state of the build.*
 
 A checkpoint buys **speed, not safety**. The transcript and the token history
 always persist; any session can be rebuilt by re-prefill. A "Save checkpoint"
@@ -324,14 +325,15 @@ until this session is warm?*
 **Automatic, at natural boundaries** (each throttled by the existing
 `lastCheckpoint` guard, so an unchanged session never rewrites gigabytes):
 
-- **On session switch** — the moment that today costs a full re-prefill, and
-  most of M6's value. The write may overlap the incoming session's own
-  restore/prefill; measure before assuming the overlap hides it (house rule).
-- **On quit** — already built (`shutdown()`).
-- **After the system-prefix prime** — already built.
-- **After a few minutes idle.** The person who walks away mid-project and
-  returns tomorrow is who checkpoints exist for, and idle is when a
-  multi-second write is invisible.
+- **On session switch** — built: `closeSession` checkpoints on the engine
+  queue before the incoming session opens, so the write and the restore are
+  serialised rather than raced.
+- **On quit** — built (`shutdown()`).
+- **After the system-prefix prime** — built.
+- **After three minutes idle** — built: the person who walks away
+  mid-project and returns tomorrow is who checkpoints exist for, and idle is
+  when a multi-second write is invisible. Cancelled by the next send or a
+  park; the in-place checkpoint does not close the session.
 
 This refines "on close, once" above from a single moment to a set of
 boundary moments; the one-live-checkpoint-per-session accounting and the
@@ -352,6 +354,14 @@ measured-figures tradition:
 | ● live | holds its share of the working set |
 | ◐ parked, warm | "resumes in ~2 s" — checkpoint verified ON DISK now |
 | ○ parked, cold | "rebuilds in ~4 min" — token count ÷ the measured ~32 tok/s |
+
+Built as designed, on a small engine addition: `qwasar_kv_probe` — the
+restore's own directory scan and stored-token validation, minus the load and
+the hit accounting — so "warm" is a claim the store just verified, not a
+memory. The sidebar probes after engine load, every turn, every checkpoint
+and every park; a cold estimate is credited with whatever prefix IS cached.
+Park is a context-menu action on the live session's row, and stops the
+session's VM too (its disk survives; the next open reboots it).
 
 "Verified on disk" is load-bearing: the LRU evicts, and an indicator that
 reflected history rather than the store would turn eviction into a mystery

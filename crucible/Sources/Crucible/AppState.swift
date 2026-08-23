@@ -109,6 +109,13 @@ final class AppState {
     /// A finished user-initiated delegation's answer, waiting to ride along
     /// with the user's next message so the local model sees it. Discardable.
     var pendingHandoff: String?
+
+    // Parking (spec 4.4). `warmTokens` is how many of each session's tokens a
+    // checkpoint on disk covers, VERIFIED by probing the store -- never
+    // remembered from history, because the LRU evicts and an indicator that
+    // reflected the past would turn eviction into a mystery slowdown.
+    var warmTokens: [UUID: Int] = [:]
+    private var idleCheckpoint: Task<Void, Never>?
     private var delegationMailbox: DelegationMailbox?
     /// Set while the app is quitting and the guests are being flushed.
     var shuttingDown = false
@@ -192,6 +199,7 @@ final class AppState {
                                                         ? draftAccess.url?.path : nil)
             if let why = engine.mtpDropped { engineNote = why }
             phase = .ready
+            refreshWarm()
         } catch {
             phase = .failed(String(describing: error))
         }
@@ -753,6 +761,7 @@ final class AppState {
                 prefillTotal = 0
             }
 
+            idleCheckpoint?.cancel()
             phase = .generating
             cancelFlag.clear()
             prefillDone = 0; prefillTotal = 0
@@ -793,10 +802,61 @@ final class AppState {
             tokensPerSecond = 0
             instantaneousTokensPerSecond = 0
             if case .generating = phase { phase = .ready }
+            scheduleIdleCheckpoint()
+            refreshWarm()
         }
     }
 
     func interrupt() { cancelFlag.set() }
+
+    // MARK: Parking (spec 4.4)
+
+    /// Re-probes the checkpoint store for every session. Cheap (a directory
+    /// scan and token compares per session) and honest by construction.
+    func refreshWarm() {
+        let recs = sessions.map { ($0.id, store?.loadTokens($0.id) ?? []) }
+        Task {
+            var fresh: [UUID: Int] = [:]
+            for (id, toks) in recs where !toks.isEmpty {
+                fresh[id] = await engine.cachedPrefix(of: toks)
+            }
+            warmTokens = fresh
+        }
+    }
+
+    /// The one user verb (spec 4.4): keep it warm, free the live slot. The
+    /// checkpoint is mechanism and goes unmentioned; the VM stops too, per
+    /// the park sequence -- its disk survives and reboots on the next open.
+    func park(_ id: UUID) {
+        guard liveSessionID == id, phase != .generating else { return }
+        idleCheckpoint?.cancel()
+        Task {
+            await engine.closeAndCheckpoint(id)
+            if let sandboxes { await sandboxes.stop(session: id) }
+            liveSessionID = nil
+            sandboxStatus = nil
+            if let i = sessions.firstIndex(where: { $0.id == id }) {
+                sessions[i].state = .closed
+                store?.save(sessions[i])
+            }
+            refreshWarm()
+        }
+    }
+
+    /// Idle autosave (spec 4.4): a few minutes after a turn ends with the
+    /// session still live, checkpoint it in place -- the user who walked away
+    /// is who checkpoints exist for. Cancelled by the next send or a park.
+    private func scheduleIdleCheckpoint() {
+        idleCheckpoint?.cancel()
+        guard let id = liveSessionID else { return }
+        idleCheckpoint = Task {
+            try? await Task.sleep(for: .seconds(180))
+            guard !Task.isCancelled, self.liveSessionID == id,
+                  self.phase == .ready else { return }
+            await self.engine.checkpointLive(id)
+            self.refreshWarm()
+        }
+    }
 
     // MARK: Materialisation
 

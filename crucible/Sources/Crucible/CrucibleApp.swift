@@ -200,9 +200,13 @@ struct Sidebar: View {
             ForEach(state.projects) { project in
                 Section {
                     ForEach(state.sessions(in: project)) { s in
-                        SessionRow(session: s, isLive: state.liveSessionID == s.id)
+                        SessionRow(session: s, isLive: state.liveSessionID == s.id,
+                                   warm: state.warmTokens[s.id])
                             .tag(s.id)
                             .contextMenu {
+                                if state.liveSessionID == s.id {
+                                    Button("Park Session") { state.park(s.id) }
+                                }
                                 Button("Delete Session", role: .destructive) {
                                     state.deleteSession(s.id)
                                 }
@@ -261,23 +265,54 @@ struct Sidebar: View {
 struct SessionRow: View {
     let session: SessionRecord
     let isLive: Bool
+    /// Tokens a checkpoint on disk covers, probed -- nil means unknown or
+    /// nothing (spec 4.4: the indicator claims only what is verified).
+    var warm: Int? = nil
+
+    /// Three states, each with the number that is its meaning: live holds
+    /// memory; parked-warm resumes as a read; parked-cold pays a re-prefill.
+    private var symbol: (name: String, tint: Color) {
+        if isLive { return ("circle.fill", Color.accentColor) }
+        if isWarm { return ("circle.lefthalf.filled", Color.accentColor.opacity(0.7)) }
+        return ("circle", Color.secondary)
+    }
+
+    private var isWarm: Bool {
+        session.tokenCount > 0 && (warm ?? 0) >= session.tokenCount
+    }
+
+    /// The size law from spec 4.4 (149.6 MB floor + 64 KB/token) over a
+    /// conservative read rate for warm; the measured ~32 tok/s prefill for
+    /// cold, credited with whatever prefix IS cached.
+    private var estimate: String? {
+        guard session.tokenCount > 0, !isLive else { return nil }
+        if isWarm {
+            let secs = max(1, Int((1.496e8 + Double(session.tokenCount) * 65536) / 7e8))
+            return "resumes in ~\(secs)s"
+        }
+        let remaining = session.tokenCount - min(warm ?? 0, session.tokenCount)
+        let secs = Int(Double(remaining) / 32.0)
+        return secs < 90 ? "rebuilds in ~\(max(secs, 5))s"
+                         : "rebuilds in ~\((secs + 30) / 60)m"
+    }
 
     var body: some View {
         HStack(spacing: 6) {
-            // PLAN.md 5.1: filled means the session holds its share of the
-            // working set; hollow means it is on disk and the first message
-            // will pay to rebuild it.
-            Image(systemName: isLive ? "circle.fill" : "circle")
+            Image(systemName: symbol.name)
                 .font(.system(size: 7))
-                .foregroundStyle(isLive ? Color.accentColor : Color.secondary)
+                .foregroundStyle(symbol.tint)
             VStack(alignment: .leading, spacing: 1) {
                 Text(session.title).lineLimit(1)
                 if session.tokenCount > 0 {
-                    Text("\(session.tokenCount) / \(session.contextSize) tokens")
+                    Text("\(session.tokenCount) / \(session.contextSize) tokens"
+                         + (estimate.map { " · \($0)" } ?? ""))
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
         }
+        .help(isLive ? "Live: holds its share of the working set."
+              : isWarm ? "Parked, warm: a checkpoint on disk covers the whole session."
+                       : "Parked, cold: no full checkpoint on disk; opening re-prefills.")
     }
 }
 

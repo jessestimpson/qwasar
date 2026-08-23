@@ -284,6 +284,44 @@ static int32_t qw_kv_try(const char *path, const qw_kv_header *want,
     return (int32_t)h.n_tokens;
 }
 
+/* How many leading tokens of `tokens` a checkpoint on disk covers, without
+ * loading anything.  The scan is qwasar_session_restore's, minus the unpack
+ * and the hit accounting: same directory, same header validation, same
+ * stored-token comparison -- so a nonzero answer here is a checkpoint restore
+ * would actually use, not a guess from a hash.  Exists so a UI can say
+ * "resumes from checkpoint" only when that is verifiably true right now. */
+int32_t qwasar_kv_probe(const qwasar_engine *e, const int32_t *tokens, int32_t n) {
+    if (!tokens || n <= 0) return 0;
+
+    char dir[1024];
+    if (!qw_kv_dir(dir, sizeof dir)) return 0;
+
+    const qw_config *c = qwasar_engine_config(e);
+    const qw_shape  *sh = qwasar_engine_shape(e);
+    qw_kv_header want;
+    memset(&want, 0, sizeof want);
+    want.model_id = qw_model_id(c);
+    qw_fill_dims(c, sh, want.dims);
+
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+
+    int32_t best_n = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.') continue;
+        char path[1200];
+        snprintf(path, sizeof path, "%s/%s", dir, ent->d_name);
+        qw_kv_header h;
+        FILE *f = NULL;
+        int32_t got = qw_kv_try(path, &want, tokens, n, &h, &f);
+        if (f) fclose(f);
+        if (got > best_n) best_n = got;
+    }
+    closedir(d);
+    return best_n;
+}
+
 int32_t qwasar_session_restore(qwasar_session *s, const qwasar_engine *e,
                                const int32_t *tokens, int32_t n) {
     if (!tokens || n <= 0 || qwasar_session_n_past(s) != 0) return 0;
