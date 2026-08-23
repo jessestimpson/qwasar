@@ -306,3 +306,59 @@ never written and a checkpoint read every time look identical from the outside,
 only slower, which is exactly how the staircase above went unnoticed.
 
 ---
+
+#### The UX, settled: there is no save verb
+
+*Designed 2026-08-23, ahead of M6 building it.*
+
+A checkpoint buys **speed, not safety**. The transcript and the token history
+always persist; any session can be rebuilt by re-prefill. A "Save checkpoint"
+button would assert the opposite contract — that forgetting it loses work —
+manufacturing anxiety about precisely the thing the architecture guarantees.
+And no user can be asked to weigh "is this 150 MB–8 GB write worth it now";
+that is what the budget above is for. So checkpoints are autosave-shaped:
+automatic at the moments that already contain a pause, visible only as the
+answer to the one question the user actually has — *if I come back, how long
+until this session is warm?*
+
+**Automatic, at natural boundaries** (each throttled by the existing
+`lastCheckpoint` guard, so an unchanged session never rewrites gigabytes):
+
+- **On session switch** — the moment that today costs a full re-prefill, and
+  most of M6's value. The write may overlap the incoming session's own
+  restore/prefill; measure before assuming the overlap hides it (house rule).
+- **On quit** — already built (`shutdown()`).
+- **After the system-prefix prime** — already built.
+- **After a few minutes idle.** The person who walks away mid-project and
+  returns tomorrow is who checkpoints exist for, and idle is when a
+  multi-second write is invisible.
+
+This refines "on close, once" above from a single moment to a set of
+boundary moments; the one-live-checkpoint-per-session accounting and the
+staircase prohibition stand unchanged.
+
+**One user verb, and it is not "save" — it is Park.** A context-menu action
+on the session row meaning "I am done here for now; keep it warm and free
+the live slot." That decision — which session deserves the slot — is genuinely
+the user's; the checkpoint it implies is mechanism and goes unmentioned. No
+dialog, no filename: checkpoints are not documents.
+
+**The honest indicator is where the UX actually lives.** The sidebar's
+live/parked circle gains a distinction with a number, in the
+measured-figures tradition:
+
+| state | shows |
+|---|---|
+| ● live | holds its share of the working set |
+| ◐ parked, warm | "resumes in ~2 s" — checkpoint verified ON DISK now |
+| ○ parked, cold | "rebuilds in ~4 min" — token count ÷ the measured ~32 tok/s |
+
+"Verified on disk" is load-bearing: the LRU evicts, and an indicator that
+reflected history rather than the store would turn eviction into a mystery
+slowdown. Showing the estimate is what converts the checkpoint from invisible
+plumbing into visible value — it *is* the user-comprehensible meaning of one.
+
+**Deliberately absent:** per-turn autosave (the staircase above, measured and
+rejected); confirmation dialogs; any cache-management UI in the session view.
+If "clear checkpoints" is ever needed it is a config-project operation, not a
+button next to someone's work.

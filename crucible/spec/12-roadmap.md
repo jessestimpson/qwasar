@@ -23,9 +23,11 @@ What a spec needs is the map: what exists, and what is next.
 
 ## Next
 
-- **M6 — session parking.** Explicit checkpoints so switching sessions
-  restores instead of re-prefilling; `crucible-cli` for headless end-to-end
-  runs; the inspector.
+- **M6 — session parking.** Checkpoints so switching sessions restores
+  instead of re-prefilling — the UX is settled ahead of the build (§4.4: no
+  save verb, boundary-moment autosave, a Park action, warm/cold indicators
+  with time estimates); `crucible-cli` for headless end-to-end runs; the
+  inspector.
 - **M7 — vision, and speculation in the app's gates.** Images into the
   session (§2's mrope machinery is already in the engine); `gate-mtp`
   promoted into CI.
