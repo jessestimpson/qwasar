@@ -26,6 +26,9 @@ struct SessionView: View {
                                                        && item.id == state.transcript.last?.id)
                                 .id(item.id)
                         }
+                        if let p = state.pendingCall {
+                            PendingCallRow(name: p.name, keys: p.keys, tokens: p.tokens)
+                        }
                         Color.clear.frame(height: 1).id("bottom")
                     }
                     .padding(20)
@@ -88,20 +91,29 @@ struct SessionHeader: View {
 /// Present only while something is generating. A rate that lingers after a turn
 /// is a number about the past pretending to be about the present.
 struct RateReadout: View {
+    /// The turn's average.
     let rate: Double
+    /// Over roughly the last second. Shown first because it is the number
+    /// that answers "what is it doing NOW" -- the two diverge whenever the
+    /// decode regime changes, sampled reasoning versus speculative answer.
+    let instantaneous: Double
     let generated: Int
 
     var body: some View {
         HStack(spacing: 4) {
             Image(systemName: "gauge.with.needle").font(.caption2)
-            Text(String(format: "%.1f tok/s", rate))
+            Text(String(format: "%.1f tok/s", instantaneous))
                 .font(.caption).monospacedDigit()
+            Text(String(format: "· %.1f avg", rate))
+                .font(.caption).monospacedDigit().foregroundStyle(.tertiary)
             Text("· \(generated)")
                 .font(.caption).monospacedDigit().foregroundStyle(.tertiary)
         }
         .foregroundStyle(.secondary)
-        .help("\(generated) tokens generated this turn. This is a dense 27B model; "
-              + "about 6 tok/s is the bandwidth ceiling, not an inefficiency.")
+        .help("Current decode rate, then the turn's average, then \(generated) "
+              + "tokens generated this turn. This is a dense 27B model; about "
+              + "6 tok/s is the serial bandwidth ceiling — higher means "
+              + "speculation is paying.")
     }
 }
 
@@ -294,6 +306,7 @@ struct StatusFooter: View {
                     Spacer(minLength: 12)
                     if state.tokensPerSecond > 0 {
                         RateReadout(rate: state.tokensPerSecond,
+                                    instantaneous: state.instantaneousTokensPerSecond,
                                     generated: state.generatedThisTurn)
                     }
                     EffortControl(state: state)
@@ -452,19 +465,65 @@ struct TranscriptRow: View {
     }
 
     private func footerText(_ s: TurnStats) -> String {
-        var parts = [
+        var parts: [String] = [
             "\(s.generatedTokens) tokens",
             "\(s.reasoningTokens) reasoning",
             String(format: "%.1f tok/s", s.tokensPerSecond),
             String(format: "prefill %d tok in %.1fs (%.0f tok/s)",
                    s.promptTokens, s.prefillSeconds, s.prefillTokensPerSecond),
         ]
+        // Only when a head is loaded and it actually ran: "1.0 tok/round" on a
+        // serial turn would be noise, not information.
+        if s.specRounds > 0 {
+            parts.append(String(format: "spec %.2f tok/round over %d",
+                                s.tokensPerRound, s.specRounds))
+        }
         if s.toolCalls > 0 { parts.append("\(s.toolCalls) tool calls") }
         if s.interrupted { parts.append("interrupted") }
         if s.hitBudget { parts.append("budget reached") }
         if s.hitStepCap { parts.append("step cap") }
         parts.append("ctx \(s.contextUsed)/\(s.contextLimit)")
         return parts.joined(separator: " · ")
+    }
+}
+
+/// A call the model is still writing.
+///
+/// The markup of a call is never echoed -- it would bury whatever narration came
+/// before it -- and a `write` or a `define` runs to hundreds of tokens, which at
+/// ~6 tok/s is minutes. Without this the transcript shows nothing at all for the
+/// longest stretch of many turns, and a person cannot tell a working model from
+/// a wedged one.
+///
+/// It says only what can be known early and honestly: the function name and the
+/// parameter keys, which arrive in the first few tokens, and a count that keeps
+/// moving. The values are not shown, because the finished ToolCard shows them
+/// and showing them twice would be worse than showing them once.
+struct PendingCallRow: View {
+    let name: String?
+    let keys: [String]
+    let tokens: Int
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            ProgressView().controlSize(.small).scaleEffect(0.7)
+            Text(name ?? "tool call")
+                .font(.callout.weight(.medium).monospaced())
+                .foregroundStyle(name == nil ? .secondary : .primary)
+            if !keys.isEmpty {
+                Text(keys.joined(separator: " · "))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Text("\(tokens) tokens")
+                .font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentColor.opacity(0.07), in: .rect(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.accentColor.opacity(0.22), lineWidth: 1))
     }
 }
 

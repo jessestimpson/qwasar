@@ -34,6 +34,11 @@ public struct MemoryProfile: Sendable, Equatable {
     public static let kvBytesPerToken: UInt64 = 64 * 1024
     /// The MTP draft head keeps its own single-layer KV cache.
     public static let mtpBytesPerToken: UInt64 = 4 * 1024
+    /// The head's own weights: a single BF16 layer, measured at 810 MB on disk.
+    public static let mtpWeightsBytes: UInt64 = 850_000_000
+    /// Below this, the context the head costs is worth more than the speed it
+    /// buys, and it stays off however much memory is free.
+    public static let mtpContextFloor: Int32 = 32_768
     /// 151 MB of SSM/conv state plus ~200 MB of activation scratch, both
     /// independent of context length.
     public static let sessionFixedBytes: UInt64 = 351 * 1024 * 1024
@@ -51,7 +56,10 @@ public struct MemoryProfile: Sendable, Equatable {
     /// switch latency and nothing else.
     public static let maxLiveSessions = 4
 
-    public static func derive(weightsBytes: UInt64 = weightsBytesDefault) -> MemoryProfile {
+    /// `mtpAvailable` says whether a draft head has been granted; without one
+    /// there is nothing to enable, so the memory question does not arise.
+    public static func derive(weightsBytes: UInt64 = weightsBytesDefault,
+                              mtpAvailable: Bool = false) -> MemoryProfile {
         let physical = ProcessInfo.processInfo.physicalMemory
         let device = MTLCreateSystemDefaultDevice()
         let workingSet = UInt64(device?.recommendedMaxWorkingSetSize ?? (physical * 84 / 100))
@@ -68,19 +76,32 @@ public struct MemoryProfile: Sendable, Equatable {
                                      + "usable session at once. Expect swapping.")
         }
 
-        // Enable the draft head only where its per-token cost is comfortable,
-        // which in practice means machines with room to spare after one session.
-        let mtp = forSessions > 24.0 * 1_073_741_824
+        // The draft head is a real trade, not a free win: 811 MB of weights plus
+        // 4 KB/token of its own cache, paid out of the same budget the context
+        // comes from. On a 32 GB machine that is 1.14 GB of a 6.30 GB session
+        // budget -- about 12% of the context -- bought with faster decode.
+        //
+        // So it is enabled when a head is actually present and the context that
+        // survives is still worth having. The previous rule (`forSessions >
+        // 24 GB`) was a guess made while nothing loaded the head at all, and it
+        // said no on every machine that could comfortably have said yes.
+        let mtp = mtpAvailable
+            && forSessions > Double(mtpWeightsBytes + sessionFixedBytes)
+            && contextFitting(budget: forSessions - Double(mtpWeightsBytes),
+                              sessions: 1,
+                              perToken: kvBytesPerToken + mtpBytesPerToken) >= mtpContextFloor
         let perToken = kvBytesPerToken + (mtp ? mtpBytesPerToken : 0)
+        // The head's weights come out of the same budget the context does.
+        let budget = mtp ? forSessions - Double(mtpWeightsBytes) : forSessions
 
         // Prefer context first, then extra live sessions, but never more than
         // the cap and never more context than the model has positions for.
         var live = 1
-        var context = contextFitting(budget: forSessions, sessions: 1, perToken: perToken)
+        var context = contextFitting(budget: budget, sessions: 1, perToken: perToken)
 
         while live < maxLiveSessions {
             let next = live + 1
-            let c = contextFitting(budget: forSessions, sessions: next, perToken: perToken)
+            let c = contextFitting(budget: budget, sessions: next, perToken: perToken)
             // Only take another live session if the context it leaves is still
             // the model's full window -- context is the resource that extends
             // what a session can do; live count only removes a park and a

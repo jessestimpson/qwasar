@@ -44,6 +44,12 @@ public struct EngineInfo: Sendable {
     public let contextSize: Int32
     public let loadSeconds: Double
     public let footprintBytes: UInt64
+    /// Whether a draft head was loaded and the engine will speculate.
+    ///
+    /// Reported from the engine rather than from what we asked for: a head that
+    /// failed to bind leaves a working engine that simply decodes serially, and
+    /// a UI that claimed otherwise would be lying about why it is slow.
+    public let mtpActive: Bool
 }
 
 public final class EngineHost: @unchecked Sendable {
@@ -52,6 +58,8 @@ public final class EngineHost: @unchecked Sendable {
 
     private var engine: OpaquePointer?
     private var tokenizer: Tokenizer?
+    /// Why speculation is off, when it was asked for and did not happen.
+    public private(set) var mtpDropped: String?
     private var sessions: [UUID: LiveSession] = [:]
     private(set) public var info: EngineInfo?
 
@@ -74,16 +82,18 @@ public final class EngineHost: @unchecked Sendable {
     /// `contextSize` comes from the caller because PLAN.md 2.3 makes it a
     /// property of the machine's profile, not of the engine: the KV cache is
     /// allocated eagerly at `qwasar_session_new` from whatever is resolved here.
-    public func load(modelPath: String, contextSize: Int32) async throws -> EngineInfo {
+    public func load(modelPath: String, contextSize: Int32,
+                     mtpPath: String? = nil) async throws -> EngineInfo {
         try await withCheckedThrowingContinuation { cont in
             queue.async {
-                do { cont.resume(returning: try self.loadSync(modelPath, contextSize)) }
+                do { cont.resume(returning: try self.loadSync(modelPath, contextSize, mtpPath)) }
                 catch { cont.resume(throwing: error) }
             }
         }
     }
 
-    private func loadSync(_ modelPath: String, _ contextSize: Int32) throws -> EngineInfo {
+    private func loadSync(_ modelPath: String, _ contextSize: Int32,
+                          _ mtpPath: String?) throws -> EngineInfo {
         Self.assertOnEngineQueue()
         if engine != nil { throw EngineError.load("already loaded") }
 
@@ -91,13 +101,31 @@ public final class EngineHost: @unchecked Sendable {
         let arena = CStringArena()
         var opts = qwasar_options()
         opts.model_path    = arena.dup(modelPath)
-        opts.mtp_path      = nil            // PLAN.md 2.3: off on this profile
+        // The MTP draft head, when the user has granted one. It proposes tokens
+        // and never decides one, so this cannot change what the model emits --
+        // only how many forward passes it takes to emit it (qwasar.h).
+        opts.mtp_path      = mtpPath.map { arena.dup($0) } ?? nil
         opts.context_size  = contextSize
         opts.prefill_chunk = 0              // engine default
         opts.verbose       = false
 
-        let (e, err) = withErrorBuffer { buf, cap in
+        var (e, err) = withErrorBuffer { buf, cap in
             withUnsafePointer(to: &opts) { qwasar_engine_load($0, buf, cap) }
+        }
+
+        // A draft head that will not bind fails the WHOLE load -- qwasar.c goes
+        // to `fail` and returns NULL -- so without this a bad or mismatched head
+        // presents as "cannot load the model", which is both alarming and
+        // wrong. Speculation is an optimisation; losing it must never cost the
+        // application. Retry once without it, and say what happened.
+        var mtpActive = mtpPath != nil
+        if e == nil, mtpPath != nil {
+            mtpDropped = "the draft head did not load (\(err)); decoding serially"
+            mtpActive = false
+            opts.mtp_path = nil
+            (e, err) = withErrorBuffer { buf, cap in
+                withUnsafePointer(to: &opts) { qwasar_engine_load($0, buf, cap) }
+            }
         }
         guard let e else { throw EngineError.load(err) }
         engine = e
@@ -113,7 +141,8 @@ public final class EngineHost: @unchecked Sendable {
                            layers: qwasar_n_layers(e),
                            contextSize: contextSize,
                            loadSeconds: Date().timeIntervalSince(t0),
-                           footprintBytes: Diagnostics.physFootprint())
+                           footprintBytes: Diagnostics.physFootprint(),
+                           mtpActive: mtpActive)
         info = i
         return i
     }

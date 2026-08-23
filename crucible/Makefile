@@ -46,7 +46,7 @@ FRAMEWORKS := -framework Foundation -framework Metal -framework AVFoundation \
               -framework JavaScriptCore
 LDLIBS    := -L$(ROOT) -lqwasar -lm $(FRAMEWORKS)
 
-.PHONY: all help run gate gate-prefix gate-full sandbox test golden guest clean clean-guest lib
+.PHONY: all help run gate gate-prefix gate-mtp gate-full sandbox test golden guest clean clean-guest lib
 
 all: $(APP)
 
@@ -60,6 +60,7 @@ help:
 	@echo "  make sandbox      boot a guest and run the sandbox gate"
 	@echo "  make gate-full    load the model and run one agent turn, headless"
 	@echo "  make gate-prefix  prove the system-prefix KV checkpoint (~80s)"
+	@echo "  make gate-mtp     load the MTP draft head and run one speculative turn"
 	@echo "  make clean        remove build products, keeping the guest image"
 	@echo "  make clean-guest  remove the guest image too"
 	@echo ""
@@ -145,6 +146,19 @@ gate: $(APP)
 # cold session, then a second one, and require that the second read the whole
 # prefix off disk.  Adds ~80s to the gate (the cold prefill), which is why it is
 # its own target rather than part of `gate`.
+# Speculative decoding, proven against the engine.  Loads the MTP draft head,
+# runs one real turn, and reports tokens committed per round -- the number that
+# says whether the head is earning the context it costs.
+MTP ?= $(HOME)/.cache/qwasar/mtp/Qwen3.8-27B-MTP-bf16
+gate-mtp: $(APP)
+	codesign --force --sign - --entitlements Crucible.gate.entitlements \
+	         --options runtime --timestamp=none $(APP)
+	@$(BIN) --gate --model "$(MODEL)" --mtp "$(MTP)" \
+	        --prompt "$(PROMPT)" --root "$(ROOT_DIR)" --no-sandbox || true
+	@echo "re-signing with the shipping entitlements"
+	@codesign --force --sign - --entitlements Crucible.entitlements \
+	          --options runtime --timestamp=none $(APP) 2>/dev/null
+
 gate-prefix: $(APP)
 	codesign --force --sign - --entitlements Crucible.gate.entitlements \
 	         --options runtime --timestamp=none $(APP)

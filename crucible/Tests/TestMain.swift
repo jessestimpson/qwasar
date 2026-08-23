@@ -25,6 +25,7 @@ struct TestMain {
         print("== materialise"); failures += MaterialiseSuite.run()
         print("== guestimage"); failures += GuestImageSuite.run()
         print("== utf8");       failures += UTF8Suite.run()
+        print("== toolparse");  failures += ToolParserSuite.run()
         print("== markdown");   failures += MarkdownSuite.run(args)
         print("== prefix");     failures += PrefixSuite.run(args)
         print("== golden");     failures += GoldenSuite.run(args)

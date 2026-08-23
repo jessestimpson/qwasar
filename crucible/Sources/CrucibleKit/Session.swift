@@ -35,7 +35,11 @@ public enum SessionEvent: Sendable {
     /// measuring the wrong thing (a token is one to several bytes, and the
     /// reasoning block is not shown at all), and at ~6 tok/s a wrong rate is
     /// obviously wrong to the person watching it.
-    case rate(generated: Int, tokensPerSecond: Double)
+    /// `tokensPerSecond` is the whole turn's average; `instantaneous` covers
+    /// only the tokens since the previous report, so it is the number that
+    /// moves when the phase changes -- sampled reasoning versus speculative
+    /// answer are different regimes, and averaging across them hides both.
+    case rate(generated: Int, tokensPerSecond: Double, instantaneous: Double)
     /// Reasoning text, with how many TOKENS produced it.
     ///
     /// One delta is not one token: the UTF-8 assembler holds bytes back until a
@@ -43,6 +47,12 @@ public enum SessionEvent: Sendable {
     /// travels with the text because only the decode loop knows it.
     case reasoning(String, tokens: Int)
     case text(String)
+    /// A call being written, before it is complete.
+    ///
+    /// The markup itself is never echoed (it would bury any narration the model
+    /// wrote first), which left the longest part of many turns looking like a
+    /// hang. This says what is being built and how far along it is.
+    case toolCallProgress(name: String?, keys: [String], tokens: Int)
     case toolCall(ToolCall)
     case toolResult(name: String, result: String)
     case note(String)                 // budget reached, step cap, malformed call
@@ -60,6 +70,21 @@ public struct TurnStats: Sendable, Codable {
     public var decodeSeconds = 0.0
     public var contextUsed = 0
     public var contextLimit = 0
+    /// Speculation, when a draft head is loaded.
+    ///
+    /// Two numbers rather than an acceptance rate, because the rate is only
+    /// meaningful with the round count beside it: 2.0 tokens a round over four
+    /// rounds says nothing, and over four hundred says the head is earning its
+    /// memory.
+    public var specRounds = 0
+    public var specCommitted = 0
+    /// Tokens committed per speculative round. 1.0 means the head proposed
+    /// nothing useful and the rounds cost a forward pass each; the engine's own
+    /// draft_depth backs off to zero when that persists.
+    public var tokensPerRound: Double {
+        specRounds > 0 ? Double(specCommitted) / Double(specRounds) : 0
+    }
+
     public var hitEOS = false
     public var hitBudget = false
     public var hitStepCap = false
@@ -86,17 +111,39 @@ public struct SessionConfig: Sendable {
     public var effort: ReasoningEffort
     public var maxTokensPerTurn: Int
     public var maxToolSteps: Int
+    /// Sampling. The defaults are the model's own generation_config -- the
+    /// same values `qwasar_sampling_defaults` encodes -- because Qwen's
+    /// guidance for thinking-mode models warns against greedy decoding: long
+    /// reasoning chains under argmax are prone to repetition loops.
+    /// `temperature = 0` means greedy and is exactly reproducible, which is
+    /// what the headless gates want.
+    public var temperature: Float
+    public var topK: Int32
+    public var topP: Float
+    public var minP: Float
+    /// 0 means seed from the clock at turn start; nonzero is reproducible.
+    public var seed: UInt64
 
     public init(system: String,
                 thinking: Bool = true,
                 effort: ReasoningEffort = .medium,
                 maxTokensPerTurn: Int = 4096,
-                maxToolSteps: Int = 24) {
+                maxToolSteps: Int = 24,
+                temperature: Float = 1.0,
+                topK: Int32 = 20,
+                topP: Float = 0.95,
+                minP: Float = 0,
+                seed: UInt64 = 0) {
         self.system = system
         self.thinking = thinking
         self.effort = effort
         self.maxTokensPerTurn = maxTokensPerTurn
         self.maxToolSteps = maxToolSteps
+        self.temperature = temperature
+        self.topK = topK
+        self.topP = topP
+        self.minP = minP
+        self.seed = seed
     }
 }
 
@@ -512,6 +559,36 @@ final class LiveSession {
         var next: Int32 = 0
         let vocab = qwasar_vocab_size(engine)
 
+        var sp = qwasar_sampling(temperature: config.temperature,
+                                 top_k: config.topK,
+                                 top_p: config.topP,
+                                 min_p: config.minP,
+                                 seed: config.seed)
+        // Same seeding as qwasar-server: an explicit seed reproduces exactly,
+        // 0 draws from the clock. The rng state lives for the turn.
+        var rng: UInt64 = sp.seed != 0
+            ? sp.seed
+            : UInt64(bitPattern: Int64(Date().timeIntervalSince1970 * 1000))
+              &* 6364136223846793005 &+ 1
+
+        // The phase split (PLAN.md 7.5). Sampling is what the reasoning block
+        // needs -- long greedy chains loop -- and speculation is what the
+        // answer needs: tool-call markup is low-entropy, drafts well, and at
+        // these settings sampling nearly always picks the argmax token there
+        // anyway. `qwasar_session_verify`'s contract is greedy equivalence, so
+        // the two cannot overlap; they alternate on the `</think>` boundary
+        // instead. With no draft head there is no speedup to buy, so sampling
+        // simply runs the whole turn.
+        var greedySP = qwasar_sampling(temperature: 0, top_k: 0, top_p: 1,
+                                       min_p: 0, seed: 0)
+        var reasoning = true
+        let hasMTP = qwasar_session_has_mtp(handle)
+        func pick(_ logits: UnsafePointer<Float>) -> Int32 {
+            hasMTP && !reasoning
+                ? qwasar_sample(logits, vocab, &greedySP, &rng)
+                : qwasar_sample(logits, vocab, &sp, &rng)
+        }
+
         let ok: Bool = autoreleasepool {
             let (logits, err) = withErrorBuffer { buf, cap in
                 prompt.withUnsafeBufferPointer { p in
@@ -521,7 +598,7 @@ final class LiveSession {
             guard let logits else { emit(.failed("evaluation failed: \(err)")); return false }
             tokens.append(contentsOf: prompt)
             emit(.context(used: Int(nPast), limit: Int(contextLimit)))
-            next = argmax(logits, vocab)      // borrowed; consumed before anything else
+            next = pick(logits)               // borrowed; consumed before anything else
             return true
         }
         guard ok else { return nil }
@@ -529,7 +606,6 @@ final class LiveSession {
 
         let thinkClose = tokenizer.id(of: "</think>")
         let callOpen = tokenizer.id(of: "<tool_call>")
-        var reasoning = true
         var inCall = false
         var textAsm = UTF8Assembler()
         var thinkAsm = UTF8Assembler()
@@ -559,27 +635,30 @@ final class LiveSession {
             return String(t)
         }
 
-        while i < config.maxTokensPerTurn {
-            if cancelled() { turn.interrupted = true; stats.interrupted = true; break }
-            if qwasar_is_eos(engine, next) { stats.hitEOS = true; break }
-            // The pre-turn check bounds the prompt; this bounds the generation.
-            // Without it a long answer walks into the engine's own limit and
-            // comes back as an evaluation failure, which is a true statement
-            // and a useless one -- the session is full, not broken.
-            if nPast >= contextLimit - 1 {
-                emit(.contextFull(used: Int(nPast), limit: Int(contextLimit)))
-                break
-            }
+        /// One token, taken. Extracted because speculation commits several at a
+        /// time and every one of them has to travel the same path -- the EOS
+        /// check, the reasoning switch, the assemblers, the tool-call test. A
+        /// drafted token that skipped any of these would be a token the
+        /// transcript never showed or the parser never saw.
+        enum Take { case go, stop }
+        func take(_ tok: Int32) -> Take {
+            if qwasar_is_eos(engine, tok) { stats.hitEOS = true; return .stop }
 
             i += 1
             stats.generatedTokens += 1
             if reasoning { stats.reasoningTokens += 1 }
 
-            if next == thinkClose {
+            if tok == thinkClose {
                 reasoning = false
             } else {
-                if !reasoning && next == callOpen { inCall = true }
-                tokenizer.withBytes(of: next) { buf, special in
+                if !reasoning && tok == callOpen {
+                    inCall = true
+                    // Immediately, not at the next report: the switch from prose
+                    // to markup is the moment the screen would otherwise go
+                    // quiet, and a second of nothing there reads as a stall.
+                    emit(.toolCallProgress(name: nil, keys: [], tokens: i))
+                }
+                tokenizer.withBytes(of: tok) { buf, special in
                     if reasoning {
                         thinkPending += 1
                         if let s = thinkAsm.feed(buf),
@@ -603,7 +682,120 @@ final class LiveSession {
 
             if !reasoning && ToolParser.isComplete(turn.text) {
                 turn.hasCall = true
+                return .stop
+            }
+            return .go
+        }
+
+        /// Progress reporting, on the same cadence whether a step committed one
+        /// token or five.
+        ///
+        /// A DELTA rather than `count % 64`, for two reasons. A speculative
+        /// round advances the count by up to nine, so a modulo test can step
+        /// straight over its own trigger and go silent for a hundred tokens.
+        /// And 64 tokens is eleven seconds at ~6 tok/s -- long enough that a
+        /// turn with no text to show reads as a stall. Eight is about a second
+        /// and costs one event.
+        var lastReported = 0
+        var lastRateTokens = 0
+        var lastRateTime = tDecode
+        func report(force: Bool = false) {
+            guard force || tokens.count - lastReported >= 8 else { return }
+            lastReported = tokens.count
+            emit(.context(used: Int(nPast), limit: Int(contextLimit)))
+            let now = Date()
+            let elapsed = now.timeIntervalSince(tDecode)
+            if elapsed > 0 {
+                // The window since the last report -- about a second, so it
+                // tracks the current regime rather than the turn's history.
+                let dt = now.timeIntervalSince(lastRateTime)
+                let inst = dt > 0 ? Double(i - lastRateTokens) / dt
+                                  : Double(i) / elapsed
+                lastRateTokens = i
+                lastRateTime = now
+                emit(.rate(generated: i, tokensPerSecond: Double(i) / elapsed,
+                           instantaneous: inst))
+            }
+            // While a call is being written there is nothing else on screen, so
+            // this is the only sign the turn is alive.
+            if inCall {
+                let (name, keys) = ToolParser.partial(turn.text)
+                emit(.toolCallProgress(name: name, keys: keys, tokens: i))
+            }
+        }
+
+        // Speculation, when the engine was given a draft head. The head only
+        // ever PROPOSES: `qwasar_session_verify` commits the longest correct
+        // prefix and rewinds the rest, so the emitted sequence is identical to
+        // decoding serially. That property is the whole point, and it is held by
+        // tests/test_verify in the C tree rather than assumed here.
+        //
+        // That contract is GREEDY equivalence, so drafting runs only in the
+        // greedy phase: the whole turn at temperature 0, otherwise from the
+        // `</think>` boundary on -- checked per iteration, because take() is
+        // what flips `reasoning`. Everything a round commits, including the
+        // boundary token verify leaves undecided, is argmax, which is exactly
+        // what pick() decodes in that phase.
+        var blk = [Int32](repeating: 0, count: Int(QWASAR_MAX_DRAFT) + 1)
+        var got = [Int32](repeating: 0, count: Int(QWASAR_MAX_DRAFT) + 1)
+
+        while i < config.maxTokensPerTurn {
+            if cancelled() { turn.interrupted = true; stats.interrupted = true; break }
+            // The pre-turn check bounds the prompt; this bounds the generation.
+            // Without it a long answer walks into the engine's own limit and
+            // comes back as an evaluation failure, which is a true statement
+            // and a useless one -- the session is full, not broken.
+            if nPast >= contextLimit - 1 {
+                emit(.contextFull(used: Int(nPast), limit: Int(contextLimit)))
                 break
+            }
+
+            if take(next) == .stop { break }
+
+            // --- speculative step -----------------------------------------
+            if hasMTP && (config.temperature <= 0 || !reasoning) {
+                // Depth 0 is a real answer, not an error: the head has been
+                // wrong often enough here that a round costs more than it saves,
+                // and the engine says so from measured acceptance.
+                let want = qwasar_session_draft_depth(handle)
+                if want > 0 {
+                    blk[0] = next
+                    let (nd, dErr): (Int32, String) = withErrorBuffer { buf, cap in
+                        blk.withUnsafeMutableBufferPointer { b in
+                            qwasar_session_draft(handle, next, b.baseAddress! + 1, want, buf, cap)
+                        }
+                    }
+                    guard nd >= 0 else { emit(.failed("drafting failed: \(dErr)")); return nil }
+
+                    let (nc, vErr): (Int32, String) = withErrorBuffer { buf, cap in
+                        blk.withUnsafeBufferPointer { bp in
+                            got.withUnsafeMutableBufferPointer { gp in
+                                qwasar_session_verify(handle, bp.baseAddress, nd + 1,
+                                                      gp.baseAddress, buf, cap)
+                            }
+                        }
+                    }
+                    guard nc > 0 else { emit(.failed("verify failed: \(vErr)")); return nil }
+
+                    // What the session actually committed: the token that was
+                    // already decided, then every draft it accepted -- which are
+                    // exactly the outputs bar the last. The last is what this
+                    // round leaves undecided, taking `next`'s place.
+                    tokens.append(next)
+                    if nc > 1 { tokens.append(contentsOf: got[0..<Int(nc) - 1]) }
+                    stats.specRounds += 1
+                    stats.specCommitted += Int(nc)
+                    report()
+
+                    var stopped = false
+                    for t in 0..<(Int(nc) - 1) {
+                        if i >= config.maxTokensPerTurn { stopped = true; break }
+                        if take(got[t]) == .stop { stopped = true; break }
+                    }
+                    if stopped { break }
+                    next = got[Int(nc) - 1]
+                    continue
+                }
             }
 
             let stepOK: Bool = autoreleasepool {
@@ -614,16 +806,12 @@ final class LiveSession {
                 }
                 guard let logits else { emit(.failed("evaluation failed: \(err)")); return false }
                 tokens.append(next)
-                // Every 64 tokens: often enough that the meter moves visibly at
-                // ~6 tok/s, rare enough to cost nothing.
-                if tokens.count % 64 == 0 {
-                    emit(.context(used: Int(nPast), limit: Int(contextLimit)))
-                    let elapsed = Date().timeIntervalSince(tDecode)
-                    if elapsed > 0 {
-                        emit(.rate(generated: i, tokensPerSecond: Double(i) / elapsed))
-                    }
-                }
-                next = argmax(logits, vocab)
+                // Often enough that the meter moves visibly at ~6 tok/s, rare
+                // enough to cost nothing.
+                report()
+                // pick(), not sp: this step also serves the answer phase when
+                // draft_depth backs off to 0, and that phase is greedy.
+                next = pick(logits)
                 return true
             }
             guard stepOK else { return nil }
@@ -638,17 +826,5 @@ final class LiveSession {
         if let s = textAsm.flush() { emit(.text(s)) }
         emit(.context(used: Int(nPast), limit: Int(contextLimit)))
         return turn
-    }
-
-    @inline(__always)
-    private func argmax(_ v: UnsafePointer<Float>, _ n: Int32) -> Int32 {
-        var best: Int32 = 0
-        var bestV = v[0]
-        var i: Int32 = 1
-        while i < n {
-            if v[Int(i)] > bestV { bestV = v[Int(i)]; best = i }
-            i += 1
-        }
-        return best
     }
 }

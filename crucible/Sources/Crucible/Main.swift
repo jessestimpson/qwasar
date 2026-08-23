@@ -90,16 +90,25 @@ struct CrucibleMain {
     /// Off-main: the engine load, which is the 16 GB mmap the gate is about.
     private static func gatePhase2(modelPath: String, prompt: String?) async {
         print("\n-- engine (the 16 GB mmap)")
+        // --mtp <dir> loads the speculative draft head. Headless, so this is
+        // the one place speculation can be exercised end to end without a
+        // screen -- and the sandbox grant a GUI run needs does not apply here.
+        let mtp = value(of: "--mtp", in: CommandLine.arguments)
+        if mtp != nil { profile = MemoryProfile.derive(mtpAvailable: true) }
         let p = profile
         let host = EngineHost()
         var loaded: EngineInfo?
         var failure: String?
-        do { loaded = try await host.load(modelPath: modelPath, contextSize: p.contextSize) }
-        catch { failure = String(describing: error) }
+        do {
+            loaded = try await host.load(modelPath: modelPath, contextSize: p.contextSize,
+                                         mtpPath: mtp)
+        } catch { failure = String(describing: error) }
 
         if let i = loaded {
             print(String(format: "  loaded in %.1fs · %d layers · vocab %d · context %d",
                          i.loadSeconds, i.layers, i.vocabSize, i.contextSize))
+            print("  speculation: \(i.mtpActive ? "ON (MTP draft head)" : "off")")
+            if let why = host.mtpDropped { print("  \(why)") }
             print(String(format: "  phys_footprint %.2f GB", Double(i.footprintBytes) / 1_073_741_824))
         } else {
             print("  FAILED: \(failure ?? "unknown")")
@@ -183,7 +192,11 @@ struct CrucibleMain {
             // turn than calling a tool, and a budget sized for the latter
             // silently truncates the former -- the turn ends with no answer and
             // nothing to show for six minutes of decode.
-            maxTokensPerTurn: 8192)) {
+            maxTokensPerTurn: 8192,
+            // The gate is a measurement, so it decodes greedily: two runs of it
+            // must be comparable, and temperature 0 is exactly reproducible.
+            // The app itself samples with the model's own generation_config.
+            temperature: 0)) {
             if case .failed(let m) = ev { print("  session failed: \(m)"); return }
         }
 
@@ -194,6 +207,11 @@ struct CrucibleMain {
                 FileHandle.standardError.write("  prefill \(done)/\(total)\r".data(using: .utf8)!)
             case .context, .rate:
                 break                                  // shown in the app's footer
+            case .toolCallProgress(let name, _, let n):
+                // Headless, the same information the app's pending row carries:
+                // a long call is otherwise a silent minute here too.
+                FileHandle.standardError.write(
+                    "  writing \(name ?? "a call") · \(n) tokens\r".data(using: .utf8)!)
             case .reasoning:
                 break                                  // counted, not printed
             case .text(let t):
@@ -242,7 +260,7 @@ struct CrucibleMain {
         for await ev in host.openSession(id: id, runner: runner, config: SessionConfig(
             system: "You are a coding assistant working in \(root.lastPathComponent). "
                   + "Use the tools to inspect files before answering.",
-            maxTokensPerTurn: 8192), history: hist) {
+            maxTokensPerTurn: 8192, temperature: 0), history: hist) {
             switch ev {
             case .prefill(let d, let t):
                 FileHandle.standardError.write("  replay \(d)/\(t)\r".data(using: .utf8)!)

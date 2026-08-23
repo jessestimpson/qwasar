@@ -259,6 +259,36 @@ public enum ToolParser {
         return .calls(calls, preamble: preamble?.isEmpty == false ? preamble : nil)
     }
 
+    /// What can be told about a call that is still being written.
+    ///
+    /// The C parser handles complete calls only, and a call takes a long time to
+    /// write: `write` or `define` can run to hundreds of tokens, which at ~6
+    /// tok/s is minutes during which the transcript shows nothing at all,
+    /// because the markup is deliberately not echoed. The name and the parameter
+    /// keys arrive early and are enough to say what is happening.
+    ///
+    /// Scanning from the last `<tool_call>` rather than the whole buffer: this
+    /// runs during generation, and re-reading an accumulating string on every
+    /// token is the kind of quadratic that only shows up on the longest calls --
+    /// exactly the ones this exists to narrate.
+    public static func partial(_ text: String) -> (name: String?, keys: [String]) {
+        let scope = text.range(of: "<tool_call>", options: .backwards)
+            .map { String(text[$0.upperBound...]) } ?? text
+        var name: String?
+        if let f = scope.range(of: "<function="),
+           let close = scope[f.upperBound...].firstIndex(of: ">") {
+            name = String(scope[f.upperBound..<close])
+        }
+        var keys: [String] = []
+        var cursor = scope.startIndex
+        while let p = scope.range(of: "<parameter=", range: cursor..<scope.endIndex) {
+            guard let close = scope[p.upperBound...].firstIndex(of: ">") else { break }
+            keys.append(String(scope[p.upperBound..<close]))
+            cursor = close
+        }
+        return (name, keys)
+    }
+
     /// True once the text holds a complete call, so generation can stop at the
     /// closing tag rather than running to the token budget.
     public static func isComplete(_ text: String) -> Bool {

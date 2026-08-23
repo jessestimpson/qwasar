@@ -28,7 +28,10 @@ final class AppState {
 
     // Engine
     var phase: Phase = .needsModel
-    let profile = MemoryProfile.derive()
+    /// Recomputed when a draft head is granted or removed: the head costs
+    /// weights and per-token cache out of the same budget the context comes
+    /// from, so it changes the answer (PLAN.md 2.3).
+    private(set) var profile = MemoryProfile.derive()
     let gate = GateCheck.run()
     var engineInfo: EngineInfo?
 
@@ -49,6 +52,10 @@ final class AppState {
     /// Live decode rate, reported by the session. Zero when nothing is
     /// generating, which is how the footer knows not to show it.
     var tokensPerSecond = 0.0
+    /// Rate over roughly the last second, next to the turn average above --
+    /// the two diverge whenever the phase changes (sampled reasoning vs
+    /// speculative answer), which is exactly when a single number misleads.
+    var instantaneousTokensPerSecond = 0.0
     var generatedThisTurn = 0
     var liveSessionID: UUID?
 
@@ -63,6 +70,11 @@ final class AppState {
 
     private let engine = EngineHost()
     private let access = ModelAccess()
+    /// The MTP draft head, granted separately. Under App Sandbox `~` is the
+    /// container, so the conventional `~/.cache/qwasar/mtp` is not a path this
+    /// app can open -- it needs its own picker and its own bookmark, exactly
+    /// like the model.
+    private let draftAccess = ModelAccess(defaultsKey: "dev.crucible.mtpBookmark")
     private var store: Store?
     /// One guest per session, booted lazily (PLAN.md 6.5). Absent until the
     /// image has been built, in which case the session falls back to the
@@ -71,6 +83,14 @@ final class AppState {
     var sandboxStatus: String?
     /// Set while the app is quitting and the guests are being flushed.
     var shuttingDown = false
+    /// Something the ENGINE has to say, which can happen with no session open:
+    /// a draft head accepted, removed, or refused. Cleared when it is read by a
+    /// reload finishing.
+    var engineNote: String?
+
+    /// The call currently being written, if any. Replaced by a real ToolCard
+    /// the moment the call parses.
+    var pendingCall: (name: String?, keys: [String], tokens: Int)?
     private var projectAccess: [UUID: URL] = [:]
     private var cancelFlag = CancelFlag()
     /// Items produced by the turn in flight, appended to the log when it ends.
@@ -125,10 +145,78 @@ final class AppState {
         phase = .loading("binding weights")
         do {
             engineInfo = try await engine.load(modelPath: u.path,
-                                               contextSize: profile.contextSize)
+                                               contextSize: profile.contextSize,
+                                               mtpPath: profile.mtpEnabled
+                                                        ? draftAccess.url?.path : nil)
+            if let why = engine.mtpDropped { engineNote = why }
             phase = .ready
         } catch {
             phase = .failed(String(describing: error))
+        }
+    }
+
+    // MARK: The draft head
+
+    var hasDraftHead: Bool { draftAccess.url != nil }
+    var draftHeadName: String? { draftAccess.url?.lastPathComponent }
+
+    /// Whether speculation is actually running, as opposed to configured.
+    var isSpeculating: Bool { engineInfo?.mtpActive == true }
+
+    /// Grants the MTP draft head, and says plainly what it costs.
+    ///
+    /// It is a trade rather than a free win: the head's weights and its own
+    /// per-token cache come out of the budget the context is sized from, so the
+    /// window shrinks. On a 32 GB machine that is 90112 tokens down to 73728,
+    /// bought with fewer forward passes per token. Stating the number is the
+    /// point -- a silent context reduction would be the worst version of this.
+    func chooseDraftHead() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.showsHiddenFiles = true
+        panel.canCreateDirectories = false
+        panel.message = "Choose the MTP draft head directory (a small model with "
+                      + "config.json + *.safetensors)."
+        panel.prompt = "Use Draft Head"
+        let conventional = ModelAccess.conventionalDraftHead
+        if FileManager.default.fileExists(atPath: conventional.path) {
+            panel.directoryURL = conventional
+        }
+        guard panel.runModal() == .OK, let u = panel.url else { return }
+        let resolved = u.resolvingSymlinksInPath()
+        guard ModelAccess.looksLikeDraftHead(resolved) else {
+            phase = .failed("\(resolved.lastPathComponent) is not a draft head — it needs a "
+                          + "config.json and *.safetensors, and should be well under a gigabyte")
+            return
+        }
+        guard draftAccess.store(resolved) else {
+            phase = .failed("could not hold a security-scoped grant for that folder")
+            return
+        }
+        applyDraftHead()
+    }
+
+    func forgetDraftHead() {
+        draftAccess.release()
+        UserDefaults.standard.removeObject(forKey: "dev.crucible.mtpBookmark")
+        applyDraftHead()
+    }
+
+    /// Re-derives the profile and asks for a reload, because a draft head can
+    /// only be bound at `qwasar_engine_load`.
+    private func applyDraftHead() {
+        profile = MemoryProfile.derive(mtpAvailable: draftAccess.url != nil)
+        guard let model = access.url else { return }
+        engineNote = draftAccess.url == nil
+            ? "Draft head removed — reloading; context returns to \(profile.contextSize)."
+            : "Draft head accepted — reloading with speculation; context becomes "
+              + "\(profile.contextSize)." 
+        Task {
+            engine.unload()
+            engineInfo = nil
+            liveSessionID = nil
+            await load(model)
         }
     }
 
@@ -391,6 +479,7 @@ final class AppState {
             }
             prefillTotal = 0
             tokensPerSecond = 0
+            instantaneousTokensPerSecond = 0
             if case .generating = phase { phase = .ready }
         }
     }
@@ -530,9 +619,10 @@ final class AppState {
         case .context(let used, let limit):
             contextUsed = used
             contextLimit = limit
-        case .rate(let generated, let rate):
+        case .rate(let generated, let rate, let inst):
             generatedThisTurn = generated
             tokensPerSecond = rate
+            instantaneousTokensPerSecond = inst
         case .reasoning(let s, let n):
             // The first token is the definitive signal that reading is over.
             // A tool result starts a new prefill and the bar comes back.
@@ -541,7 +631,11 @@ final class AppState {
         case .text(let s):
             prefillTotal = 0
             appendStreaming(s, reasoning: false)
+        case .toolCallProgress(let name, let keys, let n):
+            prefillTotal = 0
+            pendingCall = (name, keys, n)
         case .toolCall(let c):
+            pendingCall = nil
             appendItem(TranscriptItem(.tool(name: c.name, arguments: c.arguments, result: nil)))
         case .toolResult(let name, let r):
             // Fill the open card rather than adding a second item.
@@ -561,13 +655,18 @@ final class AppState {
             appendItem(TranscriptItem(.note(n)))
         case .contextFull(let used, let limit):
             prefillTotal = 0
+            pendingCall = nil
             appendItem(TranscriptItem(.contextFull(used: used, limit: limit)))
         case .turnFinished(let st):
             prefillTotal = 0
             tokensPerSecond = 0
+            instantaneousTokensPerSecond = 0
+            pendingCall = nil
             appendItem(TranscriptItem(.footer(st)))
         case .failed(let m):
             tokensPerSecond = 0
+            instantaneousTokensPerSecond = 0
+            pendingCall = nil
             // Every terminal event clears it. A bar left running after a turn
             // ended is the failure this whole change is about, and there is more
             // than one way for a turn to end.

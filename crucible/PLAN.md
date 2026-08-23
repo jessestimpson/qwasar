@@ -973,6 +973,38 @@ Two rules:
   pass is the first thing here that produces a burst.
 - **Emit on UTF-8 boundaries only** (§3.4).
 
+### 5.3a A call being written is not a stall
+
+The markup of a tool call is never echoed. That is right — a call is markup
+rather than prose, and printing it would bury whatever narration the model wrote
+before it (§3.5). But it left the *longest* stretch of many turns showing nothing
+at all: a `write` or a `define` runs to hundreds of tokens, which at ~6 tok/s is
+minutes of a window that looks identical to a wedged one.
+
+Two separate faults, found together:
+
+**Nothing was emitted while `inCall` was true.** No text, no reasoning — the only
+events were the periodic context and rate updates, and those carry no sign that
+anything is being *built*.
+
+**The rate itself reported in bursts.** It fired on `tokens.count % 64`, which is
+eleven seconds of silence between updates at this decode speed, and worse once
+speculation landed: a round advances the count by up to nine, so the modulo can
+step straight over its own trigger and go quiet for a hundred tokens. It is now
+a delta — every 8 tokens, about a second — which no stride can skip.
+
+What is shown is what can be known early and honestly. The name arrives inside
+the first line of the call (measured: 28 characters) and the parameter keys
+follow one at a time, so `ToolParser.partial` reads those from the tail of the
+buffer and the row says *what* is being built and how far along it is. The
+values are not shown, because the finished ToolCard shows them and showing them
+twice is worse than showing them once.
+
+The property that matters is asserted rather than assumed: feeding **every
+prefix** of a real call, no prefix may report a name other than the true one or
+invent a key that is not the call's. Saying nothing yet is honest; saying
+`bash` while the model writes `write` is not.
+
 ### 5.4 Prefill progress is not a spinner
 
 `qwasar_session_set_progress` reports once per chunk, and the C agent's own
@@ -1649,6 +1681,69 @@ is where a byte copy under approval is the proportionate answer.
     affordance, not a hidden folder.
 12. The guest re-baselines: the applied state becomes the new baseline commit,
     so the next proposal is a diff against what the user actually accepted.
+
+### 7.5 Sampling, and the speculative-decoding conflict
+
+Crucible samples by default — temperature 1.0, top-k 20, top-p 0.95, the
+model's own `generation_config`, via `qwasar_sample` — because Qwen's guidance
+for thinking-mode models warns against greedy decoding: long reasoning chains
+under argmax are prone to repetition loops, and a harness whose every turn
+opens with hundreds of reasoning tokens is the worst case for that failure,
+not a neutral one. `temperature = 0` remains exactly greedy, and the headless
+gates pin it, because a gate is a measurement and two runs of it must be
+comparable. A nonzero `seed` reproduces a sampled run exactly.
+
+**Sampling and speculation cannot overlap on the same tokens**, and the
+reason is a contract, not an oversight. `qwasar_session_verify` promises that
+the emitted sequence is identical to greedy decoding — `tests/test_verify` in
+the C tree holds that line at every depth — and it keeps that promise by
+comparing the target's argmax against the draft. Under sampling there is no
+single correct token to compare against, so the greedy verify is simply the
+wrong operation.
+
+**So they alternate on the `</think>` boundary instead.** The two phases of a
+turn have opposite needs: the reasoning block is where the greedy repetition
+failure lives and where entropy is high enough that drafts get rejected
+anyway, while the visible answer and tool-call markup are low-entropy and
+highly structured — exactly where the draft head's acceptance is best, and
+where sampling at these settings nearly always picks the argmax token
+regardless. `Session.generate` therefore samples serially while `reasoning`
+is true and switches to greedy decoding with drafting from the boundary on,
+checked per iteration because the token loop is what flips the flag. At
+temperature 0 the whole turn is greedy and drafting runs throughout, which is
+what the gates use. The honest caveat: reasoning is most of an agent turn's
+tokens, so the phase split buys the full quality win but confines the
+speculative speedup to the minority of tokens — tool-call-heavy turns benefit
+most.
+
+The fix is known and is an engine change, not a harness change: **rejection
+sampling** (the Leviathan et al. / Chen et al. speculative-sampling scheme). Accept draft token
+`x` with probability `min(1, p_target(x) / p_draft(x))`; on rejection, sample
+from the normalised residual `max(0, p_target − p_draft)`. The emitted
+sequence is then distributed *exactly* as serial sampling — the property that
+replaces greedy equality, and the property a new `test_verify` mode would have
+to pin (statistically, over many draws, rather than token-for-token).
+
+What it costs, and why it is not done casually:
+
+- `qwasar_session_verify` compares token ids today; rejection sampling needs
+  the target's and the draft's **probabilities** at every drafted position,
+  which means the verify pass keeping (or recomputing) full softmax rows it
+  currently never materialises, and the draft path reporting `p_draft` for
+  what it proposed.
+- The adaptive depth model (`qwasar_session_draft_depth`) is calibrated on
+  greedy acceptance. Sampled acceptance is lower and temperature-dependent, so
+  the measured price/acceptance tables shift and the top-2-logit-gap cap stops
+  being the right boundary signal.
+- The test story changes shape: bit-exact equality becomes a distributional
+  claim, which is a weaker and more expensive thing to hold. The greedy mode
+  must keep its exact test regardless.
+
+Until that lands in the engine, the phase split is the deliberate stopgap:
+sampling exactly where quality needs it, speculation exactly where it pays.
+Rejection sampling would supersede the split by allowing both everywhere,
+including the reasoning block. The C-tree CLI and agent, which use MTP today,
+keep greedy decoding for the same reason from the other side.
 
 ---
 
@@ -3206,6 +3301,65 @@ for a block with a language hint, highlighting every growing prefix leaves every
 fixtures are the constructs that span lines — docstring, block comment, heredoc,
 multiline string, sigil, raw string — because those are the only ones that could
 break it.
+
+### M5s — Speculative decoding *(built, unverified against the GPU)*
+
+The engine has had the whole API since before Crucible existed —
+`qwasar_session_has_mtp`, `_draft`, `_verify`, `_draft_depth` — and Crucible used
+none of it. `opts.mtp_path` was `nil` with the comment "off on this profile",
+`MemoryProfile.mtpEnabled` was computed and never read, and the decode loop
+evaluated one token at a time. Four separate places all saying no.
+
+**The head only ever proposes.** `qwasar_session_verify` commits the longest
+correct prefix and rewinds the rest, so the emitted sequence is identical to
+decoding serially — `tests/test_verify` in the C tree is what holds that, and it
+is why this can be turned on without changing a single answer.
+
+**The memory trade, stated.** The head is 811 MB of weights plus 4 KB/token of
+its own cache, paid out of the same budget the context comes from. Measured on
+this 32 GB machine: a 6.30 GB session budget, of which the head takes 1.14 GB,
+so **the window goes 90112 -> 73728 tokens**. That is the price of fewer forward
+passes per token, and the app says the number when granting the head rather than
+shrinking the window silently.
+
+The old rule — `forSessions > 24 GB` — was a guess made while nothing loaded the
+head at all, and said no on every machine that could comfortably have said yes.
+It is now: a head is granted, its weights fit, and the context that survives is
+still above a floor of 32768.
+
+**Sandbox.** `~` is the container, so the conventional
+`~/.cache/qwasar/mtp/...` is not a path this app can open. The head needs its own
+NSOpenPanel grant and its own security-scoped bookmark, exactly like the model —
+`ModelAccess` is now keyed rather than hardcoded, and validates a draft head by
+size, because pointing it at the 15 GB main model should fail in a millisecond
+rather than seconds into weight binding.
+
+**A bad head must not cost the application.** `qwasar_engine_load` goes to
+`fail` and returns NULL when the head will not bind, so without care a mismatched
+draft head presents as "cannot load the model". The load now retries once
+without it and reports what happened. Speculation is an optimisation; losing it
+is not an outage.
+
+**The decode loop.** `take(_:)` is extracted so that every token travels the same
+path — the EOS check, the reasoning switch, the UTF-8 assemblers, the tool-call
+test. A round commits several tokens at once and each must be indistinguishable
+from one decoded serially; a drafted token that skipped any of those is a token
+the transcript never showed or the parser never saw. Committed history is
+`next` followed by the accepted drafts, which are exactly the outputs bar the
+last, and the last takes `next`'s place — the shape `qwasar_agent.c` uses,
+because getting it wrong desynchronises the KV cache from `tokens` and every
+later checkpoint with it.
+
+Reported as **tokens committed per round** beside the round count, not as a bare
+acceptance rate: 2.0 over four rounds says nothing, over four hundred it says the
+head is earning its memory. A depth of 0 from `qwasar_session_draft_depth` is a
+real answer and is honoured — a stretch the head keeps getting wrong is cheaper
+decoded serially.
+
+**Not verified.** `make gate-mtp` loads the head and runs one real turn headless;
+it has not been run, because the GPU was in use by other work. Everything above
+compiles, the suites pass, and the memory arithmetic is measured — but whether
+the head actually accepts drafts on this model is unproven here.
 
 ### M6 — Scheduling, parking, and the compaction successor
 The single-live-session hand-off, park/restore over the explicit-path checkpoint

@@ -26,6 +26,17 @@ struct CrucibleApp: App {
                 Button("New Project…") { state.addProject() }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
             }
+            CommandGroup(after: .appSettings) {
+                // Speculation needs a folder the sandbox cannot reach on its
+                // own, so it is a grant the user makes once, like the model.
+                Button(state.hasDraftHead
+                       ? "Replace MTP Draft Head…" : "Add MTP Draft Head…") {
+                    state.chooseDraftHead()
+                }
+                if state.hasDraftHead {
+                    Button("Remove MTP Draft Head") { state.forgetDraftHead() }
+                }
+            }
         }
     }
 }
@@ -207,10 +218,21 @@ struct StatusToolbar: ToolbarContent {
                     Label(m, systemImage: "exclamationmark.triangle")
                         .font(.caption).foregroundStyle(.red).lineLimit(1)
                 case .ready, .generating:
-                    if let i = state.engineInfo {
-                        Text("\(i.contextSize) ctx · \(state.profile.liveSessions) live")
+                    if let n = state.engineNote {
+                        Label(n, systemImage: "info.circle")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    } else if let i = state.engineInfo {
+                        Text("\(i.contextSize) ctx · \(state.profile.liveSessions) live"
+                             + (i.mtpActive ? " · spec" : ""))
                             .font(.caption).foregroundStyle(.secondary)
-                            .help(state.profile.summary)
+                            .help(state.profile.summary
+                                  + (i.mtpActive
+                                     ? "\n\nSpeculative decoding is on: an MTP draft head "
+                                       + "proposes tokens and the model verifies them, so the "
+                                       + "text is identical to decoding one at a time and takes "
+                                       + "fewer passes to produce."
+                                     : "\n\nSpeculative decoding is off. Add an MTP draft head "
+                                       + "from the app menu to trade some context for speed."))
                     }
                 }
             }
