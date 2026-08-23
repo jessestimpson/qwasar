@@ -32,7 +32,7 @@ struct SessionView: View {
                         if let d = state.liveDelegation {
                             DelegationCard(model: d.model, task: d.task, log: d.log,
                                            costUSD: d.costUSD, ended: d.ended,
-                                           state: state)
+                                           waiting: d.waiting, state: state)
                         }
                         Color.clear.frame(height: 1).id("bottom")
                     }
@@ -643,6 +643,7 @@ struct DelegationCard: View {
     let log: String
     let costUSD: Double
     let ended: String?
+    var waiting = false
     let state: AppState?
 
     var body: some View {
@@ -675,12 +676,18 @@ struct DelegationCard: View {
                 Label(ended, systemImage: "flag.checkered")
                     .font(.caption2).foregroundStyle(.tertiary)
             } else if let state {
+                if waiting {
+                    Label("open for steering — closes in a few seconds unless you type",
+                          systemImage: "hourglass")
+                        .font(.caption2).foregroundStyle(.orange)
+                }
                 // The input INTO the delegation. Bound to its own draft, so
                 // the composer below stays the local model's.
                 HStack(spacing: 6) {
                     TextField("steer the remote model…",
                               text: Binding(get: { state.delegationDraft },
-                                            set: { state.delegationDraft = $0 }))
+                                            set: { state.delegationDraft = $0
+                                                   state.delegationTyping() }))
                         .textFieldStyle(.roundedBorder)
                         .font(.caption)
                         .onSubmit { state.sendToDelegation() }

@@ -65,6 +65,9 @@ public enum DelegationEvent: Sendable {
     case userTurn(String)
     /// Cumulative cost for this delegation, USD.
     case cost(Double)
+    /// The conversation is open for steering: the remote model has finished a
+    /// response and the grace window is running. Typing holds it open.
+    case waiting
     /// The remote model called a tool (E2); the result follows when it lands.
     case toolCall(name: String, arguments: String)
     case toolResult(name: String, result: String)
@@ -77,9 +80,19 @@ public final class DelegationMailbox: @unchecked Sendable {
     private let lock = NSLock()
     private var queue: [String] = []
     private var stopped = false
+    private var held = false
     private let signal = DispatchSemaphore(value: 0)
 
     public init() {}
+
+    /// The user is composing: the grace window must not close mid-sentence.
+    /// Set while the card's input is non-empty, cleared when it empties.
+    public func hold(_ holding: Bool) {
+        lock.withLock { held = holding }
+        signal.signal()
+    }
+
+    var isHeld: Bool { lock.withLock { held } }
 
     public func post(_ text: String) {
         lock.withLock { queue.append(text) }
@@ -291,11 +304,20 @@ public struct DelegateToolRunner: ToolExecuting {
 
             // The grace window: the conversation stays open briefly so the
             // user can continue it; a queued message continues, stop or
-            // silence ends.
+            // silence ends. While the user is TYPING the window does not
+            // close -- a countdown that expires mid-sentence is worse than no
+            // window -- bounded so an abandoned draft cannot hold the local
+            // turn forever.
             var (queued, stopped) = mailbox.drain()
             if queued.isEmpty && !stopped {
-                mailbox.wait(seconds: policy.graceSeconds)
-                (queued, stopped) = mailbox.drain()
+                emit(.waiting)
+                let deadline = Date().addingTimeInterval(180)
+                while true {
+                    mailbox.wait(seconds: policy.graceSeconds)
+                    (queued, stopped) = mailbox.drain()
+                    if !queued.isEmpty || stopped { break }
+                    if !mailbox.isHeld || Date() > deadline { break }
+                }
             }
             if stopped { reason = "the user ended it"; break }
             if queued.isEmpty { break }

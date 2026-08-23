@@ -148,7 +148,13 @@ with a dollar figure on it.
   response the conversation holds open for a **grace window** (10 s) —
   a queued user message continues it, stop or silence ends it — because
   "ends the instant the model stops" and "waits forever" both fail the
-  person mid-sentence.
+  person mid-sentence. Field use immediately found the window's weak
+  spot: reading the answer takes longer than 10 s, so a single-response
+  delegation offered no real chance to steer. So **typing holds the
+  window open** (the card's non-empty draft, bounded at 180 s so an
+  abandoned draft cannot hold the local turn forever), and the card says
+  the window exists while it runs — an invisible countdown is not an
+  opportunity.
 - **E2 — the remote agent works.** *Built.* The inner executor's surface
   proxied to the remote model -- its schemas are already OpenAI function
   schemas, so the proxy is a translation loop: streamed tool-call fragments

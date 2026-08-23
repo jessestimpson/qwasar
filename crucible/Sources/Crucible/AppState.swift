@@ -97,6 +97,9 @@ final class AppState {
         var log: String = ""
         var costUSD: Double = 0
         var ended: String?
+        /// The grace window is running: the conversation is open for
+        /// steering and will close shortly unless the user types.
+        var waiting = false
     }
     var liveDelegation: LiveDelegation?
     var delegationDraft = ""
@@ -308,7 +311,15 @@ final class AppState {
         let text = delegationDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, let mailbox = delegationMailbox else { return }
         delegationDraft = ""
+        mailbox.hold(false)
         mailbox.post(text)
+        liveDelegation?.waiting = false
+    }
+
+    /// Called as the card's input changes: a non-empty draft holds the grace
+    /// window open, an emptied one releases it.
+    func delegationTyping() {
+        delegationMailbox?.hold(!delegationDraft.trimmingCharacters(in: .whitespaces).isEmpty)
     }
 
     func stopDelegation() { delegationMailbox?.stop() }
@@ -319,6 +330,9 @@ final class AppState {
             liveDelegation = LiveDelegation(model: model, task: task)
         case .delta(let piece):
             liveDelegation?.log += piece
+            liveDelegation?.waiting = false
+        case .waiting:
+            liveDelegation?.waiting = true
         case .userTurn(let text):
             liveDelegation?.log += "\n\n**you:** \(text)\n\n"
         case .cost(let usd):

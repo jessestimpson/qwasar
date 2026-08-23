@@ -219,6 +219,26 @@ enum EscalationSuite {
                 session: SandboxOverlay(agentModels: [])).agentModels.isEmpty,
             "a session's empty agent_models turns escalation OFF over a global grant")
 
+        // Typing holds the grace window: with hold set, a message posted well
+        // after the grace period still lands; without it, the same delay
+        // would have missed the window (the first test above proves silence
+        // closes it).
+        Stub.script = .init(responses: [.text(["draft answer"], cost: 0.0),
+                                        .text(["revised"], cost: 0.0)])
+        ev = Events(); mb = DelegationMailbox()
+        mb.hold(true)
+        let late = mb
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.4)   // 8x the 0.05s grace
+            late.hold(false)
+            late.post("revise it")
+        }
+        out = runner(events: ev, mailbox: mb).run(call(["task": "t"]))
+        f += TestMain.check(out.contains("revised"),
+                            "a held window accepts a message the grace period would have missed")
+        f += TestMain.check(ev.all.contains { if case .waiting = $0 { return true } else { return false } },
+                            "the card is told the window is open")
+
         // ---- E2: the remote agent works the sandbox by proxy ------------
 
         // The gate shape from spec §15.6: the remote model edits a file and
