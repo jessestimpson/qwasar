@@ -6,23 +6,16 @@ defmodule Warden.Bridge do
   big-endian length ahead of each message on the port side and strips it on the
   way in — so `vsock_port` stays a byte pipe and nothing here parses a length.
 
-  This is the module PLAN.md 9.2's invariants are about, and it is written to be
-  simulated:
+  Two rules keep the channel alive under load:
 
     * **Nothing here blocks.** A request is handed to `Warden.Worker` and the
       bridge goes straight back to its mailbox, so a slow op cannot stall the
-      channel (invariant 6).
-    * **Every deadline is a `Sim.send_after/3`**, so the virtual clock owns it
-      and a thirty-second timeout costs a simulation nothing.
-    * **No `receive ... after` anywhere.** eta's Elixir macros cannot virtualize
-      that construct, so a deadline written that way would run on the real clock
-      inside a run that reports itself deterministic.
+      channel.
+    * **Every deadline is a `Process.send_after/3`** matched in a plain
+      `receive`, never a `receive ... after`, so a late reply is told apart
+      from a timeout by message identity rather than by racing the clock.
   """
-  use Warden.Sim, gen_server: true
-
-  # Publishes this server's state to the simulation, when there is one. Compiled
-  # away entirely when there is not.
-  @eta_observe :all
+  use GenServer
 
   @default_timeout_ms 30_000
 
@@ -59,13 +52,12 @@ defmodule Warden.Bridge do
 
 
   @doc "Injects a frame as though it arrived from the host. Simulation only."
-  def deliver(server, frame), do: Sim.send(server, {:frame, frame})
+  def deliver(server, frame), do: Kernel.send(server, {:frame, frame})
 
   # ---- callbacks -----------------------------------------------------------
 
-  @impl :gen_server
+  @impl GenServer
   def init(opts) do
-    Sim.label(:warden_bridge)
 
     port =
       case Keyword.fetch(opts, :port) do
@@ -83,7 +75,7 @@ defmodule Warden.Bridge do
     {:ok, state}
   end
 
-  @impl :gen_server
+  @impl GenServer
   def handle_info({port, {:data, frame}}, %{port: port} = state),
     do: {:noreply, handle_frame(frame, state)}
 
@@ -118,13 +110,13 @@ defmodule Warden.Bridge do
     {:noreply, state}
   end
 
-  @impl :gen_server
+  @impl GenServer
   def handle_cast({:done, id, reply}, state), do: {:noreply, done(state, id, reply)}
   def handle_cast(_other, state), do: {:noreply, state}
 
   # Required by :gen_server, and genuinely useful: a health probe that does not
   # go through the wire.
-  @impl :gen_server
+  @impl GenServer
   def handle_call(:health, _from, state),
     do: {:reply, %{inflight: map_size(state.inflight), answered: length(state.answered)}, state}
 
@@ -181,7 +173,7 @@ defmodule Warden.Bridge do
   defp entry(state, id) do
     %{
       started_at: System.monotonic_time(:millisecond),
-      timer: Sim.send_after(self(), {:timeout_fired, id}, state.timeout_ms)
+      timer: Process.send_after(self(), {:timeout_fired, id}, state.timeout_ms)
     }
   end
 
@@ -212,7 +204,7 @@ defmodule Warden.Bridge do
 
   defp respond(state, id, reply) do
     {entry, inflight} = Map.pop(state.inflight, id)
-    if entry, do: Sim.cancel_timer(entry.timer)
+    if entry, do: Process.cancel_timer(entry.timer)
 
     took =
       case entry do
@@ -254,10 +246,8 @@ defmodule Warden.Bridge do
   # replies without needing a second channel.
   defp emit(state, level, text), do: write(state, %{event: "log", level: level, text: text})
 
-  # When there is no port, what would have been written is kept instead.
-  # A simulation reads it through eta_observe rather than by draining a mailbox,
-  # which is what `check/1` is allowed to do (it must not call into a scheduled
-  # process).
+  # When there is no port, what would have been written is kept instead, so a
+  # test can assert on it.
   defp write(%{port: nil} = state, payload),
     do: %{state | written: state.written ++ [payload]}
 
@@ -267,7 +257,7 @@ defmodule Warden.Bridge do
   end
 
   defp write(%{port: pid} = state, payload) when is_pid(pid) do
-    Sim.send(pid, {:wrote, payload})
+    Kernel.send(pid, {:wrote, payload})
     %{state | written: state.written ++ [payload]}
   end
 

@@ -2,15 +2,18 @@
 //
 // PLAN.md 7.1, and this list is now FROZEN. §2.2 is why: the tool surface is the
 // system turn, and the system turn is the prefix of everything, so adding a tool
-// after this point re-prefills every session in the application. Twelve tools,
-// and one of them is `invoke` -- which is how the agent gets an unbounded number
-// of its own without any of this changing.
+// after this point re-prefills every session in the application. Ten tools, and
+// one of them is `invoke` -- which is how the agent gets an unbounded number of
+// its own without any of this changing. (It was twelve: `simulate` and `replay`
+// went with the eta experiment, PLAN.md §9, whose removal was the one sanctioned
+// change to a frozen list -- and it cost exactly the re-prefill the freeze
+// exists to prevent, once, on the next session of each project.)
 //
 // The first six are the C agent's, verbatim, because those descriptions were
-// written against this model's training. The last six are new, and each carries
+// written against this model's training. The last four are new, and each carries
 // its contract in its description for the same reason `edit`'s spells out its
 // match rule: a rule the model is not told is a rule it will break.
-// `Tests/golden.tsv` pins all twelve; `Tests/gen_golden.c` carries the same
+// `Tests/golden.tsv` pins all ten; `Tests/gen_golden.c` carries the same
 // list, and the golden suite failing is how the two are kept identical.
 
 import Foundation
@@ -57,19 +60,12 @@ public enum ToolSurface {
     {"type": "function", "function": {"name": "invoke", "description": "Call a tool you defined with define. `name` is the string that tool's name/0 returns, which is not the module name -- call tools to see the names. `args` is handed to its run/1 as a map with string keys; a bare string that is not JSON arrives as %{\"input\" => that_string}.", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "The tool name, as returned by tools."}, "args": {"type": "object", "description": "Arguments passed to the tool's run/1."}}, "required": ["name"]}}}
     """#
 
-    public static let simulateSchema = #"""
-    {"type": "function", "function": {"name": "simulate", "description": "Run code you defined under deterministic simulation, on a throwaway node, with the scheduler and the clock under test control. This is how to find an ordering bug before depending on the code, and a timeout costs the run nothing. You must first define a harness module implementing the :eta_harness behaviour: init/2 starts the system and returns its state, processes/1 lists the pids to schedule, generate/2 draws the next operation, execute/2 performs it, check/1 asserts an invariant after every step, check_final/2 asserts one once everything has settled, and terminate/1 cleans up. Three rules whose violation fails silently: execute/2 must not block, check/1 must not call into a scheduled process (read state with :eta_observe.read/1 instead), and anything init/2 starts must be unregistered, because init/2 runs once per seed and many times while shrinking. A violation is reported as a minimal trace. A run reporting no violations is not evidence until you have broken the code deliberately and seen it go red.", "parameters": {"type": "object", "properties": {"harness": {"type": "string", "description": "Harness module name, e.g. MyHarness."}, "seeds": {"type": "integer", "description": "How many seeds to try; default 8."}, "max_ops": {"type": "integer", "description": "Operations per run; default 25."}}, "required": ["harness"]}}}
-    """#
 
-    public static let replaySchema = #"""
-    {"type": "function", "function": {"name": "replay", "description": "Re-run one exact schedule from a previous simulate, so that a fix is a checkable claim rather than a hope. A concurrency fix normally cannot be verified: you re-run, it does not fail, and that proves nothing. This runs the same interleaving again.", "parameters": {"type": "object", "properties": {"harness": {"type": "string", "description": "The harness the trace came from."}, "trace": {"type": "array", "description": "The trace returned by simulate."}}, "required": ["harness", "trace"]}}}
-    """#
 
     /// The frozen surface, in order -- and the order is part of the system turn.
     public static let guestSchemas: [String] = [
         readSchema, writeSchema, editSchema, listSchema, grepSchema, bashSchema,
         elixirSchema, defineSchema, toolsSchema, invokeSchema,
-        simulateSchema, replaySchema,
     ]
 
     /// M1's host-side stand-in: the three that cannot change anything. Kept for
@@ -78,7 +74,7 @@ public enum ToolSurface {
 
     public static let names: Set<String> = [
         "read", "write", "edit", "list", "grep", "bash",
-        "elixir", "define", "tools", "invoke", "simulate", "replay",
+        "elixir", "define", "tools", "invoke",
     ]
     public static let readOnlyNames: Set<String> = ["read", "list", "grep"]
 

@@ -27,9 +27,7 @@ defmodule Warden.Workspace do
   to the model, not something to hammer: the host is told through an unsolicited
   event, and the next `eval` says plainly that the node is down.
   """
-  use Warden.Sim, gen_server: true
-
-  @eta_observe :all
+  use GenServer
 
   @backoff_ms [200, 500, 1_000, 2_000, 5_000]
 
@@ -62,7 +60,7 @@ defmodule Warden.Workspace do
   end
 
   @doc "Whether the node answers right now, with how long it took."
-  def status(server \\ __MODULE__), do: Sim.call(server, :status, 10_000)
+  def status(server \\ __MODULE__), do: GenServer.call(server, :status, 10_000)
 
   @doc """
   Evaluates Elixir on the workspace node.
@@ -72,7 +70,7 @@ defmodule Warden.Workspace do
   is invariant 6 applied to the node boundary the whole design turns on.
   """
   def eval(server \\ __MODULE__, code, timeout_ms),
-    do: Sim.call(server, {:eval, code, timeout_ms}, timeout_ms + 5_000)
+    do: GenServer.call(server, {:eval, code, timeout_ms}, timeout_ms + 5_000)
 
   @doc "Calls a registered tool on the agent's node."
   def invoke(module, args, timeout_ms) do
@@ -92,16 +90,15 @@ defmodule Warden.Workspace do
 
   # ---- callbacks -----------------------------------------------------------
 
-  @impl :gen_server
+  @impl GenServer
   def init(opts) do
-    Sim.label(:warden_workspace)
     Process.flag(:trap_exit, true)
     enabled = Keyword.get(opts, :enabled, true)
     state = %__MODULE__{enabled: enabled}
     {:ok, if(enabled, do: spawn_node(state), else: state)}
   end
 
-  @impl :gen_server
+  @impl GenServer
   def handle_call(:status, _from, state) do
     {:reply, describe(state), state}
   end
@@ -128,13 +125,13 @@ defmodule Warden.Workspace do
 
   def handle_call(_other, _from, state), do: {:reply, {:error, :unknown_call}, state}
 
-  @impl :gen_server
+  @impl GenServer
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     # The node died. Report it, then bring it back -- and say how many times,
     # because a workspace that keeps dying is information the model needs.
     log("workspace exited with #{status}; restarting")
     state = %{state | port: nil, restarts: state.restarts + 1, last_exit: status}
-    Sim.send_after(self(), :respawn, backoff(state.restarts))
+    Process.send_after(self(), :respawn, backoff(state.restarts))
     {:noreply, state}
   end
 
@@ -161,7 +158,7 @@ defmodule Warden.Workspace do
 
     cond do
       not reachable ->
-        Sim.send_after(self(), :verify_up, 300)
+        Process.send_after(self(), :verify_up, 300)
         {:noreply, state}
 
       state.restarts > 0 ->
@@ -175,7 +172,7 @@ defmodule Warden.Workspace do
   def handle_info({:EXIT, _port, _reason}, state), do: {:noreply, state}
   def handle_info(_other, state), do: {:noreply, state}
 
-  @impl :gen_server
+  @impl GenServer
   def handle_cast(_msg, state), do: {:noreply, state}
 
   # ---- the node ------------------------------------------------------------
@@ -214,7 +211,7 @@ defmodule Warden.Workspace do
       ])
 
     log("workspace starting (#{node_name()})")
-    Sim.send_after(self(), :verify_up, 300)
+    Process.send_after(self(), :verify_up, 300)
     %{state | port: port, started_at: System.monotonic_time(:millisecond)}
   rescue
     e ->

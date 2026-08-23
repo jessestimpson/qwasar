@@ -37,12 +37,12 @@ static void render(const qwasar_tokenizer *t, const char *name,
     free(toks);
 }
 
-/* The twelve tools M4 hands the model.
+/* The ten tools M4 hands the model.
  *
  * GENERATED from Sources/CrucibleKit/ToolSurface.swift by tools/schemas2c.py,
  * because the point of this file is to prove that the Swift path and the C path
  * build the same system turn from the SAME tools -- and for a while they were
- * the same only because twelve JSON schemas had been transcribed here by hand.
+ * the same only because the JSON schemas had been transcribed here by hand.
  * Editing one description then failed the goldens with a diff about the
  * description rather than about the template: a real failure, pointing at the
  * wrong thing. Now there is one definition and the goldens test the template. */

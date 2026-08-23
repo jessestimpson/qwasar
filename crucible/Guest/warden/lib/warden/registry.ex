@@ -18,9 +18,7 @@ defmodule Warden.Registry do
       earlier ones and compilation order is the only ordering information there
       is.
   """
-  use Warden.Sim, gen_server: true
-
-  @eta_observe :all
+  use GenServer
 
   defstruct entries: %{}, order: [], replays: 0
 
@@ -34,21 +32,20 @@ defmodule Warden.Registry do
     end
   end
 
-  def put(server \\ __MODULE__, entry), do: Sim.call(server, {:put, entry}, 10_000)
-  def lookup(server \\ __MODULE__, tool_name), do: Sim.call(server, {:lookup, tool_name}, 10_000)
-  def list(server \\ __MODULE__), do: Sim.call(server, :list, 10_000)
-  def manifest(server \\ __MODULE__), do: Sim.call(server, :manifest, 10_000)
-  def note_replay(server \\ __MODULE__), do: Sim.call(server, :note_replay, 10_000)
+  def put(server \\ __MODULE__, entry), do: GenServer.call(server, {:put, entry}, 10_000)
+  def lookup(server \\ __MODULE__, tool_name), do: GenServer.call(server, {:lookup, tool_name}, 10_000)
+  def list(server \\ __MODULE__), do: GenServer.call(server, :list, 10_000)
+  def manifest(server \\ __MODULE__), do: GenServer.call(server, :manifest, 10_000)
+  def note_replay(server \\ __MODULE__), do: GenServer.call(server, :note_replay, 10_000)
 
   # ---- callbacks -----------------------------------------------------------
 
-  @impl :gen_server
+  @impl GenServer
   def init(_opts) do
-    Sim.label(:warden_registry)
     {:ok, %__MODULE__{}}
   end
 
-  @impl :gen_server
+  @impl GenServer
   def handle_call({:put, entry}, _from, state) do
     key = entry.module
 
@@ -100,9 +97,9 @@ defmodule Warden.Registry do
 
   def handle_call(_other, _from, state), do: {:reply, {:error, :unknown_call}, state}
 
-  @impl :gen_server
+  @impl GenServer
   def handle_cast(_msg, state), do: {:noreply, state}
 
-  @impl :gen_server
+  @impl GenServer
   def handle_info(_msg, state), do: {:noreply, state}
 end

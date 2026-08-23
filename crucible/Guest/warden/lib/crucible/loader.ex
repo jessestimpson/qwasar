@@ -108,8 +108,8 @@ defmodule Crucible.Loader do
       tool_name: if(tool?, do: mod.name(), else: nil),
       schema: if(tool? and function_exported?(mod, :schema, 0), do: mod.schema(), else: %{}),
       # A module that spawns, or implements a behaviour with callbacks, is code
-      # whose correctness is about *when* rather than *what* -- and PLAN.md 9.4
-      # wants the model told so before it loads that into the node it depends on.
+      # whose correctness is about *when* rather than *what* -- the model is
+      # told so before it depends on code a green load has proven nothing about.
       concurrent: concurrent?(mod, behaviours)
     }
   end

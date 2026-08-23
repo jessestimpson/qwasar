@@ -154,15 +154,9 @@ RUN chmod +x $ROOTFS/sbin/crucible-init
 # would pass while every edit the model made was silently reverted.
 RUN SEED_WORK=$ROOTFS/sbin/seed-work sh /tmp/test_seed_work.sh
 
-# The warden: linted, simulated, then compiled.
-#
-# The order is the point. `make guest` cannot produce an image unless the
-# control plane is fully instrumented (lint_sim.sh) and its deterministic
-# simulation is green across a seed sweep (PLAN.md 9.2). A control plane that
-# ships without those having passed is a control plane nobody checked.
-#
-# MIX_ENV=prod is what ships, and the build asserts it carries no eta at all --
-# which is the property PLAN.md 9.5's exit depends on.
+# The warden: tested, then compiled. `make guest` cannot produce an image
+# unless the control plane's suite is green -- a control plane that ships
+# without it having passed is a control plane nobody checked.
 ENV PATH="/opt/mise/installs/elixir/1.18.4-otp-27/bin:/opt/mise/installs/erlang/27.3.4.16/bin:${PATH}" \
     MIX_HOME=/tmp/mix HEX_HOME=/tmp/hex
 RUN set -eux; \
@@ -170,30 +164,11 @@ RUN set -eux; \
     mix local.hex --force >/dev/null; \
     mix local.rebar --force >/dev/null; \
     \
-    : '--- the control plane must be fully instrumented ---'; \
-    sh lint_sim.sh; \
-    \
     : '--- the logic: the edit contract, confinement, ceilings ---'; \
     MIX_ENV=test mix test --no-start; \
     \
-    : '--- and the simulation must be green before anything ships ---'; \
-    MIX_ENV=dst mix deps.get >/dev/null; \
-    MIX_ENV=dst mix test --no-start; \
-    \
-    : '--- what ships: no eta anywhere in it ---'; \
     MIX_ENV=prod mix compile; \
-    if [ -d _build/prod/lib/eta ]; then \
-      echo "prod build contains eta; the seam is broken" >&2; exit 1; \
-    fi; \
     echo "prod build carries: $(ls _build/prod/lib | tr '\n' ' ')"; \
-    \
-    : '--- the sim node DOES ship eta, and only the sim node ---'; \
-    mkdir -p $ROOTFS/opt/sim/lib; \
-    for app in _build/dst/lib/*; do \
-      mkdir -p "$ROOTFS/opt/sim/lib/$(basename $app)"; \
-      cp -a "$app/ebin" "$ROOTFS/opt/sim/lib/$(basename $app)/ebin"; \
-    done; \
-    echo "sim node carries: $(ls $ROOTFS/opt/sim/lib | tr '\n' ' ')"; \
     mkdir -p $ROOTFS/opt/warden; \
     cp -a _build/prod/lib/warden/ebin $ROOTFS/opt/warden/ebin; \
     cp -a lib mix.exs $ROOTFS/opt/warden/; \

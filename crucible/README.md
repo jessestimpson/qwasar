@@ -11,7 +11,7 @@ Two things make it different, and they come from the same idea:
   own address space — no serialisation boundary, and no reason to throw away a
   session's KV cache and recurrent state between turns.
 * **The tools live in a VM, and the model owns them.** The fixed tool set is
-  twelve calls wide and one of them is `invoke`; everything else the model
+  ten calls wide and one of them is `invoke`; everything else the model
   needs, it writes in Elixir, hot-loads into a live node, and calls. The blast
   radius of that freedom is one virtual machine with no network device.
 
@@ -83,7 +83,7 @@ The session header should say **`sandboxed · booted in 0.6s`**. If it says
 * **~6 tokens a second.** A dense 27B on ~120 GB/s of memory bandwidth; the
   ceiling is a bandwidth identity, not an efficiency problem.
 * **A pause before the first token, once per project.** The system turn is
-  ~2500 tokens (the twelve tool schemas render into it), so a cold project
+  ~2200 tokens (the ten tool schemas render into it), so a cold project
   spends roughly a minute reading its own prompt. It is then checkpointed and
   restored by every later session in that project.
 * **Formatted replies.** Markdown renders — headings, lists, tables, fenced
@@ -120,7 +120,7 @@ make gate-full ROOT_DIR=/path/to/project PROMPT="what does qw_edit_apply do?"
 | `make guest` | build the guest image (needs Docker) |
 | `make test` | host suite: goldens, path confinement, UTF-8, persistence, KV prefix |
 | `make golden` | regenerate the chat-template goldens — read the diff |
-| `make sandbox` | boot a guest and exercise the twelve tools end to end |
+| `make sandbox` | boot a guest and exercise the ten tools end to end |
 | `make gate-full` | load the model and run one agent turn, headless |
 | `make gate-prefix` | prove the system-prefix KV checkpoint against the engine (~80s) |
 | `make clean` | remove build products, keeping the guest image |

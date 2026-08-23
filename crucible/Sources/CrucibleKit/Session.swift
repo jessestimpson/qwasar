@@ -299,7 +299,7 @@ final class LiveSession {
     /// cache when it is there, leaving a checkpoint behind when it is not.
     ///
     /// Measured on this surface: the system turn is 1954 tokens of the 1970 in
-    /// a first turn, 99.2%, because the twelve tool schemas are rendered into
+    /// a first turn, 99.2%, because the ten tool schemas are rendered into
     /// it. At the 31.8 tok/s of PLAN.md 2.5 that is about a minute of prefill,
     /// and it is IDENTICAL for every session of a project at a given effort --
     /// so it is paid again on every new session and, since compaction is a

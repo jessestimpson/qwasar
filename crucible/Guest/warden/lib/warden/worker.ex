@@ -15,9 +15,7 @@ defmodule Warden.Worker do
   M4's `invoke` gets its concurrency from the workspace node on the far side of
   distribution, not from spawning here.
   """
-  use Warden.Sim, gen_server: true
-
-  @eta_observe :all
+  use GenServer
 
   defstruct pending: %{}
 
@@ -37,24 +35,21 @@ defmodule Warden.Worker do
 
 
   @doc "Runs `req` for `id` and casts the reply back to `reply_to`."
-  def run(server, id, req, reply_to), do: Sim.cast(server, {:run, id, req, reply_to})
+  def run(server, id, req, reply_to), do: GenServer.cast(server, {:run, id, req, reply_to})
 
-  @impl :gen_server
+  @impl GenServer
   def init(_opts) do
-    Sim.label(:warden_worker)
     {:ok, %__MODULE__{}}
   end
 
-  @impl :gen_server
+  @impl GenServer
   def handle_cast({:run, id, req, reply_to}, state) do
-    # `sleep` exists so a simulation can make a request outlive its deadline,
-    # which is the only way to exercise invariant 2: a late reply must not be
+    # `sleep` exists so a test can make a request outlive its deadline, which
+    # is the only way to exercise the rule that a late reply must not be
     # delivered as success after the request was already reported timed out.
-    # It defers through Sim.send_after, so the virtual clock owns it and the
-    # test costs no wall-clock time at all.
     case req do
       %{"op" => "sleep", "args" => %{"ms" => ms}} when is_integer(ms) ->
-        Sim.send_after(self(), {:wake, id, reply_to}, ms)
+        Process.send_after(self(), {:wake, id, reply_to}, ms)
         {:noreply, %{state | pending: Map.put(state.pending, id, reply_to)}}
 
       # A reply shape the bridge does not expect. This exists because the
@@ -75,12 +70,12 @@ defmodule Warden.Worker do
             _ -> {:ok, 12_345}
           end
 
-        Sim.cast(reply_to, {:done, id, reply})
+        GenServer.cast(reply_to, {:done, id, reply})
         {:noreply, state}
 
       _ ->
         reply = Warden.Dispatch.run(req)
-        Sim.cast(reply_to, {:done, id, reply})
+        GenServer.cast(reply_to, {:done, id, reply})
         {:noreply, state}
     end
   end
@@ -88,15 +83,15 @@ defmodule Warden.Worker do
   def handle_cast(_other, state), do: {:noreply, state}
 
   # Required by :gen_server.
-  @impl :gen_server
+  @impl GenServer
   def handle_call(:health, _from, state),
     do: {:reply, %{pending: map_size(state.pending)}, state}
 
   def handle_call(_other, _from, state), do: {:reply, {:error, :unknown_call}, state}
 
-  @impl :gen_server
+  @impl GenServer
   def handle_info({:wake, id, reply_to}, state) do
-    Sim.cast(reply_to, {:done, id, {:ok, "slept"}})
+    GenServer.cast(reply_to, {:done, id, {:ok, "slept"}})
     {:noreply, %{state | pending: Map.delete(state.pending, id)}}
   end
 

@@ -193,11 +193,8 @@ enum SandboxGate {
             // tool surface, which is what makes it free (§2.2).
             failures += try await exerciseSelfModification(channel)
 
-            // Deterministic simulation, handed to the agent (PLAN.md 9.4).
-            failures += try await exerciseSimulation(channel)
-
-            // Invariant 6, on the real thing rather than in simulation: while a
-            // slow request is outstanding, the channel must still answer. The
+            // While a slow request is outstanding, the channel must still
+            // answer. The
             // bridge used to call dispatch inline, which meant one slow op
             // stalled everything -- and no test it had could have shown that,
             // because every op it had was instant.
@@ -316,7 +313,7 @@ enum SandboxGate {
     /// The last part is the one that matters. A tool the agent wrote must
     /// survive the node it lives on dying, because agent-written code crashes
     /// that node — and the manifest lives in warden precisely so it can be
-    /// replayed (PLAN.md 7.3, and 9.2 invariant 4).
+    /// replayed (PLAN.md 7.3).
     private static func exerciseSelfModification(_ channel: VsockChannel) async throws -> Int {
         var bad = 0
         func check(_ label: String, _ ok: Bool, _ detail: String) {
@@ -361,7 +358,7 @@ enum SandboxGate {
         check("invoke wordcount", i.ok == true && (i.result ?? "").contains("3 words"),
               i.result ?? i.error ?? "?")
 
-        // Two modules cannot answer to one name -- invariant 3.
+        // Two modules cannot answer to one name.
         let clash = try await channel.send(op: "define", args: ["source": .string(#"""
         defmodule OtherCounter do
           @behaviour Crucible.Tool
@@ -397,132 +394,6 @@ enum SandboxGate {
         return bad
     }
 
-
-    /// `define` a module with a genuine timing bug, `define` a harness for it,
-    /// and `simulate`.
-    ///
-    /// The bug is a flush that adds its pending batch to the total and forgets
-    /// to clear it, so a second flush counts the same increments again. Whether
-    /// it manifests depends entirely on when the timer fires relative to the
-    /// adds, which is to say it is invisible to any test that does not control
-    /// the clock. That is exactly what PLAN.md 9.4 claims this machinery is for.
-    private static func exerciseSimulation(_ channel: VsockChannel) async throws -> Int {
-        var bad = 0
-
-        // Agent code writes `use Warden.Sim`, not `use Eta`: the seam is on
-        // both nodes' code paths and resolves to eta on the sim node and to the
-        // stdlib on the workspace, so one source compiles in both places.
-        let tally = #"""
-        defmodule Tally do
-          use Warden.Sim, gen_server: true
-          @eta_observe :all
-          defstruct total: 0, pending: 0, timer: nil
-
-          # Unregistered on purpose: eta calls init/2 once per run and many
-          # times while shrinking, so a fixed name works exactly once.
-          def start_link(_arg), do: :gen_server.start_link(__MODULE__, [], [])
-          def add(pid, n), do: Sim.cast(pid, {:add, n})
-
-          def init(_) do
-            Sim.label(:tally)
-            {:ok, %Tally{}}
-          end
-
-          def handle_cast({:add, n}, s) do
-            timer = s.timer || Sim.send_after(self(), :flush, 50)
-            {:noreply, %{s | pending: s.pending + n, timer: timer}}
-          end
-
-          def handle_cast(_, s), do: {:noreply, s}
-
-          def handle_info(:flush, s) do
-            # The bug: pending is added to the total and never cleared, so the
-            # next flush counts the same increments again.
-            {:noreply, %{s | total: s.total + s.pending, timer: nil}}
-          end
-
-          def handle_info(_, s), do: {:noreply, s}
-          def handle_call(:total, _from, s), do: {:reply, s.total, s}
-          def handle_call(_, _from, s), do: {:reply, :ok, s}
-        end
-        """#
-
-        let harness = #"""
-        defmodule TallyHarness do
-          @behaviour :eta_harness
-          defstruct pid: nil, added: 0
-
-          def init(_seed, _config) do
-            {:ok, pid} = Tally.start_link([])
-            {:ok, %TallyHarness{pid: pid}}
-          end
-
-          def processes(%{pid: p}), do: [p]
-          def labels(%{pid: p}), do: %{p => :tally}
-          def terminate(_), do: :ok
-
-          def generate(_state, rand) do
-            {n, rand} = :rand.uniform_s(5, rand)
-            {pick, rand} = :rand.uniform_s(10, rand)
-            op = if pick > 6, do: :advance_time, else: {:add, n}
-            {op, rand}
-          end
-
-          def execute({:add, n}, state) do
-            Tally.add(state.pid, n)
-            %{state | added: state.added + n}
-          end
-
-          def execute(:advance_time, state) do
-            :eta_time.advance_to_next()
-            state
-          end
-
-          def check(_state), do: :ok
-
-          # Once everything has settled the total must never exceed what was
-          # added. Counting the same batch twice is the only way it can.
-          def check_final(_settled, state) do
-            case :eta_observe.read(state.pid) do
-              %{total: total} ->
-                if total <= state.added do
-                  :ok
-                else
-                  {:violation, {:overcounted, %{total: total, added: state.added}}}
-                end
-
-              _ ->
-                :ok
-            end
-          end
-        end
-        """#
-
-        for (label, src) in [("Tally", tally), ("TallyHarness", harness)] {
-            let d = try await channel.send(op: "define", args: ["source": .string(src)], timeout: 90)
-            if d.ok != true {
-                print("  define \(label) → FAILED: \(d.error ?? "?")")
-                return bad + 1
-            }
-            let hinted = (d.result ?? "").contains("simulate")
-            print("  define \(label) → ok\(hinted ? " (flagged concurrent, simulate suggested)" : "")")
-        }
-
-        let sim = try await channel.send(op: "simulate",
-                                         args: ["harness": .string("TallyHarness"),
-                                                "seeds": .int(8),
-                                                "max_ops": .int(20)],
-                                         timeout: 240)
-        let text = sim.result ?? sim.error ?? "?"
-        let caught = text.contains("VIOLATION")
-        print("  simulate TallyHarness →")
-        for line in text.split(separator: "\n").prefix(14) { print("      \(line)") }
-        if !caught {
-            print("      (expected a VIOLATION: the module double-counts on a second flush)")
-            bad += 1
-        }
-        return bad
-    }
 
     private static func line(_ what: String, _ ok: Bool) {
         print("  \(ok ? "OK " : "NO ") \(what)")

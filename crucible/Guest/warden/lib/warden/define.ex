@@ -12,7 +12,9 @@ defmodule Warden.Define do
        running the previous version the load is *refused* and the result names
        the processes. Silently killing a process the agent started three steps
        ago is the kind of failure that costs an hour of confusion.
-    4. **Offer simulation** for anything concurrent (PLAN.md 9.4).
+    4. **Flag concurrency**: a module that spawns or implements an OTP
+       behaviour is called out, because a green load proves nothing about
+       ordering.
     5. **Load**, and **register** if it implements `Crucible.Tool`.
     6. **Report** what it now exports and whether it became a tool.
   """
@@ -94,11 +96,10 @@ defmodule Warden.Define do
 
   # Every defined module, not only the ones that became tools.
   #
-  # The registry started as a tool registry, and that was wrong twice over: a
-  # workspace restart must replay helper modules too, and a simulation needs the
-  # harness -- which is by definition not a tool. The symptom was
-  # `{TallyHarness, :init, ...} :undef` on the sim node, for a module that had
-  # been defined perfectly well and simply was not in the manifest.
+  # The registry started as a tool registry, and that was wrong: a workspace
+  # restart must replay helper modules too, not only the ones that became
+  # tools -- a helper a tool depends on that is absent from the manifest is
+  # an :undef after the first crash.
   defp register(source, described) do
     for d <- described do
       Warden.Registry.put(%{
@@ -123,13 +124,13 @@ defmodule Warden.Define do
             do: base <> "\n  registered as the tool #{inspect(d.tool_name)} — call it with invoke",
             else: base <> "\n  not a Crucible.Tool, so it is loaded but not callable through invoke"
 
-        # PLAN.md 7.2 step 4, and 9.4: concurrent code is where a green result
-        # means least, so the offer is made where the model will see it.
+        # PLAN.md 7.2 step 4: concurrent code is where a green result means
+        # least, so say so where the model will see it.
         if d.concurrent do
           base <>
             "\n  this module spawns or implements an OTP behaviour, so its " <>
-            "correctness is about ordering. Consider writing an eta harness and " <>
-            "running simulate before you depend on it."
+            "correctness is about ordering — test it under load before you " <>
+            "depend on it."
         else
           base
         end

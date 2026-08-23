@@ -6,8 +6,8 @@ defmodule Warden.Dispatch do
   that writes. The six file tools move here in M3, and `define`/`invoke` in M4.
 
   Pure with respect to the bridge: it takes a decoded request and returns a
-  reply. That is what lets the simulation drive the contract without a socket,
-  and what keeps the correlation logic in one place.
+  reply, which keeps the correlation logic in one place and the contract
+  testable without a socket.
   """
 
   @type reply :: {:ok, String.t()} | {:error, String.t(), String.t()}
@@ -113,33 +113,13 @@ defmodule Warden.Dispatch do
 
   # ---- materialisation (PLAN.md 7.4) ---------------------------------------
   #
-  # Not part of the twelve tools (PLAN.md 7.1). The model does not propose its
+  # Not part of the ten tools (PLAN.md 7.1). The model does not propose its
   # own work for approval -- the USER asks to see what changed, from the host.
   # Keeping it off the model's surface means the frozen list stays frozen, and
   # that the one thing which crosses out of the sandbox is something a person
   # initiated.
   def run(%{"op" => "propose"}), do: Warden.Materialise.propose()
   def run(%{"op" => "accept_baseline"}), do: Warden.Materialise.accept()
-
-  # ---- deterministic simulation (PLAN.md 9.4) ------------------------------
-
-  def run(%{"op" => "simulate", "args" => %{"harness" => harness} = args}) do
-    Warden.Simulate.run(harness, Warden.Registry.manifest(), %{
-      seeds: seeds(args),
-      max_ops: int(args["max_ops"], 25),
-      max_steps: int(args["max_steps"], 20_000)
-    })
-  end
-
-  def run(%{"op" => "simulate"}),
-    do: {:error, "args", "simulate requires a harness module name"}
-
-  def run(%{"op" => "replay", "args" => %{"harness" => harness, "trace" => trace}}) do
-    Warden.Simulate.replay(harness, Warden.Registry.manifest(), trace, %{})
-  end
-
-  def run(%{"op" => "replay"}),
-    do: {:error, "args", "replay requires a harness and a trace"}
 
   # Deliberately available: the only honest way to test that a workspace crash
   # is survivable is to cause one. It kills the agent's node, never warden's.
@@ -149,9 +129,9 @@ defmodule Warden.Dispatch do
     end
   end
 
-  # Handled by the worker, which defers it through the virtual clock; it exists
-  # so a simulation can make a request outlive its deadline. Listed here so an
-  # unknown-op reply never claims it does not exist.
+  # Handled by the worker, which defers it; it exists so a test can make a
+  # request outlive its deadline. Listed here so an unknown-op reply never
+  # claims it does not exist.
   def run(%{"op" => "sleep"}), do: {:ok, "slept"}
 
   def run(%{"op" => op}), do: {:error, "unknown_op", "no such op: #{op}"}
@@ -189,16 +169,6 @@ defmodule Warden.Dispatch do
         %{"input" => other}
     end
   end
-
-  defp seeds(args) do
-    case args["seeds"] do
-      n when is_integer(n) and n > 0 -> Enum.to_list(1..n)
-      _ -> Enum.to_list(1..8)
-    end
-  end
-
-  defp int(v, _default) when is_integer(v), do: v
-  defp int(_, default), do: default
 
   # What the agent has to work with. mise manages these; the warden only reports
   # them, because a control plane that installs runtimes is a control plane the

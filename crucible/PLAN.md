@@ -370,7 +370,6 @@ continued with `qwasar_render_tool_result`.
 │  warden    (Elixir)  immutable control plane, owns the bridge  │
 │     │ Erlang distribution over loopback                        │
 │  workspace (Elixir)  the agent's node — hot-loadable, restarts │
-│  sim       (ephemeral) per-simulation, eta-instrumented (§9.3) │
 │  /base   virtiofs, read-only, the project as it was            │
 │  /work   guest disk, writable, where everything happens        │
 └────────────────────────────────────────────────────────────────┘
@@ -382,9 +381,8 @@ Two rules this diagram encodes:
   command run, it runs in the guest.
 - The **guest never writes the host**. `/base` is mounted read-only and `/work`
   is the guest's own disk. The only path back is a patch through §7.4.
-- **Three nodes, not one**, and the split is load-bearing in both directions:
-  warden must survive anything the agent does, and eta's simulator must be able
-  to stop the world without stopping the bridge (§9.3).
+- **Two nodes, not one**: warden must survive anything the agent does, so
+  the agent's code never runs on the node that owns the wire (§7.3).
 
 ### 3.2 Directory layout
 
@@ -673,7 +671,6 @@ sessions/<uuid>/
   baseline.json                    path → sha256 + mode, at sandbox creation
   disk.img                         APFS clone of the golden guest image
   modules/                         agent-written source, one file per module
-  traces/<id>.trace                eta simulation traces, replayable (§9)
   undo/<n>/                        pre-application snapshot of touched files
 images/
   golden-<version>.img             the guest image, cloned per session
@@ -878,7 +875,8 @@ small ones a bad trade.
 The policy is now:
 
 - **The system prefix, always.** Measured on the M4 surface, the system turn is
-  **2491 tokens — 99.6% of a first turn**, because the twelve tool schemas are
+  **~2200 tokens — 99.6% of a first turn (2491 before `simulate` and `replay`
+  left with §9)**, because the ten tool schemas are
   rendered into it. It is identical for every session of a project at a given
   effort, so at the ~32 tok/s of §2.5 it is *~78 s paid again on every new
   session*, and — since compaction is a successor session (§2.4) — on every
@@ -1265,11 +1263,8 @@ the image**. `git` is in the image because the diff engine is git (§7.4) — th
 is the one dependency worth its size.
 
 OTP 27 specifically, for two reasons beyond currency: its built-in `json`
-module removes the last dependency from the guest (§6.4), and eta is developed
-against modern OTP. One language and one build tool across the guest — warden,
-workspace, and the DST profile are all `mix` (§9.1). `eta` and the DST-built support beams are the only test
-machinery in a shipping artefact anywhere in this design, and they are there
-because §9.3's sim node is a runtime feature, not a test.
+module removes the last dependency from the guest (§6.4). One language and
+one build tool across the guest — warden and workspace are both `mix`.
 
 Init is not OpenRC. `/sbin/init` is a ~40-line shell script that mounts
 `/proc`, `/sys`, `/base` (virtiofs), starts the warden, and execs. Target: **VM
@@ -1372,16 +1367,14 @@ for one.
 | `define(source)` | guest workspace node | compile + hot-load a module (§7.2) |
 | `tools()` | guest warden | the current registry of agent-defined tools |
 | `invoke(name, args)` | guest workspace node | call one of them (§7.3) |
-| `simulate(harness, opts)` | guest sim node | run agent code under deterministic simulation (§9.4) |
-| `replay(trace)` | guest sim node | re-run one exact schedule, to verify a fix (§9.4) |
 
 Six of these are the C agent's own tools with their descriptions kept nearly
 verbatim — those descriptions were written against this model's training and the
 `edit` one in particular spells out its match rule because that rule *is* the
 contract. Do not paraphrase them for the sake of paraphrasing them.
 
-The last six are the new idea, and they are where all the leverage is: four let
-the agent change what it can do, and two let it find out whether the change is
+The last four are the new idea, and they are where all the leverage is: they
+let the agent change what it can do, and find out whether the change is
 correct **before** it commits to it.
 
 ### 7.2 `define` — compiling into a live node
@@ -1413,12 +1406,10 @@ What happens, in order, all inside the guest:
    accept the loss with a `force: true` argument. Silently killing a process the
    agent started three steps ago is the kind of failure that costs an hour of
    confusion, and it is entirely avoidable.
-4. **Offer simulation.** If the compiled module spawns processes, implements
-   `gen_server`/`gen_statem`/`supervisor`, or sends messages, warden says so in
-   the tool result and names `simulate` (§9.4). With `verify: "SomeHarness"` the
-   load is *gated* on the simulation passing. This is the step the whole of §9
-   exists to make possible: the agent can find out whether concurrent code is
-   correct before it is running in the node it depends on.
+4. **Flag concurrency.** If the compiled module spawns processes, implements
+   `gen_server`/`gen_statem`/`supervisor`, or sends messages, warden says so
+   in the tool result: correctness there is about ordering, and a module that
+   loads green has proven nothing about it.
 5. **Load.** `:code.load_binary(mod, ~c"crucible://#{name}.ex", bin)` on the
    workspace node.
 6. **Register.** If the module implements `Crucible.Tool`, warden adds it to the
@@ -1438,9 +1429,6 @@ warden  (Elixir, :warden@guest)      workspace (Elixir, :workspace@guest)
   Warden.Fs        /work primitives    Crucible.Fs    (the six file tools)
   Warden.Workspace spawn / monitor     ...every module the agent writes
   Warden.Diff      git plumbing
-  Warden.Sim       simulation driver ──▶ sim (:sim_N@guest)
-                                           ephemeral, eta-instrumented,
-                                           discarded after each run (§9.3)
 ```
 
 They are **separate OS processes**, connected by Erlang distribution over
@@ -1452,25 +1440,13 @@ supervision trees. Three reasons, and each one alone would be sufficient:
    goes silent and the user sees a hang.
 2. `eta_sched` **serialises every process in the VM and takes over the clock**.
    A simulation running on the workspace node would freeze the tools, and one
-   running on warden would freeze the bridge. Simulation needs its own node
-   because deterministic simulation is, by construction, hostile to anything
-   else trying to make progress (§9.3).
-3. The node boundary is exactly where `eta_net` injects faults. Warden's
-   handling of a dead, slow, or partitioned workspace is the most failure-prone
-   code in the guest, and putting workspace on the far side of distribution is
-   what makes that code **testable** rather than merely careful (§9.2).
+   running on warden would freeze the bridge.
+3. Warden's handling of a dead, slow, or partitioned workspace is the most
+   failure-prone code in the guest, and putting workspace on the far side of
+   distribution is what keeps that boundary explicit rather than accidental.
 
-**Warden is Elixir, on eta's `elixir` branch.** An earlier draft made it Erlang
-because eta instrumented via `parse_transform` and its Elixir support was
-limited. The `elixir` branch replaces that with explicit `use Eta` macros (§9.1),
-which removes the reason — so the guest is one language and one build tool, and
-the same `mix` invocation builds warden, workspace, and the DST profile.
-
-The three justifications above are unaffected by that choice: they are about
-process boundaries, not syntax. And the Erlang fallback stays written down
-rather than forgotten, because the branch is best-effort by its author's own
-description: if it proves too thin, warden moves to Erlang and `main`, the node
-topology does not change, and §9.5 is the review where that call gets made.
+(A third, ephemeral sim node existed while the eta experiment ran — §9 — and
+was deleted with it; the reasons above never depended on it.)
 
 So:
 
@@ -1482,11 +1458,8 @@ So:
   it and **replays the module manifest** in load order, then reports to the
   host, which reports to the model as a tool result: *the workspace restarted;
   N modules were reloaded; process state was lost.* The agent is told the truth
-  and can recover. That sentence is a promise, and §9.2 is how it is kept.
-- **Sim nodes are cattle.** Started per `simulate` call with `-noinput`, given
-  the modules under test via eta's `preload`, killed when the run returns or the
-  budget expires. A simulation that hangs, deadlocks, or exhausts memory takes
-  nothing with it.
+  and can recover. That sentence is a promise, and the unit suite plus the
+  sandbox gate are how it is kept (§9.2 lists the invariants).
 - **The manifest is the durable artefact.** It is sent to the host on every
   change and stored in `SessionRecord.moduleManifest`. That is what makes
   self-modification survive parking, a VM crash, and an app relaunch. A session
@@ -1823,552 +1796,53 @@ normal, expected outcome and the UI should treat it as one.
 
 ---
 
-## 9. Deterministic simulation testing with `eta`
+## 9. Deterministic simulation testing with `eta` — ended
 
-[`eta`](https://github.com/jessestimpson/eta) is a BEAM deterministic simulation
-testing framework: it serialises the scheduler, virtualises the clock, records
-every scheduling decision, replays a recorded trace exactly, and shrinks a
-failing trace to a minimal counterexample. No patched BEAM, no NIF.
+An experiment (removed 2026-08-23), kept here as the record §9.5 promised.
+Warden was built under eta's deterministic simulation — virtual clock,
+controlled scheduler, seed sweeps — through a `Warden.Sim` seam whose macros
+expanded to the stdlib when eta was absent, and the machinery was handed to
+the agent as two tools, `simulate` and `replay`, backed by a throwaway sim
+node in the guest.
 
-**We start on the `elixir` branch, and eta is an experiment with a defined
-exit** (§9.5). That framing is deliberate and it constrains the integration:
-nothing in the shipping guest may depend on eta being present, and removing it
-must cost a build flag rather than a rewrite. The good news is that the `elixir`
-branch's design gives that almost for free (§9.1).
+**The verdict, against §9.5's own exit criteria: it did not buy anything.**
+The count that mattered — invariant violations the harnesses caught that the
+conventional suite would have missed — ended at zero, which §9.5 said in
+advance would mean eta was not worth it for warden. So it went, the way the
+exit was designed: the dependency deleted, the seam's call sites inlined back
+to `Process.send_after`/`GenServer.*`, the sim node and its build stage
+removed, the dst environment and lint gone.
 
-It appears in this plan twice, for two different reasons, and they should not be
-confused:
+One deliberate deviation from §9.5's plan: it prescribed leaving `simulate`
+and `replay` in the frozen tool surface reporting unavailable, to avoid
+re-prefilling every session. They were removed instead — a smaller system
+turn every turn forever was judged worth one re-prefill per project, and the
+disk-cached prefix makes that a single cold start each.
 
-- **§9.2 — as how the warden is built.** The guest's control plane is a
-  concurrency-and-time argument, and DST is how such an argument is settled
-  rather than hoped for.
-- **§9.4 — as a tool handed to the model.** The agent writes concurrent Elixir
-  and Erlang into a live node. Giving it a way to *understand code before it
-  loads it* turns hot-loading from a stunt into an engineering practice. This is
-  the more speculative of the two, and it is also the more interesting.
+### 9.2 The invariants that outlived it
 
-### 9.1 What eta provides, and what the `elixir` branch changes
-
-On `main`, instrumentation is a `parse_transform` — invisible, total, and
-Erlang-only. On the **`elixir` branch** it is explicit macros instead:
-
-> "Elixir is supported: `use Eta` in a module provides explicit macros
-> (`Eta.send_after/3`, `Eta.cast/2`, `Eta.call/3`, `Eta.send/2`, etc.) that
-> expand to `:eta_*` calls when `:eta` is a compile-time dependency and to
-> stdlib calls otherwise — no parse_transform required."
-
-Plus `@eta_observe` for state extraction, `Eta.log/1` for the unified timeline, a
-`@before_compile` hook that wraps `gen_server` callbacks to publish state and
-route replies (the Elixir-AST equivalent of `eta_transform`'s observe and
-reply-routing passes), and a `mix.exs` so the whole thing is an ordinary
-dependency.
-
-**One non-obvious thing about consuming it**, found by reading its `mix.exs`
-rather than by an afternoon of confusion. eta's Elixir entry point is compiled
-only in its own `:test` environment:
-
-```elixir
-defp elixirc_paths(:test), do: ["lib", "test/support"]
-defp elixirc_paths(_),     do: []
-defp erlc_options(:test),  do: [:debug_info, {:d, :DST}]
-```
-
-Mix builds dependencies in `:prod` unless told otherwise, so a plain dependency
-on eta yields the Erlang library **without the `Eta` macro module** — and
-`use Eta` fails with a module-not-found that says nothing about why. The
-dependency has to name the environment, which also turns on the `DST` define
-that the header hangs on:
-
-```elixir
-{:eta, github: "jessestimpson/eta", branch: "elixir", env: :test, only: :dst}
-```
-
-Worth raising upstream: the package's own `files` list ships `lib`, so the
-intent is clearly for consumers to have `Eta`, and `elixirc_paths` is what stops
-them.
-
-Three consequences, and the third is the one to watch:
-
-1. **Warden can be Elixir after all.** §7.3 previously chose Erlang solely
-   because eta's Elixir support was limited. On this branch that reason is gone,
-   and one language plus one build tool across the whole guest is worth having.
-   The Erlang fallback stays documented, because the branch is best-effort.
-2. **Removal is a dependency toggle.** The macros expand to stdlib calls when
-   `:eta` is not a compile-time dependency, which is exactly the containment
-   §9.5 needs. The shipping warden build simply does not list eta, and the same
-   source compiles to `Process.send_after/3` and `GenServer.cast/2`.
-3. **Instrumentation is now opt-in per call site, and that is a real caveat.**
-   A `parse_transform` catches every timer and every message in the module. An
-   explicit macro catches only the ones you wrote as macros. **A hand-written
-   `Process.send_after/3` is invisible to the simulator** — it reintroduces real
-   time and real nondeterminism into a run that reports itself as deterministic,
-   and it does so silently. This is the single most likely way for §9 to produce
-   a confident, meaningless green result.
-
-   The branch's own documentation names the sharpest instance, and it is a
-   language construct rather than a function call, so no lint on module names
-   will catch it:
-
-   > **`receive ... after` is not virtualized.** The parse transform rewrites
-   > this language construct; without it, a `receive ... after` timeout runs on
-   > the real clock.
-
-   So the rule for warden is concrete: **no `receive ... after`, anywhere.** A
-   process that wants a deadline sends itself a message with `Eta.send_after/3`
-   and matches it in a plain `receive`. That is a rule about how the control
-   plane is written, not a build setting, and it is the first thing to check
-   when a simulation says a timeout never fired.
-
-   For warden, the answer is discipline plus a lint: a `dst` -profile compile
-   check that fails the build on a raw `Process.send_after`, `send/2`,
-   `GenServer.call/3`, or `:timer.*` in any module that `use Eta`. For
-   *agent-written* code, the answer is in §9.4, and it is harder, because the
-   model will reach for the stdlib call by default.
-
-The framework's own documentation is candid that "Elixir support works and is
-tested, but continued development focuses on Erlang". Treat Erlang as the
-supported path for anything that must not break, which is why §9.5 exists.
-
-#### The harness contract
-
-A system under test supplies six required callbacks (plus two optional) through
-the `eta_harness` behaviour:
-
-```erlang
--callback init(Seed :: integer(), Config :: map()) -> {ok, state()}.
--callback processes(state())                       -> [pid()].
--callback generate(state(), rand:state())          -> {op(), rand:state()}.
--callback execute(op(), state())                   -> state().
--callback check(state())          -> ok | {violation, violation()}.
--callback terminate(state())                       -> ok.
-%% optional
--callback labels(state())         -> #{pid() => term()}.
--callback check_final(settled(), state()) -> ok | {violation, violation()}.
-```
-
-and is driven by
-
-```erlang
-#{outcome := Outcome, trace := Trace} =
-    eta_run:run(warden_harness, #{seed => 7, max_ops => 25,
-                                  max_steps => 20000, preload => [warden]}),
-
-#{trace := Minimal, verified := true} =
-    eta_shrink:shrink(warden_harness, Trace, #{seed => 7, max_ops => 25,
-                                               preload => [warden]}).
-```
-
-The modules that matter here:
-
-| module | what it buys this project |
-|---|---|
-| `eta_sched` | one process runs at a time, chosen by a seeded RNG; every interleaving is reachable and reproducible |
-| `eta_time` | virtual clock that jumps to the next deadline — **a 30-second warden timeout costs zero wall-clock**, which is the difference between testing timeout behaviour and not testing it |
-| `eta_run` | drive a harness; returns outcome plus a trace |
-| `eta_shrink` | delta-debug a failing trace to its essential decisions |
-| `eta_log` | correlates scheduling with custom events on one timeline — a failure reads as a narrative, not a decision vector |
-| `eta_observe` | inspects suspended process state; the only safe way for an invariant to read a halted system |
-| `eta_net` | injects message-delivery faults across simulated nodes, plus `nodedown`/`nodeup` and monitor cleanup |
-| `eta_transform` | the `parse_transform` that makes all of it work |
-
-**One documented constraint still shapes the architecture: one simulation per
-VM.** `eta_time` and `eta_log` use named ETS tables, so runs must be serial.
-This is why simulation gets its own ephemeral node (§9.3) rather than sharing
-the workspace — and why that decision survives the branch change intact.
-
-Two pitfalls the docs call out, which become part of the `simulate` tool's
-description verbatim, because a tool's contract belongs in its description:
-**`execute/2` must not block**, and **`check/1` must not call into scheduled
-processes**. Both fail silently, which is exactly the kind of rule a model needs
-told rather than left to infer.
-
-### 9.2 Building the warden under simulation
-
-The warden's job is a list of things that are hard for the same reason: they are
-about *when*, not about *what*.
-
-- A request arrives on vsock; a response must be sent exactly once, with the
-  right `id`, even if the workspace answers after the timeout fired.
-- The workspace dies mid-`erpc`. The pending request must fail, the monitor must
-  be cleaned up, the restart must happen, and the manifest must be replayed **in
-  load order**.
-- Two `define` calls race. The registry must not end up with two modules
-  claiming one tool name.
-- The VM is stopped while a `propose` is streaming a 200 MB patch.
-- A soft-purge refusal (§7.2, step 3) races the process that was holding old
-  code exiting on its own.
-
-Written by hand and tested with ExUnit, every one of these is a `Process.sleep`
-and a hope. Under eta they are ordinary test cases.
-
-**The harness.** `warden_harness` implements the eight callbacks over a warden
-instance plus a *simulated* workspace node:
-
-```erlang
-%% generate/2 draws from this op set:
-{host_request, Id, Op}          %% a tool call arrives on the bridge
-{host_cancel, Id}               %% the user interrupted
-{ws_reply, Id, Result}          %% the workspace answers
-{ws_crash, Reason}              %% it does not
-{ws_slow, Millis}               %% it answers after the deadline
-{net_partition, Duration}       %% eta_net drops distribution traffic
-{define, Module, Source}        %% a hot-load lands mid-flight
-{advance_time, Millis}          %% eta_time jumps to the next deadline
-{vm_stop}                       %% the host pulls the plug
-```
-
-**The invariants** — `check/1` after every step, `check_final/2` once settled:
+The properties the harnesses checked are properties of the control plane, not
+of the simulator, and production comments still cite them by number:
 
 1. Every `id` receives **exactly one** terminal response. Never zero, never two.
-2. No response is delivered as `ok` after its request has been reported as timed
-   out. This is the classic late-reply bug and it is invisible without a
-   controlled clock.
-3. The registry has no duplicate tool names, and every registered name resolves
-   to a loaded module.
+2. No response is delivered as `ok` after its request has been reported as
+   timed out.
+3. The registry has no duplicate tool names, and every registered name
+   resolves to a loaded module.
 4. After a workspace restart, the replayed manifest is order-preserving and
    contains exactly the modules that were loaded before the crash.
-5. No monitor outlives the request that created it. (`eta_observe` reads this
-   directly out of the suspended warden state.)
+5. No monitor outlives the request that created it.
 6. Warden never blocks on the workspace: the bridge remains responsive to a
    `cancel` while an `invoke` is outstanding.
 
-Invariant 6 is the one that justifies the whole architecture, and until eta it
-was an assertion in a design document rather than a property of the code.
+Invariants 1, 2, 4 and 6 are held by the unit suite and the sandbox gate;
+the code that satisfies them did not change when the simulator left.
 
-**Build integration**, corrected by contact. The intended shape was that warden
-modules `use Eta` unconditionally and the macros expand to the stdlib when eta
-is absent. **That does not work, and the reason is worth writing down:** `use Eta`
-requires the `Eta` module to *exist* at compile time, and eta compiles its Elixir
-entry point only in its own `:test` environment (§9.1). A shipping build with no
-eta dependency therefore cannot `use Eta` at all, however cleverly the macros
-inside it are written. The first attempt failed with
-`module Eta is not loaded and could not be found`.
-
-So warden carries a seam of its own — `Warden.Sim`, the Elixir analogue of the
-wrapper header eta's README prescribes for Erlang consumers:
-
-```elixir
-defmacro __using__(_) do
-  if Code.ensure_loaded?(Eta) do
-    quote do: (use Eta; require Eta; alias Eta, as: Sim)
-  else
-    quote do: (require Warden.Sim.Stdlib; alias Warden.Sim.Stdlib, as: Sim)
-  end
-end
-```
-
-Warden writes `Sim.send_after/3`, `Sim.label/1`, `Sim.log/1`. With eta on the
-code path those are eta's; without it they are `Process.send_after/3` and, for
-the observation hooks, nothing at all. **One source tree, two compilations, and
-the shipping image carries no trace of eta** — which is the property §9.5's exit
-depends on.
-
-```elixir
-defp deps(:dst), do: [{:eta, github: "jessestimpson/eta", branch: "elixir",
-                       env: :test, runtime: false}]
-defp deps(_),    do: []
-```
-
-One trap inside the trap: `Sim.*` are **macros**, so the aliased module needs a
-`require`. Without it the calls compile as remote function calls and fail at
-runtime with `Warden.Sim.Stdlib.label/1 is undefined or private`, which is a
-confusing way to be told you forgot a `require`.
-
-`make image` builds the default env. The DST build is a host-side test artefact
-and never reaches `mkimage.sh`. The one exception is §9.3, where the sim node
-deliberately ships DST-built beams.
-
-**And the lint ships with it.** §9.1's third consequence — a raw
-`Process.send_after` silently opting out of determinism — is caught by a compile
-check in the `dst` env that fails on stdlib timing and messaging calls inside any
-module that `use Eta`. Without it, warden's simulation coverage decays quietly
-every time someone writes the obvious thing.
-
-### 9.3 The sim node
-
-`eta_sched` suspends every process in the VM and resumes one at a time.
-`eta_time` replaces the clock. Neither is something to do to a node that is also
-answering a user's tool calls or holding the vsock bridge open.
-
-So `simulate` starts a **fresh, ephemeral node**:
-
-```
-warden_sim:run(Harness, Opts) ─▶ spawn `erl -noinput -sname sim_N`
-                                 with the DST code path and eta on it
-                              ─▶ preload the agent's modules (eta's own
-                                 `preload` option does exactly this)
-                              ─▶ eta_run:run/2 under a wall-clock budget
-                              ─▶ collect outcome + trace, kill the node
-```
-
-Properties that fall out of this, all of them wanted:
-
-- A simulation cannot hang the workspace, and a workspace tool call cannot
-  perturb a simulation. eta's "one simulation per VM" constraint is satisfied
-  per *node*, so it never becomes a global lock on the session.
-- A run that deadlocks or exhausts memory kills one throwaway OS process.
-- The sim node's code path is DST-built; the workspace's is not. The agent's
-  module is compiled twice, once for each — and the fact that instrumentation is
-  a compile-time transform is what makes that honest rather than a different
-  program.
-- Concurrent `simulate` calls are serialised by warden with a queue depth of
-  one and a stated wait, because a session at 128K context is already the only
-  thing running (§4.3) and a second simulator competing for the guest's two
-  cores helps nobody.
-
-The image carries eta plus the DST-built beams under `/opt/sim/lib`, reachable
-only by a sim node's `ERL_LIBS` — a few megabytes on top of §6.2's budget, and
-the only reason a testing framework ships in a production artefact anywhere in
-this design. The build prints both, so the separation is visible rather than
-asserted:
-
-```
-prod build carries: warden
-sim node carries:   eta warden
-```
-
-### 9.4 `simulate` and `replay` — handing DST to the model
-
-This is the part that is genuinely new, and it is worth being precise about what
-it does and does not claim.
-
-**The claim.** An agent that writes concurrent code into a node it depends on
-should be able to answer "is this correct?" with evidence rather than with
-confidence. Deterministic simulation is the only technique that answers that
-question for concurrency in bounded time, and eta makes it a function call.
-
-**The flow.**
-
-```
-define(source: "-module(build_queue). ...")            % compile only, no load
-  ↳ "compiled. exports start_link/1, submit/2. spawns processes —
-     consider simulate/2 before loading."
-
-define(source: "-module(build_queue_harness). ...")    % the eta harness
-  ↳ "compiled. implements eta_harness."
-
-simulate(harness: "build_queue_harness", seed: 7, max_ops: 25)
-  ↳ VIOLATION after 3 ops (shrunk from 21):
-      1. submit(job_a)      [pid<0.312.0> queue]
-      2. worker crashes     [pid<0.315.0> worker_1]
-      3. submit(job_b)      -> job_a never re-queued
-    invariant: every submitted job reaches done or failed
-    trace: t_7f3a  (replay with replay/1)
-
-define(source: "-module(build_queue). ... % monitor workers")
-replay(trace: "t_7f3a")
-  ↳ PASS. 3 ops, same schedule, invariant held.
-
-define(source: "...", verify: "build_queue_harness")   % now load it
-  ↳ simulated 25 ops across 12 seeds, 0 violations. loaded and registered.
-```
-
-The two things that make this useful rather than noisy:
-
-- **Shrinking is not optional.** A raw failing trace is thousands of scheduling
-  decisions and would consume the context window to no purpose. Warden runs
-  `eta_shrink:shrink/3` automatically on any violation and returns **only** the
-  minimised trace, rendered through `eta_log` as the narrative above. The model
-  sees three steps, not twenty thousand.
-- **`replay` is the verification story.** A concurrency fix normally cannot be
-  verified — you re-run and it does not fail, which proves nothing. Here the
-  exact failing schedule is a stored artefact, so "I fixed it" becomes a
-  checkable claim. Traces are persisted host-side under
-  `sessions/<uuid>/traces/`, survive parking and VM restarts, and are shown in
-  the inspector.
-
-**Where it will disappoint, stated now.** The model has to write an
-`eta_harness`, and a harness is a small formal specification: an op generator
-and an invariant. Models are markedly better at writing implementations than at
-writing the invariants that would catch their own mistakes, so the likely failure
-mode is not a broken simulator but a **vacuous harness** — one whose `check/1`
-returns `ok` unconditionally, or whose `generate/2` never produces the
-interleaving that matters. Three mitigations, in order of confidence:
-
-1. Ship **harness templates** in the guest for the shapes an agent actually
-   writes — a queue, a supervised worker pool, a cache with TTL, a retry loop.
-   `simulate` names the closest template in its result when no harness is given.
-2. Warden **rejects a vacuous harness**: if `check/1` never inspects state, or
-   if a control run against a deliberately broken reference module fails to
-   produce a violation, the harness is reported as not discriminating. A harness
-   that cannot fail is worse than no harness because it produces a green result.
-3. Report **coverage honestly**: ops executed, distinct schedules explored,
-   seeds tried. `0 violations in 12 seeds` is a much weaker and much more useful
-   statement than `PASS`.
-4. **Detect uninstrumented calls and say so.** This is the agent-facing form of
-   §9.1's third consequence, and it is the one most likely to bite. A model
-   writing Elixir will reach for `Process.send_after/3`, not `Eta.send_after/3`,
-   and the resulting run is partly real-time and wholly misreported. So warden
-   scans the module under test for stdlib timing and messaging calls before
-   simulating, and the result leads with them:
-
-   ```
-   simulate(harness: "build_queue_harness")
-     ↳ 2 calls outside the simulation:
-         build_queue.ex:14  Process.send_after/3  → use Eta.send_after/3
-         build_queue.ex:31  GenServer.call/3      → use Eta.call/3
-       these run in real time and are NOT explored by the scheduler.
-       0 violations in 12 seeds — but coverage is partial.
-   ```
-
-   The `define` tool's description states the macro requirement up front, and
-   the harness templates use the macros throughout, because the most reliable
-   way to get a model to write `Eta.send_after/3` is to show it in the template
-   it is copying.
-
-**This is measured, not assumed.** M4's gate (§11) covers it: does the agent,
-given these tools, actually catch a planted concurrency bug in code it wrote?
-eta's own repository ships a two-phase-commit example with a planted bug and a
-leader-election example with time-dependent correctness — those are the fixtures,
-and they are a fair test precisely because they were not written for this.
-
-**And it is optional, always.** `simulate` is a tool the model may call, not a
-gate it must pass, except when the model itself passes `verify:`. An agent that
-wants to hot-load a two-line pure function should not have to write a harness,
-and a design that made it do so would simply be worked around.
-
-#### Determinism has a precondition, and it is that the code is already loaded
-
-The DST suite was **flaky: 12 failures in 30 runs**, on a hard-coded `1..64`
-seed range. It reported a real-looking violation — `{:unanswered, [...]}`, ids
-that never got a response — which is exactly what a genuine bridge defect would
-look like. It was not one.
-
-The shape of the failures gave it away. Always **exactly one** seed, always one
-of the **first three**, and each seed failed *identically* when it failed. So the
-seeds were individually deterministic; what varied was which one was unlucky.
-Running a single seed twelve times in one process settled it:
-
-```
-SEQ seed1: 1:unanswered/11  2:ok  3:ok  4:ok  5:ok  6:ok  7:ok  8:ok  9:ok  10:ok
-```
-
-Only the **first `:eta_run.run` in a process** differs. Diffing `:code.all_loaded()`
-across the first two runs says why: **165 modules load during run 1, zero during
-run 2** — warden's, eta's own, parts of Elixir, and a good deal of OTP.
-
-A module load is a blocking call into `code_server`, a process the scheduler does
-not control and cannot interleave. A scheduled process that touches an unloaded
-module therefore stops for a reason the seed did not choose, and the interleaving
-diverges from the one the seed selected. **The first run measures the code server;
-only the runs after it measure the system.**
-
-Two fixes, in `test/dst/`:
-
-1. **A warm-up run, discarded**, plus one `inspect/2` call — the `Inspect`
-   protocol's implementations arrive lazily and the bridge reaches for them only
-   on the `bad_reply` path, which a single warm-up seed may not take. Six modules
-   were still landing mid-sweep before that line existed.
-2. **The precondition is asserted rather than assumed.** The sweep snapshots
-   `:code.all_loaded()` before and after and fails, *naming the modules*, if any
-   arrived in between. A seed that ran while a module loaded produced a result —
-   pass or fail — that means nothing, and saying so is better than flaking with a
-   violation that reads as a real defect.
-
-**40 runs, 40 passes** afterwards. And the suite is still discriminating: removing
-the `{:error, msg}` clause from `Bridge.respond/3` — the original bug — is caught
-immediately, with the CaseClauseError named.
-
-Separately, `generate/2` ended with `Enum.random/1` for the `bad_reply` shape.
-That draws from the **process dictionary's** `:rand` state, seeded from real
-entropy, rather than from the state eta threads through the generator. Fixed by
-threading the draw. This was worse than a second source of flakiness: `shrink`
-and `replay` both re-run `generate/2`, so either would have drawn a *different*
-shape than the trace it was trying to reproduce. **A generator that cannot be
-replayed takes the whole point of the framework with it**, and nothing would have
-reported that — the shrink would simply have produced a trace that did not fail.
-
-The general lesson is the one §9.5 should weigh: eta's guarantee is conditional on
-the system being fully loaded and fully instrumented, and neither condition
-announces itself when broken. Both failures here were silent, both produced
-plausible-looking output, and both were found only by asking whether the result
-was reproducible rather than whether it was green.
-
-This bears directly on §7.2. `define` **loads code at runtime, by design** — so any
-simulation running while the agent compiles a module is, for that moment, not
-deterministic. The warm-up trick does not help there, because the load is the
-point. If the model is to trust `simulate` on code it has just written, `define`
-and `simulate` have to be ordered so that no load happens inside a run.
-
-#### Open: most tools will touch the filesystem, and eta cannot see it
-
-The `define` schema now says plainly what the tool is *for* — moving work off
-the token stream, since generation at ~6 tok/s is by far the slowest thing the
-model does. A tool that reads, transforms or checks files under `/work` does in
-one `invoke` what would otherwise cost hundreds of generated tokens and several
-round trips through `read` and `edit`. That is the case worth writing a module
-for; a pure helper used once is cheaper inline with `elixir`.
-
-Which means **the expected tool takes a path and touches the disk, and is not a
-pure function of its arguments** — and that changes the testability profile
-this section assumed. eta gives determinism over *scheduling*: message order,
-timer expiry, process interleaving. It says nothing about the filesystem. A
-harness for a path-taking tool currently has three options, none good:
-
-- run against a real temp tree, which reintroduces exactly the nondeterminism
-  eta exists to remove, and makes a shrunk trace unreplayable;
-- confine the tool to a pure core with I/O at the edges, which is the right
-  advice and which the model will not reliably follow;
-- test nothing but the pure part, which is how a harness ends up vacuous —
-  the failure already seen once in M4, where a harness asserted nothing for its
-  entire first life and only a planted bug revealed it.
-
-So: **eta likely needs a simulated filesystem** — an in-memory tree the sim node
-owns, with `File`/`Path` calls routed through it under simulation and passing
-through untouched in production, in the same shape as `eta_time` and `eta_net`.
-That would make a file-touching tool as replayable as a concurrent one, and
-would let `simulate` shrink a failure involving a missing file, a permission
-error, or a partial write.
-
-Not scoped here, and deliberately not built before the §9.5 review: it is a real
-extension to eta itself, and whether it is worth writing depends on the answer
-to "did DST earn its place", not the other way round. Recorded so the review has
-it. If the answer is that eta goes, this goes with it.
-
-### 9.5 The experiment, and how it ends
-
-eta is **an experiment with a defined exit**, and saying so changes how it is
-integrated rather than how seriously it is taken. Three requirements make the
-exit cheap:
-
-1. **No shipping dependency.** Warden's default build has no `:eta` dep and its
-   macros expand to stdlib calls (§9.2). Removing eta removes a dev dependency
-   and a test directory. The production guest is byte-identical either way.
-2. **No architectural dependency.** The three-node split (§7.3) is justified by
-   isolation and by the bridge staying responsive, both of which hold with no
-   simulator anywhere. Deleting the sim node deletes a node, not a design.
-3. **The tool surface does not shrink.** This one is a trap worth naming: §2.2
-   freezes the tool list because it is the system turn, so **removing
-   `simulate` and `replay` later would change the system turn and re-prefill
-   every session in the application.** They therefore stay in the surface
-   permanently, and if eta goes they return `"deterministic simulation is not
-   available in this build"` — which the model handles the way it handles any
-   other tool result. Withdrawing a tool is more expensive than never shipping
-   it; ship these two knowing that.
-
-**The review is at the end of M4**, against three questions:
-
-| question | how it is answered |
-|---|---|
-| Did DST make warden materially better? | Count the invariant violations §9.2's harnesses caught that a conventional test suite would have missed. Zero is a real answer and it means eta was not worth it for warden. |
-| Can the model use it? | M4 gate (b): does the agent catch a planted concurrency bug given `define` + `simulate` + `replay`? |
-| Is the `elixir` branch holding up? | Bugs hit, time lost, how much of warden had to be shaped around best-effort support. |
-
-Four outcomes, all of them acceptable:
-
-- **Keep both.** The intended result.
-- **Keep it for warden, drop it for the agent.** Likely if the model cannot write
-  a discriminating harness. `simulate` degrades to a warden-authored harness
-  library the agent selects from — and `replay` keeps its value regardless, since
-  a stored failing schedule is useful even when the model did not write the spec
-  that found it.
-- **Move warden to Erlang and `main`.** If the `elixir` branch costs more than it
-  saves. The node topology is unchanged; workspace stays Elixir; §9.2's harnesses
-  port with the language.
-- **Rip it out.** Warden keeps its stdlib-expanded macros, the sim node goes, the
-  two tools stay and report unavailable, and this section becomes a record of
-  what was tried. That is a normal outcome for an experiment and it costs a
-  build flag.
+What the experiment did leave behind in the design: no `receive ... after`
+anywhere in warden (deadlines are `Process.send_after` matched by message
+identity, which is simply a better shape), the workspace crash-replay story
+(invariant 4), and the bridge's never-block rule (invariant 6) — all of which
+predated eta as intentions and were made precise by having to be checked.
 
 ## 10. Correctness
 
