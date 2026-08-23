@@ -234,7 +234,7 @@ read-only share.
    and the first boot of a new set shows "provisioning" during the fetch.
 
 **Failure is named, never fatal.** An unknown package is reported at session
-open by name ("no Alpine package `gcc-13`; `skills`-era spelling is `gcc`"),
+open by name ("no Alpine package `gcc-13` — did you mean `gcc`?"),
 and the session boots without it. A network failure during fetch degrades the
 same way: the session runs on the golden image, the note says which packages
 are missing and why.
