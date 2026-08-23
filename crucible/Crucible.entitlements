@@ -14,5 +14,13 @@
     <true/>
     <key>com.apple.security.files.bookmarks.app-scope</key>
     <true/>
+    <!-- Outgoing connections only, for the HOST's own egress: fetch (spec
+         8.3) and delegate (spec 15), both policy-gated in the app.  The
+         GUEST still has no network device; com.apple.vm.networking stays
+         deliberately absent, so even a misconfigured VM cannot get one.
+         Without this entitlement a sandboxed connection fails with the
+         misleading "hostname could not be found". -->
+    <key>com.apple.security.network.client</key>
+    <true/>
 </dict>
 </plist>

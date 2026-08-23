@@ -7,6 +7,7 @@
 <key>com.apple.security.virtualization</key>           <true/>
 <key>com.apple.security.files.user-selected.read-write</key> <true/>
 <key>com.apple.security.files.bookmarks.app-scope</key> <true/>
+<key>com.apple.security.network.client</key>            <true/>
 ```
 
 Notes that matter:
@@ -14,10 +15,15 @@ Notes that matter:
 - `com.apple.security.virtualization` is required and is available with an
   ordinary Developer ID — it is **not** one of the restricted entitlements that
   needs a request to Apple.
+- `com.apple.security.network.client` is outgoing-only and exists for the
+  HOST's own egress — `fetch` (§8.3) and `delegate` (§15), both policy-gated
+  in the app. It grants the guest nothing: the VM has no network device to
+  use it with. Without it, a sandboxed connection fails with the misleading
+  "a server with the specified hostname could not be found".
 - `com.apple.vm.networking` **is** restricted and needs Apple's approval. We do
   not want it: bridged networking is exactly the capability this design is built
-  to withhold. NAT (`VZNATNetworkDeviceAttachment`) needs no special entitlement
-  if §8.3's escape hatch is ever enabled.
+  to withhold, and its absence means even a misconfigured VM cannot acquire a
+  bridged device.
 - **App Sandbox plus Virtualization plus a 16 GB mmap is the combination to
   prove first.** It is a Milestone 1 gate (§12), not a Milestone 6 discovery.
   If App Sandbox turns out to fight the guest disk or the virtiofs share,
