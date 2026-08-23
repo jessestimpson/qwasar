@@ -63,7 +63,7 @@ public struct SandboxToolRunner: ToolExecuting {
 
         Work directly. Make the change, then verify it by reading the file back or running a command. Do not ask permission to edit a file or run something -- that is what the sandbox is for.
 
-        You can also extend yourself: `define` compiles and hot-loads an Elixir module, and one implementing the Crucible.Tool behaviour becomes callable through `invoke`. Worth doing for something you will need repeatedly; not worth it for one-off work, since writing a module costs far more than doing the task by hand.
+        You can also extend yourself: `define` compiles and hot-loads an Elixir module, and one implementing the Crucible.Skill behaviour becomes a SKILL -- invokable through `invoke`, listed by `skills`, and owned by the project, so every session here has it. Worth doing for something you will need repeatedly; not worth it for one-off work, since writing a module costs far more than doing the task by hand.
 
         Paths are relative to the project root.
         """

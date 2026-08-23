@@ -21,7 +21,7 @@ What a spec needs is the map: what exists, and what is next.
 | — | sandbox configuration in three layers + the config project (§8.5) |
 | — | delegation E1+E2: budgeted, embedded, steerable; the remote agent drives the sandbox by proxy; one feature under one name, user- or model-initiated (§15) |
 | — | session parking: boundary autosave, Park, verified warm/cold indicators (§4.4) |
-| — | the project tool library: defines captured host-side, replayed into every sibling session's guest (§7.3) |
+| — | the project SKILL library: defines captured host-side, replayed into every sibling session's guest; skills named apart from tools everywhere (§7.2, §7.3) |
 
 ## Next
 

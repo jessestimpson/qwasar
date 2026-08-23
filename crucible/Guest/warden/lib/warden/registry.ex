@@ -9,7 +9,7 @@ defmodule Warden.Registry do
 
   Two invariants it exists to hold (spec 10, invariants 3 and 4):
 
-    * **No two modules claim the same tool name.** A second `define` for an
+    * **No two modules claim the same skill name.** A second `define` for an
       existing name replaces it and bumps a version; two *different* modules
       claiming one name is refused, because `invoke` would then be ambiguous and
       the model would have no way to say which it meant.
@@ -59,7 +59,7 @@ defmodule Warden.Registry do
       {other, _} ->
         {:reply,
          {:error,
-          "the tool name #{inspect(entry.tool_name)} is already claimed by #{other}. " <>
+          "the skill name #{inspect(entry.tool_name)} is already claimed by #{other}. " <>
             "Two modules cannot answer to one name; rename one of them."}, state}
 
       nil ->

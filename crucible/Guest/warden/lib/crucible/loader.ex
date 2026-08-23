@@ -99,7 +99,7 @@ defmodule Crucible.Loader do
       |> Keyword.get_values(:behaviour)
       |> List.flatten()
 
-    tool? = Crucible.Tool in behaviours and function_exported?(mod, :name, 0)
+    tool? = Crucible.Skill in behaviours and function_exported?(mod, :name, 0)
 
     %{
       module: inspect(mod),

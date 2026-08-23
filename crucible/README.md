@@ -10,9 +10,10 @@ Two things make it different, and they come from the same idea:
 * **The engine is in-process.** `qwasar_session_eval` is called from the app's
   own address space — no serialisation boundary, and no reason to throw away a
   session's KV cache and recurrent state between turns.
-* **The tools live in a VM, and the model owns them.** The fixed tool set is
-  ten calls wide and one of them is `invoke`; everything else the model
-  needs, it writes in Elixir, hot-loads into a live node, and calls. The blast
+* **The tools live in a VM, and the model grows its own.** The fixed tool
+  set is ten calls wide, and one of them is `invoke`: everything else the
+  model needs, it writes in Elixir as a **skill** — hot-loaded into a live
+  node, owned by the project, replayed into every sibling session. The blast
   radius of that freedom is one virtual machine with no network device.
 
 The design lives in [the spec](spec/README.md), one topic per file; the measurements that shaped it are in the git history.

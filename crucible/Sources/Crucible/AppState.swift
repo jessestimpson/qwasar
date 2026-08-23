@@ -719,7 +719,7 @@ final class AppState {
                             // The project's tools, into this guest (spec
                             // 7.2): what one session defined, every sibling
                             // has from its first token.
-                            await replayToolLibrary(p, channel: ready.channel)
+                            await replaySkillLibrary(p, channel: ready.channel)
                         } catch {
                             sandboxStatus = "read-only — the sandbox did not start"
                         }
@@ -827,7 +827,7 @@ final class AppState {
 
     func interrupt() { cancelFlag.set() }
 
-    // MARK: The project tool library (spec 7.2)
+    // MARK: The project skill library (spec 7.2)
 
     /// A successful define becomes project property: source keyed by module,
     /// replayed into every sibling session's guest at open. Helper modules
@@ -839,37 +839,37 @@ final class AppState {
         guard let colon = first.firstIndex(of: ":"), first.contains("exports") else { return }
         let module = String(first[..<colon])
         var toolName: String?
-        if let r = result.range(of: #"registered as the tool \"([^\"]+)\""#,
+        if let r = result.range(of: #"registered as the skill \"([^\"]+)\""#,
                                 options: .regularExpression) {
             toolName = String(result[r]).split(separator: "\"").dropFirst().first.map(String.init)
         }
         guard let rec = selectedSession,
               let i = projects.firstIndex(where: { $0.id == rec.projectID }),
               !projects[i].isConfig else { return }
-        projects[i].recordDefine(module: module, toolName: toolName, source: source)
+        projects[i].recordDefine(module: module, skillName: toolName, source: source)
         store?.saveProjects(projects)
     }
 
     /// Replays the project's library into a freshly booted guest, in
     /// definition order. Failures are noted, not fatal: a module that no
     /// longer compiles should not hold the session hostage.
-    private func replayToolLibrary(_ p: Project, channel: VsockChannel) async {
-        guard let lib = p.toolLibrary, !lib.isEmpty else { return }
+    private func replaySkillLibrary(_ p: Project, channel: VsockChannel) async {
+        guard let lib = p.skillLibrary, !lib.isEmpty else { return }
         var loaded = 0, failed = 0
-        for tool in lib {
+        for skill in lib {
             do {
                 let r = try await channel.send(op: "define",
-                                               args: ["source": .string(tool.source),
+                                               args: ["source": .string(skill.source),
                                                       "force": .string("true")],
                                                timeout: 60)
                 if r.ok == true { loaded += 1 } else { failed += 1 }
             } catch { failed += 1 }
         }
         if loaded > 0 {
-            sandboxStatus = (sandboxStatus ?? "") + " · \(loaded) tool\(loaded == 1 ? "" : "s")"
+            sandboxStatus = (sandboxStatus ?? "") + " · \(loaded) skill\(loaded == 1 ? "" : "s")"
         }
         if failed > 0 {
-            engineNote = "\(failed) library module\(failed == 1 ? "" : "s") failed to reload; define again to update"
+            engineNote = "\(failed) skill\(failed == 1 ? "" : "s") failed to reload; define again to update"
         }
     }
 

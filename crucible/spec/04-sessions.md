@@ -21,7 +21,7 @@ struct SessionRecord: Codable, Identifiable {
     var state: SessionState        // .live, .parked, .rebuilding, .archived
     var tokens: [Int32]            // FULL history — 4 bytes/token, see §4.4
     var transcript: [TranscriptItem]
-    // agent-defined modules live on the PROJECT (toolLibrary, §7.3)
+    // skills live on the PROJECT (skillLibrary, §7.3)
     var pendingPatch: PatchProposal?
 
     // Compaction chain (§2.4). A successor inherits the sandbox, not the context.

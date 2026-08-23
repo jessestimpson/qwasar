@@ -325,7 +325,7 @@ enum SandboxGate {
         // sequence, and in a plain multiline literal it is a compile error.
         let source = #"""
         defmodule WordCount do
-          @behaviour Crucible.Tool
+          @behaviour Crucible.Skill
           def name, do: "wordcount"
           def schema, do: %{"description" => "counts words in a file under /work",
                             "args" => ["path"]}
@@ -348,8 +348,8 @@ enum SandboxGate {
         check("define", d.ok == true && (d.result ?? "").contains("wordcount"),
               (d.result ?? d.error ?? "?").split(separator: "\n").first.map(String.init) ?? "?")
 
-        let t = try await channel.send(op: "tools", timeout: 15)
-        check("tools", (t.result ?? "").contains("wordcount"), t.result ?? t.error ?? "?")
+        let t = try await channel.send(op: "skills", timeout: 15)
+        check("skills", (t.result ?? "").contains("wordcount"), t.result ?? t.error ?? "?")
 
         let i = try await channel.send(op: "invoke",
                                        args: ["name": .string("wordcount"),
@@ -361,7 +361,7 @@ enum SandboxGate {
         // Two modules cannot answer to one name.
         let clash = try await channel.send(op: "define", args: ["source": .string(#"""
         defmodule OtherCounter do
-          @behaviour Crucible.Tool
+          @behaviour Crucible.Skill
           def name, do: "wordcount"
           def run(_), do: {:ok, "nope"}
         end

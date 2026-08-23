@@ -121,8 +121,8 @@ defmodule Warden.Define do
 
         base =
           if d.tool,
-            do: base <> "\n  registered as the tool #{inspect(d.tool_name)} — call it with invoke",
-            else: base <> "\n  not a Crucible.Tool, so it is loaded but not callable through invoke"
+            do: base <> "\n  registered as the skill #{inspect(d.tool_name)} — call it with invoke",
+            else: base <> "\n  not a Crucible.Skill, so it is loaded but not invokable — kept as a helper"
 
         # PLAN.md 7.2 step 4: concurrent code is where a green result means
         # least, so say so where the model will see it.

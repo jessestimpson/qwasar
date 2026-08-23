@@ -18,7 +18,7 @@ for one.
 | `shell(command)` | guest `/work` | unconfirmed; no network, no host |
 | `elixir(code)` | guest workspace node | evaluate, with a persistent binding |
 | `define(source)` | guest workspace node | compile + hot-load a module (§7.2) |
-| `tools()` | guest warden | the current registry of agent-defined tools |
+| `skills()` | guest warden | the registry of SKILLS — capabilities the agent wrote, as distinct from these fixed tools |
 | `invoke(name, args)` | guest workspace node | call one of them (§7.3) |
 
 Six of these are the C agent's own tools with their descriptions kept nearly
@@ -30,12 +30,21 @@ The last four are the new idea, and they are where all the leverage is: they
 let the agent change what it can do, and find out whether the change is
 correct **before** it commits to it.
 
-### 7.2 `define` — compiling into a live node
+### 7.2 `define` — compiling a SKILL into a live node
+
+**The vocabulary, deliberate:** the ten in-context schemas are *tools* —
+given, fixed, selected by the model from its list. What `define` produces is
+a **skill** — made, open-ended, reached through `invoke`, owned by the
+project. Overloading "tool" for both confused the model and the user alike
+about which list a thing lived on; the two words now carry the distinction
+everywhere: schemas, briefings, ops (`skills`), the behaviour
+(`Crucible.Skill`), the library. Pre-release, so no legacy aliases survive.
+
 
 ```
 define(source: """
   defmodule ASTGrep do
-    @behaviour Crucible.Tool
+    @behaviour Crucible.Skill
     def name, do: "grep_ast"
     def schema, do: %{...}
     def run(%{"pattern" => p}), do: ...
@@ -65,7 +74,7 @@ What happens, in order, all inside the guest:
    loads green has proven nothing about it.
 5. **Load.** `:code.load_binary(mod, ~c"crucible://#{name}.ex", bin)` on the
    workspace node.
-6. **Register.** If the module implements `Crucible.Tool`, warden adds it to the
+6. **Register.** If the module implements `Crucible.Skill`, warden adds it to the
    registry: name, schema, source, load timestamp, version counter.
 7. **Report.** The tool result names the module, the functions it exports, and
    whether it registered as a tool. The host also emits a *module load* card
@@ -77,7 +86,7 @@ What happens, in order, all inside the guest:
 
 ```
 warden  (Elixir, :warden@guest)      workspace (Elixir, :workspace@guest)
-  Warden.Bridge    vsock port          Crucible.Tool  (behaviour)
+  Warden.Bridge    vsock port          Crucible.Skill (behaviour)
   Warden.Registry  tool manifest       Crucible.Shell (eval binding)
   Warden.Fs        /work primitives    Crucible.Fs    (the six file tools)
   Warden.Workspace spawn / monitor     ...every module the agent writes
@@ -110,10 +119,10 @@ So:
   N modules were reloaded; process state was lost.* The agent is told the truth
   and can recover. That sentence is a promise, and the unit suite plus the
   sandbox gate are how it is kept (§10 lists the invariants).
-- **The library is the durable artefact, and it belongs to the PROJECT.**
+- **The skill library is the durable artefact, and it belongs to the PROJECT.**
   The host captures every successful `define` from its own event stream --
   the call carries the source, the result names the module -- and stores it
-  as `Project.toolLibrary`: source keyed by module, first-definition order
+  as `Project.skillLibrary`: source keyed by module, first-definition order
   preserved (later modules may reference earlier ones), helper modules kept
   for the warden's own reason. At every session open, the library replays
   into the freshly booted guest before the first token, so a tool written

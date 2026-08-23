@@ -49,11 +49,11 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
     public var networkAllowlist: [String]?
     /// This project's layer of sandbox configuration (PLAN.md 8.5).
     public var sandbox: SandboxOverlay?
-    /// The project's tool library (spec 7.2): every module the agent has
+    /// The project's skill library (spec 7.2): every module the agent has
     /// defined, in definition order, replayed into every session's guest at
-    /// open. A tool written once belongs to the project, not to the VM that
+    /// open. A skill written once belongs to the project, not to the VM that
     /// happened to compile it first.
-    public var toolLibrary: [DefinedTool]?
+    public var skillLibrary: [DefinedSkill]?
 
     /// The project layer as resolution sees it: the overlay, with the legacy
     /// network field standing in where the overlay is silent.
@@ -82,22 +82,22 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, rootBookmark, systemPrompt, defaultEffort, networkAllowlist,
-             sandbox, toolLibrary
+             sandbox, skillLibrary
     }
 
     /// Upsert by module, preserving first-definition order -- later modules
     /// may reference earlier ones, and definition order is the only ordering
     /// information there is (the same rule the warden's own replay follows).
-    public mutating func recordDefine(module: String, toolName: String?, source: String) {
-        var lib = toolLibrary ?? []
+    public mutating func recordDefine(module: String, skillName: String?, source: String) {
+        var lib = skillLibrary ?? []
         if let i = lib.firstIndex(where: { $0.module == module }) {
             lib[i].source = source
-            lib[i].toolName = toolName
+            lib[i].skillName = skillName
         } else {
-            lib.append(DefinedTool(module: module, toolName: toolName,
-                                   source: source, definedAt: Date()))
+            lib.append(DefinedSkill(module: module, skillName: skillName,
+                                    source: source, definedAt: Date()))
         }
-        toolLibrary = lib
+        skillLibrary = lib
     }
 
     // MARK: The config project (PLAN.md 8.5)
@@ -143,20 +143,21 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
     ]
 }
 
-/// One agent-defined module (spec 7.2), stored at the PROJECT level so the
-/// work survives the VM that compiled it and reaches every sibling session.
-public struct DefinedTool: Codable, Sendable, Hashable {
+/// One skill (spec 7.2): an agent-defined module, stored at the PROJECT
+/// level so the work survives the VM that compiled it and reaches every
+/// sibling session.
+public struct DefinedSkill: Codable, Sendable, Hashable {
     public var module: String
-    /// The invoke name, when the module registered as a Crucible.Tool; nil
+    /// The invoke name, when the module registered as a Crucible.Skill; nil
     /// for helper modules, which are kept for the same reason the warden's
     /// manifest keeps them -- later modules may depend on them.
-    public var toolName: String?
+    public var skillName: String?
     public var source: String
     public var definedAt: Date
 
-    public init(module: String, toolName: String?, source: String, definedAt: Date) {
+    public init(module: String, skillName: String?, source: String, definedAt: Date) {
         self.module = module
-        self.toolName = toolName
+        self.skillName = skillName
         self.source = source
         self.definedAt = definedAt
     }

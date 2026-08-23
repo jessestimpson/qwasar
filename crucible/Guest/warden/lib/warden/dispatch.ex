@@ -83,10 +83,10 @@ defmodule Warden.Dispatch do
 
   def run(%{"op" => "define"}), do: {:error, "args", "define requires source"}
 
-  def run(%{"op" => "tools"}) do
+  def run(%{"op" => "skills"}) do
     case Warden.Registry.list() do
       [] ->
-        {:ok, "[no tools defined yet — write one with define]"}
+        {:ok, "[no skills defined yet — write one with define]"}
 
       entries ->
         {:ok,
@@ -101,8 +101,8 @@ defmodule Warden.Dispatch do
   def run(%{"op" => "invoke", "args" => %{"name" => name} = args}) do
     case Warden.Registry.lookup(name) do
       nil ->
-        {:error, "unknown_tool",
-         "no tool named #{inspect(name)}. Call tools to see what is defined."}
+        {:error, "unknown_skill",
+         "no skill named #{inspect(name)}. Call skills to see what is defined."}
 
       entry ->
         Warden.Workspace.invoke(entry.module, tool_args(args), 60_000)

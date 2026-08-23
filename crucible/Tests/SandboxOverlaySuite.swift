@@ -69,16 +69,16 @@ enum SandboxOverlaySuite {
         f += TestMain.check(legacy.overlay.networkAllowlist == ["new.dev"],
                             "the overlay wins over the legacy field once set")
 
-        // The tool library (spec 7.2): upsert by module, order preserved.
+        // The skill library (spec 7.2): upsert by module, order preserved.
         var proj = Project(name: "p", rootBookmark: Data())
-        proj.recordDefine(module: "Helper", toolName: nil, source: "v1")
-        proj.recordDefine(module: "Counter", toolName: "count", source: "c1")
-        proj.recordDefine(module: "Helper", toolName: nil, source: "v2")
-        f += TestMain.check(proj.toolLibrary?.map(\.module) == ["Helper", "Counter"],
+        proj.recordDefine(module: "Helper", skillName: nil, source: "v1")
+        proj.recordDefine(module: "Counter", skillName: "count", source: "c1")
+        proj.recordDefine(module: "Helper", skillName: nil, source: "v2")
+        f += TestMain.check(proj.skillLibrary?.map(\.module) == ["Helper", "Counter"],
                             "a redefine keeps its place in definition order")
-        f += TestMain.check(proj.toolLibrary?.first?.source == "v2",
+        f += TestMain.check(proj.skillLibrary?.first?.source == "v2",
                             "and carries the newest source")
-        f += TestMain.check(proj.toolLibrary?.last?.toolName == "count",
+        f += TestMain.check(proj.skillLibrary?.last?.skillName == "count",
                             "the invoke name rides along")
 
         // The config project is what it claims.

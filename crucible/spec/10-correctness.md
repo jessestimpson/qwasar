@@ -53,7 +53,7 @@ message identity, so a late reply is told apart from a timeout by identity
 rather than by racing the clock.
 
 **Guest, workspace.** ExUnit, ordinarily: the six file tools against a fixture
-`/work`, the `Crucible.Tool` behaviour, JSON marshalling, malformed and
+`/work`, the `Crucible.Skill` behaviour, JSON marshalling, malformed and
 oversized frames. This half is logic, not timing, and does not need a simulator.
 
 **`crucible-cli`.** A headless driver that loads the engine, runs one scripted
