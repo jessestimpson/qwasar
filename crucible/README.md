@@ -55,10 +55,12 @@ a prompt injection could encode project contents into request URLs to an
 allowed host. The default is off, and for confidential work it should stay
 off. The reasoning is spec §8.3.
 
-**Status:** milestones 0–5 built and gated, plus markdown rendering with
-syntax highlighting. Not yet built: session parking to explicit checkpoints
-(M6), vision and speculative decoding (M7), and replacing the file-copy
-patch-back with a real git branch you can merge (spec §7.4a).
+**Status:** milestones 0–5 built and gated, plus markdown with syntax
+highlighting, session parking with verified warm/cold indicators, delegation
+(remote sub-agents under a budget), the config project, and project-owned
+skills. Not yet built: `crucible-cli` and the inspector (M6 remainder),
+vision (M7), and the git crossing (spec §7.4a). The full map is
+[spec/12-roadmap.md](spec/12-roadmap.md).
 
 ## Requirements
 
