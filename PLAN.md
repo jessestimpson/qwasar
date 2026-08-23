@@ -1242,25 +1242,81 @@ of it is one tensor:
 | the MTP layer | ~200 MB |
 | `fc [5120, 10240]` | ~26 MB |
 
-**The compact draft head is therefore the next thing to try**, and it is the
-challenge's idea. Restrict the *draft's* `lm_head` to a vocabulary prefix — they
-use rows `[0, 98304)` plus the 26 control tokens at `[248044, 248070)`, which is
-40% of qwasar's 248,320 and lines up exactly with the merges-vocab boundary in
-§1.4, because it is the same tokenizer. It cannot change what the model emits:
-the draft only proposes, the target verifies with the full head, and a token the
-draft cannot reach is simply rejected. So the only thing at risk is the
-acceptance rate, and the only question is empirical.
+### The compact draft head — done, and the cut is measured
 
-Their measurement of the cut below that is worth having before trying a smaller
-one: halving again to 49,152 **regressed**, because three committed argmax ids
-lived above the cut — acceptance 1.00 → 0.877, 21.1 → 22.8 ms/token. The trim
-is not free just because it is safe.
+The draft's `lm_head` now scores two runs of rows instead of all 248,320: the
+prefix `[0, QW_DRAFT_PREFIX)` and the tail from the first added special token
+(`QW_DRAFT_TAIL_LO`, 248,044 — verified against the real tokenizer by
+`tests/test_select`, which also confirms all 33 specials sit at or above it).
+No copy and no repack: a 4-bit affine row is a fixed stride, so a run of rows is
+three offsets and a smaller `n`. The selection kernel maps a compact row back to
+a token id on the device, so the chained gather still reads a real id.
 
-Expected here: 715 MB → 283 MB takes the draft step from ~10 ms to ~5.5 ms, so
-drafting falls ~45%. At the adaptive depth that is ~10% of decode, so ~4-5% end
-to end — larger than anything in the scheduling direction, and worth measuring
-on a cold machine, because thermal drift on this one reached 23% across eight
-consecutive runs of the same binary and swamps everything smaller.
+The prefix is a build-time override, because the right cut is empirical.
+Palindromic sweep, 160 tokens of prose, paired so drift cancels:
+
+| prefix | decode | drafting | tokens/round |
+| --- | ---: | ---: | ---: |
+| full 248,320 | 15.91 s | 1.5 s | 2.33 |
+| **98,304** | **15.50 s** | **0.8 s** | **2.33** |
+| 49,152 | 15.84 s | 0.7 s | 2.30 |
+| 24,576 | 16.13 s | 0.6 s | 2.33 at depth 2.17 |
+
+98,304 halves drafting for no acceptance cost at all: **2.6% end to end**. Below
+it the trade inverts — 49,152 drafts more cheaply and still loses, because
+acceptance falls to 2.30, and 24,576 is worse than not trimming at all: drafting
+is cheapest there and the adaptive controller answers the worse proposals by
+drafting deeper (2.17 against 2.04), which costs more than the saving.
+
+**This reproduces the challenge's own negative result independently.** They
+measured 49,152 regressing on the same tokenizer for the same reason. Two
+different implementations landing on 98,304 is worth more than either alone.
+
+### The decode rate excluded drafting
+
+Found while chasing why halving `t_draft` moved the reported decode time not at
+all: it could not, because `t_decode` never contained `t_draft`. The CLI timed
+the verify and the plain-eval path into the headline rate and left the draft
+call out of it.
+
+So every published speculative figure was the cost of speculation *if proposals
+were free* — flattering exactly the configuration being measured, and by more
+the deeper it drafts, while the serial control it was compared against had no
+excluded time at all. Fixed: drafting is decode time and is counted as such,
+with `t_draft` kept as the breakdown.
+
+**The ratios in README's MTP section predate this and are not comparable.** They
+were re-measured rather than adjusted.
+
+### The depth table was wrong in both directions, and re-measuring it paid
+
+`QW_DEPTH_COST` was calibrated through the same broken timer, which understated
+every depth, while the full-vocabulary head overstated them. The errors did not
+cancel. Re-measured with each depth bracketed by its own serial control:
+
+| depth | was | measured |
+| --- | ---: | ---: |
+| 1 | 1.39 | 1.32 |
+| 2 | 1.58 | **1.40** |
+| 3 | 1.91 | **1.56** |
+| 4 | 2.60, extrapolated | **3.08, measured** |
+
+The marginal drafts at 2 and 3 are far cheaper than the table claimed, so the
+rule had been **declining depth it should have taken**. With the real numbers it
+settles at mean depth 2.71 instead of 2.04 and takes 2.59 tokens a round instead
+of 2.33 — about **5% on prose**, on top of the compact head's 2.6%, and it came
+from fixing a measurement rather than writing any kernel.
+
+Depth 4 is now measured rather than guessed, and the cliff is worse than the
+extrapolation assumed: 1.56 → 3.08, a doubling for one more token, where the
+verify needs a second batched-matvec block. `QW_DEPTH_MEASURED` stays at 3 — but
+on evidence now, not on caution.
+
+**The general lesson is the one worth keeping.** Two of the three wins in this
+round were measurement errors, not missing code: a timer that excluded the cost
+of the thing being measured, and a calibration table left behind by the kernels
+it described. The compact head was worth 2.6%; believing the instruments was
+worth more.
 
 ### Batched matvec width is a register cliff, not a work curve
 

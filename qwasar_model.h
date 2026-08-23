@@ -13,9 +13,40 @@
 
 #define QW_MAX_LAYERS      128
 #define QW_MAX_VIS_BLOCKS   64
-#define QW_MAX_VIS_BLOCKS   64
 #define QW_MAX_SHARDS       16
 #define QW_MAX_DIMS          6
+
+/* ---- the draft head's vocabulary -------------------------------------------
+ *
+ * The MTP head's lm_head is the largest single read in a draft step: 715 MB of
+ * the ~950 MB one costs, three quarters of it, and drafting is otherwise
+ * already at about 80% of bandwidth (PLAN.md section 5).  The draft scores only
+ * part of the vocabulary, which cuts that read proportionally.
+ *
+ * This cannot change what the model emits.  The draft only PROPOSES; every
+ * proposal is checked against the full head by the verify, so a token the draft
+ * can no longer reach is not mis-emitted -- it is rejected, and the round still
+ * advances by the target's own answer.  The exactness surface is untouched, and
+ * the only thing at risk is the acceptance rate.
+ *
+ * Two runs of rows are kept.  The prefix is a BPE-rank cut, which works because
+ * a byte-level BPE vocabulary is ordered by merge priority and therefore
+ * roughly by frequency.  The tail is every added special token -- 276 rows, too
+ * cheap to be worth trimming, and losing the ability to propose an end-of-turn
+ * marker would cost a rejection at every turn boundary.
+ *
+ * QW_DRAFT_TAIL_LO is the first added special token id.  The graph cannot reach
+ * the tokenizer, so it is a constant; tests/test_select checks it against the
+ * real one rather than trusting it.
+ *
+ * The prefix is overridable at build time (-DQW_DRAFT_PREFIX=n) because the
+ * right cut is an empirical question and the sweep has to be repeatable.  A
+ * value at or above the vocabulary disables the trim and scores everything,
+ * which is how the baseline is built. */
+#ifndef QW_DRAFT_PREFIX
+#define QW_DRAFT_PREFIX   98304
+#endif
+#define QW_DRAFT_TAIL_LO  248044
 
 
 typedef enum {

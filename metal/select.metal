@@ -32,7 +32,17 @@ struct qw_sel_args {
     uint rows;
     uint tiles;
     uint write_token;   /* also publish the winning id as an int32 token */
+    /* Compact-vocabulary mapping, for a head that scored only a prefix of the
+     * rows plus a tail.  Row i below `prefix` is token i; at or above it, the
+     * rows are the run starting at `tail_base`.  Zero for both is the identity,
+     * so a full-vocabulary call needs no special case. */
+    uint prefix;
+    uint tail_base;
 };
+
+static inline uint qw_sel_token(uint bi, uint prefix, uint tail_base) {
+    return bi < prefix ? bi : tail_base + (bi - prefix);
+}
 
 /* The identity: an empty range.  `sv <= bv` holds for every state built from
  * this one, which the equal-maxima branch below relies on. */
@@ -162,6 +172,7 @@ kernel void qw_argmax_top2_final(
          * -inf, which a matvec output is not; it keeps the two exactly equal
          * anyway rather than leaving a case to reason about later. */
         c.sv = max(c.sv, -3.0e38f);
+        c.bi = qw_sel_token(c.bi, a.prefix, a.tail_base);
         out[tgid] = c;
         /* Publishing the id straight into the token buffer is what lets a
          * whole draft block be one command buffer: the next step's embedding

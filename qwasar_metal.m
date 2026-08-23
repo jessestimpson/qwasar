@@ -869,10 +869,11 @@ void qw_op_swiglu(qw_cmd c, qw_ref y, qw_ref gate, qw_ref up, int32_t n) {
    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
-typedef struct { uint32_t n, rows, tiles, write_token; } qw_sel_args;
+typedef struct { uint32_t n, rows, tiles, write_token, prefix, tail_base; } qw_sel_args;
 
 void qw_op_argmax_top2(qw_cmd c, qw_ref out, qw_ref scratch, qw_ref logits,
-                       int32_t n, int32_t rows, qw_ref token_out) {
+                       int32_t n, int32_t rows, qw_ref token_out,
+                       int32_t prefix, int32_t tail_base) {
     if (!c || !c->enc) return;
     id<MTLComputePipelineState> p1 = qw_pipeline(@"qw_argmax_top2_partial");
     id<MTLComputePipelineState> p2 = qw_pipeline(@"qw_argmax_top2_final");
@@ -880,7 +881,8 @@ void qw_op_argmax_top2(qw_cmd c, qw_ref out, qw_ref scratch, qw_ref logits,
 
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
     qw_sel_args args = { (uint32_t)n, (uint32_t)rows, (uint32_t)QW_SEL_TILES,
-                         token_out.buf ? 1u : 0u };
+                         token_out.buf ? 1u : 0u,
+                         (uint32_t)prefix, (uint32_t)tail_base };
 
     [enc setComputePipelineState:p1];
     qw_set(enc, logits, 0);

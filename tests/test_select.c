@@ -16,6 +16,7 @@
 
 #include "qwasar.h"
 #include "qwasar_gpu.h"
+#include "qwasar_model.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -80,7 +81,7 @@ static void run_case_ex(const char *what, const float *logits, int32_t n, int32_
     qw_cmd c = qw_cmd_begin();
     if (!c) { CHECK(0, "%s: no command buffer", what); return; }
     qw_op_argmax_top2(c, qw_ref_at(out, 0), qw_ref_at(scr, 0), qw_ref_at(lg, 0), n, rows,
-                      publish ? qw_ref_at(tok, 0) : qw_ref_at(NULL, 0));
+                      publish ? qw_ref_at(tok, 0) : qw_ref_at(NULL, 0), 0, 0);
     qw_cmd_wait(c);
     const char *cerr = qw_cmd_error(c);
     CHECK(!cerr, "%s: GPU error: %s", what, cerr ? cerr : "");
@@ -116,6 +117,33 @@ static void run_case_ex(const char *what, const float *logits, int32_t n, int32_
 
 static void run_case(const char *what, const float *logits, int32_t n, int32_t rows) {
     run_case_ex(what, logits, n, rows, 1);
+}
+
+/* Scores `n` compacted rows and checks the winner comes back as a TOKEN id
+ * under the prefix/tail mapping, not as the row it was found at. */
+static void run_mapped(const char *what, const float *logits, int32_t n,
+                       int32_t prefix, int32_t tail_base, int32_t want_token) {
+    qw_buf lg  = qw_buf_alloc((size_t)n * 4);
+    qw_buf out = qw_buf_alloc(sizeof(qw_cand));
+    qw_buf scr = qw_buf_alloc((size_t)QW_SEL_TILES * sizeof(qw_cand));
+    qw_buf tok = qw_buf_alloc(sizeof(int32_t));
+    if (!lg || !out || !scr || !tok) { CHECK(0, "%s: out of memory", what); return; }
+    memcpy(qw_buf_contents(lg), logits, (size_t)n * 4);
+
+    qw_cmd c = qw_cmd_begin();
+    if (!c) { CHECK(0, "%s: no command buffer", what); return; }
+    qw_op_argmax_top2(c, qw_ref_at(out, 0), qw_ref_at(scr, 0), qw_ref_at(lg, 0), n, 1,
+                      qw_ref_at(tok, 0), prefix, tail_base);
+    qw_cmd_wait(c);
+    qw_cmd_free(c);
+
+    const qw_cand *got = qw_buf_contents(out);
+    const int32_t  pub = *(const int32_t *)qw_buf_contents(tok);
+    CHECK((int32_t)got->index == want_token,
+          "%s: mapped index %u, want token %d", what, got->index, want_token);
+    CHECK(pub == want_token, "%s: published %d, want token %d", what, pub, want_token);
+
+    qw_buf_free(lg); qw_buf_free(out); qw_buf_free(scr); qw_buf_free(tok);
 }
 
 /* The tie cases only prove anything if the lowest-index rule can actually be
@@ -206,6 +234,75 @@ int main(void) {
      * and the margin is zero. */
     for (int32_t i = 0; i < vocab; i++) big[i] = -1.5f;
     run_case("all equal", big, vocab, 1);
+
+    /* The compact draft head scores [0, prefix) then the tail run starting at
+     * QW_DRAFT_TAIL_LO, so a winning row has to come back as a token id.  Both
+     * sides of the seam, and the seam itself. */
+    const int32_t tail_n = vocab - QW_DRAFT_TAIL_LO;
+    const int32_t compact = QW_DRAFT_PREFIX + tail_n;
+    struct { int32_t row; int32_t token; const char *what; } maps[] = {
+        { 0,                    0,                     "map first" },
+        { 777,                  777,                   "map in prefix" },
+        { QW_DRAFT_PREFIX - 1,  QW_DRAFT_PREFIX - 1,   "map last of prefix" },
+        { QW_DRAFT_PREFIX,      QW_DRAFT_TAIL_LO,      "map first of tail" },
+        { compact - 1,          vocab - 1,             "map last of tail" },
+    };
+    for (size_t i = 0; i < sizeof maps / sizeof *maps; i++) {
+        fill_random(big, (size_t)compact, (uint32_t)(5000 + i));
+        big[maps[i].row] = 60.0f;
+        run_mapped(maps[i].what, big, compact, QW_DRAFT_PREFIX, QW_DRAFT_TAIL_LO,
+                   maps[i].token);
+    }
+
+    /* The mapping must be the identity when the head scored everything, or the
+     * verify path -- which passes zeroes -- would rewrite its own answers. */
+    fill_random(big, (size_t)vocab, 6001);
+    big[123456] = 60.0f;
+    run_mapped("map identity", big, vocab, 0, 0, 123456);
+
+    /* QW_DRAFT_TAIL_LO is a constant because the graph cannot see the
+     * tokenizer.  Check it against the real one: every added special token must
+     * fall inside the kept tail, and the tail must not overlap the prefix.
+     * Without this the draft could silently lose the ability to propose an
+     * end-of-turn marker, which no output comparison would catch -- it would
+     * only show up as a worse acceptance rate. */
+    const char *model = getenv("QWASAR_TEST_MODEL");
+    if (model) {
+        char terr[512];
+        qwasar_tokenizer *tk = qwasar_tokenizer_load(model, terr, sizeof terr);
+        if (!tk) {
+            fprintf(stderr, "tokenizer: %s\n", terr);
+            fails++;
+        } else {
+            CHECK(QW_DRAFT_TAIL_LO > QW_DRAFT_PREFIX,
+                  "tail overlaps the prefix: %d <= %d", QW_DRAFT_TAIL_LO, QW_DRAFT_PREFIX);
+            /* The head is padded past the tokenizer -- 248,320 rows against
+             * 248,077 tokens -- so the kept tail carries some rows that decode
+             * to nothing.  That is not a new hazard: the target argmaxes over
+             * those same rows today, and a draft proposal is verified anyway.
+             * The direction is what matters, and it is asserted. */
+            CHECK(vocab >= qwasar_tokenizer_size(tk),
+                  "head has %d rows but the tokenizer has %d tokens",
+                  vocab, qwasar_tokenizer_size(tk));
+            int32_t lowest = qwasar_tokenizer_size(tk), n_special = 0;
+            for (int32_t id = 0; id < qwasar_tokenizer_size(tk); id++) {
+                size_t len; bool sp = false;
+                if (!qwasar_token_bytes(tk, id, &len, &sp)) continue;
+                if (!sp) continue;
+                n_special++;
+                if (id < lowest) lowest = id;
+            }
+            CHECK(n_special > 0, "no special tokens found; the check is vacuous");
+            CHECK(lowest >= QW_DRAFT_TAIL_LO,
+                  "special token %d is below QW_DRAFT_TAIL_LO %d, so the draft "
+                  "cannot propose it", lowest, QW_DRAFT_TAIL_LO);
+            printf("  %d special tokens, lowest id %d, tail keeps from %d\n",
+                   n_special, lowest, QW_DRAFT_TAIL_LO);
+            qwasar_tokenizer_free(tk);
+        }
+    } else {
+        printf("  (set QWASAR_TEST_MODEL to check the vocabulary split)\n");
+    }
 
     free(big);
     qw_gpu_shutdown();

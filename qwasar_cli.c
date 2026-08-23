@@ -303,7 +303,9 @@ int main(int argc, char **argv) {
                 double td = now_sec();
                 int32_t got = qwasar_session_draft(s, next, drafts, mtp_depth,
                                                    err, sizeof err);
-                t_draft += now_sec() - td;
+                const double dt = now_sec() - td;
+                t_draft  += dt;
+                t_decode += dt;
                 if (got < 0) { fprintf(stderr, "\nqwasar: %s\n", err); return 1; }
                 n_drafted = got;
                 draft_at = 0;
@@ -334,10 +336,17 @@ int main(int argc, char **argv) {
                 continue;
             }
             depth_sum += want;
+            /* Drafting is decode time.  It was excluded here, which made the
+             * headline rate report what speculation would cost if proposals
+             * were free -- flattering exactly the configuration being measured,
+             * and by more the deeper it drafts.  t_draft stays as the
+             * breakdown; t_decode is the whole of it. */
             double td = now_sec();
             int32_t nd = qwasar_session_draft(s, next, blk + 1, want,
                                               err, sizeof err);
-            t_draft += now_sec() - td;
+            const double dt = now_sec() - td;
+            t_draft  += dt;
+            t_decode += dt;
             if (nd < 0) { fprintf(stderr, "\nqwasar: %s\n", err); return 1; }
 
             double t1 = now_sec();

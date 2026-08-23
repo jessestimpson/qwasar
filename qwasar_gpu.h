@@ -327,8 +327,14 @@ typedef struct { float best, second; uint32_t index, pad; } qw_cand;
  * `token_out`, when it names a buffer, also receives the winning ids as int32
  * [rows].  Pointing it at the token buffer a later dispatch reads is what lets
  * a chain of dependent steps go into one command buffer without the host in
- * between; pass an empty ref when nothing needs that. */
+ * between; pass an empty ref when nothing needs that.
+ *
+ * `prefix` and `tail_base` map row indices back to token ids for a head that
+ * scored only part of the vocabulary: rows below `prefix` are tokens 0..prefix,
+ * and the rest are the run starting at `tail_base`.  Pass 0 for both when the
+ * head scored everything -- that is the identity, not a special case. */
 void qw_op_argmax_top2(qw_cmd c, qw_ref out, qw_ref scratch, qw_ref logits,
-                       int32_t n, int32_t rows, qw_ref token_out);
+                       int32_t n, int32_t rows, qw_ref token_out,
+                       int32_t prefix, int32_t tail_base);
 
 #endif /* QWASAR_GPU_H */

@@ -478,6 +478,21 @@ static void qw_encode_qlinear(qw_cmd c, const qw_qlinear *ql, qw_ref out, qw_ref
                   qw_tensor_ref(ql->biases), ql->in_features, ql->out_features, rows);
 }
 
+/* The same projection over a contiguous run of output rows, writing them at
+ * `out`.  A 4-bit affine row is in_features/2 bytes of nibbles and
+ * in_features/32 bytes each of scales and biases, all row-major, so a run of
+ * rows is just three offsets and a smaller n -- no copy and no repack. */
+static void qw_encode_qlinear_rows(qw_cmd c, const qw_qlinear *ql, qw_ref out, qw_ref in,
+                                   int32_t rows, int32_t row0, int32_t n_rows) {
+    const size_t wstride = (size_t)ql->in_features / 2;
+    const size_t sstride = (size_t)ql->in_features / 32;
+    qw_op_qmat_q4(c, out, in,
+                  qw_ref_offset(qw_tensor_ref(ql->weight), (size_t)row0 * wstride),
+                  qw_ref_offset(qw_tensor_ref(ql->scales), (size_t)row0 * sstride),
+                  qw_ref_offset(qw_tensor_ref(ql->biases), (size_t)row0 * sstride),
+                  ql->in_features, n_rows, rows);
+}
+
 static void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
                                         const qw_layer *L, int32_t li, int32_t rows) {
     const qw_config *cfg = s->cfg;
@@ -832,12 +847,40 @@ static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wa
     if (s->mtp_on && !s->mtp_defer) qw_encode_mtp_upkeep(s, c, rows);
 }
 
+/* ---- compact draft head -----------------------------------------------------
+ *
+ * Why the draft scores only part of the vocabulary, and why that is safe, is in
+ * qwasar_model.h above QW_DRAFT_PREFIX.  What is here is only the mechanics. */
+
+/* How many rows a draft scored, and how to read a winning row as a token id.
+ * Zeroed prefix/tail_base is the identity, which is what a full score wants. */
+typedef struct { int32_t scored, prefix, tail_base; } qw_draft_head;
+
+/* Scores the kept rows into `out`, compacted: [0, prefix) then the tail. */
+static qw_draft_head qw_encode_draft_head(qwasar_session *s, qw_cmd c,
+                                          qw_ref out, qw_ref in) {
+    const qw_qlinear *head  = qwasar_engine_head(s->e);
+    const int32_t     vocab = s->cfg->vocab_size;
+
+    /* A model whose vocabulary does not reach the cut scores all of it. */
+    if (vocab <= QW_DRAFT_PREFIX || QW_DRAFT_TAIL_LO >= vocab) {
+        qw_encode_qlinear(c, head, out, in, 1);
+        return (qw_draft_head){ vocab, 0, 0 };
+    }
+    const int32_t tail = vocab - QW_DRAFT_TAIL_LO;
+    qw_encode_qlinear_rows(c, head, out, in, 1, 0, QW_DRAFT_PREFIX);
+    qw_encode_qlinear_rows(c, head, qw_ref_offset(out, (size_t)QW_DRAFT_PREFIX * 4), in,
+                           1, QW_DRAFT_TAIL_LO, tail);
+    return (qw_draft_head){ QW_DRAFT_PREFIX + tail, QW_DRAFT_PREFIX, QW_DRAFT_TAIL_LO };
+}
+
 /* ---- adaptive draft depth --------------------------------------------------
  *
  * Cost of one round at each depth, in decode steps, measured on this machine
- * over 200 tokens of prose against a paired serial control:
+ * over 200 tokens of prose, each depth bracketed by its own serial control so
+ * that drift cancels per point:
  *
- *   depth 1  1.39      depth 2  1.58      depth 3  1.91
+ *   depth 1  1.32      depth 2  1.40      depth 3  1.56      depth 4  3.08
  *
  * Index 0 is not drafting at all, which is a decode step exactly.  The step
  * from 0 to 1 is much the largest -- turning drafting on switches every
@@ -846,16 +889,26 @@ static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wa
  * not asking for one.  That discontinuity is the whole reason this rule beats a
  * constant.
  *
+ * Re-measured after the compact draft head and after the CLI stopped leaving
+ * drafting out of its decode timer.  The previous numbers (1.39 / 1.58 / 1.91)
+ * were wrong in BOTH directions at once -- the timer understated every depth,
+ * the full-vocabulary head overstated them -- and the errors did not cancel:
+ * the marginal drafts at 2 and 3 are much cheaper than the table claimed, so
+ * the rule had been declining depth it should have taken.
+ *
  * These are properties of the kernels, not of the model, and they have to be
  * re-measured whenever the kernels move.  The comment above QW_QMVB_B says the
  * same thing about the width curve they come from. */
 static const double QW_DEPTH_COST[QWASAR_MAX_DRAFT + 1] = {
-    1.00, 1.39, 1.58, 1.91, 2.60, 2.90, 3.20, 3.50, 3.80
+    1.00, 1.32, 1.40, 1.56, 3.08, 3.35, 3.60, 3.85, 5.35
 };
 
-/* Past depth 3 a verify needs a second batched-matvec block, so the costs above
- * are extrapolated rather than measured and deliberately pessimistic: the rule
- * should need convincing to go there. */
+/* Depth 4 is where a verify needs a second batched-matvec block, and it is now
+ * measured rather than guessed: 1.56 -> 3.08, a doubling for one more token.
+ * That is a cliff, not a slope, so the search still stops at 3 -- reaching past
+ * it would need an acceptance rate this model does not produce.  Depths 5-8 stay
+ * extrapolated and deliberately pessimistic, with a second cliff at 8 where a
+ * third block starts; nothing consults them while the cap is 3. */
 #define QW_DEPTH_MEASURED 3
 
 static void qw_mtp_seed(qwasar_session *s) {
@@ -980,14 +1033,19 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
                              1, cfg->hidden_size, 0, cfg->hidden_size);
         /* Only the last row is a proposal; the ones in front of it are history
          * being caught up, and their outputs go nowhere. */
-        qw_encode_qlinear(c, qwasar_engine_head(s->e), qw_ref_at(s->mtp_logits, 0),
-                          qw_off(s->mtp_out, (size_t)(rows - 1) * cfg->hidden_size), 1);
+        const qw_draft_head dh =
+            qw_encode_draft_head(s, c, qw_ref_at(s->mtp_logits, 0),
+                                 qw_off(s->mtp_out, (size_t)(rows - 1) * cfg->hidden_size));
         /* Result to this step's own slot, so the host can read the whole block
-         * after one wait; token to the slot the NEXT step gathers from. */
-        qw_op_argmax_top2(c, qw_off(s->sel_out, (size_t)n * 4),
-                          qw_off(s->sel_scratch, (size_t)n * QW_SEL_TILES * 4),
-                          qw_ref_at(s->mtp_logits, 0), cfg->vocab_size, 1,
-                          qw_off(s->mtp_tokens, rows0 + n));
+         * after one wait; token to the slot the NEXT step gathers from.  The
+         * mapping turns a compact row back into a token id on the device, so
+         * the chained gather reads a real id. */
+        const size_t cand = sizeof(qw_cand) / 4;   /* qw_off counts 4-byte units */
+        qw_op_argmax_top2(c, qw_off(s->sel_out, (size_t)n * cand),
+                          qw_off(s->sel_scratch, (size_t)n * QW_SEL_TILES * cand),
+                          qw_ref_at(s->mtp_logits, 0), dh.scored, 1,
+                          qw_off(s->mtp_tokens, rows0 + n),
+                          dh.prefix, dh.tail_base);
 
         s->mtp_n_past += rows;
         /* Row 0 was just refilled when there were owed rows, so it still holds
@@ -1083,7 +1141,7 @@ int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n
      * them costs one dispatch over logits the GPU already holds. */
     qw_op_argmax_top2(c, qw_ref_at(s->sel_out, 0), qw_ref_at(s->sel_scratch, 0),
                       qw_ref_at(s->verify_logits, 0), s->cfg->vocab_size, n_block,
-                      qw_ref_at(NULL, 0));
+                      qw_ref_at(NULL, 0), 0, 0);
     qw_cmd_wait(c);
     const char *cerr = qw_cmd_error(c);
     s->n_snap = 0;
