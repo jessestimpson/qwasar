@@ -868,3 +868,36 @@ void qw_op_swiglu(qw_cmd c, qw_ref y, qw_ref gate, qw_ref up, int32_t n) {
     [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
+
+typedef struct { uint32_t n, rows, tiles, write_token; } qw_sel_args;
+
+void qw_op_argmax_top2(qw_cmd c, qw_ref out, qw_ref scratch, qw_ref logits,
+                       int32_t n, int32_t rows, qw_ref token_out) {
+    if (!c || !c->enc) return;
+    id<MTLComputePipelineState> p1 = qw_pipeline(@"qw_argmax_top2_partial");
+    id<MTLComputePipelineState> p2 = qw_pipeline(@"qw_argmax_top2_final");
+    if (!p1 || !p2) return;
+
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    qw_sel_args args = { (uint32_t)n, (uint32_t)rows, (uint32_t)QW_SEL_TILES,
+                         token_out.buf ? 1u : 0u };
+
+    [enc setComputePipelineState:p1];
+    qw_set(enc, logits, 0);
+    qw_set(enc, scratch, 1);
+    [enc setBytes:&args length:sizeof args atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows * QW_SEL_TILES, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    /* Same encoder, so the partial writes are visible to the fold: Metal
+     * orders dispatches within one compute encoder. */
+    [enc setComputePipelineState:p2];
+    qw_set(enc, scratch, 0);
+    qw_set(enc, out, 1);
+    /* An absent destination still needs a bound buffer; the kernel guards on
+     * the flag rather than the pointer, as the norm kernels do. */
+    qw_set(enc, token_out.buf ? token_out : out, 3);
+    [enc setBytes:&args length:sizeof args atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}

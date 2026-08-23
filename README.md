@@ -81,6 +81,17 @@ against. The 4-bit affine quantisation format qwasar reads is MLX's. MLX's own
 quantised matmul is the throughput target the kernels here are measured against,
 and it is still ahead.
 
+**The [Qwen3.8 MTP challenge](https://github.com/Layr-Labs/qwen-3.8-mtp-challenge)
+and its contributors.** A public leaderboard for speculative decoding on this
+exact model and this exact tokenizer, where every accepted submission carries
+the measurement that justified it — including the ones that regressed, which is
+what makes it worth reading. Selecting the next token on the GPU here follows
+the shape of theirs: a partial pass over tiles, then a fold. Two of their
+findings qwasar has not acted on yet are recorded in `PLAN.md` rather than
+quietly borrowed — a compact draft head that restricts the draft's vocabulary
+but never the target's, and a cross-row study showing that batched matvec width
+is bounded by a register cliff rather than by work.
+
 **The Qwen team**, for open weights worth building for, and for a model card and
 chat template precise enough to reimplement from.
 
@@ -88,8 +99,8 @@ chat template precise enough to reimplement from.
 
 Beta, and young. Text generation, the tokenizer, the chat template, the agent,
 and the disk cache all work and are covered by tests that run against the real
-model. **Vision is not implemented** — the tower is parsed and reported but not
-executed. Expect rough edges, and see *What is not implemented* below.
+model. Images and video work in the CLI, the agent, and the server. Expect rough
+edges, and see *What is not implemented* below.
 
 ---
 
@@ -503,7 +514,7 @@ length. That single fact drives the cache design — few large entries, a
 | | |
 | --- | ---: |
 | language model weights, 4-bit | 14.09 GB |
-| vision tower, bf16 (loaded, not yet used) | 0.86 GB |
+| vision tower, bf16 | 0.86 GB |
 | KV cache | 64 KB/token — 2 GB at 32K |
 | recurrent state | 147 MB, constant |
 

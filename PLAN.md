@@ -1216,6 +1216,70 @@ payoff:
 
 A `qwasar-bench` binary lands at the start of this milestone, not the end.
 
+### What the draft step actually costs — measured 2026-08-22
+
+Selection moved to the GPU (`metal/select.metal`), and the draft block now goes
+into one command buffer instead of one per draft: the selection kernel publishes
+the winning id straight into the token buffer the next step's embedding gather
+reads, so the host is no longer in the loop. Exact by construction and confirmed
+so — acceptance is identical old and new at every depth tried (2.33 tokens per
+round adaptive, 2.61 at depth 4, 2.78 at depth 8, across fourteen runs).
+
+**It bought about 5% of drafting time and nothing measurable end to end**, which
+is the useful part of the result. The reasoning that motivated it — that a sync
+plus a megabyte of host-side scanning per draft was a real cost — was wrong, and
+the numbers say why. At depth 8, drafting is 3.7 s over 46 rounds of 8 steps:
+**~10 ms per draft step, against ~950 MB of weight traffic, so roughly 80% of
+bandwidth.** The draft step was never overhead-bound. Removing seven of eight
+syncs per round moves ~1%.
+
+Do not re-litigate scheduling here. The traffic is the cost, and three quarters
+of it is one tensor:
+
+| per draft step | bytes |
+| --- | ---: |
+| `lm_head`, 4-bit affine + scales/biases | 715 MB |
+| the MTP layer | ~200 MB |
+| `fc [5120, 10240]` | ~26 MB |
+
+**The compact draft head is therefore the next thing to try**, and it is the
+challenge's idea. Restrict the *draft's* `lm_head` to a vocabulary prefix — they
+use rows `[0, 98304)` plus the 26 control tokens at `[248044, 248070)`, which is
+40% of qwasar's 248,320 and lines up exactly with the merges-vocab boundary in
+§1.4, because it is the same tokenizer. It cannot change what the model emits:
+the draft only proposes, the target verifies with the full head, and a token the
+draft cannot reach is simply rejected. So the only thing at risk is the
+acceptance rate, and the only question is empirical.
+
+Their measurement of the cut below that is worth having before trying a smaller
+one: halving again to 49,152 **regressed**, because three committed argmax ids
+lived above the cut — acceptance 1.00 → 0.877, 21.1 → 22.8 ms/token. The trim
+is not free just because it is safe.
+
+Expected here: 715 MB → 283 MB takes the draft step from ~10 ms to ~5.5 ms, so
+drafting falls ~45%. At the adaptive depth that is ~10% of decode, so ~4-5% end
+to end — larger than anything in the scheduling direction, and worth measuring
+on a cold machine, because thermal drift on this one reached 23% across eight
+consecutive runs of the same binary and swamps everything smaller.
+
+### Batched matvec width is a register cliff, not a work curve
+
+From the challenge's public cross-row study, and consistent with qwasar's own
+history — the first `qmvb` was 6× too slow because runtime loop bounds spilled:
+
+| rows per pass | µs |
+| --- | ---: |
+| 7 | 319 |
+| 8 | 437 |
+| 9 | 216 |
+
+Eight is the worst of the three because an even 4+4 split needs two simultaneous
+four-wide accumulators in every worker; nine splits 3+3+3 and is cheaper despite
+doing more work. **The implication for `QW_QMVB_B` is that the group size need
+not divide the block evenly, and that the sweep should be over register pressure
+rather than over width.** qwasar's sweep only tried even groupings, and drafts
+run to depth 8 — exactly the width that cliff lands on.
+
 ### Later (not planned in detail)
 
 Todo tracking and a `glob` tool in the agent, `/v1/responses` and

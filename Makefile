@@ -94,7 +94,8 @@ QWASAR_TEST_MODEL ?= $(HOME)/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX
 QWASAR_TEST_MTP ?= $(HOME)/.cache/qwasar/mtp/Qwen3.8-27B-MTP-bf16
 
 TESTS := tests/test_json tests/test_toolcall tests/test_sample tests/test_tokenizer tests/test_qmv tests/test_ops \
-         tests/test_gdn tests/test_attn tests/test_kvstore tests/test_mtp tests/test_verify tests/test_vision tests/test_forward
+         tests/test_gdn tests/test_attn tests/test_kvstore tests/test_mtp tests/test_verify tests/test_vision tests/test_forward \
+         tests/test_select
 
 tests/test_json: tests/test_json.c qwasar_json.o qwasar_json.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_json.c qwasar_json.o $(LDLIBS)
@@ -104,6 +105,9 @@ tests/test_qmv: tests/test_qmv.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model
 
 tests/test_verify: tests/test_verify.c $(CORE_OBJS) qwasar.h qwasar_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_verify.c $(CORE_OBJS) $(LDLIBS)
+
+tests/test_select: tests/test_select.c $(CORE_OBJS) qwasar.h qwasar_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_select.c $(CORE_OBJS) $(LDLIBS)
 
 tests/test_vision: tests/test_vision.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_vision.c $(CORE_OBJS) $(LDLIBS)
@@ -147,10 +151,24 @@ test: $(TESTS)
 # The shipping build never needs the Metal Toolchain -- kernels are compiled at
 # runtime -- but when the component is installed this catches a bad kernel in a
 # second instead of at model-load time, several gigabytes into a test run.
+#
+# The tiling constants the kernels expect are injected by the runtime compile
+# from qwasar_gpu.h (see the preprocessorMacros in qwasar_metal.m), so this has
+# to inject them too.  Read back out of that same header rather than restated,
+# or the check drifts from what actually gets compiled -- without them it could
+# not parse qmv.metal at all, and silently reported the rest as fine.
+#
+# Matched by field rather than against a '#define' literal: an unescaped hash
+# starts a Makefile comment and swallows the rest of the call.  The numeric
+# guard drops QW_QMM_THREADS, whose value is an expression the runtime does not
+# inject either.
+METAL_DEFS := $(shell awk '$$1 ~ /define$$/ && $$2 ~ /^QW_QM/ && $$3 ~ /^[0-9]+$$/ \
+                           { print "-D" $$2 "=" $$3 }' qwasar_gpu.h)
+
 check-metal:
 	@if xcrun -sdk macosx metal --version >/dev/null 2>&1; then \
 		cat $(METAL_SRCS) > .metal_check.metal; \
-		xcrun -sdk macosx metal -Wall -Wextra -ffast-math \
+		xcrun -sdk macosx metal -Wall -Wextra -ffast-math $(METAL_DEFS) \
 			-c .metal_check.metal -o /dev/null && echo "metal: kernels ok"; \
 		rm -f .metal_check.metal; \
 	else \

@@ -109,6 +109,12 @@ struct qwasar_session {
     qw_buf  mtp_tokens, mtp_positions;
     qw_buf  mtp_embed, mtp_fused, mtp_h, mtp_out, mtp_logits;
 
+    /* Selection results, written by the GPU and read back once the command
+     * buffer they were encoded into has completed.  `sel_scratch` is the
+     * partial pass's workspace; neither is ever touched by the host between
+     * dispatch and wait.  Four kilobytes, so they are not worth deferring. */
+    qw_buf  sel_out, sel_scratch;
+
     /* Acceptance, counted per draft position.  Drafting is free of the
      * exactness surface, so these are the only way to know it is working. */
     int64_t mtp_drafted[QWASAR_MAX_DRAFT];
@@ -234,9 +240,14 @@ static bool qw_alloc_all(qwasar_session *s, char *err, size_t errcap) {
         s->mtp_h      = qw_buf_alloc((size_t)R * c->hidden_size * 4);
         s->mtp_out    = qw_buf_alloc((size_t)R * c->hidden_size * 4);
         s->mtp_logits = qw_buf_alloc((size_t)c->vocab_size * 4);
+        /* Sized for a full block so the verify can select every row at once;
+         * the draft only ever asks for the first. */
+        s->sel_out     = qw_buf_alloc((size_t)(QWASAR_MAX_DRAFT + 1) * sizeof(qw_cand));
+        s->sel_scratch = qw_buf_alloc((size_t)(QWASAR_MAX_DRAFT + 1)
+                                      * QW_SEL_TILES * sizeof(qw_cand));
         if (!s->mtp_kcache || !s->mtp_vcache || !s->mtp_hidden || !s->mtp_tokens
             || !s->mtp_positions || !s->mtp_embed || !s->mtp_fused || !s->mtp_h
-            || !s->mtp_out || !s->mtp_logits) {
+            || !s->mtp_out || !s->mtp_logits || !s->sel_out || !s->sel_scratch) {
             qw_gerrf(err, errcap, "cannot allocate MTP head state");
             return false;
         }
@@ -291,6 +302,7 @@ void qwasar_session_free(qwasar_session *s) {
         &s->qg, &s->q, &s->gate, &s->k, &s->v, &s->attn_out,
         &s->mlp_gate, &s->mlp_up, &s->mlp_act, &s->logits,
         &s->mtp_kcache, &s->mtp_vcache, &s->mtp_hidden, &s->mtp_tokens,
+        &s->sel_out, &s->sel_scratch,
         &s->mtp_positions, &s->mtp_embed, &s->mtp_fused, &s->mtp_h,
         &s->mtp_out, &s->mtp_logits,
         &s->ssm_snap, &s->conv_snap, &s->verify_logits, &s->img_rows,
@@ -592,7 +604,7 @@ static void qw_encode_attention_layer(qwasar_session *s, qw_cmd c,
  * `mtp_positions` their backbone positions.  The result lands in `mtp_out`,
  * which is what the base lm_head reads. */
 static void qw_encode_mtp_rows(qwasar_session *s, qw_cmd c, qw_ref hidden,
-                               int32_t rows) {
+                               int32_t rows, qw_ref pos) {
     const qw_config *cfg = s->cfg;
     const qw_shape  *sh  = s->shape;
     const qw_mtp    *m   = qwasar_engine_mtp(s->e);
@@ -623,10 +635,10 @@ static void qw_encode_mtp_rows(qwasar_session *s, qw_cmd c, qw_ref hidden,
     qw_op_rms_norm(c, qw_ref_at(s->k, 0), qw_ref_at(s->k, 0), qw_tensor_ref(m->k_norm),
                    hd, rows * cfg->num_key_value_heads, cfg->rms_norm_eps, 1.0f);
 
-    qw_op_rope_partial(c, qw_ref_at(s->q, 0), qw_ref_at(s->mtp_positions, 0),
+    qw_op_rope_partial(c, qw_ref_at(s->q, 0), pos,
                        qw_ref_at(s->rope_axis, 0), qw_ref_at(s->rope_inv_freq, 0),
                        rows, cfg->num_attention_heads, hd, cfg->rotary_dim);
-    qw_op_rope_partial(c, qw_ref_at(s->k, 0), qw_ref_at(s->mtp_positions, 0),
+    qw_op_rope_partial(c, qw_ref_at(s->k, 0), pos,
                        qw_ref_at(s->rope_axis, 0), qw_ref_at(s->rope_inv_freq, 0),
                        rows, cfg->num_key_value_heads, hd, cfg->rotary_dim);
 
@@ -661,8 +673,15 @@ static void qw_encode_mtp_rows(qwasar_session *s, qw_cmd c, qw_ref hidden,
 
 /* Fills the head's position buffer.  Text-only positions are identical on all
  * three MRoPE axes, and the stride is the row count of this call. */
-static void qw_mtp_positions(qwasar_session *s, int32_t first, int32_t rows) {
-    int32_t *pv = qw_buf_contents(s->mtp_positions);
+/* Writes one step's positions at `slot` (an int32 offset into mtp_positions).
+ *
+ * The axis stride is `rows`, so a step's region is 3*rows wide and steps of
+ * different widths cannot share one.  Chaining a draft block needs a region
+ * per step anyway: the host fills these while earlier steps are still queued,
+ * and overwriting a region the GPU has not read yet would corrupt it. */
+static void qw_mtp_positions(qwasar_session *s, int32_t slot,
+                             int32_t first, int32_t rows) {
+    int32_t *pv = (int32_t *)qw_buf_contents(s->mtp_positions) + slot;
     for (int axis = 0; axis < 3; axis++)
         for (int32_t r = 0; r < rows; r++) pv[axis * rows + r] = first + r;
 }
@@ -696,7 +715,7 @@ static void qw_encode_mtp_upkeep(qwasar_session *s, qw_cmd c, int32_t rows) {
         const int32_t *tokens = qw_buf_contents(s->tokens);
         int32_t *tv = qw_buf_contents(s->mtp_tokens);
         memcpy(tv, tokens + (s->mtp_pending ? 0 : 1), (size_t)n_up * sizeof *tv);
-        qw_mtp_positions(s, s->mtp_n_past, n_up);
+        qw_mtp_positions(s, 0, s->mtp_n_past, n_up);
 
         qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_ref_at(s->mtp_tokens, 0),
                        qw_tensor_ref(embed->weight), qw_tensor_ref(embed->scales),
@@ -704,7 +723,7 @@ static void qw_encode_mtp_upkeep(qwasar_session *s, qw_cmd c, int32_t rows) {
         qw_encode_mtp_rows(s, c,
                            qw_off(s->mtp_hidden,
                                   s->mtp_pending ? 0 : (size_t)cfg->hidden_size),
-                           n_up);
+                           n_up, qw_ref_at(s->mtp_positions, 0));
         s->mtp_n_past += n_up;
     }
 
@@ -813,26 +832,6 @@ static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wa
     if (s->mtp_on && !s->mtp_defer) qw_encode_mtp_upkeep(s, c, rows);
 }
 
-static int32_t qw_argmax(const float *v, int32_t n) {
-    int32_t best = 0;
-    for (int32_t i = 1; i < n; i++) if (v[i] > v[best]) best = i;
-    return best;
-}
-
-/* argmax plus the gap to the runner-up, in one pass.  The gap is what says
- * whether the target was nearly undecided here, and a near-tie is exactly when
- * a draft is about to be wrong. */
-static int32_t qw_top2(const float *v, int32_t n, double *margin) {
-    int32_t best = 0;
-    float b = v[0], second = -3.0e38f;
-    for (int32_t i = 1; i < n; i++) {
-        if (v[i] > b) { second = b; b = v[i]; best = i; }
-        else if (v[i] > second) second = v[i];
-    }
-    *margin = (double)b - (double)second;
-    return best;
-}
-
 /* ---- adaptive draft depth --------------------------------------------------
  *
  * Cost of one round at each depth, in decode steps, measured on this machine
@@ -930,28 +929,46 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
      * the head only guessed, so those are speculative and are dropped at the
      * end by rewinding the write cursor. */
     const int32_t committed = s->mtp_n_past + lead + 1;
-    int32_t token  = emitted;
     qw_ref  hidden = qw_off(s->mtp_hidden, (size_t)first * cfg->hidden_size);
     int32_t n = 0;
 
-    for (; n < n_draft; n++) {
-        const int32_t rows = (n == 0) ? lead + 1 : 1;
-        int32_t *tv = qw_buf_contents(s->mtp_tokens);
-        for (int32_t i = 0; i < lead && n == 0; i++) tv[i] = s->mtp_owed_tokens[i];
-        tv[rows - 1] = token;
-        qw_mtp_positions(s, s->mtp_n_past, rows);
+    /* The whole block goes into ONE command buffer.  Step n+1 needs step n's
+     * token, which used to mean a sync per draft: the host read the id back
+     * and wrote it into the token buffer for the next embedding gather.  Now
+     * the selection kernel writes it there itself, so the dependency stays on
+     * the device and the chain is just a sequence of dispatches.
+     *
+     * That is safe because the encoder is serial -- Metal orders each dispatch
+     * after the last, so every shared scratch buffer behaves exactly as it did
+     * when the steps were separate command buffers.  What is NOT automatic is
+     * the buffers the host fills: it writes them all up front, while later
+     * steps are still queued, so each step needs its own region rather than
+     * reusing offset zero.  Token slots and position slots below are that. */
+    const int32_t rows0 = lead + 1;
 
-        /* A round trip per draft, because the next row needs this row's token
-         * id on the CPU to look up its embedding.  Chaining the whole block in
-         * one command buffer would need argmax and the embedding gather to run
-         * on the GPU; worth doing when the schedule is being tuned, not while
-         * the acceptance rate is still unknown. */
-        qw_cmd c = qw_cmd_begin();
-        if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return -1; }
-        qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_ref_at(s->mtp_tokens, 0),
+    /* Step 0's tokens are all known here: the rows a verify left owed, then
+     * the token just emitted.  Every later step's token is written by the GPU
+     * into the slot that step's gather reads. */
+    int32_t *tv = qw_buf_contents(s->mtp_tokens);
+    for (int32_t i = 0; i < lead; i++) tv[i] = s->mtp_owed_tokens[i];
+    tv[rows0 - 1] = emitted;
+
+    qw_cmd c = qw_cmd_begin();
+    if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return -1; }
+
+    for (; n < n_draft; n++) {
+        const int32_t rows = (n == 0) ? rows0 : 1;
+        /* Step 0 owns [0, rows0); each later step owns one slot after it. */
+        const int32_t tok_slot = (n == 0) ? 0 : rows0 + n - 1;
+        /* Position regions are 3*rows wide, so they cannot overlap either. */
+        const int32_t pos_slot = (n == 0) ? 0 : 3 * rows0 + 3 * (n - 1);
+
+        qw_mtp_positions(s, pos_slot, s->mtp_n_past, rows);
+
+        qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_off(s->mtp_tokens, tok_slot),
                        qw_tensor_ref(embed->weight), qw_tensor_ref(embed->scales),
                        qw_tensor_ref(embed->biases), cfg->hidden_size, rows);
-        qw_encode_mtp_rows(s, c, hidden, rows);
+        qw_encode_mtp_rows(s, c, hidden, rows, qw_off(s->mtp_positions, pos_slot));
         /* The pending slot has to end up holding the last CONFIRMED hidden
          * state, which is the one the drafted row was built from.  It is
          * refilled after the rows above have read it, not before -- row 0 is
@@ -965,14 +982,12 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
          * being caught up, and their outputs go nowhere. */
         qw_encode_qlinear(c, qwasar_engine_head(s->e), qw_ref_at(s->mtp_logits, 0),
                           qw_off(s->mtp_out, (size_t)(rows - 1) * cfg->hidden_size), 1);
-        qw_cmd_wait(c);
-        const char *cerr = qw_cmd_error(c);
-        if (cerr) {
-            qw_gerrf(err, errcap, "GPU error: %s", cerr);
-            qw_cmd_free(c);
-            return -1;
-        }
-        qw_cmd_free(c);
+        /* Result to this step's own slot, so the host can read the whole block
+         * after one wait; token to the slot the NEXT step gathers from. */
+        qw_op_argmax_top2(c, qw_off(s->sel_out, (size_t)n * 4),
+                          qw_off(s->sel_scratch, (size_t)n * QW_SEL_TILES * 4),
+                          qw_ref_at(s->mtp_logits, 0), cfg->vocab_size, 1,
+                          qw_off(s->mtp_tokens, rows0 + n));
 
         s->mtp_n_past += rows;
         /* Row 0 was just refilled when there were owed rows, so it still holds
@@ -980,10 +995,20 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
          * it, and the next eval's upkeep is what will. */
         if (n == 0) s->mtp_pending = after_verify;
 
-        token = qw_argmax(qw_buf_contents(s->mtp_logits), cfg->vocab_size);
-        drafts[n] = token;
         hidden = qw_off(s->mtp_out, (size_t)(rows - 1) * cfg->hidden_size);
     }
+
+    qw_cmd_wait(c);
+    const char *cerr = qw_cmd_error(c);
+    if (cerr) {
+        qw_gerrf(err, errcap, "GPU error: %s", cerr);
+        qw_cmd_free(c);
+        return -1;
+    }
+    qw_cmd_free(c);
+
+    const qw_cand *sel = qw_buf_contents(s->sel_out);
+    for (int32_t i = 0; i < n_draft; i++) drafts[i] = (int32_t)sel[i].index;
 
     s->mtp_n_past = committed;
     return n;
@@ -1053,6 +1078,12 @@ int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n
     qw_cmd c = qw_cmd_begin();
     if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return -1; }
     qw_encode_forward(s, c, n_block, true);
+    /* Every row, not just the one that turns out to decide: which row that is
+     * depends on results this pass has not produced yet, and selecting all of
+     * them costs one dispatch over logits the GPU already holds. */
+    qw_op_argmax_top2(c, qw_ref_at(s->sel_out, 0), qw_ref_at(s->sel_scratch, 0),
+                      qw_ref_at(s->verify_logits, 0), s->cfg->vocab_size, n_block,
+                      qw_ref_at(NULL, 0));
     qw_cmd_wait(c);
     const char *cerr = qw_cmd_error(c);
     s->n_snap = 0;
@@ -1066,16 +1097,16 @@ int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n
 
     /* Row i's logits predict the token after block[i], so they are what
      * block[i+1] guessed.  Accept while the guesses hold. */
-    const float *lg = qw_buf_contents(s->verify_logits);
-    const int32_t vocab = s->cfg->vocab_size;
+    const qw_cand *sel = qw_buf_contents(s->sel_out);
     int32_t j = 0;
-    while (j < n_draft && qw_argmax(lg + (size_t)j * vocab, vocab) == block[j + 1]) j++;
+    while (j < n_draft && (int32_t)sel[j].index == block[j + 1]) j++;
 
     /* The accepted drafts, plus the token row j predicts.  That last one is
      * free: the pass computed it whether or not anything was accepted, which is
      * why even a fully rejected round still advances by one. */
     for (int32_t i = 0; i < j; i++) out[i] = block[i + 1];
-    out[j] = qw_top2(lg + (size_t)j * vocab, vocab, &s->mtp_margin);
+    out[j] = (int32_t)sel[j].index;
+    s->mtp_margin = (double)sel[j].best - (double)sel[j].second;
 
     /* Update the acceptance estimates.  Position i was only put to the test if
      * everything before it was accepted, so only those are observations -- the
@@ -1152,14 +1183,15 @@ static bool qw_mtp_flush_owed(qwasar_session *s, char *err, size_t errcap) {
 
     int32_t *tv = qw_buf_contents(s->mtp_tokens);
     for (int32_t i = 0; i < rows; i++) tv[i] = s->mtp_owed_tokens[i];
-    qw_mtp_positions(s, s->mtp_n_past, rows);
+    qw_mtp_positions(s, 0, s->mtp_n_past, rows);
 
     qw_cmd c = qw_cmd_begin();
     if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return false; }
     qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_ref_at(s->mtp_tokens, 0),
                    qw_tensor_ref(embed->weight), qw_tensor_ref(embed->scales),
                    qw_tensor_ref(embed->biases), cfg->hidden_size, rows);
-    qw_encode_mtp_rows(s, c, qw_off(s->mtp_hidden, (size_t)cfg->hidden_size), rows);
+    qw_encode_mtp_rows(s, c, qw_off(s->mtp_hidden, (size_t)cfg->hidden_size), rows,
+                       qw_ref_at(s->mtp_positions, 0));
     qw_op_slice_rows(c, qw_ref_at(s->mtp_hidden, 0),
                      qw_off(s->mtp_hidden, (size_t)(rows + 1) * cfg->hidden_size),
                      1, cfg->hidden_size, 0, cfg->hidden_size);

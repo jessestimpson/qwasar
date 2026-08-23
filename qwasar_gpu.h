@@ -304,4 +304,31 @@ void qw_op_attn_decode(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vca
                        int32_t head_dim, int32_t max_ctx, int32_t base_pos,
                        float scale);
 
+/* ---- token selection ------------------------------------------------------
+ *
+ * Argmax and runner-up per row of a logits block, on the GPU.  This replaces a
+ * host scan of the whole vocabulary that ran after a full sync, once per draft
+ * token; see metal/select.metal for why it is exactly equal to that scan.
+ *
+ * The result is small enough to read straight off the shared buffer once the
+ * command buffer the op was encoded into has completed. */
+
+/* Threadgroups the partial pass splits each row across.  Only needed here to
+ * size the scratch buffer. */
+#define QW_SEL_TILES 32
+
+/* One row's answer.  `index` is the argmax; `best - second` is the margin to
+ * the runner-up, which is what says whether the model was nearly undecided. */
+typedef struct { float best, second; uint32_t index, pad; } qw_cand;
+
+/* `logits` is fp32 [rows, n]; `out` is [rows] qw_cand; `scratch` is
+ * [rows * QW_SEL_TILES] qw_cand of workspace.
+ *
+ * `token_out`, when it names a buffer, also receives the winning ids as int32
+ * [rows].  Pointing it at the token buffer a later dispatch reads is what lets
+ * a chain of dependent steps go into one command buffer without the host in
+ * between; pass an empty ref when nothing needs that. */
+void qw_op_argmax_top2(qw_cmd c, qw_ref out, qw_ref scratch, qw_ref logits,
+                       int32_t n, int32_t rows, qw_ref token_out);
+
 #endif /* QWASAR_GPU_H */
