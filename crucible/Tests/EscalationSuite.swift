@@ -256,6 +256,8 @@ enum EscalationSuite {
                                                  arguments: ["path": "notes.txt", "content": "hi"])],
                             "the remote tool call reached the inner executor, arguments decoded")
         f += TestMain.check(out.contains("wrote it"), "and the model finished after it")
+        f += TestMain.check(out.contains("write×1") && out.contains("re-read"),
+                            "the result header tallies the tools so the local model knows /work moved")
         let second = Stub.lock.withLock { Stub.script.requests.last }
         let toolMsg = (second?["messages"] as? [[String: Any]])?.first {
             ($0["role"] as? String) == "tool"

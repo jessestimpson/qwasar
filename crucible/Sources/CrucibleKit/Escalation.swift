@@ -153,6 +153,11 @@ public struct DelegateToolRunner: ToolExecuting {
         let models = policy.models.joined(separator: ", ")
         let desc = "Delegate a task to a more capable remote model and return its answer. "
             + "Available models: \(models). The first is the default. "
+            + "THE REMOTE MODEL HAS YOUR TOOLS: the same read/write/edit/list/grep/bash "
+            + "and the rest, acting on the same /work you act on. Changes it makes are "
+            + "real -- expect files to differ afterwards, and read back anything you "
+            + "depend on rather than assuming the state you left. Its tool activity is "
+            + "summarised in the result only; the transcript shows the user the detail. "
             + "Budget: $\(String(format: "%.2f", policy.turnBudgetUSD)) per delegation, "
             + "$\(String(format: "%.2f", policy.sessionRemainingUSD)) remaining this session; "
             + "a delegation that trips its budget returns a partial answer marked as such. "
@@ -183,7 +188,7 @@ public struct DelegateToolRunner: ToolExecuting {
         inner.environmentDescription + """
 
 
-        Escalation: `delegate` hands a task to a more capable remote model (\(policy.models.joined(separator: ", "))) under a budget -- $\(String(format: "%.2f", policy.sessionRemainingUSD)) remains this session. Reach for it at genuine capability walls, not for effort; say what you already tried.
+        Escalation: `delegate` hands a task to a more capable remote model (\(policy.models.joined(separator: ", "))) under a budget -- $\(String(format: "%.2f", policy.sessionRemainingUSD)) remains this session. The remote model works with YOUR tools on the SAME files: after a delegation, /work reflects whatever it did, so re-read anything you rely on. Reach for it at genuine capability walls, not for effort; say what you already tried.
         """
     }
 
@@ -229,6 +234,7 @@ public struct DelegateToolRunner: ToolExecuting {
         var messages: [[String: Any]] = [["role": "user", "content": brief]]
         var cost = 0.0
         var toolSteps = 0
+        var toolTally: [String: Int] = [:]
         var lastAnswer = ""
         var reason = "the remote model finished"
         let turnCap = min(policy.turnBudgetUSD, policy.sessionRemainingUSD)
@@ -272,6 +278,7 @@ public struct DelegateToolRunner: ToolExecuting {
                 messages.append(assistant)
                 for tc in r.toolCalls {
                     toolSteps += 1
+                    toolTally[tc.name, default: 0] += 1
                     emit(.toolCall(name: tc.name, arguments: tc.arguments))
                     let result: String
                     if toolSteps > policy.maxToolSteps {
@@ -328,7 +335,14 @@ public struct DelegateToolRunner: ToolExecuting {
         }
 
         emit(.ended(reason: reason, costUSD: cost))
-        let header = "delegation to \(model): \(reason) · $\(String(format: "%.4f", cost))"
+        var header = "delegation to \(model): \(reason) · $\(String(format: "%.4f", cost))"
+        if !toolTally.isEmpty {
+            // The local model must know /work moved under it, per delegation
+            // and concretely -- the schema's general warning is not evidence.
+            let tally = toolTally.sorted { $0.key < $1.key }
+                .map { "\($0.key)×\($0.value)" }.joined(separator: ", ")
+            header += " · it used tools on /work: \(tally) -- re-read anything you depend on"
+        }
         return header + "\n\n" + lastAnswer
     }
 
