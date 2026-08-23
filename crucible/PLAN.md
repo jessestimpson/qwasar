@@ -1785,19 +1785,67 @@ applier. Both are small, both are pure functions over untrusted input, and both
 are tested adversarially. Warden validates every host message; the host
 validates every guest path (§7.4 step 8).
 
-### 8.3 The networking escape hatch
+### 8.3 Network: host-mediated egress, never a NIC
 
-Some tasks need the network — installing a dependency, reading a doc. So
-`Project.sandboxNetworking` exists, defaults **off**, and when a user turns it
-on:
+Some tasks need the network — reading a doc, checking an API. An earlier
+draft of this section sketched a NAT device behind a settings toggle. That
+design is rejected, and the reason generalises: **any in-guest network is
+policed by in-guest code, and everything in the guest is inside the blast
+radius.** The agent's own code runs in an Erlang VM (the workspace node), so
+"network for the BEAM only" grants network to the agent by definition; and
+the agent has root, so nftables rules, a de-privileged socket owner, even the
+warden's own binaries on disk are advisory the moment they stand between the
+agent and something it was told to want. Today none of that matters because
+there is nothing inside the guest worth protecting — the security story is
+that nothing gets out. A NIC would make warden integrity security-critical,
+which is exactly the property root cannot be made to respect.
 
-- The VM is reconfigured with a NAT attachment. This requires a **VM restart**,
-  which is stated in the toggle, because reconfiguration is not live.
-- Every session in that project shows a persistent badge in the transcript
-  header, and the transcript records the moment it was enabled with a
-  timestamped item.
-- It never turns itself on. No tool can request it. It is a settings toggle a
-  human flips.
+So the guest keeps **zero network devices, permanently**, and network exists
+only as `fetch`: a tool the **host** executes, under host-side policy the
+agent cannot reach. The guest is not in the loop at all — the call goes
+model → host, and the host answers it like any tool result.
+
+The policy, all of it enforced in `NetworkPolicy` on the host:
+
+- **Default off.** A project with an empty allowlist has no `fetch` in its
+  tool surface at all — the system turn is unchanged, nothing is advertised
+  that will be refused, and the network-off project keeps today's guarantees
+  exactly. Granting domains changes the surface, which re-prefills that
+  project once (the disk-cached prefix makes it one cold start).
+- **A per-project domain allowlist**, edited by a person in the app, stored
+  with the project. An entry matches its exact host; a `*.example.com` entry
+  matches subdomains. Nothing the model does can grow the list; a refused
+  fetch is a tool result naming the domain, so the user can decide.
+- **GET only, https only, port 443 only,** no userinfo, no IP literals
+  unless explicitly listed. Redirects are re-checked against the allowlist
+  hop by hop — a 302 to an unlisted host fails the request, because a
+  redirect is the classic way an allowed domain becomes a proxy for an
+  arbitrary one.
+- **A response byte cap** (256 KB), enforced during download rather than
+  after, and a timeout. Bodies come back as text in the tool result;
+  binary content is reported, not delivered.
+- **Every request is a tool call in the transcript**: URL, outcome, size.
+  There is no quiet path.
+
+#### What this keeps, and what it breaks — stated for the README
+
+Execution sandboxing is kept intact: code in the guest still cannot open a
+socket, scan, listen, or exfiltrate on its own — the only egress is a request
+the host chooses to perform. What is broken, by construction and not by
+implementation, is **perfect confidentiality**: an outbound channel, however
+mediated, is a channel. A prompt injection in a file the model reads could
+previously send nothing anywhere; with `fetch` granted it can encode project
+contents into request URLs aimed at allowed hosts. The allowlist narrows the
+recipients and the log makes it visible; nothing closes the channel while it
+exists. Fetched content is also new injection input, so the loop can
+self-amplify. The honest posture: for projects where confidentiality is the
+point, the answer is the default — leave the list empty. The README says
+this in as many words rather than hiding it in a settings tooltip.
+
+Future, deliberately not in v1: a package-mirror proxy (hex/npm read-only)
+for dependency installation — most of the remaining utility at a fraction of
+the general-egress risk — and binary delivery into `/work` for fetched
+archives.
 
 ### 8.4 The model directory
 

@@ -81,6 +81,9 @@ final class AppState {
     /// read-only host tools and the UI says so.
     private var sandboxes: SandboxManager?
     var sandboxStatus: String?
+    /// The project whose network allowlist is being edited, when the sheet is
+    /// up. Set only from the UI -- no tool result or model output can reach it.
+    var networkEditing: Project?
     /// Set while the app is quitting and the guests are being flushed.
     var shuttingDown = false
     /// Something the ENGINE has to say, which can happen with no session open:
@@ -254,6 +257,15 @@ final class AppState {
         projects.append(p)
         store?.saveProjects(projects)
         newSession(in: p)
+    }
+
+    /// The single write path for a project's network grant (PLAN.md 8.3).
+    /// Takes effect when a session is next opened; the live session keeps the
+    /// surface it was prefilled with, because the tool list is the system turn.
+    func setNetworkAllowlist(_ p: Project, hosts: [String]) {
+        guard let i = projects.firstIndex(where: { $0.id == p.id }) else { return }
+        projects[i].networkAllowlist = hosts.isEmpty ? nil : hosts
+        store?.saveProjects(projects)
     }
 
     func removeProject(_ p: Project) {
@@ -441,6 +453,15 @@ final class AppState {
                     }
                 } else {
                     sandboxStatus = "read-only — no guest image (run `make guest`)"
+                }
+                // Network, when this project granted any (PLAN.md 8.3). The
+                // fetch tool is the HOST's -- the wrapper answers it itself
+                // and delegates everything else -- so the guest stays exactly
+                // as network-less as the line above left it.
+                if !p.network.isEmpty {
+                    runner = NetworkToolRunner(inner: runner,
+                                               policy: NetworkPolicy(allowlist: p.network))
+                    sandboxStatus = (sandboxStatus ?? "") + " · net: \(p.network.count) host\(p.network.count == 1 ? "" : "s")"
                 }
 
                 for await ev in engine.openSession(id: rec.id, runner: runner,

@@ -21,6 +21,7 @@ struct TestMain {
         var failures = 0
 
         print("== pathguard");  failures += PathGuardSuite.run()
+        print("== network");    failures += NetworkPolicySuite.run()
         print("== store");      failures += StoreSuite.run()
         print("== materialise"); failures += MaterialiseSuite.run()
         print("== guestimage"); failures += GuestImageSuite.run()

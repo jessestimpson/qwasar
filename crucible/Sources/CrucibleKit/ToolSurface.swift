@@ -62,6 +62,14 @@ public enum ToolSurface {
 
 
 
+    /// `fetch` is NOT part of the frozen guest surface: it is executed by the
+    /// HOST under per-project policy (PLAN.md 8.3), appears only when the
+    /// project's allowlist is non-empty, and never reaches the guest at all.
+    /// The golden suite pins the ten guest schemas; this one rides alongside.
+    public static let fetchSchema = #"""
+    {"type": "function", "function": {"name": "fetch", "description": "HTTPS GET a URL and return the response as text. Executed by the host, outside the sandbox, under a per-project allowlist of hosts -- a fetch to a host not on the list is refused and the refusal names the host, so say which host you need and why if the user should add one. GET only; responses are capped and binary content is not delivered.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "The https URL to fetch."}}, "required": ["url"]}}}
+    """#
+
     /// The frozen surface, in order -- and the order is part of the system turn.
     public static let guestSchemas: [String] = [
         readSchema, writeSchema, editSchema, listSchema, grepSchema, bashSchema,

@@ -43,18 +43,30 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
     // vectors keep comparing like with like.
     public var effort: ReasoningEffort { defaultEffort ?? .medium }
 
+    /// Hosts `fetch` may reach, per PLAN.md 8.3. Empty (or absent, for
+    /// records written before this existed) means network OFF: the tool is
+    /// not advertised and the project keeps the no-egress guarantees exactly.
+    /// Optional so older stores still decode; `network` resolves the absence.
+    public var networkAllowlist: [String]?
+
+    public var network: [String] { networkAllowlist ?? [] }
+
     public init(id: UUID = UUID(), name: String, rootBookmark: Data,
                 resolvedRoot: URL? = nil, systemPrompt: String = Project.defaultSystem,
-                defaultEffort: ReasoningEffort? = nil) {
+                defaultEffort: ReasoningEffort? = nil,
+                networkAllowlist: [String]? = nil) {
         self.id = id
         self.name = name
         self.rootBookmark = rootBookmark
         self.resolvedRoot = resolvedRoot
         self.systemPrompt = systemPrompt
         self.defaultEffort = defaultEffort
+        self.networkAllowlist = networkAllowlist
     }
 
-    enum CodingKeys: String, CodingKey { case id, name, rootBookmark, systemPrompt, defaultEffort }
+    enum CodingKeys: String, CodingKey {
+        case id, name, rootBookmark, systemPrompt, defaultEffort, networkAllowlist
+    }
 
     /// The project's own instructions. NOT a description of the environment --
     /// that is the executor's to state (see `ToolExecuting.environmentDescription`),

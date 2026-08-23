@@ -36,6 +36,16 @@ project copy, and one vsock channel to the host. So a prompt injection in a
 file the model reads degrades from *arbitrary code execution on your laptop*
 to *a bad edit inside a VM you can throw away*.
 
+**Network is opt-in, per project, and never touches the guest.** Right-click
+a project → **Network…** to grant a host allowlist; the model then gets a
+`fetch` tool (HTTPS GET only, capped, logged in the transcript) that the
+*app* executes under that list — the sandbox stays network-less either way.
+Stated plainly, because it is the one real trade in this design: with any
+host granted, code sandboxing is unchanged, but *confidentiality* is not —
+a prompt injection could encode project contents into request URLs to an
+allowed host. The default is off, and for confidential work it should stay
+off. The reasoning is PLAN.md 8.3.
+
 **Status:** milestones 0–5 built and gated, plus markdown rendering with
 syntax highlighting. Not yet built: session parking to explicit checkpoints
 (M6), vision and speculative decoding (M7), and replacing the file-copy
