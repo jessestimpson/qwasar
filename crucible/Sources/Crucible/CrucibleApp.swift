@@ -202,6 +202,17 @@ struct EmptyPane: View {
 struct StatusToolbar: ToolbarContent {
     @Bindable var state: AppState
 
+    private static let specOnHelp =
+        "\n\nSpeculative decoding is on: an MTP draft head proposes tokens and "
+        + "the model verifies them, so the text is distributed exactly as "
+        + "decoding one at a time and takes fewer passes to produce."
+    private static let speedUpHelp =
+        "Enable speculative decoding: point Crucible at the MTP draft head "
+        + "(./download_model.sh mtp-head, or an existing ~/.cache/qwasar/mtp). "
+        + "Decoding gets roughly 1.5x faster; the context window shrinks to "
+        + "pay for the head's weights and cache. The grant is remembered "
+        + "across launches."
+
     var body: some ToolbarContent {
         ToolbarItem(placement: .status) {
             HStack(spacing: 10) {
@@ -222,17 +233,27 @@ struct StatusToolbar: ToolbarContent {
                         Label(n, systemImage: "info.circle")
                             .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     } else if let i = state.engineInfo {
-                        Text("\(i.contextSize) ctx · \(state.profile.liveSessions) live"
-                             + (i.mtpActive ? " · spec" : ""))
+                        let label = "\(i.contextSize) ctx · "
+                                  + "\(state.profile.liveSessions) live"
+                                  + (i.mtpActive ? " · spec" : "")
+                        Text(label)
                             .font(.caption).foregroundStyle(.secondary)
                             .help(state.profile.summary
-                                  + (i.mtpActive
-                                     ? "\n\nSpeculative decoding is on: an MTP draft head "
-                                       + "proposes tokens and the model verifies them, so the "
-                                       + "text is identical to decoding one at a time and takes "
-                                       + "fewer passes to produce."
-                                     : "\n\nSpeculative decoding is off. Add an MTP draft head "
-                                       + "from the app menu to trade some context for speed."))
+                                  + (i.mtpActive ? Self.specOnHelp : ""))
+                        // Speculation is worth ~1.5x on decode and was buried
+                        // in the app menu; a one-time grant deserves a
+                        // one-click home where the eye already checks status.
+                        // Gone once granted -- the ctx label gains "spec".
+                        if !i.mtpActive {
+                            Button {
+                                state.chooseDraftHead()
+                            } label: {
+                                Label("Speed Up…", systemImage: "hare")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.borderless)
+                            .help(Self.speedUpHelp)
+                        }
                     }
                 }
             }

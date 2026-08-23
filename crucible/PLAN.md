@@ -1682,7 +1682,7 @@ is where a byte copy under approval is the proportionate answer.
 12. The guest re-baselines: the applied state becomes the new baseline commit,
     so the next proposal is a diff against what the user actually accepted.
 
-### 7.5 Sampling, and the speculative-decoding conflict
+### 7.5 Sampling, and speculation under it
 
 Crucible samples by default — temperature 1.0, top-k 20, top-p 0.95, the
 model's own `generation_config`, via `qwasar_sample` — because Qwen's guidance
@@ -1693,57 +1693,55 @@ not a neutral one. `temperature = 0` remains exactly greedy, and the headless
 gates pin it, because a gate is a measurement and two runs of it must be
 comparable. A nonzero `seed` reproduces a sampled run exactly.
 
-**Sampling and speculation cannot overlap on the same tokens**, and the
-reason is a contract, not an oversight. `qwasar_session_verify` promises that
-the emitted sequence is identical to greedy decoding — `tests/test_verify` in
-the C tree holds that line at every depth — and it keeps that promise by
-comparing the target's argmax against the draft. Under sampling there is no
-single correct token to compare against, so the greedy verify is simply the
-wrong operation.
+**Speculation now runs under sampling, by rejection** — the Leviathan et al.
+/ Chen et al. scheme, implemented as `qwasar_session_verify_sampled` in the
+engine. The old conflict was a contract: `qwasar_session_verify` promises the
+greedy sequence exactly and keeps that promise by comparing the target's
+argmax against the draft, which under sampling is simply the wrong operation.
+The sampled verify replaces the comparison with an acceptance test: draft `x`
+is accepted with probability `min(1, p(x)/q(x))` against the target's
+*filtered* distribution `p` (temperature, top-k, min-p, top-p — the same
+chain serial sampling applies), the first rejection is replaced by a sample
+from the normalised residual `max(0, p − q)`, and a fully accepted block ends
+with a plain sample from the final row. Because the draft head proposes
+deterministically, `q` is a point mass and the scheme simplifies: accept `x`
+with probability `p(x)`, resample from `p` with `x` removed on a miss. What
+comes out is distributed **exactly** as serial sampling — the law that
+replaces greedy equality.
 
-**So they alternate on the `</think>` boundary instead.** The two phases of a
-turn have opposite needs: the reasoning block is where the greedy repetition
-failure lives and where entropy is high enough that drafts get rejected
-anyway, while the visible answer and tool-call markup are low-entropy and
-highly structured — exactly where the draft head's acceptance is best, and
-where sampling at these settings nearly always picks the argmax token
-regardless. `Session.generate` therefore samples serially while `reasoning`
-is true and switches to greedy decoding with drafting from the boundary on,
-checked per iteration because the token loop is what flips the flag. At
-temperature 0 the whole turn is greedy and drafting runs throughout, which is
-what the gates use. The honest caveat: reasoning is most of an agent turn's
-tokens, so the phase split buys the full quality win but confines the
-speculative speedup to the minority of tokens — tool-call-heavy turns benefit
-most.
+What made it cheap, against the section's earlier cost estimate: the verify
+pass already materialises full logits for every row (`s->verify_logits`, in
+unified memory), so the target probabilities were lying there all along; and
+the point-mass draft means `p_draft` never needs to be reported at all. The
+CPU-side acceptance reads a few rows of 248K floats per round — noise next to
+a pass over 15 GB of weights.
 
-The fix is known and is an engine change, not a harness change: **rejection
-sampling** (the Leviathan et al. / Chen et al. speculative-sampling scheme). Accept draft token
-`x` with probability `min(1, p_target(x) / p_draft(x))`; on rejection, sample
-from the normalised residual `max(0, p_target − p_draft)`. The emitted
-sequence is then distributed *exactly* as serial sampling — the property that
-replaces greedy equality, and the property a new `test_verify` mode would have
-to pin (statistically, over many draws, rather than token-for-token).
+How it is held, in three layers:
 
-What it costs, and why it is not done casually:
+- **The law, without a model.** `tests/test_sample` runs the accept/resample
+  rule 400K times against brute-forced filtered distributions and requires
+  total variation under 0.005 — including a draft the filters cut, which must
+  be rejected always and still leave the residual equal to the distribution.
+- **The engine path.** `tests/test_verify` proves temperature 0 through the
+  sampled entry point is token-for-token the greedy verify, and that a
+  seeded sampled run reproduces exactly — any state the rewind corrupted
+  would surface as the second run diverging.
+- **The greedy contract is untouched**: `qwasar_session_verify` still exists,
+  still exact, still pinned at every depth.
 
-- `qwasar_session_verify` compares token ids today; rejection sampling needs
-  the target's and the draft's **probabilities** at every drafted position,
-  which means the verify pass keeping (or recomputing) full softmax rows it
-  currently never materialises, and the draft path reporting `p_draft` for
-  what it proposed.
-- The adaptive depth model (`qwasar_session_draft_depth`) is calibrated on
-  greedy acceptance. Sampled acceptance is lower and temperature-dependent, so
-  the measured price/acceptance tables shift and the top-2-logit-gap cap stops
-  being the right boundary signal.
-- The test story changes shape: bit-exact equality becomes a distributional
-  claim, which is a weaker and more expensive thing to hold. The greedy mode
-  must keep its exact test regardless.
+Two things this deliberately leaves alone. The adaptive depth model is
+calibrated on greedy acceptance; sampled acceptance is lower (accepting the
+mode with probability `p(mode)` rather than certainty), so the controller
+will settle shallower — which is correct behaviour, just tuned by observation
+rather than re-derivation, and the acceptance estimator adapts on its own.
+And the C-tree CLI and agent stay on the greedy verify, because they decode
+greedily to begin with.
 
-Until that lands in the engine, the phase split is the deliberate stopgap:
-sampling exactly where quality needs it, speculation exactly where it pays.
-Rejection sampling would supersede the split by allowing both everywhere,
-including the reasoning block. The C-tree CLI and agent, which use MTP today,
-keep greedy decoding for the same reason from the other side.
+Crucible calls the sampled verify unconditionally: at the gates' temperature
+0 it *is* the greedy verify, and at the app's defaults speculation now covers
+the whole turn — the reasoning block included, which is most of an agent
+turn's tokens and is exactly what the phase split (this section's previous
+design, now superseded) could not reach.
 
 ---
 

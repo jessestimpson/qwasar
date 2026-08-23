@@ -111,6 +111,13 @@ final class AppState {
         sessions = store?.loadSessions() ?? []
         migrateSystemPrompts()
         resolveProjectRoots()
+        // The draft head's grant has to come back BEFORE the model loads: a
+        // head can only be bound at qwasar_engine_load, and the profile the
+        // context is sized from changes with it. Restoring only the model here
+        // was the bug that made speculation silently vanish on every relaunch
+        // until the head was picked again.
+        draftAccess.restore()
+        profile = MemoryProfile.derive(mtpAvailable: draftAccess.url != nil)
         if let u = access.restore() { Task { await load(u) } }
     }
 
@@ -176,13 +183,14 @@ final class AppState {
         panel.canChooseFiles = false
         panel.showsHiddenFiles = true
         panel.canCreateDirectories = false
-        panel.message = "Choose the MTP draft head directory (a small model with "
-                      + "config.json + *.safetensors)."
+        panel.message = "Choose the MTP draft head directory (config.json + "
+                      + "*.safetensors, well under a gigabyte). Get it with "
+                      + "./download_model.sh mtp-head."
         panel.prompt = "Use Draft Head"
-        let conventional = ModelAccess.conventionalDraftHead
-        if FileManager.default.fileExists(atPath: conventional.path) {
-            panel.directoryURL = conventional
-        }
+        // Always set, never probed first: the sandbox cannot stat the real
+        // home, so a fileExists gate here is permanently false. The panel
+        // falls back gracefully when the folder is absent.
+        panel.directoryURL = ModelAccess.conventionalDraftHead
         guard panel.runModal() == .OK, let u = panel.url else { return }
         let resolved = u.resolvingSymlinksInPath()
         guard ModelAccess.looksLikeDraftHead(resolved) else {

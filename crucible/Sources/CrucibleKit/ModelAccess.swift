@@ -96,7 +96,13 @@ public final class ModelAccess {
     /// Where the CLI and the tests keep it (`QWASAR_TEST_MTP`), for the
     /// picker's starting directory. Not readable from inside the sandbox
     /// without a grant -- this only saves the user some navigation.
+    ///
+    /// The REAL home, via passwd, not `~`: under App Sandbox both
+    /// NSHomeDirectory and $HOME are the container, so a tilde expansion
+    /// points the picker at a folder that does not exist. The open panel
+    /// itself runs out of process and can show anywhere.
     public static var conventionalDraftHead: URL {
-        URL(fileURLWithPath: NSString(string: "~/.cache/qwasar/mtp").expandingTildeInPath)
+        let home = String(cString: getpwuid(getuid()).pointee.pw_dir)
+        return URL(fileURLWithPath: home).appendingPathComponent(".cache/qwasar/mtp")
     }
 }

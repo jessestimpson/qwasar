@@ -37,8 +37,8 @@ public enum SessionEvent: Sendable {
     /// obviously wrong to the person watching it.
     /// `tokensPerSecond` is the whole turn's average; `instantaneous` covers
     /// only the tokens since the previous report, so it is the number that
-    /// moves when the phase changes -- sampled reasoning versus speculative
-    /// answer are different regimes, and averaging across them hides both.
+    /// moves when the workload changes -- serial stretches versus rounds
+    /// where speculation is landing -- and averaging across them hides both.
     case rate(generated: Int, tokensPerSecond: Double, instantaneous: Double)
     /// Reasoning text, with how many TOKENS produced it.
     ///
@@ -571,22 +571,15 @@ final class LiveSession {
             : UInt64(bitPattern: Int64(Date().timeIntervalSince1970 * 1000))
               &* 6364136223846793005 &+ 1
 
-        // The phase split (PLAN.md 7.5). Sampling is what the reasoning block
-        // needs -- long greedy chains loop -- and speculation is what the
-        // answer needs: tool-call markup is low-entropy, drafts well, and at
-        // these settings sampling nearly always picks the argmax token there
-        // anyway. `qwasar_session_verify`'s contract is greedy equivalence, so
-        // the two cannot overlap; they alternate on the `</think>` boundary
-        // instead. With no draft head there is no speedup to buy, so sampling
-        // simply runs the whole turn.
-        var greedySP = qwasar_sampling(temperature: 0, top_k: 0, top_p: 1,
-                                       min_p: 0, seed: 0)
+        // Sampling and speculation run together now (PLAN.md 7.5): the engine
+        // verifies drafts by rejection sampling, which emits tokens
+        // distributed exactly as serial sampling. The phase split this
+        // replaced -- sampled reasoning, greedy speculative answers -- is
+        // gone, and with it the greedy answer phase.
         var reasoning = true
         let hasMTP = qwasar_session_has_mtp(handle)
         func pick(_ logits: UnsafePointer<Float>) -> Int32 {
-            hasMTP && !reasoning
-                ? qwasar_sample(logits, vocab, &greedySP, &rng)
-                : qwasar_sample(logits, vocab, &sp, &rng)
+            qwasar_sample(logits, vocab, &sp, &rng)
         }
 
         let ok: Bool = autoreleasepool {
@@ -725,17 +718,12 @@ final class LiveSession {
         }
 
         // Speculation, when the engine was given a draft head. The head only
-        // ever PROPOSES: `qwasar_session_verify` commits the longest correct
-        // prefix and rewinds the rest, so the emitted sequence is identical to
-        // decoding serially. That property is the whole point, and it is held by
-        // tests/test_verify in the C tree rather than assumed here.
-        //
-        // That contract is GREEDY equivalence, so drafting runs only in the
-        // greedy phase: the whole turn at temperature 0, otherwise from the
-        // `</think>` boundary on -- checked per iteration, because take() is
-        // what flips `reasoning`. Everything a round commits, including the
-        // boundary token verify leaves undecided, is argmax, which is exactly
-        // what pick() decodes in that phase.
+        // ever PROPOSES: the sampled verify accepts each draft by rejection
+        // against the target's own filtered distribution and resamples the
+        // residual on a miss, so what comes out is distributed exactly as
+        // serial sampling -- the law is held by tests/test_sample, the engine
+        // path by tests/test_verify. At temperature 0 the same call is the
+        // old exact-greedy verify.
         var blk = [Int32](repeating: 0, count: Int(QWASAR_MAX_DRAFT) + 1)
         var got = [Int32](repeating: 0, count: Int(QWASAR_MAX_DRAFT) + 1)
 
@@ -753,7 +741,7 @@ final class LiveSession {
             if take(next) == .stop { break }
 
             // --- speculative step -----------------------------------------
-            if hasMTP && (config.temperature <= 0 || !reasoning) {
+            if hasMTP {
                 // Depth 0 is a real answer, not an error: the head has been
                 // wrong often enough here that a round costs more than it saves,
                 // and the engine says so from measured acceptance.
@@ -770,8 +758,9 @@ final class LiveSession {
                     let (nc, vErr): (Int32, String) = withErrorBuffer { buf, cap in
                         blk.withUnsafeBufferPointer { bp in
                             got.withUnsafeMutableBufferPointer { gp in
-                                qwasar_session_verify(handle, bp.baseAddress, nd + 1,
-                                                      gp.baseAddress, buf, cap)
+                                qwasar_session_verify_sampled(handle, bp.baseAddress, nd + 1,
+                                                              &sp, &rng,
+                                                              gp.baseAddress, buf, cap)
                             }
                         }
                     }
@@ -809,8 +798,6 @@ final class LiveSession {
                 // Often enough that the meter moves visibly at ~6 tok/s, rare
                 // enough to cost nothing.
                 report()
-                // pick(), not sp: this step also serves the answer phase when
-                // draft_depth backs off to 0, and that phase is greedy.
                 next = pick(logits)
                 return true
             }

@@ -92,13 +92,13 @@ The session header should say **`sandboxed · booted in 0.6s`**. If it says
   stay raw.
 * **A lot of reasoning**, collapsed by default; click to expand. A turn where
   the model wrote itself a tool ran 4151 reasoning tokens.
-* **Sampled reasoning, speculative answers.** Crucible samples with the
-  model's own generation_config (temperature 1.0, top-k 20, top-p 0.95) —
-  Qwen's own guidance, since thinking-mode models are prone to repetition
-  loops under greedy decoding — and, when a draft head is loaded, switches to
-  greedy decoding with speculation at the `</think>` boundary, where the text
-  is structured enough to draft well. The headless gates pin temperature 0 so
-  runs stay comparable. Design and trade-offs: PLAN.md 7.5.
+* **Sampled output, speculation included.** Crucible samples with the model's
+  own generation_config (temperature 1.0, top-k 20, top-p 0.95) — Qwen's own
+  guidance, since thinking-mode models are prone to repetition loops under
+  greedy decoding. With a draft head loaded, speculation runs under sampling
+  too: the engine verifies drafts by rejection sampling, so the output is
+  distributed exactly as serial sampling would produce. The headless gates
+  pin temperature 0 so runs stay comparable. Design: PLAN.md 7.5.
 * **⌘.** stops a turn at the next token.
 * **Switching sessions is not free.** Only one session is live at a time on a
   32 GB machine; switching re-prefills (helped by the engine's LRU cache).
