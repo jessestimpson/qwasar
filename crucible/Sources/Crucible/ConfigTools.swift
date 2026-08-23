@@ -180,7 +180,7 @@ extension AppState {
         out.append("global: \(describe(globalSandbox))")
         // Presence only, by design (spec §15.4): there is no operation that
         // returns the key.
-        out.append("escalation API key: \(KeychainAccess.hasKey ? "set (in the Keychain)" : "absent")")
+        out.append("escalation API key: \(KeychainAccess.status())")
         for p in projects where !p.isConfig {
             out.append("project \(p.name) [\(p.id.uuidString)]: \(describe(p.sandbox ?? (p.overlay.isEmpty ? nil : p.overlay)))")
             for s in sessions where s.projectID == p.id {

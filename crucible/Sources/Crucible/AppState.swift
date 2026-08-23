@@ -290,8 +290,13 @@ final class AppState {
     var hasAPIKey = KeychainAccess.hasKey
 
     func setAPIKey(_ key: String) {
-        KeychainAccess.set(key)
+        if !KeychainAccess.set(key) {
+            // A refused write must not present as "absent" three layers
+            // later; say so where the user just acted.
+            engineNote = "the Keychain refused the key: \(KeychainAccess.status())"
+        }
         hasAPIKey = KeychainAccess.hasKey
+        if hasAPIKey { engineNote = "escalation API key stored" }
     }
 
     func removeAPIKey() {

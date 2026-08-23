@@ -14,6 +14,12 @@ public enum KeychainAccess {
 
     public static var hasKey: Bool { key() != nil }
 
+    /// The last status each operation returned, for surfacing failures --
+    /// ad-hoc signing plus App Sandbox is exactly where keychain calls fail
+    /// quietly, and a swallowed OSStatus here presents three layers away as
+    /// "the key is absent" right after the user typed it.
+    nonisolated(unsafe) public private(set) static var lastStatus: OSStatus = errSecSuccess
+
     /// Host code only. Never place the result anywhere a model reads:
     /// not a prompt, not a tool result, not a transcript, not a log.
     public static func key() -> String? {
@@ -22,10 +28,21 @@ public enum KeychainAccess {
                                 kSecAttrAccount as String: account,
                                 kSecReturnData as String: true]
         var out: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+        lastStatus = SecItemCopyMatching(q as CFDictionary, &out)
+        guard lastStatus == errSecSuccess,
               let d = out as? Data, let s = String(data: d, encoding: .utf8),
               !s.isEmpty else { return nil }
         return s
+    }
+
+    /// A one-line report for the UI and config_show: set, or absent with the
+    /// OSStatus that made it so.
+    public static func status() -> String {
+        if hasKey { return "set (in the Keychain)" }
+        if lastStatus == errSecItemNotFound { return "absent" }
+        let msg = SecCopyErrorMessageString(lastStatus, nil).map { $0 as String }
+            ?? "OSStatus \(lastStatus)"
+        return "absent — the keychain read failed: \(msg) (\(lastStatus))"
     }
 
     @discardableResult
@@ -37,7 +54,8 @@ public enum KeychainAccess {
                                 kSecAttrService as String: service,
                                 kSecAttrAccount as String: account,
                                 kSecValueData as String: Data(trimmed.utf8)]
-        return SecItemAdd(q as CFDictionary, nil) == errSecSuccess
+        lastStatus = SecItemAdd(q as CFDictionary, nil)
+        return lastStatus == errSecSuccess
     }
 
     public static func remove() {
