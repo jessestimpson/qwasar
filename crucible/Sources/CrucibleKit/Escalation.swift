@@ -37,18 +37,13 @@ public struct EscalationPolicy: Sendable {
     public var turnBudgetUSD: Double
     /// Seconds the conversation stays open for the user after each response.
     public var graceSeconds: Double
-    /// Ceiling on remote tool calls per delegation, so a looping remote
-    /// agent runs into a wall the budget might take too long to provide.
-    public var maxToolSteps: Int
 
     public init(models: [String], sessionRemainingUSD: Double,
-                turnBudgetUSD: Double, graceSeconds: Double = 10,
-                maxToolSteps: Int = 32) {
+                turnBudgetUSD: Double, graceSeconds: Double = 10) {
         self.models = models
         self.sessionRemainingUSD = sessionRemainingUSD
         self.turnBudgetUSD = turnBudgetUSD
         self.graceSeconds = graceSeconds
-        self.maxToolSteps = maxToolSteps
     }
 
     public var isEnabled: Bool {
@@ -276,15 +271,16 @@ public struct DelegateToolRunner: ToolExecuting {
                      "function": ["name": tc.name, "arguments": tc.arguments]]
                 }
                 messages.append(assistant)
+                // No step ceiling, deliberately (spec §15.2): a delegation is
+                // long-horizon by design, and its governors are the DOLLAR
+                // budgets and the user's Stop -- both visible in the card,
+                // where a looping agent is watched rather than guessed at.
                 for tc in r.toolCalls {
                     toolSteps += 1
                     toolTally[tc.name, default: 0] += 1
                     emit(.toolCall(name: tc.name, arguments: tc.arguments))
                     let result: String
-                    if toolSteps > policy.maxToolSteps {
-                        result = "error: this delegation's tool-step ceiling "
-                               + "(\(policy.maxToolSteps)) is reached; finish with what you have"
-                    } else if tc.name == "delegate" {
+                    if tc.name == "delegate" {
                         result = "error: nested escalation is not available"
                     } else {
                         result = inner.run(ToolCall(name: tc.name,
@@ -294,7 +290,6 @@ public struct DelegateToolRunner: ToolExecuting {
                     messages.append(["role": "tool", "tool_call_id": tc.id,
                                      "content": result])
                 }
-                if toolSteps > policy.maxToolSteps { reason = "the tool-step ceiling"; }
                 // Steering lands between steps too -- no grace wait while the
                 // model is mid-work, just a drain.
                 let (queued, stopped) = mailbox.drain()

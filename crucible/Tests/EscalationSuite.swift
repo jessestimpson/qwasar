@@ -123,15 +123,14 @@ enum EscalationSuite {
 
     static func runner(models: [String] = ["stub/model-a", "stub/model-b"],
                        remaining: Double = 1.0, turn: Double = 1.0,
-                       grace: Double = 0.05, steps: Int = 32, log: CallLog? = nil,
+                       grace: Double = 0.05, log: CallLog? = nil,
                        events: Events, mailbox: DelegationMailbox,
                        key: String? = "SECRET-KEY") -> DelegateToolRunner {
         DelegateToolRunner(inner: Inner(log: log),
                            policy: EscalationPolicy(models: models,
                                                     sessionRemainingUSD: remaining,
                                                     turnBudgetUSD: turn,
-                                                    graceSeconds: grace,
-                                                    maxToolSteps: steps),
+                                                    graceSeconds: grace),
                            mailbox: mailbox,
                            emit: { events.add($0) },
                            baseURL: URL(string: "https://stub.invalid/api/v1")!,
@@ -283,7 +282,8 @@ enum EscalationSuite {
             if case .toolResult(_, let r) = ev { return r.contains("nested escalation") } else { return false }
         }, "nested escalation is refused")
 
-        // The step ceiling stops a looping remote agent.
+        // Long-horizon: NO step ceiling -- many cheap tool steps run to
+        // completion; the governors are the budget (proven above) and Stop.
         Stub.script = .init(responses: [
             .toolCall(name: "write", args: #"{"path": "a", "content": "x"}"#, cost: 0.0),
             .toolCall(name: "write", args: #"{"path": "b", "content": "x"}"#, cost: 0.0),
@@ -292,12 +292,25 @@ enum EscalationSuite {
         ])
         ev = Events(); mb = DelegationMailbox()
         let log2 = CallLog()
-        _ = runner(steps: 2, log: log2, events: ev, mailbox: mb).run(call(["task": "t"]))
-        f += TestMain.check(log2.all.count == 2,
-                            "the step ceiling stops execution at the cap")
-        f += TestMain.check(ev.all.contains { ev in
-            if case .toolResult(_, let r) = ev { return r.contains("ceiling") } else { return false }
-        }, "and the remote model is told so")
+        out = runner(log: log2, events: ev, mailbox: mb).run(call(["task": "t"]))
+        f += TestMain.check(log2.all.count == 3 && out.contains("stopping"),
+                            "no step ceiling: a long tool run goes to completion")
+        // Mid-work stop still cuts a long horizon short.
+        Stub.script = .init(responses: [
+            .toolCall(name: "write", args: #"{"path": "a", "content": "x"}"#, cost: 0.0),
+            .toolCall(name: "write", args: #"{"path": "b", "content": "x"}"#, cost: 0.0),
+            .text(["never"], cost: 0.0),
+        ])
+        ev = Events(); mb = DelegationMailbox()
+        let log3 = CallLog()
+        let stopper = mb
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.02)
+            stopper.stop()
+        }
+        _ = runner(log: log3, events: ev, mailbox: mb).run(call(["task": "t"]))
+        f += TestMain.check(ev.endedReason == "the user ended it",
+                            "Stop still ends a long-horizon delegation mid-work")
 
         return f
     }

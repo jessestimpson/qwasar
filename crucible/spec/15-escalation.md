@@ -63,8 +63,13 @@ own input field.
   is serialised with the local agent's by construction, since the local turn
   is blocked inside `delegate`.
 - **Ending.** The delegation ends when the remote model stops, the budget
-  trips, the user stops it, or a wall-clock ceiling passes. Whatever ended
-  it, the local model receives a tool result: the remote model's final
+  trips, or the user stops it — and nothing else, by explicit decision:
+  no wall-clock ceiling, no tool-step ceiling, no token cap. A delegation is
+  **long-horizon by design**; its governors are the dollar budgets and the
+  person watching the card, both of which see a looping agent rather than
+  guessing at one. (E2 briefly shipped a 32-step ceiling; it was removed —
+  a step count is a proxy for cost, and the cost is already governed
+  directly.) Whatever ended it, the local model receives a tool result: the remote model's final
   message, plus a header stating model, tokens, cost, and how it ended.
   A budget-tripped delegation is reported as exactly that — the local model
   can act on a partial answer knowing it is partial.
@@ -163,11 +168,13 @@ with a dollar figure on it.
   gets the *whole* inner surface, not just the guest ten -- if the project
   granted `fetch`, the remote agent fetches under the same allowlist,
   because "the same rules as the local agent" is the statement a person can
-  reason about; nested `delegate` is refused as a tool result (the wrapper
-  appends itself after inner, so it is never advertised, and a model that
-  guesses the name is told no); and a **tool-step ceiling** (32) backstops
-  the budget against a cheap looping agent. Steering drains between tool
-  steps too -- no grace wait while the model is mid-work. All pinned by
+  reason about; and nested `delegate` is refused as a tool result (the
+  wrapper appends itself after inner, so it is never advertised, and a model
+  that guesses the name is told no). Steering drains between tool steps
+  too -- no grace wait while the model is mid-work. A tool-step ceiling
+  shipped here and was later removed at the user's direction (see §15.2's
+  Ending): long horizon is the point, and the budget governs cost directly
+  where a step count only guessed at it. All pinned by
   `EscalationSuite` against the scripted provider, including the E2 gate
   shape: the remote model writes a file and its result returns in the next
   request.
