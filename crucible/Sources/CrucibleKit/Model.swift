@@ -152,6 +152,9 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
     /// This session's layer of sandbox configuration (PLAN.md 8.5): the most
     /// specific overlay, consulted first. Optional so old records decode.
     public var sandbox: SandboxOverlay?
+    /// What this session's delegations have cost (spec §15.3), summed. The
+    /// escalation budget is enforced against this, so it persists.
+    public var spentUSD: Double?
 
     public var effort: ReasoningEffort { storedEffort ?? .medium }
 
@@ -198,6 +201,11 @@ public struct TranscriptItem: Codable, Identifiable, Sendable {
         case note(String)
         case footer(TurnStats)
         case contextFull(used: Int, limit: Int)
+        /// A completed delegation (spec §15.2): the sub-session, kept in the
+        /// transcript so a parked session replays it readable. `log` is the
+        /// rendered sub-conversation, `ended` how it finished.
+        case delegation(model: String, task: String, log: String,
+                        costUSD: Double, ended: String)
     }
 
     public init(_ kind: Kind, id: UUID = UUID(), at: Date = Date(), tokens: Int? = nil) {

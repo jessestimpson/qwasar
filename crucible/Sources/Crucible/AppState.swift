@@ -87,6 +87,21 @@ final class AppState {
     /// The global sandbox layer (PLAN.md 8.5), loaded once and written only
     /// through performConfig -- the config session's single mutation path.
     var globalSandbox: SandboxOverlay?
+
+    // Escalation (spec §15). The live delegation is what the embedded card
+    // renders; the mailbox is the path INTO it. Both exist only while a
+    // delegation runs.
+    struct LiveDelegation {
+        var model: String
+        var task: String
+        var log: String = ""
+        var costUSD: Double = 0
+        var ended: String?
+    }
+    var liveDelegation: LiveDelegation?
+    var delegationDraft = ""
+    var showingAPIKeySheet = false
+    private var delegationMailbox: DelegationMailbox?
     /// Set while the app is quitting and the guests are being flushed.
     var shuttingDown = false
     /// Something the ENGINE has to say, which can happen with no session open:
@@ -266,6 +281,58 @@ final class AppState {
         projects.append(p)
         store?.saveProjects(projects)
         newSession(in: p)
+    }
+
+    // MARK: Escalation (spec §15)
+
+    /// Observable mirror of "a key exists" -- never the key itself, which
+    /// goes straight to the Keychain and nowhere else (spec §15.4).
+    var hasAPIKey = KeychainAccess.hasKey
+
+    func setAPIKey(_ key: String) {
+        KeychainAccess.set(key)
+        hasAPIKey = KeychainAccess.hasKey
+    }
+
+    func removeAPIKey() {
+        KeychainAccess.remove()
+        hasAPIKey = false
+    }
+
+    func sendToDelegation() {
+        let text = delegationDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, let mailbox = delegationMailbox else { return }
+        delegationDraft = ""
+        mailbox.post(text)
+    }
+
+    func stopDelegation() { delegationMailbox?.stop() }
+
+    private func handleDelegation(_ ev: DelegationEvent, session sid: UUID) {
+        switch ev {
+        case .started(let model, let task):
+            liveDelegation = LiveDelegation(model: model, task: task)
+        case .delta(let piece):
+            liveDelegation?.log += piece
+        case .userTurn(let text):
+            liveDelegation?.log += "\n\n**you:** \(text)\n\n"
+        case .cost(let usd):
+            liveDelegation?.costUSD = usd
+        case .ended(let reason, let usd):
+            // The sub-session becomes a transcript item so a parked session
+            // replays it readable (spec §15.2), and the spend persists so the
+            // budget survives a relaunch (spec §15.3).
+            if let live = liveDelegation {
+                appendItem(TranscriptItem(.delegation(model: live.model, task: live.task,
+                                                      log: live.log, costUSD: usd,
+                                                      ended: reason)))
+            }
+            if let i = sessions.firstIndex(where: { $0.id == sid }) {
+                sessions[i].spentUSD = (sessions[i].spentUSD ?? 0) + usd
+                store?.save(sessions[i])
+            }
+            liveDelegation = nil
+        }
     }
 
     /// The single write path for a project's network grant (PLAN.md 8.3).
@@ -498,6 +565,30 @@ final class AppState {
                             policy: NetworkPolicy(allowlist: net,
                                                   maxResponseBytes: settings.fetchMaxKB * 1024))
                         sandboxStatus = (sandboxStatus ?? "") + " · net: \(net.count) host\(net.count == 1 ? "" : "s")"
+                    }
+                    // Escalation (spec §15): advertised only when models are
+                    // granted, a key exists, and budget remains -- the same
+                    // absent-means-absent rule fetch follows.
+                    let remaining = max(0, settings.agentBudgetUSD - (rec.spentUSD ?? 0))
+                    if !settings.agentModels.isEmpty, KeychainAccess.hasKey, remaining > 0 {
+                        let mailbox = DelegationMailbox()
+                        delegationMailbox = mailbox
+                        let sid = rec.id
+                        runner = DelegateToolRunner(
+                            inner: runner,
+                            policy: EscalationPolicy(models: settings.agentModels,
+                                                     sessionRemainingUSD: remaining,
+                                                     turnBudgetUSD: settings.agentTurnBudgetUSD),
+                            mailbox: mailbox,
+                            emit: { ev in
+                                DispatchQueue.main.async {
+                                    MainActor.assumeIsolated {
+                                        self.handleDelegation(ev, session: sid)
+                                    }
+                                }
+                            })
+                        sandboxStatus = (sandboxStatus ?? "")
+                            + String(format: " · delegate: $%.2f", remaining)
                     }
                 }
 

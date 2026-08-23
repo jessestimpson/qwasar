@@ -22,20 +22,32 @@ public struct SandboxOverlay: Codable, Sendable, Equatable, Hashable {
     public var toolTimeoutSeconds: Int?
     /// `fetch` response cap.
     public var fetchMaxKB: Int?
+    /// Escalation (spec §15): remote model ids `delegate` may use. Empty is
+    /// an OPINION -- escalation explicitly off -- where nil is silence.
+    public var agentModels: [String]?
+    /// Ceiling per session, summed across its delegations, USD.
+    public var agentBudgetUSD: Double?
+    /// Ceiling per single delegation, USD.
+    public var agentTurnBudgetUSD: Double?
 
     public init(networkAllowlist: [String]? = nil, guestMemoryMB: Int? = nil,
                 guestCPUs: Int? = nil, toolTimeoutSeconds: Int? = nil,
-                fetchMaxKB: Int? = nil) {
+                fetchMaxKB: Int? = nil, agentModels: [String]? = nil,
+                agentBudgetUSD: Double? = nil, agentTurnBudgetUSD: Double? = nil) {
         self.networkAllowlist = networkAllowlist
         self.guestMemoryMB = guestMemoryMB
         self.guestCPUs = guestCPUs
         self.toolTimeoutSeconds = toolTimeoutSeconds
         self.fetchMaxKB = fetchMaxKB
+        self.agentModels = agentModels
+        self.agentBudgetUSD = agentBudgetUSD
+        self.agentTurnBudgetUSD = agentTurnBudgetUSD
     }
 
     public var isEmpty: Bool {
         networkAllowlist == nil && guestMemoryMB == nil && guestCPUs == nil
             && toolTimeoutSeconds == nil && fetchMaxKB == nil
+            && agentModels == nil && agentBudgetUSD == nil && agentTurnBudgetUSD == nil
     }
 }
 
@@ -47,6 +59,9 @@ public enum SandboxKey: String, CaseIterable, Sendable {
     case guestCPUs = "guest_cpus"
     case toolTimeoutSeconds = "tool_timeout_seconds"
     case fetchMaxKB = "fetch_max_kb"
+    case agentModels = "agent_models"
+    case agentBudgetUSD = "agent_budget_usd"
+    case agentTurnBudgetUSD = "agent_turn_budget_usd"
 
     public var doc: String {
         switch self {
@@ -56,6 +71,10 @@ public enum SandboxKey: String, CaseIterable, Sendable {
         case .guestCPUs: return "guest VM CPUs (default 2)"
         case .toolTimeoutSeconds: return "per-tool-call ceiling, seconds (default 180)"
         case .fetchMaxKB: return "fetch response cap, KB (default 256)"
+        case .agentModels:
+            return "remote model ids `delegate` may use (spec §15); comma-separated, empty string for explicitly OFF"
+        case .agentBudgetUSD: return "escalation ceiling per session, USD (default 5.00)"
+        case .agentTurnBudgetUSD: return "escalation ceiling per delegation, USD (default 1.00)"
         }
     }
 
@@ -84,6 +103,19 @@ public enum SandboxKey: String, CaseIterable, Sendable {
         case .fetchMaxKB:
             guard let n = int(1...10240) else { return "fetch_max_kb needs an integer in 1...10240" }
             overlay.fetchMaxKB = n
+        case .agentModels:
+            let ids = value.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            overlay.agentModels = ids                // [] = explicitly off
+        case .agentBudgetUSD:
+            guard let d = Double(value.trimmingCharacters(in: .whitespaces)),
+                  (0...1000).contains(d) else { return "agent_budget_usd needs a number in 0...1000" }
+            overlay.agentBudgetUSD = d
+        case .agentTurnBudgetUSD:
+            guard let d = Double(value.trimmingCharacters(in: .whitespaces)),
+                  (0...1000).contains(d) else { return "agent_turn_budget_usd needs a number in 0...1000" }
+            overlay.agentTurnBudgetUSD = d
         }
         return nil
     }
@@ -95,6 +127,9 @@ public enum SandboxKey: String, CaseIterable, Sendable {
         case .guestCPUs: overlay.guestCPUs = nil
         case .toolTimeoutSeconds: overlay.toolTimeoutSeconds = nil
         case .fetchMaxKB: overlay.fetchMaxKB = nil
+        case .agentModels: overlay.agentModels = nil
+        case .agentBudgetUSD: overlay.agentBudgetUSD = nil
+        case .agentTurnBudgetUSD: overlay.agentTurnBudgetUSD = nil
         }
     }
 
@@ -105,6 +140,9 @@ public enum SandboxKey: String, CaseIterable, Sendable {
         case .guestCPUs: return overlay.guestCPUs.map(String.init)
         case .toolTimeoutSeconds: return overlay.toolTimeoutSeconds.map(String.init)
         case .fetchMaxKB: return overlay.fetchMaxKB.map(String.init)
+        case .agentModels: return overlay.agentModels.map { $0.isEmpty ? "(explicitly off)" : $0.joined(separator: ", ") }
+        case .agentBudgetUSD: return overlay.agentBudgetUSD.map { String(format: "%.2f", $0) }
+        case .agentTurnBudgetUSD: return overlay.agentTurnBudgetUSD.map { String(format: "%.2f", $0) }
         }
     }
 }
@@ -118,12 +156,18 @@ public struct SandboxSettings: Sendable, Equatable {
     public var guestCPUs: Int
     public var toolTimeoutSeconds: Int
     public var fetchMaxKB: Int
+    public var agentModels: [String]
+    public var agentBudgetUSD: Double
+    public var agentTurnBudgetUSD: Double
 
     public static let defaults = SandboxSettings(networkAllowlist: [],
                                                  guestMemoryMB: 2048,
                                                  guestCPUs: 2,
                                                  toolTimeoutSeconds: 180,
-                                                 fetchMaxKB: 256)
+                                                 fetchMaxKB: 256,
+                                                 agentModels: [],
+                                                 agentBudgetUSD: 5.0,
+                                                 agentTurnBudgetUSD: 1.0)
 
     public enum Layer: String, Sendable { case session, project, global, builtin = "built-in" }
 
@@ -138,7 +182,10 @@ public struct SandboxSettings: Sendable, Equatable {
             guestMemoryMB: pick({ $0.guestMemoryMB }, defaults.guestMemoryMB),
             guestCPUs: pick({ $0.guestCPUs }, defaults.guestCPUs),
             toolTimeoutSeconds: pick({ $0.toolTimeoutSeconds }, defaults.toolTimeoutSeconds),
-            fetchMaxKB: pick({ $0.fetchMaxKB }, defaults.fetchMaxKB))
+            fetchMaxKB: pick({ $0.fetchMaxKB }, defaults.fetchMaxKB),
+            agentModels: pick({ $0.agentModels }, defaults.agentModels),
+            agentBudgetUSD: pick({ $0.agentBudgetUSD }, defaults.agentBudgetUSD),
+            agentTurnBudgetUSD: pick({ $0.agentTurnBudgetUSD }, defaults.agentTurnBudgetUSD))
     }
 
     /// Which layer decided `key`, for display.

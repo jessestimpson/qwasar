@@ -29,6 +29,11 @@ struct SessionView: View {
                         if let p = state.pendingCall {
                             PendingCallRow(name: p.name, keys: p.keys, tokens: p.tokens)
                         }
+                        if let d = state.liveDelegation {
+                            DelegationCard(model: d.model, task: d.task, log: d.log,
+                                           costUSD: d.costUSD, ended: d.ended,
+                                           state: state)
+                        }
                         Color.clear.frame(height: 1).id("bottom")
                     }
                     .padding(20)
@@ -461,6 +466,10 @@ struct TranscriptRow: View {
         case .footer(let s):
             Text(footerText(s))
                 .font(.caption).monospacedDigit().foregroundStyle(.tertiary)
+
+        case .delegation(let model, let task, let log, let cost, let ended):
+            DelegationCard(model: model, task: task, log: log,
+                           costUSD: cost, ended: ended, state: nil)
         }
     }
 
@@ -618,5 +627,72 @@ struct Composer: View {
             }
         }
         .padding(12)
+    }
+}
+
+
+// MARK: - Delegation (spec §15.2)
+
+/// The embedded sub-session: a transcript item with an inside. Live (state
+/// non-nil) it streams, meters cost, and takes input -- the paid model is
+/// steerable by the person paying. Completed, it renders the same card from
+/// the transcript record, read-only.
+struct DelegationCard: View {
+    let model: String
+    let task: String
+    let log: String
+    let costUSD: Double
+    let ended: String?
+    let state: AppState?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.up.forward.circle")
+                    .foregroundStyle(ended == nil ? Color.accentColor : Color.secondary)
+                Text(model).font(.caption.bold())
+                if ended == nil { ProgressView().controlSize(.mini) }
+                Spacer()
+                Text(String(format: "$%.4f", costUSD))
+                    .font(.caption).monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .help("What this delegation has cost so far. The budget "
+                          + "stops the next request, never the one in flight.")
+                if ended == nil, let state {
+                    Button("Stop") { state.stopDelegation() }
+                        .controlSize(.small)
+                }
+            }
+            Text(task).font(.caption).foregroundStyle(.secondary).lineLimit(3)
+            Divider()
+            if log.isEmpty && ended == nil {
+                Text("waiting for the remote model…")
+                    .font(.caption).foregroundStyle(.tertiary)
+            } else {
+                MarkdownView(source: log, isStreaming: ended == nil)
+            }
+            if let ended {
+                Label(ended, systemImage: "flag.checkered")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            } else if let state {
+                // The input INTO the delegation. Bound to its own draft, so
+                // the composer below stays the local model's.
+                HStack(spacing: 6) {
+                    TextField("steer the remote model…",
+                              text: Binding(get: { state.delegationDraft },
+                                            set: { state.delegationDraft = $0 }))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                        .onSubmit { state.sendToDelegation() }
+                    Button("Send") { state.sendToDelegation() }
+                        .controlSize(.small)
+                        .disabled(state.delegationDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.06)))
+        .overlay(RoundedRectangle(cornerRadius: 8)
+            .stroke(ended == nil ? Color.accentColor.opacity(0.4) : Color.secondary.opacity(0.2)))
     }
 }

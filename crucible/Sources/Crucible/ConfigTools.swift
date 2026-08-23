@@ -33,7 +33,7 @@ struct ConfigToolRunner: ToolExecuting {
     """#
 
     static let setSchema = #"""
-    {"type": "function", "function": {"name": "config_set", "description": "Set one sandbox configuration key at one layer. Resolution is field-wise: session overrides project overrides global overrides the built-in default -- setting a value REPLACES what lower layers said for that key, never merges. Changes apply when a session is next opened (a live session keeps the settings it booted with). Keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
+    {"type": "function", "function": {"name": "config_set", "description": "Set one sandbox configuration key at one layer. Resolution is field-wise: session overrides project overrides global overrides the built-in default -- setting a value REPLACES what lower layers said for that key, never merges. Changes apply when a session is next opened (a live session keeps the settings it booted with). Keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb, agent_models (comma-separated remote model ids, empty string for explicitly OFF), agent_budget_usd, agent_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
     """#
 
     static let clearSchema = #"""
@@ -176,6 +176,9 @@ extension AppState {
             "\(k.rawValue)=\(k.value(in: defaultsAsOverlay) ?? "?")"
         }.joined(separator: ", ")]
         out.append("global: \(describe(globalSandbox))")
+        // Presence only, by design (spec §15.4): there is no operation that
+        // returns the key.
+        out.append("escalation API key: \(KeychainAccess.hasKey ? "set (in the Keychain)" : "absent")")
         for p in projects where !p.isConfig {
             out.append("project \(p.name) [\(p.id.uuidString)]: \(describe(p.sandbox ?? (p.overlay.isEmpty ? nil : p.overlay)))")
             for s in sessions where s.projectID == p.id {
@@ -188,7 +191,9 @@ extension AppState {
                 out.append("  session \(s.title) [\(s.id.uuidString)]: layer \(describe(s.sandbox))")
                 out.append("    effective: network=[\(eff.networkAllowlist.joined(separator: ", "))] "
                          + "memory=\(eff.guestMemoryMB)MB cpus=\(eff.guestCPUs) "
-                         + "timeout=\(eff.toolTimeoutSeconds)s fetch_cap=\(eff.fetchMaxKB)KB")
+                         + "timeout=\(eff.toolTimeoutSeconds)s fetch_cap=\(eff.fetchMaxKB)KB "
+                         + "agent=[\(eff.agentModels.joined(separator: ", "))] "
+                         + String(format: "spent=$%.4f of $%.2f", s.spentUSD ?? 0, eff.agentBudgetUSD))
                 out.append("    provenance: \(prov)")
             }
         }

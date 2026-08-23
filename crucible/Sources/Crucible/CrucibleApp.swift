@@ -36,6 +36,17 @@ struct CrucibleApp: App {
                 if state.hasDraftHead {
                     Button("Remove MTP Draft Head") { state.forgetDraftHead() }
                 }
+                Divider()
+                // Escalation (spec §15.4): the key is entered here, lands in
+                // the Keychain, and is never seen again -- not by the config
+                // project, not by any model, not by this UI.
+                Button(state.hasAPIKey ? "Replace Escalation API Key…"
+                                       : "Set Escalation API Key…") {
+                    state.showingAPIKeySheet = true
+                }
+                if state.hasAPIKey {
+                    Button("Remove Escalation API Key") { state.removeAPIKey() }
+                }
             }
         }
     }
@@ -83,6 +94,7 @@ struct RootView: View {
                 }
             }
             .toolbar { StatusToolbar(state: state) }
+            .sheet(isPresented: $state.showingAPIKeySheet) { APIKeySheet(state: state) }
 
             // Spans the window, not the detail pane: what the engine is doing
             // is a property of the application, and there is only ever one
@@ -90,6 +102,41 @@ struct RootView: View {
             StatusFooter(state: state)
         }
         .animation(.easeInOut(duration: 0.15), value: state.prefillTotal > 0)
+    }
+}
+
+// MARK: - Escalation API key (spec §15.4)
+
+struct APIKeySheet: View {
+    @Bindable var state: AppState
+    @State private var key = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Escalation API key").font(.headline)
+            Text("An OpenRouter (or OpenAI-compatible) key. It is stored in "
+                 + "the macOS Keychain and attached to requests by the app "
+                 + "alone — no model, tool, or config session can read it.")
+                .font(.caption).foregroundStyle(.secondary)
+            SecureField("sk-or-…", text: $key)
+                .textFieldStyle(.roundedBorder)
+            Text("Escalation also needs models granted: in a Crucible Config "
+                 + "session, `config_set` the `agent_models` key at the layer "
+                 + "you want.")
+                .font(.caption2).foregroundStyle(.tertiary)
+            HStack {
+                Spacer()
+                Button("Cancel") { state.showingAPIKeySheet = false }
+                Button("Save") {
+                    state.setAPIKey(key)
+                    state.showingAPIKeySheet = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 420)
     }
 }
 

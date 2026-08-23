@@ -36,6 +36,11 @@ public struct ToolCall: Sendable, Equatable {
     public var name: String
     public var arguments: [String: String]
 
+    public init(name: String, arguments: [String: String]) {
+        self.name = name
+        self.arguments = arguments
+    }
+
     public func argument(_ key: String) -> String? { arguments[key] }
 }
 

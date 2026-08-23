@@ -1,7 +1,7 @@
 ## 15. Escalation: remote sub-agents, embedded and budgeted
 
-*Planned 2026-08-23. Not started. This section is the design; the milestones
-are at the end of it.*
+*E1 built 2026-08-23; E2/E3 not started. This section is the design; the
+milestones are at the end of it.*
 
 The premise: the local model is cheap, private, and always available, and it
 is a 27B. Some problems deserve more model than that. So a session can
@@ -139,10 +139,16 @@ with a dollar figure on it.
 
 ### 15.6 Milestones
 
-- **E1 — consult.** Text-in/text-out delegation, no remote tools: budget
-  keys, keychain panel, cost metering, the embedded card with live streaming
-  and mid-flight user input. Gate: a scripted delegation against a cheap
-  model, budget trip included, replayed from a parked session.
+- **E1 — consult.** *Built.* Text-in/text-out delegation, no remote tools:
+  budget keys, keychain panel, cost metering, the embedded card with live
+  streaming and mid-flight user input. `EscalationSuite` scripts the provider
+  through a URLProtocol stub and pins the budget rule, the steering
+  semantics, and the key's absence from every model-visible surface. One
+  semantic E1 settled that the design left open: after each completed
+  response the conversation holds open for a **grace window** (10 s) —
+  a queued user message continues it, stop or silence ends it — because
+  "ends the instant the model stops" and "waits forever" both fail the
+  person mid-sentence.
 - **E2 — the remote agent works.** The ten-tool surface proxied to the
   remote model; serialisation with the local turn; tool cards inside the
   sub-session card. Gate: the remote model edits a file in `/work` and the
