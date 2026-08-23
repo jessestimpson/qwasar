@@ -182,3 +182,87 @@ applies to a refused confirmation: the model gets told and chooses again.
   did, it is on the disk.
 
 ---
+
+### 6.6 Provisioning: packages as configuration, never as images
+
+*Specified 2026-08-23. Not started.*
+
+The gap this closes: the guest has no network **by design**, so the agent can
+never install anything, and the golden image's package list is a constant in
+`mkrootfs.py` that only a developer edits. Real projects need system
+components — a compiler, a database client, an image library — and today the
+answer is "rebuild the image," which is no answer for a user.
+
+**The user's primitive is a package list, not an image.** One new overlay
+key, with §8.5's semantics exactly:
+
+| key | meaning |
+|---|---|
+| `guest_packages` | Alpine package names, comma-separated; a session's list REPLACES the project's; empty = explicitly none, nil = fall through |
+
+Set it the way everything else is set — conversationally in the config
+project ("give this project rust and cmake"), at whichever layer fits. The
+agent participates through the loop that already exists: a missing command is
+a tool result, the model says what it needs, the user tells the config agent,
+the next session open has it. No new machinery surfaces the request because
+requests already have a surface.
+
+#### The mechanism: a provision overlay over virtiofs
+
+Two facts the codebase already established do all the work. Alpine packages
+are tarballs, and the HOST knows how to resolve and extract them natively —
+that is precisely what `mkrootfs.py` does at image-build time. And the guest
+already has a boot-time ingestion path — virtiofs, copy, unmount — the
+`/base` pattern whose security argument (§8.2) is unchanged by a second
+read-only share.
+
+1. **Resolve and cache, host-side.** The dependency closure is computed
+   against APKINDEX (the ~100-line resolver from `mkrootfs.py`, ported to
+   Swift — the app already holds the outgoing-network entitlement, and the
+   Alpine mirror URLs are pinned host-side, not configurable, the §8.3
+   rule). Packages are verified against the index checksums and extracted
+   into a **content-addressed cache**: one directory per package-set hash,
+   in Application Support, built once, shared across projects. Packages the
+   golden image already carries are excluded from the closure.
+2. **Overlay at boot.** The cache directory rides into the guest as a second
+   read-only virtiofs share (`/provision`); `crucible-init` copies it into
+   `/` once per session disk — a marker file, the seed-work pattern — and
+   unmounts. Session disks persist, so later boots skip the copy. apk
+   install scripts do not run; the busybox precedent (§6.2) says how to
+   handle the rare package that needs one, and most need nothing.
+3. **Say what happened.** The session header carries it — `· +14 packages` —
+   and the first boot of a new set shows "provisioning" during the fetch.
+
+**Failure is named, never fatal.** An unknown package is reported at session
+open by name ("no Alpine package `gcc-13`; `skills`-era spelling is `gcc`"),
+and the session boots without it. A network failure during fetch degrades the
+same way: the session runs on the golden image, the note says which packages
+are missing and why.
+
+#### What this deliberately is not
+
+- **Not per-project images.** Derived images would multiply kernel-matching
+  liabilities, cost gigabytes per variant, and rebuild on every golden
+  update; an overlay directory is content-addressed bytes that compose with
+  ANY golden. No ext4 surgery from macOS either (possible via debugfs,
+  miserable, and unnecessary).
+- **Not guest-side installation.** Nothing inside the VM fetches anything;
+  the no-network property survives untouched. The host fetches, from pinned
+  URLs, and the guest receives files — the same trust shape as `fetch`.
+- **Not a general software manager.** Alpine/musl packages only (~20k of
+  them), stated plainly in the config agent's briefing. The recorded escape
+  hatch for glibc-only software or services needing real post-install setup
+  is a custom golden: `make guest` with a `PACKAGES` override — a build-time
+  operation for power users, and the image it produces still composes with
+  every project's overlay.
+
+**Deferred, deliberately:** version-pinned language runtimes
+(`guest_runtimes` fetching Node 20 vs 24, Python 3.11 vs 3.12 from pinned
+sources). Alpine's shipped versions cover v1; pinning is a second key and a
+second source of truth, and it waits until the plain package path has been
+lived with.
+
+**Correctness bar, set now:** the resolver port is pinned against
+`mkrootfs.py`'s closures (same inputs, same package sets); the gate boots a
+session with a provisioned package and runs its binary; a bogus package name
+must produce the named note and a working session.

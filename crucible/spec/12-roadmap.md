@@ -36,6 +36,10 @@ What a spec needs is the map: what exists, and what is next.
 - **§7.4 cleanup.** The git crossing is built (§7.4a); the byte-copy sheet
   survives as the non-git fallback and still carries drift machinery the
   crossing obsoleted — a net-removal pass is owed.
+- **§6.6 — provisioning.** Specified: `guest_packages` as an overlay key, a
+  host-side native resolver with a content-addressed cache, a `/provision`
+  virtiofs overlay at first boot. Closes "the sandbox lacks the tools this
+  project needs" without images or guest networking.
 - **§15 — delegation.** E1 and E2 built; next E3 (judgment: prompt-fragment
   tuning and a measured week of use).
 
