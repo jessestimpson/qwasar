@@ -170,29 +170,29 @@ defmodule Warden.Dispatch do
     end
   end
 
-  # What the agent has to work with. mise manages these; the warden only reports
-  # them, because a control plane that installs runtimes is a control plane the
-  # agent can break.
+  # What the agent has to work with: the runtimes baked into the image,
+  # reported by asking each one. There is no runtime installer in the guest --
+  # a VM with no network device could never fetch one anyway, which is what
+  # retired mise from this image (PLAN.md 6.2).
   #
-  # Absolute path on purpose: this runs under an init whose PATH is whatever the
-  # kernel handed PID 1, and a PATH lookup that fails here would report "no
-  # runtimes" for a guest that has them.
-  @mise "/usr/local/bin/mise"
-
+  # Absolute paths on purpose: this runs under an init whose PATH is whatever
+  # the kernel handed PID 1, and a PATH lookup that fails here would report
+  # "no runtimes" for a guest that has them.
   defp runtimes do
-    if File.exists?(@mise) do
-      case cmd(@mise, ["ls", "--installed", "--no-header"]) do
-        "(" <> _ -> "none"
-        "" -> "none"
-        out ->
-          out
-          |> String.split("\n", trim: true)
-          |> Enum.map_join(",", fn line ->
-            line |> String.split() |> Enum.take(2) |> Enum.join("@")
-          end)
-      end
-    else
-      "none"
+    [
+      {"erlang", "/usr/bin/erl",
+       ["-noshell", "-eval", "io:put_chars(erlang:system_info(otp_release)), halt(0)."]},
+      {"elixir", "/usr/bin/elixir", ["-e", "IO.write(System.version())"]},
+      {"node", "/usr/bin/node", ["--version"]},
+      {"python", "/usr/bin/python3", ["--version"]}
+    ]
+    |> Enum.filter(fn {_, path, _} -> File.exists?(path) end)
+    |> Enum.map_join(",", fn {name, path, args} ->
+      "#{name}@#{cmd(path, args) |> String.replace_prefix("Python ", "") |> String.replace_prefix("v", "")}"
+    end)
+    |> case do
+      "" -> "none"
+      s -> s
     end
   end
 

@@ -47,11 +47,14 @@ patch-back with a real git branch you can merge (PLAN.md 7.4a).
 |---|---|
 | Machine | Apple silicon. Developed and measured on an M4 with 32 GB |
 | macOS | 14.0 minimum; developed on 26 |
-| Build | Xcode command line tools, and Docker **only** to build the guest image |
+| Build | Xcode command line tools, `mise` (erlang/elixir/zig pins), `brew install e2fsprogs` |
 | Model | The same `qwasar-model` directory the CLI uses; ~16 GB, not bundled |
 | Disk | ~530 MB for the guest image, plus the app |
 
-Docker is build-time only; the shipped app never needs it.
+There is no Docker and no Linux anywhere in the build: the guest image is
+assembled natively on macOS. Alpine packages are tarballs, BEAM bytecode is
+portable, and `mke2fs -d` builds an ext4 image without root — see
+`Guest/mkimage.sh` for the whole story.
 
 ## Build and run
 
@@ -59,11 +62,14 @@ Docker is build-time only; the shipped app never needs it.
 make guest && make run
 ```
 
-`make guest` builds the Linux guest image (Alpine, OTP 27 and Elixir, the
-warden, the vsock bridge) — about ten minutes the first time, cached after,
-Docker Desktop running. `make run` builds the app, signs it, stages the guest
-image, and opens it; after the first time, `make run` alone is enough. The
-result is `build/Crucible.app`, self-contained apart from the weights.
+`make guest` assembles the Linux guest image natively — Alpine packages
+fetched and untarred, OTP 27 from Alpine's own `erlang27` package, Elixir as
+the precompiled `-otp-27` release, the warden compiled on the host's pinned
+toolchain, the initramfs and ext4 image built by `Guest/mkrootfs.py`. A
+couple of minutes on first run, and downloads are cached after. `make run`
+builds the app, signs it, stages the guest image, and opens it; after the
+first time, `make run` alone is enough. The result is `build/Crucible.app`,
+self-contained apart from the weights.
 
 Then, on first launch:
 
@@ -117,7 +123,7 @@ make gate-full ROOT_DIR=/path/to/project PROMPT="what does qw_edit_apply do?"
 |---|---|
 | `make` | build and sign `build/Crucible.app` |
 | `make run` | build, then launch it |
-| `make guest` | build the guest image (needs Docker) |
+| `make guest` | build the guest image, natively — no Docker |
 | `make test` | host suite: goldens, path confinement, UTF-8, persistence, KV prefix |
 | `make golden` | regenerate the chat-template goldens — read the diff |
 | `make sandbox` | boot a guest and exercise the ten tools end to end |
@@ -125,9 +131,6 @@ make gate-full ROOT_DIR=/path/to/project PROMPT="what does qw_edit_apply do?"
 | `make gate-prefix` | prove the system-prefix KV checkpoint against the engine (~80s) |
 | `make clean` | remove build products, keeping the guest image |
 | `make clean-guest` | remove the guest image too |
-
-`make guest` grows Docker's build cache by several GB per run; if a rebuild
-hits *no space left on device*, run `docker builder prune -af`.
 
 ## What is not verified
 

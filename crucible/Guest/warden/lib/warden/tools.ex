@@ -183,7 +183,7 @@ defmodule Warden.Tools do
         System.cmd("/bin/sh", ["-c", command],
           cd: @root,
           stderr_to_stdout: true,
-          env: [{"PATH", "/opt/mise/shims:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"}]
+          env: [{"PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"}]
         )
       end)
 

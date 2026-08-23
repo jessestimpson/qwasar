@@ -54,7 +54,7 @@ help:
 	@echo "Crucible build targets (see README.md):"
 	@echo "  make              build and sign build/Crucible.app"
 	@echo "  make run          build, then launch it"
-	@echo "  make guest        build the Linux guest image (needs Docker)"
+	@echo "  make guest        build the guest image (native macOS build; no Docker)"
 	@echo "  make test         the host test suite"
 	@echo "  make golden       regenerate the chat-template goldens -- read the diff"
 	@echo "  make sandbox      boot a guest and run the sandbox gate"
@@ -231,18 +231,24 @@ golden: $(BUILD)/gen_golden
 # only reach it through a grant.  The shipping app will carry the image in its
 # own bundle and copy it into its container on first run, at which point no
 # exception is needed -- see PLAN.md 6.2.
+# The gate's project is the warden's own source, not $(ROOT): the repo root
+# carries build/ -- several GB of guest image and cache -- and the raw share
+# has no exclusion list, so copying it into a 3 GB guest disk is ENOSPC
+# reported three layers away as a cookie-file write failure.
+SANDBOX_ROOT ?= Guest/warden
 sandbox: $(APP)
 	@codesign --force --sign - --entitlements Crucible.gate.entitlements \
 	          --options runtime --timestamp=none $(APP)
 	@$(BIN) --sandbox --guest "$(abspath $(BUILD)/guest)" \
-	        $(if $(ROOT_DIR),--root "$(abspath $(ROOT_DIR))") || true
+	        --root "$(abspath $(SANDBOX_ROOT))" || true
 	@codesign --force --sign - --entitlements Crucible.entitlements \
 	          --options runtime --timestamp=none $(APP) 2>/dev/null
 
 # ---- guest image -------------------------------------------------------------
 #
-# Built once, cloned per session (PLAN.md 6.3).  Docker is a build dependency
-# and nothing else: the .app never needs it.
+# Built once, cloned per session (PLAN.md 6.3).  Built natively on macOS --
+# Alpine packages are tarballs and BEAM is portable, so no Docker and no
+# Linux anywhere (PLAN.md 6.2, and Guest/mkimage.sh for the how).
 guest:
 	@Guest/mkimage.sh
 

@@ -13,6 +13,10 @@ defmodule Warden.ToolsTest do
   pointed them somewhere else would be testing something else.
   """
   use ExUnit.Case, async: false
+  # Writes under the real /work, which exists only in the guest. Excluded by
+  # the image build (mkimage.sh runs on macOS); `make sandbox` exercises the
+  # real tools in the real guest instead.
+  @moduletag :work_fs
 
   @root "/work"
 

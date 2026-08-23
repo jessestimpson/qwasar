@@ -12,6 +12,19 @@
 
 set -u
 
+# The applet farm, before anything needs an applet. apk's busybox trigger
+# would have made these symlinks at install time; this image is assembled
+# without running apk's scripts (mkrootfs.py), so PID 1 does it -- one call,
+# idempotent, and everything below (`mount`, `awk`, `modprobe`, ...) exists
+# because of it. Only /bin/sh predates this line, planted at build so this
+# script can start at all.
+#
+# Explicit /bin/busybox for the remount, because this is a cycle stated
+# plainly: --install writes symlinks, which needs / writable, and remounting
+# needs a mount command -- which busybox can be, without any symlink.
+/bin/busybox mount -o remount,rw / 2>/dev/null || true
+/bin/busybox --install -s 2>/dev/null || true
+
 # One destination. stdout is already the console, and writing to both printed
 # every line twice.
 # Boot time is a tracked number (PLAN.md 6.2): every second here is a second
@@ -20,10 +33,10 @@ set -u
 up() { awk '{printf "%6.2f", $1}' /proc/uptime 2>/dev/null || echo "  ?  "; }
 log() { echo "[$(up)] $*"; }
 
-# The initramfs hands root over read-only regardless of the `rw` on the command
-# line, so the first thing that has to happen is a remount -- without it every
-# mkdir below fails and the guest boots into a useless read-only box.
-mount -o remount,rw / 2>/dev/null || log "WARNING: root is still read-only"
+# The initramfs honours the command line's rw, and the busybox line above
+# remounted regardless; by here a read-only root means the filesystem itself
+# refused, which is worth a loud line before everything else fails after it.
+touch /run-probe 2>/dev/null && rm -f /run-probe || log "WARNING: root is read-only"
 
 mount -t proc     proc     /proc 2>/dev/null || true
 mount -t sysfs    sysfs    /sys  2>/dev/null || true
@@ -78,17 +91,10 @@ hostname crucible 2>/dev/null || true
 # candidate and was tested separately. It made no difference; this did.
 printf '127.0.0.1 localhost crucible\n::1 localhost crucible\n' > /etc/hosts 2>/dev/null || true
 
-# mise's runtimes, for the agent and for anything running in /work. The warden
-# itself does NOT go through mise (see the Dockerfile): its erl is a concrete
-# path, so nothing the agent does to a mise config can stop the control plane
-# from restarting.
 # PID 1 inherits whatever PATH the kernel gave it, which is close to nothing.
-# Anything that shells out -- including the warden asking mise what runtimes
-# exist -- needs this spelled out, or it fails with a "command not found" that
-# gets reported as the feature being absent.
-export PATH=/opt/mise/shims:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-export MISE_DATA_DIR=/opt/mise
-export MISE_CONFIG_DIR=/etc/mise
+# Anything that shells out needs this spelled out, or it fails with a "command
+# not found" that gets reported as the feature being absent.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 # HOME must be set before any BEAM starts: distribution nodes authenticate with
 # $HOME/.erlang.cookie, which the first node creates and the second reads. With
@@ -113,8 +119,8 @@ trap 'log "host asked us to stop"; sync; poweroff -f' USR1
 trap 'log "host asked us to stop"; sync; poweroff -f' TERM
 
 # erl directly, with the warden already compiled. Not `elixir`, which is a
-# shell script that starts the compiler; see the Dockerfile for the 5.31 s that
-# bought.
+# shell script that starts the compiler -- starting erl directly was measured
+# at 5.31 s saved per boot.
 # ERL_LIBS rather than a pile of -pa flags: Elixir ships elixir, logger, mix and
 # the rest as separate OTP applications, and warden depends on logger. Putting
 # only elixir/ebin on the path started the BEAM and then failed with

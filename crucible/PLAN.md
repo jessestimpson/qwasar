@@ -1200,67 +1200,79 @@ guest does, and the guest is mostly waiting on the model.
 
 ### 6.2 The golden image
 
-`Guest/mkimage.sh` builds it, reproducibly, from an Alpine arm64 minirootfs:
+`Guest/mkimage.sh` builds it **natively on macOS** — no Docker, no Linux
+anywhere in the build. What made that possible is that every reason the old
+containerised build needed a Linux userland turned out to dissolve:
+
+- **Alpine packages are tarballs.** `mkrootfs.py` reads APKINDEX, resolves the
+  dependency closure itself, verifies and untars the packages into a plain
+  directory tree. The one apk trigger that matters — busybox's applet symlink
+  farm — is one idempotent line in `crucible-init` at boot instead.
+- **OTP 27 is Alpine's own `erlang27` package** (3.23 finally carries it), so
+  the 1m39s source build is simply gone. Elixir is the precompiled `-otp-27`
+  release: pure BEAM, portable, pinned by sha256.
+- **The warden is compiled on the host** with mise's pinned
+  `erlang@27.3.4` + `elixir@1.18.4-otp-27` — BEAM bytecode does not care which
+  OS compiled it, only which OTP. The `:work_fs` unit tests are excluded on
+  the host (they write under the real `/work`); `make sandbox` exercises the
+  real tools in the real guest, which is the stronger claim anyway.
+- **`vsock_port` is cross-compiled with zig** (`-target aarch64-linux-musl
+  -static`), a self-contained toolchain already on the machine.
+- **The initramfs is ours**: a generated ~15-line `/init`, `busybox.static`,
+  and the module closure for virtio/ext4 computed from `modules.dep` (with
+  `modules.builtin` consulted, because linux-virt moves drivers across that
+  line between releases). 1.1 MB, against mkinitfs's 6.4.
+- **The ext4 image comes from `mke2fs -d`** (brew e2fsprogs): populated from
+  the directory tree with no root, no loop devices, no Linux.
 
 ```
 alpine base + busybox                 ~  10 MB
 linux-virt kernel + modules           ~  70 MB
-mise + erlang 27 (source-built)       ~ 160 MB
-mise + elixir 1.18 (precompiled)      ~  30 MB
+erlang 27 (Alpine apk)                ~ 100 MB
+elixir 1.18 (precompiled, otp-27)     ~  30 MB
 node, python3, git, ripgrep (apk)     ~ 180 MB
 warden (compiled) + vsock_port        ~   2 MB
 --------------------------------------------
-rootfs 479 MB · disk image 540 MB allocated, 3 GB apparent
+rootfs 249 MB · disk image ~270 MB allocated, 3 GB apparent
 ```
 
-#### Runtimes come from mise, not from apk
+Host build dependencies, the whole list: `python3`, `mise` (the erlang,
+elixir and zig pins), and `brew install e2fsprogs`. Measured: a warm rebuild
+is under a minute; downloads are cached in `build/guest-cache`.
 
-The operating system is Alpine's. The **language runtimes are mise's**, and the
-split is deliberate:
+Two details that cost an afternoon each, written down so they are not paid
+again: the kernel silently ignores a malformed initramfs and falls back to
+mounting root itself, so a cpio header miscount presents as a boot panic
+three layers away; and remounting `/` read-write needs `/proc/mounts`, so the
+initramfs *moves* `/proc` into the new root rather than unmounting it.
 
-- **apk cannot supply what this design needs.** Alpine's `elixir` package
-  depends on `erlang26` and *conflicts* with `erlang27`, so the two cannot be
-  installed together at all — and OTP 27 is not negotiable, because §6.4 decodes
-  JSON with its built-in `:json` module. That is what forced the question.
-- **The guest exists to work on someone's project, and projects pin versions.**
-  mise reads `.tool-versions` and `mise.toml` out of `/work`, so the agent gets
-  the runtime the project actually asks for rather than whatever the image
-  happened to ship.
-- **Adding a language becomes one word.** `$RUNTIMES` in the Dockerfile is the
-  entire interface for giving the sandbox Go, Rust, or another Erlang.
+#### mise is gone from the guest, and the reason is honest
 
-**Measured:** erlang@27.3.4.16 is a source build and takes **1m39s**;
-elixir@1.18.4-otp-27 is precompiled `.beam` files and takes **1.2s**. Both are
-cached in a Docker layer, so they cost that once per pinned version.
+The old image shipped mise so the agent could get "the runtime the project
+pins". But the sandbox has **no network device** — mise could never install
+anything in there; it could only ever select among runtimes already baked in,
+which is what plain `/usr/bin` paths do with less machinery. The runtimes are
+the image's, reported by `info` as `runtimes=erlang@27,elixir@...`, and adding
+a language is adding its package to `PACKAGES` in `mkrootfs.py`.
 
-**And a measured constraint: this guest is musl, and mise's catalogue is largely
-glibc.** `node@22` fails outright — Node ships no musl binaries, so mise falls
-back to a source build the image is not equipped for. So mise handles what mise
-can handle here, and the musl-native runtimes (node, python3) come from apk.
-Moving the guest to a glibc base would open the whole mise catalogue; that trade
-is recorded here rather than made silently, and it is the first thing to
-reconsider if the agent starts wanting runtimes Alpine does not package.
+The musl constraint stands unchanged: runtimes must be Alpine packages (or
+portable bytecode, as Elixir is). Moving to a glibc base to widen the
+catalogue remains the first thing to reconsider if the agent starts wanting
+runtimes Alpine does not package.
 
-#### The control plane does not go through mise
+#### The control plane's runtime is a concrete path
 
-`warden` runs on a **concrete path** — `/opt/mise/installs/erlang/27.3.4.16/bin/erl`,
-resolved once at build time and symlinked — not through `mise exec`.
+`warden` runs on `/usr/bin/erl` — the erlang27 package's own binary — with
+`ERL_LIBS` from `/etc/crucible-erl-libs`. §7.3 requires that warden survive
+anything the agent does; nothing the agent edits can move a package-installed
+`/usr/bin/erl`, which is the same property the old mise-bypassing symlinks
+bought, with fewer moving parts.
 
-§7.3 requires that warden survive anything the agent does. If it started through
-mise, an agent that edited a mise config, or simply switched the project's
-Erlang version, would take the control plane down with it, and init's restart
-loop would spin forever restarting something that can no longer start. mise is
-what the agent and the project use. The control plane's runtime is infrastructure
-and is pinned.
-
-An Erlang built from source bakes its `ROOTDIR` into the `erl` script, so mise
-installs into `/opt/mise` in the *builder* and the tree is copied across
-wholesale — built at the path it will live at, rather than relocated afterwards.
-
-Alpine rather than Debian: musl, no systemd, and a boot-to-BEAM path measured in
-hundreds of milliseconds — **0.56 s to warden-ready, with all of the above in
-the image**. `git` is in the image because the diff engine is git (§7.4) — that
-is the one dependency worth its size.
+Alpine rather than Debian: musl, no systemd, and a boot-to-BEAM path measured
+in hundreds of milliseconds — **0.54 s to warden-ready with the native-built
+image**, matching the containerised build it replaced. `git` is in the image
+because the diff engine is git (§7.4) — that is the one dependency worth its
+size.
 
 OTP 27 specifically, for two reasons beyond currency: its built-in `json`
 module removes the last dependency from the guest (§6.4). One language and
@@ -1272,7 +1284,7 @@ boot to warden-ready under 2 seconds.** Every second here is a second a user
 waits before the model can do anything, on every resume.
 
 **Shipping it.** The image goes in `Contents/Resources/` compressed, or is
-fetched on first launch. Decided in §14 — 320 MB is right at the boundary where
+fetched on first launch. Decided in §14 — 270 MB is right at the boundary where
 bundling stops being polite.
 
 ### 6.3 Per-session disks are APFS clones

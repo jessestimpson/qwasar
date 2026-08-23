@@ -297,11 +297,11 @@ enum SandboxGate {
         check("shell", sh.ok == true && inWork,
               (sh.result ?? sh.error ?? "?").replacingOccurrences(of: "\n", with: " "))
 
-        // And the runtimes mise installed are actually usable by the agent.
+        // And the baked-in BEAM is actually usable by the agent.
         let elixir = try await channel.send(op: "shell",
                                             args: ["command": .string("elixir -e 'IO.puts(:erlang.system_info(:otp_release))'")],
                                             timeout: 30)
-        check("shell (mise runtime)", elixir.ok == true && (elixir.result ?? "").contains("27"),
+        check("shell (guest runtime)", elixir.ok == true && (elixir.result ?? "").contains("27"),
               (elixir.result ?? elixir.error ?? "?").trimmingCharacters(in: .whitespacesAndNewlines))
 
         return bad
