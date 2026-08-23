@@ -19,7 +19,12 @@ struct SessionView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 16) {
                         ForEach(state.transcript) { item in
-                            TranscriptRow(item: item).id(item.id)
+                            // Only the tail item can be mid-generation, and
+                            // only then is a fence possibly still open.
+                            TranscriptRow(item: item,
+                                          isStreaming: state.phase == .generating
+                                                       && item.id == state.transcript.last?.id)
+                                .id(item.id)
                         }
                         Color.clear.frame(height: 1).id("bottom")
                     }
@@ -400,6 +405,9 @@ private struct ReasoningBlock: View {
 
 struct TranscriptRow: View {
     let item: TranscriptItem
+    /// True only for the item currently being generated. Code blocks use it to
+    /// decide whether an unhinted fence can be language-detected yet.
+    var isStreaming: Bool = false
 
     var body: some View {
         switch item.kind {
@@ -413,9 +421,11 @@ struct TranscriptRow: View {
             }
 
         case .assistant(let t):
-            Text(t)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            // Markdown, because the model writes markdown (PLAN.md 5.6). User
+            // turns, reasoning and tool results deliberately do not get this:
+            // each would be claiming a formatting intent that is not in the
+            // source.
+            MarkdownView(source: t, isStreaming: isStreaming)
 
         case .reasoning(let t):
             // The model always reasons, so this is a first-class item with its

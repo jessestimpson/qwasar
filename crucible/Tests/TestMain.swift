@@ -5,6 +5,7 @@
 //   store      persistence, including what survives a crash mid-turn
 //   materialise the only code that writes to the user's own files (PLAN.md 7.4)
 //   utf8       pure; the transcript's silent corruption bug
+//   markdown   blocks out of Foundation's parse; the highlighter's reconstruction
 //   prefix     loads the tokenizer; the invariant the KV checkpoint rests on
 //   golden     loads the tokenizer (~1s); the highest-value test in the project
 //
@@ -24,6 +25,7 @@ struct TestMain {
         print("== materialise"); failures += MaterialiseSuite.run()
         print("== guestimage"); failures += GuestImageSuite.run()
         print("== utf8");       failures += UTF8Suite.run()
+        print("== markdown");   failures += MarkdownSuite.run(args)
         print("== prefix");     failures += PrefixSuite.run(args)
         print("== golden");     failures += GoldenSuite.run(args)
 

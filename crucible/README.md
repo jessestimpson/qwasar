@@ -21,21 +21,24 @@ The design, the measurements, and the decisions behind both are in
 
 ## Status
 
-Milestones 0 through 4 are built and gated. **Milestone 5 is not**, and that is
-the thing to understand before using it:
+Milestones 0 through 5 are built and gated, plus markdown rendering with syntax
+highlighting. The thing to understand before using it:
 
 > **Nothing the agent does reaches your files.** Your project folder is mounted
 > read-only, copied into the guest at boot, and unmounted. The agent reads,
 > writes, edits and runs commands against *that copy*. It will tell you —
 > accurately — that it edited a file, and your file will be byte-identical.
 
-M5 is the patch-back: diff the sandbox against its baseline, show you the
-change, apply it on approval. Until then Crucible is a very good way to have a
-model investigate a codebase, and not a way to have it change one.
+**Review Changes…** in the session header is how work crosses back: the sandbox
+is diffed against the baseline it booted with, every file is shown with its diff,
+and nothing is written until you tick it and apply. Whatever gets overwritten is
+copied aside first. There is no "apply all and don't ask again" — the whole
+architecture exists to put a person at this one point.
 
 Also not built: session parking to explicit checkpoints (M6 — switching sessions
 currently re-prefills, helped by the engine's own LRU cache), vision, and
-speculative decoding (M7).
+speculative decoding (M7). Planned but not started: replacing the file-copy
+patch-back with a real git branch you can merge (PLAN.md 7.4a).
 
 ## Requirements
 
@@ -83,10 +86,16 @@ The session header should say **`sandboxed · booted in 0.6s`**. If it says
 
 * **~6 tokens a second.** This is a dense 27B model on ~120 GB/s of memory
   bandwidth; the ceiling is a bandwidth identity, not an efficiency problem.
-* **A pause before the first token.** The system turn is about 1793 tokens, so a
-  cold session spends roughly a minute reading its own prompt. The prefill bar
-  shows a real count and an estimate. It is checkpointed, so later sessions in
-  the same project start warm.
+* **A pause before the first token, once.** The system turn is about 2500 tokens
+  — 99.6% of a first turn, because the twelve tool schemas render into it — so a
+  cold project spends roughly a minute reading its own prompt. It is then
+  checkpointed, and every later session in that project restores it instead of
+  re-reading it. The footer shows a real count and an estimate.
+* **Formatted replies.** Markdown renders: headings, lists, tables, quotes, and
+  fenced code blocks with syntax highlighting for ~200 languages, a language
+  label and a copy button. A block highlights as each line completes rather than
+  all at once at the end. Reasoning, your own turns and tool results stay raw —
+  formatting them would claim an intent that is not in the source.
 * **A lot of reasoning.** The block is collapsed by default; click to expand. A
   turn where the model writes itself a tool ran 4151 reasoning tokens.
 * **⌘.** stops a turn at the next token.

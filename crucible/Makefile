@@ -42,7 +42,8 @@ KITLIB    := $(BUILD)/libCrucibleKit.a
 # is in the app, not here.
 FRAMEWORKS := -framework Foundation -framework Metal -framework AVFoundation \
               -framework CoreMedia -framework CoreGraphics -framework Virtualization \
-              -framework SwiftUI -framework AppKit -framework Security
+              -framework SwiftUI -framework AppKit -framework Security \
+              -framework JavaScriptCore
 LDLIBS    := -L$(ROOT) -lqwasar -lm $(FRAMEWORKS)
 
 .PHONY: all help run gate gate-prefix gate-full sandbox test golden guest clean clean-guest lib
@@ -83,13 +84,28 @@ $(KITLIB): lib $(KIT_SRCS) Sources/CQwasar/module.modulemap
 	    -emit-module -emit-module-path $(BUILD)/CrucibleKit.swiftmodule \
 	    -emit-library -static -o $@ $(KIT_SRCS)
 
+# highlight.js, concatenated from the vendored core and language modules.
+#
+# Generated rather than committed, for the reason tools/bin2c gives for the Metal
+# kernels: the pieces stay reviewable and diffable, and the single artefact is
+# built.  Offline -- everything it needs is in vendor/.
+HLJS := vendor/highlight.js/highlight.bundle.js
+
+$(HLJS): vendor/highlight.js/core.min.js vendor/highlight.js/build.sh
+	@sh vendor/highlight.js/build.sh
+
 $(BIN): $(KITLIB) $(APP_SRCS)
 	@mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	$(SWIFT) $(SWIFTFLAGS) $(INCLUDES) -I $(BUILD) $(APP_SRCS) -o $@ \
 	    -L$(BUILD) -lCrucibleKit $(LDLIBS)
 
-$(APP): $(BIN) Resources/Info.plist Crucible.entitlements
+$(APP): $(BIN) Resources/Info.plist Crucible.entitlements $(HLJS)
 	@cp Resources/Info.plist $(APP)/Contents/Info.plist
+	@# Syntax highlighting (PLAN.md 5.6).  Loaded at runtime by JavaScriptCore;
+	@# without it code blocks render as plain monospace, which is what the
+	@# transcript did before, so a missing bundle degrades rather than breaks.
+	@cp $(HLJS) $(APP)/Contents/Resources/highlight.bundle.js
+	@echo "  highlight.js staged ($$(wc -c < $(HLJS) | tr -d ' ') bytes)"
 	@# The guest image, staged where the app looks for it.
 	@#
 	@# Without this the app finds no image, falls back to the read-only host

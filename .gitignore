@@ -30,6 +30,11 @@ reference/
 libqwasar.a
 crucible/build/
 
+# Generated from vendor/highlight.js/{core.min.js,langs/} by its build.sh.
+# The pieces are vendored and reviewable; the concatenation is not committed,
+# for the same reason qwasar_metal_src.inc is not.
+crucible/vendor/highlight.js/highlight.bundle.js
+
 # Elixir build artefacts. The guest image is built in Docker, which fetches
 # deps itself; these only appear when the warden suites are run on the host.
 # mix.lock is NOT ignored -- it pins what Docker resolves.
