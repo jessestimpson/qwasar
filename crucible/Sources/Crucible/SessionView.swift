@@ -744,7 +744,10 @@ struct DelegationCard: View {
 /// decide. Consult-only; the answer rides along with the next message.
 struct EscalateSheet: View {
     @Bindable var state: AppState
-    @State private var task = ""
+    /// Prefilled so the common case is two clicks: with the conversation
+    /// tail included by default, "continue" plus the context IS the brief --
+    /// the remote model picks up exactly where the local one is stuck.
+    @State private var task = "Continue with the task at hand."
     @State private var model: String = ""
     @State private var includeContext = true
 
@@ -767,6 +770,9 @@ struct EscalateSheet: View {
                             .allowsHitTesting(false)
                     }
                 }
+            Text("Replace the default with specifics when you have them; with "
+                 + "the conversation included below, \"continue\" is often enough.")
+                .font(.caption2).foregroundStyle(.tertiary)
             Toggle("Include the recent conversation — the last message and "
                    + "everything the local model produced since, reasoning included",
                    isOn: $includeContext)
