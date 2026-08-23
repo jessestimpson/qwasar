@@ -37,7 +37,7 @@ struct CrucibleApp: App {
                     Button("Remove MTP Draft Head") { state.forgetDraftHead() }
                 }
                 Divider()
-                // Escalation (spec §15.4): the key is entered here, lands in
+                // Delegation (spec §15.4): the key is entered here, lands in
                 // the Keychain, and is never seen again -- not by the config
                 // project, not by any model, not by this UI.
                 Button(state.hasAPIKey ? "Replace Escalation API Key…"
@@ -45,7 +45,7 @@ struct CrucibleApp: App {
                     state.showingAPIKeySheet = true
                 }
                 if state.hasAPIKey {
-                    Button("Remove Escalation API Key") { state.removeAPIKey() }
+                    Button("Remove Delegation API Key") { state.removeAPIKey() }
                 }
             }
         }
@@ -105,7 +105,7 @@ struct RootView: View {
     }
 }
 
-// MARK: - Escalation API key (spec §15.4)
+// MARK: - Delegation API key (spec §15.4)
 
 struct APIKeySheet: View {
     @Bindable var state: AppState
@@ -113,16 +113,16 @@ struct APIKeySheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Escalation API key").font(.headline)
+            Text("Delegation API key").font(.headline)
             Text("An OpenRouter (or OpenAI-compatible) key. It is stored in "
                  + "the macOS Keychain and attached to requests by the app "
                  + "alone — no model, tool, or config session can read it.")
                 .font(.caption).foregroundStyle(.secondary)
             SecureField("sk-or-…", text: $key)
                 .textFieldStyle(.roundedBorder)
-            Text("Escalation also needs models granted: in a Crucible Config "
-                 + "session, `config_set` the `agent_models` key at the layer "
-                 + "you want.")
+            Text("Delegation also needs models granted: in a Crucible Config "
+                 + "session, `config_set` the `delegate_models` key at the "
+                 + "layer you want.")
                 .font(.caption2).foregroundStyle(.tertiary)
             HStack {
                 Spacer()

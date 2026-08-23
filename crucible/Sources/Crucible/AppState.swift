@@ -88,7 +88,7 @@ final class AppState {
     /// through performConfig -- the config session's single mutation path.
     var globalSandbox: SandboxOverlay?
 
-    // Escalation (spec §15). The live delegation is what the embedded card
+    // Delegation (spec §15). The live delegation is what the embedded card
     // renders; the mailbox is the path INTO it. Both exist only while a
     // delegation runs.
     struct LiveDelegation {
@@ -104,8 +104,8 @@ final class AppState {
     var liveDelegation: LiveDelegation?
     var delegationDraft = ""
     var showingAPIKeySheet = false
-    /// The user-initiated escalation sheet (spec §15: "escalate this").
-    var showingEscalateSheet = false
+    /// The user-initiated delegation sheet (spec §15).
+    var showingDelegateSheet = false
     /// A finished user-initiated delegation's answer, waiting to ride along
     /// with the user's next message so the local model sees it. Discardable.
     var pendingHandoff: String?
@@ -291,7 +291,7 @@ final class AppState {
         newSession(in: p)
     }
 
-    // MARK: Escalation (spec §15)
+    // MARK: Delegation (spec §15)
 
     /// Observable mirror of "a key exists" -- never the key itself, which
     /// goes straight to the Keychain and nowhere else (spec §15.4).
@@ -329,9 +329,9 @@ final class AppState {
 
     func stopDelegation() { delegationMailbox?.stop() }
 
-    /// Whether the selected session could escalate right now: models granted,
+    /// Whether the selected session could delegate right now: models granted,
     /// a key present, budget remaining, and no delegation already live.
-    var canEscalate: Bool {
+    var canDelegate: Bool {
         guard liveDelegation == nil, hasAPIKey,
               let rec = selectedSession, let p = project(of: rec), !p.isConfig
         else { return false }
@@ -341,19 +341,21 @@ final class AppState {
             && max(0, s.agentBudgetUSD - (rec.spentUSD ?? 0)) > 0
     }
 
-    var escalationModels: [String] {
+    var delegationModels: [String] {
         guard let rec = selectedSession, let p = project(of: rec) else { return [] }
         return SandboxSettings.resolve(global: globalSandbox, project: p.overlay,
                                        session: rec.sandbox).agentModels
     }
 
-    /// "Escalate this" (spec §15): the user pushes the problem up without
-    /// waiting for the local model to decide. Interrupts a running turn --
-    /// which is the point, since a model visibly stuck mid-reasoning is the
-    /// case this exists for. Consult-only (no remote tools) by design: the
-    /// session's tool chain belongs to the local turn.
-    func startEscalation(task: String, model: String?, includeContext: Bool) {
-        guard canEscalate, let rec = selectedSession, let p = project(of: rec),
+    /// A user-initiated delegation (spec §15): the user pushes the problem up
+    /// without waiting for the local model to decide. Interrupts a running
+    /// turn -- which is the point, since a model visibly stuck mid-reasoning
+    /// is the case this exists for. IDENTICAL to a model-initiated delegation
+    /// in every respect: the remote model gets the same sandboxed tool chain
+    /// against the same /work (the warden serialises tool requests, so a turn
+    /// still winding down cannot collide, only queue).
+    func startDelegation(task: String, model: String?, includeContext: Bool) {
+        guard canDelegate, let rec = selectedSession, let p = project(of: rec),
               !task.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         if case .generating = phase { interrupt() }
 
@@ -367,11 +369,30 @@ final class AppState {
                 brief += "\n\n---\n\nRecent conversation, for context:\n\n" + ctx
             }
         }
+
+        // The same tool chain a session's local agent gets: the sandbox over
+        // the session's own vsock channel when the guest is up, the read-only
+        // host tools when it is not, network per the same resolved policy.
+        var inner: ToolExecuting
+        if let channel = sandboxes?.channel(for: rec.id) {
+            inner = SandboxToolRunner(channel: channel,
+                                      timeout: settings.toolTimeoutSeconds)
+        } else if let root = root(of: rec) {
+            inner = ToolRunner(root: root)
+        } else {
+            return
+        }
+        if !settings.networkAllowlist.isEmpty {
+            inner = NetworkToolRunner(inner: inner,
+                                      policy: NetworkPolicy(allowlist: settings.networkAllowlist,
+                                                            maxResponseBytes: settings.fetchMaxKB * 1024))
+        }
+
         let mailbox = DelegationMailbox()
         delegationMailbox = mailbox
         let sid = rec.id
         let runner = DelegateToolRunner(
-            inner: ConsultOnly(),
+            inner: inner,
             policy: EscalationPolicy(models: settings.agentModels,
                                      sessionRemainingUSD: remaining,
                                      turnBudgetUSD: settings.agentTurnBudgetUSD),
@@ -393,7 +414,7 @@ final class AppState {
         }
     }
 
-    /// The tail of the conversation, for the escalation brief: the last user
+    /// The tail of the conversation, for the delegation brief: the last user
     /// message and everything the local model produced after it -- which,
     /// when it is stuck, is exactly the reasoning worth showing the expert.
     private func recentContext(cap: Int = 6000) -> String {
@@ -691,7 +712,7 @@ final class AppState {
                                                   maxResponseBytes: settings.fetchMaxKB * 1024))
                         sandboxStatus = (sandboxStatus ?? "") + " · net: \(net.count) host\(net.count == 1 ? "" : "s")"
                     }
-                    // Escalation (spec §15): advertised only when models are
+                    // Delegation (spec §15): advertised only when models are
                     // granted, a key exists, and budget remains -- the same
                     // absent-means-absent rule fetch follows.
                     let remaining = max(0, settings.agentBudgetUSD - (rec.spentUSD ?? 0))
@@ -978,13 +999,3 @@ final class CancelFlag: @unchecked Sendable {
     func clear() { lock.lock(); value = false; lock.unlock() }
 }
 
-
-/// The user-initiated escalation is consult-only: no schemas, and a runner
-/// that refuses anything the remote model invents.
-private struct ConsultOnly: ToolExecuting {
-    var schemas: [String] { [] }
-    var environmentDescription: String { "" }
-    func run(_ call: ToolCall) -> String {
-        "error: tools are not available in a user-initiated consultation"
-    }
-}

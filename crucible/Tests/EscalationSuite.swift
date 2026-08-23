@@ -203,7 +203,7 @@ enum EscalationSuite {
         out = runner(events: ev, mailbox: mb, key: nil).run(call(["task": "t"]))
         f += TestMain.check(out.contains("no API key"), "a missing key is named")
         out = runner(remaining: 0, events: ev, mailbox: mb).run(call(["task": "t"]))
-        f += TestMain.check(out.contains("budget is exhausted"), "an exhausted budget is named")
+        f += TestMain.check(out.contains("delegation budget is exhausted"), "an exhausted budget is named")
 
         // The schema: carries models and budgets, never the key; and the
         // overlay's empty-list semantics gate the whole feature.

@@ -65,8 +65,8 @@ struct SessionView: View {
         .sheet(isPresented: $state.showingApproval) {
             ApprovalSheet(state: state)
         }
-        .sheet(isPresented: $state.showingEscalateSheet) {
-            EscalateSheet(state: state)
+        .sheet(isPresented: $state.showingDelegateSheet) {
+            DelegateSheet(state: state)
         }
     }
 }
@@ -84,19 +84,20 @@ struct SessionHeader: View {
                     }
                 }
                 Spacer()
-                if state.canEscalate {
+                if state.canDelegate {
                     Button {
-                        state.showingEscalateSheet = true
+                        state.showingDelegateSheet = true
                     } label: {
-                        Label(state.phase == .generating ? "Escalate (stops the turn)…"
-                                                         : "Escalate…",
+                        Label(state.phase == .generating ? "Delegate (stops the turn)…"
+                                                         : "Delegate…",
                               systemImage: "arrow.up.forward.circle")
                     }
-                    .help("Hand this problem to a more capable remote model, under "
-                          + "the session's budget. If the local model is mid-turn -- "
-                          + "stuck in a bad line of reasoning, say -- escalating "
-                          + "interrupts it. The result rides along with your next "
-                          + "message.")
+                    .help("Hand this problem to a more capable remote model -- the "
+                          + "same delegation the local model can start itself: same "
+                          + "tools, same /work, same budget. If the local model is "
+                          + "mid-turn -- stuck in a bad line of reasoning, say -- "
+                          + "delegating interrupts it. The result also rides along "
+                          + "with your next message.")
                 }
                 if state.canReviewChanges {
                     Button {
@@ -738,11 +739,13 @@ struct DelegationCard: View {
 }
 
 
-// MARK: - Escalate this (spec §15)
+// MARK: - Delegate (spec §15)
 
-/// The user pushes a problem up without waiting for the local model to
-/// decide. Consult-only; the answer rides along with the next message.
-struct EscalateSheet: View {
+/// The user delegates without waiting for the local model to decide --
+/// IDENTICAL to the model's own delegate tool: same remote agent, same
+/// sandboxed tools, same /work, same budget. The answer additionally rides
+/// along with the user's next message so the local model sees it.
+struct DelegateSheet: View {
     @Bindable var state: AppState
     /// Prefilled so the common case is two clicks: with the conversation
     /// tail included by default, "continue" plus the context IS the brief --
@@ -753,9 +756,9 @@ struct EscalateSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Escalate to a remote model").font(.headline)
+            Text("Delegate to a remote model").font(.headline)
             if state.phase == .generating {
-                Label("the local model is mid-turn; escalating interrupts it",
+                Label("the local model is mid-turn; delegating interrupts it",
                       systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundStyle(.orange)
             }
@@ -778,19 +781,20 @@ struct EscalateSheet: View {
                    isOn: $includeContext)
                 .font(.caption)
             Picker("Model", selection: $model) {
-                ForEach(state.escalationModels, id: \.self) { Text($0).tag($0) }
+                ForEach(state.delegationModels, id: \.self) { Text($0).tag($0) }
             }
             .pickerStyle(.menu)
-            Text("You can watch and steer it while it works; its answer is "
-                 + "attached to your next message so the local model sees it.")
+            Text("The remote model works with the session's own tools on the "
+                 + "same /work — watch and steer it as it goes. Its answer is "
+                 + "also attached to your next message so the local model sees it.")
                 .font(.caption2).foregroundStyle(.tertiary)
             HStack {
                 Spacer()
-                Button("Cancel") { state.showingEscalateSheet = false }
-                Button("Escalate") {
-                    state.startEscalation(task: task, model: model.isEmpty ? nil : model,
+                Button("Cancel") { state.showingDelegateSheet = false }
+                Button("Delegate") {
+                    state.startDelegation(task: task, model: model.isEmpty ? nil : model,
                                           includeContext: includeContext)
-                    state.showingEscalateSheet = false
+                    state.showingDelegateSheet = false
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(task.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -798,6 +802,6 @@ struct EscalateSheet: View {
         }
         .padding(16)
         .frame(width: 480)
-        .onAppear { model = state.escalationModels.first ?? "" }
+        .onAppear { model = state.delegationModels.first ?? "" }
     }
 }

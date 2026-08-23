@@ -23,7 +23,7 @@ struct TestMain {
         print("== pathguard");  failures += PathGuardSuite.run()
         print("== network");    failures += NetworkPolicySuite.run()
         print("== overlay");    failures += SandboxOverlaySuite.run()
-        print("== escalation"); failures += EscalationSuite.run()
+        print("== delegation");  failures += EscalationSuite.run()
         print("== store");      failures += StoreSuite.run()
         print("== materialise"); failures += MaterialiseSuite.run()
         print("== guestimage"); failures += GuestImageSuite.run()

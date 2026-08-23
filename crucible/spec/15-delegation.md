@@ -1,11 +1,11 @@
-## 15. Escalation: remote sub-agents, embedded and budgeted
+## 15. Delegation: remote sub-agents, embedded and budgeted
 
 *E1 and E2 built 2026-08-23; E3 not started. This section is the design;
 the milestones are at the end of it.*
 
 The premise: the local model is cheap, private, and always available, and it
 is a 27B. Some problems deserve more model than that. So a session can
-**escalate** — open a sub-agent against an OpenAI-compatible API (OpenRouter
+**delegate** — open a sub-agent against an OpenAI-compatible API (OpenRouter
 is the reference target, so one key reaches many models) — under a budget the
 sandbox configuration defines, with the API key invisible to every model
 involved, and with the sub-agent running as an **embedded interactive
@@ -85,15 +85,15 @@ everything (field-wise, most specific non-nil wins, replace never merge):
 
 | key | meaning |
 |---|---|
-| `agent_models` | allowlisted model ids, comma-separated; empty = escalation explicitly OFF, nil = fall through |
-| `agent_budget_usd` | ceiling per session, summed across its delegations |
-| `agent_turn_budget_usd` | ceiling per single delegation |
+| `delegate_models` | allowlisted model ids, comma-separated; empty = delegation explicitly OFF, nil = fall through |
+| `delegate_budget_usd` | ceiling per session, summed across its delegations |
+| `delegate_turn_budget_usd` | ceiling per single delegation |
 
 The same semantics carry the same weight: a global grant with a per-session
-empty `agent_models` is how one confidential session opts out; a project
+empty `delegate_models` is how one confidential session opts out; a project
 layer replaces the global model list rather than merging with it. The config
 project manages these with the tools it already has — `config_set project
-qwasar agent_models "anthropic/claude-...,openai/gpt-..."` — and
+qwasar delegate_models "anthropic/claude-...,openai/gpt-..."` — and
 `config_show` reports provenance like any other key.
 
 Cost accounting is the host's: OpenRouter returns token usage per response
@@ -188,19 +188,25 @@ in E1/E2); and whether budget exhaustion should park the session or merely
 disable the tool (disable, initially — a session that stops mid-thought
 because money ran out is worse than one that says so and continues locally).
 
-**"Escalate this" — the user's own affordance, built.** A header button, live
-whenever the session could escalate — including *mid-turn*, which is the
-design driver: a model visibly stuck in a bad line of reasoning is exactly
-when the person watching knows before the model does. Escalating then
-interrupts the turn (the button says so). The sheet takes the brief, a model
-pick, and — on by default — the conversation tail: the last user message and
-everything the local model produced since, *reasoning included*, because
-"here is what it tried" is most of what the expert needs. The delegation runs
-in the same card with the same steering and the same budget accounting; it
-is **consult-only** (no remote tools — the session's tool chain belongs to
-the local turn, whose state mid-interrupt is exactly what should not be
-driven around). The answer then rides along with the user's next message —
-shown as a discardable chip above the composer, attached to the prompt but
-not duplicated in the display — so the local model sees it as context, which
-closes the loop: the user escalates, the expert answers, the local model
-continues with the answer in hand.
+**The user's own Delegate button — identical to the tool, by decree.** A
+header button, live whenever the session could delegate — including
+*mid-turn*, which is the design driver: a model visibly stuck in a bad line
+of reasoning is exactly when the person watching knows before the model
+does. Delegating then interrupts the turn (the button says so). The sheet
+takes the brief (prefilled "Continue with the task at hand."), a model pick,
+and — on by default — the conversation tail: the last user message and
+everything the local model produced since, *reasoning included*.
+
+There is ONE delegation feature under one name. The user-initiated path is
+exactly the model-initiated one: the same remote agent, the same sandboxed
+tool chain against the same `/work` (built over the session's own vsock
+channel; the warden serialises tool requests, so a turn still winding down
+after the interrupt queues rather than collides), the same network policy,
+the same card, steering, and budget accounting. An earlier version made the
+user's path consult-only on the theory that a mid-interrupt tool chain
+should not be driven around; field use showed the opposite failure — the
+expert diagnosing the fix and handing it back to the model that could not do
+the work — and the serialisation argument dissolved the safety concern. The
+one addition the user's path keeps: the answer also rides along with the
+user's next message as a discardable chip, so the local model resumes with
+it in hand.

@@ -33,7 +33,7 @@ struct ConfigToolRunner: ToolExecuting {
     """#
 
     static let setSchema = #"""
-    {"type": "function", "function": {"name": "config_set", "description": "Set one sandbox configuration key at one layer. Resolution is field-wise: session overrides project overrides global overrides the built-in default -- setting a value REPLACES what lower layers said for that key, never merges. Changes apply when a session is next opened (a live session keeps the settings it booted with). Keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb, agent_models (comma-separated remote model ids, empty string for explicitly OFF), agent_budget_usd, agent_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
+    {"type": "function", "function": {"name": "config_set", "description": "Set one sandbox configuration key at one layer. Resolution is field-wise: session overrides project overrides global overrides the built-in default -- setting a value REPLACES what lower layers said for that key, never merges. Changes apply when a session is next opened (a live session keeps the settings it booted with). Keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb, delegate_models (comma-separated remote model ids, empty string for explicitly OFF), delegate_budget_usd, delegate_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
     """#
 
     static let clearSchema = #"""
@@ -50,7 +50,7 @@ struct ConfigToolRunner: ToolExecuting {
 
         Keys: \(SandboxKey.allCases.map { "\($0.rawValue) — \($0.doc)" }.joined(separator: "; ")).
 
-        Two things you cannot do, and what to tell the user instead: the escalation API key is entered by the user through the app menu — Crucible ▸ Set Escalation API Key… — and lands in the macOS Keychain; you can report whether one is set (config_show shows it) but never read or write it. Escalation needs both that key AND agent_models granted at some layer, which IS yours to set.
+        Two things you cannot do, and what to tell the user instead: the delegation API key is entered by the user through the app menu — Crucible ▸ Set Delegation API Key… — and lands in the macOS Keychain; you can report whether one is set (config_show shows it) but never read or write it. Delegation needs both that key AND delegate_models granted at some layer, which IS yours to set.
 
         Start with config_show. Change only what the user asked for, and say what changed at which layer.
         """
@@ -180,7 +180,7 @@ extension AppState {
         out.append("global: \(describe(globalSandbox))")
         // Presence only, by design (spec §15.4): there is no operation that
         // returns the key.
-        out.append("escalation API key: \(KeychainAccess.status())")
+        out.append("delegation API key: \(KeychainAccess.status())")
         for p in projects where !p.isConfig {
             out.append("project \(p.name) [\(p.id.uuidString)]: \(describe(p.sandbox ?? (p.overlay.isEmpty ? nil : p.overlay)))")
             for s in sessions where s.projectID == p.id {

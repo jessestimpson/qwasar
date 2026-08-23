@@ -22,8 +22,10 @@ public struct SandboxOverlay: Codable, Sendable, Equatable, Hashable {
     public var toolTimeoutSeconds: Int?
     /// `fetch` response cap.
     public var fetchMaxKB: Int?
-    /// Escalation (spec §15): remote model ids `delegate` may use. Empty is
-    /// an OPINION -- escalation explicitly off -- where nil is silence.
+    /// Delegation (spec §15): remote model ids `delegate` may use. Empty is
+    /// an OPINION -- delegation explicitly off -- where nil is silence.
+    /// (Swift property names keep the older `agent` prefix so stored overlay
+    /// JSON continues to decode; the user-facing key is `delegate_models`.)
     public var agentModels: [String]?
     /// Ceiling per session, summed across its delegations, USD.
     public var agentBudgetUSD: Double?
@@ -59,9 +61,9 @@ public enum SandboxKey: String, CaseIterable, Sendable {
     case guestCPUs = "guest_cpus"
     case toolTimeoutSeconds = "tool_timeout_seconds"
     case fetchMaxKB = "fetch_max_kb"
-    case agentModels = "agent_models"
-    case agentBudgetUSD = "agent_budget_usd"
-    case agentTurnBudgetUSD = "agent_turn_budget_usd"
+    case agentModels = "delegate_models"
+    case agentBudgetUSD = "delegate_budget_usd"
+    case agentTurnBudgetUSD = "delegate_turn_budget_usd"
 
     public var doc: String {
         switch self {
@@ -73,8 +75,8 @@ public enum SandboxKey: String, CaseIterable, Sendable {
         case .fetchMaxKB: return "fetch response cap, KB (default 256)"
         case .agentModels:
             return "remote model ids `delegate` may use (spec §15); comma-separated, empty string for explicitly OFF"
-        case .agentBudgetUSD: return "escalation ceiling per session, USD (default 5.00)"
-        case .agentTurnBudgetUSD: return "escalation ceiling per delegation, USD (default 1.00)"
+        case .agentBudgetUSD: return "delegation ceiling per session, USD (default 5.00)"
+        case .agentTurnBudgetUSD: return "delegation ceiling per single delegation, USD (default 1.00)"
         }
     }
 

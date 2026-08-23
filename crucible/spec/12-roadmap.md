@@ -19,7 +19,7 @@ What a spec needs is the map: what exists, and what is next.
 | — | the native macOS image build — no Docker, no Linux (§6.2) |
 | — | host-mediated network: `fetch` under a per-project allowlist (§8.3) |
 | — | sandbox configuration in three layers + the config project (§8.5) |
-| — | escalation E1+E2: `delegate`, budgeted, embedded, steerable; the remote agent drives the sandbox by proxy (§15) |
+| — | delegation E1+E2: budgeted, embedded, steerable; the remote agent drives the sandbox by proxy; one feature under one name, user- or model-initiated (§15) |
 
 ## Next
 
@@ -33,7 +33,7 @@ What a spec needs is the map: what exists, and what is next.
   promoted into CI.
 - **§7.4a — the git crossing.** Replace the file-copy patch-back with a real
   branch the user merges; §7.4 demoted to the fallback for non-git projects.
-- **§15 — escalation.** E1 and E2 built; next E3 (judgment: prompt-fragment
+- **§15 — delegation.** E1 and E2 built; next E3 (judgment: prompt-fragment
   tuning and a measured week of use).
 
 ## Retired

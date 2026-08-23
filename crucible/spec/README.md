@@ -23,7 +23,7 @@ invariants live in §10.
 | [12-roadmap.md](12-roadmap.md) | what is built, what is next (histories: git log) |
 | [13-rules.md](13-rules.md) | rules for this codebase |
 | [14-open-questions.md](14-open-questions.md) | open questions |
-| [15-escalation.md](15-escalation.md) | planned: remote sub-agents, embedded and budgeted |
+| [15-delegation.md](15-delegation.md) | delegation: remote sub-agents, embedded, budgeted, steerable |
 
 House rule, carried over from when this was one file: design decisions carry
 their measurements, and a measurement that contradicts an assumption wins.

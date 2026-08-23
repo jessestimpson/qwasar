@@ -183,7 +183,7 @@ public struct DelegateToolRunner: ToolExecuting {
         inner.environmentDescription + """
 
 
-        Escalation: `delegate` hands a task to a more capable remote model (\(policy.models.joined(separator: ", "))) under a budget -- $\(String(format: "%.2f", policy.sessionRemainingUSD)) remains this session. The remote model works with YOUR tools on the SAME files: after a delegation, /work reflects whatever it did, so re-read anything you rely on. Reach for it at genuine capability walls, not for effort; say what you already tried.
+        Delegation: `delegate` hands a task to a more capable remote model (\(policy.models.joined(separator: ", "))) under a budget -- $\(String(format: "%.2f", policy.sessionRemainingUSD)) remains this session. The remote model works with YOUR tools on the SAME files: after a delegation, /work reflects whatever it did, so re-read anything you rely on. Reach for it at genuine capability walls, not for effort; say what you already tried.
         """
     }
 
@@ -199,9 +199,9 @@ public struct DelegateToolRunner: ToolExecuting {
         }
         guard let key = keyProvider() else {
             return "error: no API key is set. The user can add one via "
-                 + "Crucible ▸ Set Escalation API Key…"
+                 + "Crucible ▸ Set Delegation API Key…"
         }
-        guard policy.isEnabled else { return "error: the escalation budget is exhausted" }
+        guard policy.isEnabled else { return "error: the delegation budget is exhausted" }
 
         var brief = task
         if let ctx = call.arguments["context"], !ctx.isEmpty {
