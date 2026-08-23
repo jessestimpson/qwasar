@@ -246,6 +246,22 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
 int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n_block,
                               int32_t *out, char *err, size_t errcap);
 
+/* The same verify under SAMPLING, by rejection (Leviathan et al. / Chen et
+ * al.).  Draft block[i+1] is accepted with probability p(block[i+1]), where p
+ * is the target's filtered distribution at that position; the first rejection
+ * is replaced by a sample from p with the rejected token removed and the rest
+ * renormalised, and a fully accepted block ends with a sample from the final
+ * row.  Because the draft proposes deterministically, that scheme emits
+ * tokens distributed EXACTLY as serial sampling with `sp` -- the property
+ * that replaces greedy equality, held distributionally by tests/test_sample
+ * and against the engine by tests/test_verify.
+ *
+ * The sequence is not the serial one, only its law: acceptance tests consume
+ * randomness serial decoding would not, so the same seed produces a different
+ * (equally distributed) continuation.  `sp` NULL or temperature 0 is exactly
+ * qwasar_session_verify.  Declared in the sampling section below, which
+ * defines its parameter types. */
+
 /* How deep to draft the next round, from the acceptance this session has
  * actually seen and the measured price of a wider verify.  Returns 0 when
  * drafting is not worth it, which is a real answer: turning it on at all costs
@@ -271,6 +287,34 @@ typedef struct {
 void    qwasar_sampling_defaults(qwasar_sampling *sp);
 int32_t qwasar_sample(const float *logits, int32_t n, const qwasar_sampling *sp,
                       uint64_t *rng);
+
+/* The sampled verify -- documented above with qwasar_session_verify, declared
+ * here because it takes the types this section defines. */
+int32_t qwasar_session_verify_sampled(qwasar_session *s, const int32_t *block,
+                                      int32_t n_block, const qwasar_sampling *sp,
+                                      uint64_t *rng, int32_t *out,
+                                      char *err, size_t errcap);
+
+/* The pieces the sampled verify is built from, public because the
+ * distributional test needs to exercise them without a model.
+ *
+ * qwasar_sample_prob is the probability the FILTERED distribution assigns to
+ * `token` -- zero when a filter cut it, which is what makes rejection against
+ * it correct: a token the filters exclude can never be emitted, so a draft
+ * proposing it is always rejected.
+ *
+ * qwasar_sample_excluding samples with `banned` removed and the remaining
+ * mass renormalised; pass -1 to ban nothing.  Greedy (temperature 0) picks
+ * the best non-banned token and consumes no randomness. */
+float   qwasar_sample_prob(const float *logits, int32_t n,
+                           const qwasar_sampling *sp, int32_t token);
+int32_t qwasar_sample_excluding(const float *logits, int32_t n,
+                                const qwasar_sampling *sp, uint64_t *rng,
+                                int32_t banned);
+
+/* One uniform draw in [0, 1) from the sampler's own generator, so a caller
+ * running an acceptance test draws from the same stream the sampler uses. */
+float   qwasar_rng_uniform(uint64_t *state);
 
 /* How many leading tokens of `tokens` this session has already evaluated.
  *

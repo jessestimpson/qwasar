@@ -186,6 +186,109 @@ static void test_edges(void) {
     printf("  edges                   n=1, top_k>n, top_p=0, min_p>1\n");
 }
 
+/* The exact filtered distribution, by brute force, mirroring the chain's
+ * order and its cut semantics.  Small n only. */
+static void exact_dist(const float *v, int32_t n, const qwasar_sampling *sp,
+                       double *p) {
+    float mx = v[0];
+    for (int32_t i = 1; i < n; i++) if (v[i] > mx) mx = v[i];
+    typedef struct { int32_t id; double w; } ent;
+    ent e[256];
+    int32_t m = 0;
+    for (int32_t i = 0; i < n; i++) {
+        double w = exp((double)(v[i] - mx) / (double)sp->temperature);
+        if (sp->min_p > 0.0 && w < (double)sp->min_p) continue;
+        e[m].id = i; e[m].w = w; m++;
+    }
+    for (int32_t i = 0; i < m; i++)          /* insertion sort, descending */
+        for (int32_t k = i; k > 0 && e[k].w > e[k - 1].w; k--) {
+            ent t = e[k]; e[k] = e[k - 1]; e[k - 1] = t;
+        }
+    if (sp->top_k > 0 && sp->top_k < m) m = sp->top_k;
+    if (sp->top_p > 0.0f && sp->top_p < 1.0f) {
+        double total = 0.0;
+        for (int32_t i = 0; i < m; i++) total += e[i].w;
+        double want = total * (double)sp->top_p, acc = 0.0;
+        int32_t cut = m;
+        for (int32_t i = 0; i < m; i++) {
+            acc += e[i].w;
+            if (acc >= want) { cut = i + 1; break; }
+        }
+        m = cut;
+    }
+    double total = 0.0;
+    for (int32_t i = 0; i < m; i++) total += e[i].w;
+    for (int32_t i = 0; i < n; i++) p[i] = 0.0;
+    for (int32_t i = 0; i < m; i++) p[e[i].id] = e[i].w / total;
+}
+
+/* The property the sampled verify stands on: accept a point-mass proposal
+ * with the probability the filtered distribution gives it, resample from the
+ * residual on rejection, and what comes out is that distribution exactly.
+ * This is the acceptance rule qw_verify runs per drafted position, exercised
+ * here without a model and checked against brute force in total variation. */
+static void test_rejection_law(void) {
+    const int32_t n = 24;
+    float v[24];
+    for (int32_t i = 0; i < n; i++) v[i] = -0.35f * (float)i;   /* distinct */
+    v[7] = 1.6f; v[3] = 1.1f; v[9] = 0.4f;
+
+    qwasar_sampling sp;
+    qwasar_sampling_defaults(&sp);     /* temp 1, top_k 20, top_p 0.95 */
+
+    double p[24];
+    exact_dist(v, n, &sp, p);
+
+    /* qwasar_sample_prob must agree with brute force everywhere, including
+     * the zeros the filters cut. */
+    for (int32_t i = 0; i < n; i++)
+        CHECK(fabs((double)qwasar_sample_prob(v, n, &sp, i) - p[i]) < 1e-5,
+              "prob(%d): %g vs %g", i, (double)qwasar_sample_prob(v, n, &sp, i), p[i]);
+
+    /* The draft proposes the mode, as a greedy head does. */
+    int32_t draft = 7;
+    const int32_t N = 400000;
+    int32_t counts[24] = {0};
+    uint64_t rng = 20260823;
+    int32_t accepted = 0;
+    for (int32_t t = 0; t < N; t++) {
+        int32_t emitted;
+        if (qwasar_rng_uniform(&rng) < qwasar_sample_prob(v, n, &sp, draft)) {
+            emitted = draft;
+            accepted++;
+        } else {
+            emitted = qwasar_sample_excluding(v, n, &sp, &rng, draft);
+            CHECK(emitted != draft, "excluding returned the banned token");
+        }
+        counts[emitted]++;
+    }
+
+    double tv = 0.0;
+    for (int32_t i = 0; i < n; i++)
+        tv += fabs((double)counts[i] / N - p[i]);
+    tv *= 0.5;
+    CHECK(tv < 0.005, "total variation %g exceeds 0.005", tv);
+    CHECK(fabs((double)accepted / N - p[draft]) < 0.005,
+          "acceptance rate %g vs p(draft) %g", (double)accepted / N, p[draft]);
+
+    /* A proposal the filters cut must never be accepted, and the law must
+     * still come out right. */
+    draft = n - 1;                     /* below the top-k cut */
+    CHECK(qwasar_sample_prob(v, n, &sp, draft) == 0.0f,
+          "a token outside the filtered support must have probability 0");
+    memset(counts, 0, sizeof counts);
+    for (int32_t t = 0; t < N / 4; t++)
+        counts[qwasar_sample_excluding(v, n, &sp, &rng, draft)]++;
+    tv = 0.0;
+    for (int32_t i = 0; i < n; i++)
+        tv += fabs((double)counts[i] / (N / 4) - p[i]);
+    CHECK(0.5 * tv < 0.01, "residual after a zero-mass ban must be the "
+                           "distribution itself (tv %g)", 0.5 * tv);
+
+    printf("  rejection law           point-mass accept/resample emits the "
+           "filtered distribution\n");
+}
+
 int main(void) {
     test_greedy();
     test_top_k();
@@ -194,6 +297,7 @@ int main(void) {
     test_unfiltered_is_still_the_right_law();
     test_seed_reproducibility();
     test_edges();
+    test_rejection_law();
     if (fails) { fprintf(stderr, "%d check(s) failed\n", fails); return 1; }
     printf("ok: sample\n");
     return 0;

@@ -39,6 +39,53 @@ static int qw_cand_desc(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
+/* The filter chain, factored out because the sampled verify needs the same
+ * pruned candidate set three ways: to sample from, to read one token's
+ * probability out of, and to sample from with a token removed.  Fills `*out`
+ * with candidates carrying unnormalised weights, ordered descending, and
+ * returns how many survived -- or -1 when the scratch allocation failed, in
+ * which case callers fall back to argmax exactly as qwasar_sample always has. */
+static int32_t qw_filter(const float *logits, int32_t n, const qwasar_sampling *sp,
+                         float max_logit, qw_cand **out) {
+    const float inv_t = 1.0f / sp->temperature;
+    /* Prune before ordering.  exp(x - max) is 1 at the mode, so a candidate is
+     * kept when its unnormalised weight clears min_p; that is the same test as
+     * against the normalised max probability, without needing the sum yet. */
+    const float keep = sp->min_p > 0.0f ? sp->min_p : 0.0f;
+    qw_cand *cand = malloc((size_t)n * sizeof *cand);
+    *out = cand;
+    if (!cand) return -1;
+
+    int32_t m = 0;
+    for (int32_t i = 0; i < n; i++) {
+        float w = (float)exp((double)(logits[i] - max_logit) * inv_t);
+        if (w < keep) continue;
+        cand[m].id = i;
+        cand[m].p = w;
+        m++;
+    }
+    if (m == 0) return 0;
+
+    qsort(cand, (size_t)m, sizeof *cand, qw_cand_desc);
+
+    if (sp->top_k > 0 && sp->top_k < m) m = sp->top_k;
+
+    if (sp->top_p > 0.0f && sp->top_p < 1.0f) {
+        /* Recompute the mass over what survived top-k, so top_p is a fraction
+         * of the candidates actually in play. */
+        double total = 0.0;
+        for (int32_t i = 0; i < m; i++) total += cand[i].p;
+        double want = total * (double)sp->top_p, acc = 0.0;
+        int32_t cut = m;
+        for (int32_t i = 0; i < m; i++) {
+            acc += cand[i].p;
+            if (acc >= want) { cut = i + 1; break; }
+        }
+        m = cut;
+    }
+    return m;
+}
+
 void qwasar_sampling_defaults(qwasar_sampling *sp) {
     /* Matches the model's own generation_config. */
     sp->temperature = 1.0f;
@@ -81,44 +128,14 @@ int32_t qwasar_sample(const float *logits, int32_t n, const qwasar_sampling *sp,
         return n - 1;
     }
 
-    /* Prune before ordering.  exp(x - max) is 1 at the mode, so a candidate is
-     * kept when its unnormalised weight clears min_p; that is the same test as
-     * against the normalised max probability, without needing the sum yet. */
-    const float keep = sp->min_p > 0.0f ? sp->min_p : 0.0f;
-    qw_cand *cand = malloc((size_t)n * sizeof *cand);
-    if (!cand) {
+    qw_cand *cand;
+    int32_t m = qw_filter(logits, n, sp, max_logit, &cand);
+    if (m < 0) {
         int32_t best = 0;
         for (int32_t i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
         return best;
     }
-
-    int32_t m = 0;
-    for (int32_t i = 0; i < n; i++) {
-        float w = (float)exp((double)(logits[i] - max_logit) * inv_t);
-        if (w < keep) continue;
-        cand[m].id = i;
-        cand[m].p = w;
-        m++;
-    }
     if (m == 0) { free(cand); return 0; }
-
-    qsort(cand, (size_t)m, sizeof *cand, qw_cand_desc);
-
-    if (sp->top_k > 0 && sp->top_k < m) m = sp->top_k;
-
-    if (sp->top_p > 0.0f && sp->top_p < 1.0f) {
-        /* Recompute the mass over what survived top-k, so top_p is a fraction
-         * of the candidates actually in play. */
-        double total = 0.0;
-        for (int32_t i = 0; i < m; i++) total += cand[i].p;
-        double want = total * (double)sp->top_p, acc = 0.0;
-        int32_t cut = m;
-        for (int32_t i = 0; i < m; i++) {
-            acc += cand[i].p;
-            if (acc >= want) { cut = i + 1; break; }
-        }
-        m = cut;
-    }
 
     double total = 0.0;
     for (int32_t i = 0; i < m; i++) total += cand[i].p;
@@ -127,6 +144,115 @@ int32_t qwasar_sample(const float *logits, int32_t n, const qwasar_sampling *sp,
     for (int32_t i = 0; i < m; i++) {
         target -= cand[i].p;
         if (target <= 0.0) { chosen = cand[i].id; break; }
+    }
+    free(cand);
+    return chosen;
+}
+
+float qwasar_rng_uniform(uint64_t *state) { return qw_rng_float(state); }
+
+/* Whether any filter is on, given `n` live logits.  Mirrors the test in
+ * qwasar_sample so the streaming no-filter path stays shared behaviour. */
+static bool qw_filtering(const qwasar_sampling *sp, int32_t n) {
+    return (sp->top_k > 0 && sp->top_k < n)
+        || (sp->top_p > 0.0f && sp->top_p < 1.0f)
+        || (sp->min_p > 0.0f);
+}
+
+float qwasar_sample_prob(const float *logits, int32_t n,
+                         const qwasar_sampling *sp, int32_t token) {
+    if (n <= 0 || token < 0 || token >= n) return 0.0f;
+    if (!sp || sp->temperature <= 0.0f) {
+        /* Greedy is a point mass at the first argmax -- the same tie-break
+         * qwasar_sample uses, so the two agree on which token has mass 1. */
+        int32_t best = 0;
+        for (int32_t i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
+        return token == best ? 1.0f : 0.0f;
+    }
+
+    float max_logit = logits[0];
+    for (int32_t i = 1; i < n; i++) if (logits[i] > max_logit) max_logit = logits[i];
+    const float inv_t = 1.0f / sp->temperature;
+
+    if (!qw_filtering(sp, n)) {
+        double sum = 0.0;
+        for (int32_t i = 0; i < n; i++)
+            sum += exp((double)(logits[i] - max_logit) * inv_t);
+        return sum > 0.0
+            ? (float)(exp((double)(logits[token] - max_logit) * inv_t) / sum)
+            : 0.0f;
+    }
+
+    qw_cand *cand;
+    int32_t m = qw_filter(logits, n, sp, max_logit, &cand);
+    if (m <= 0) { if (m == 0) free(cand); return 0.0f; }
+    double total = 0.0, w = 0.0;
+    for (int32_t i = 0; i < m; i++) {
+        total += cand[i].p;
+        if (cand[i].id == token) w = cand[i].p;
+    }
+    free(cand);
+    return total > 0.0 ? (float)(w / total) : 0.0f;
+}
+
+int32_t qwasar_sample_excluding(const float *logits, int32_t n,
+                                const qwasar_sampling *sp, uint64_t *rng,
+                                int32_t banned) {
+    if (n <= 0) return 0;
+    if (!sp || sp->temperature <= 0.0f) {
+        int32_t best = -1;
+        for (int32_t i = 0; i < n; i++) {
+            if (i == banned) continue;
+            if (best < 0 || logits[i] > logits[best]) best = i;
+        }
+        return best >= 0 ? best : 0;
+    }
+
+    float max_logit = logits[0];
+    for (int32_t i = 1; i < n; i++) if (logits[i] > max_logit) max_logit = logits[i];
+    const float inv_t = 1.0f / sp->temperature;
+
+    if (!qw_filtering(sp, n)) {
+        double sum = 0.0;
+        for (int32_t i = 0; i < n; i++) {
+            if (i == banned) continue;
+            sum += exp((double)(logits[i] - max_logit) * inv_t);
+        }
+        double target = (double)qw_rng_float(rng) * sum;
+        int32_t last = banned == n - 1 ? n - 2 : n - 1;
+        for (int32_t i = 0; i < n; i++) {
+            if (i == banned) continue;
+            target -= exp((double)(logits[i] - max_logit) * inv_t);
+            if (target <= 0.0) return i;
+        }
+        return last >= 0 ? last : 0;
+    }
+
+    qw_cand *cand;
+    int32_t m = qw_filter(logits, n, sp, max_logit, &cand);
+    if (m < 0) return qwasar_sample_excluding(logits, n, NULL, rng, banned);
+    double total = 0.0;
+    int32_t live = 0;
+    for (int32_t i = 0; i < m; i++) {
+        if (cand[i].id == banned) continue;
+        total += cand[i].p;
+        live++;
+    }
+    if (live == 0 || total <= 0.0) {
+        /* The filtered support was exactly the banned token.  Unreachable
+         * from rejection (a token with mass 1 is never rejected), but a
+         * caller can construct it; the least-wrong answer is the best token
+         * the raw distribution has besides the ban. */
+        free(cand);
+        return qwasar_sample_excluding(logits, n, NULL, rng, banned);
+    }
+    double target = (double)qw_rng_float(rng) * total;
+    int32_t chosen = -1;
+    for (int32_t i = 0; i < m; i++) {
+        if (cand[i].id == banned) continue;
+        chosen = cand[i].id;
+        target -= cand[i].p;
+        if (target <= 0.0) break;
     }
     free(cand);
     return chosen;

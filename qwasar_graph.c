@@ -1100,8 +1100,12 @@ static bool qw_snap_reserve(qwasar_session *s, int32_t n_draft,
     return true;
 }
 
-int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n_block,
-                              int32_t *out, char *err, size_t errcap) {
+/* The shared verify pass.  `sp` NULL (or temperature 0) accepts by argmax
+ * equality; otherwise by rejection sampling against the target's filtered
+ * distribution, which needs the per-row logits the pass already keeps. */
+static int32_t qw_verify(qwasar_session *s, const int32_t *block, int32_t n_block,
+                         const qwasar_sampling *sp, uint64_t *rng,
+                         int32_t *out, char *err, size_t errcap) {
     if (!s || !block || n_block < 2 || !out) {
         qw_gerrf(err, errcap, "nothing to verify");
         return -1;
@@ -1154,16 +1158,43 @@ int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n
     qw_cmd_free(c);
 
     /* Row i's logits predict the token after block[i], so they are what
-     * block[i+1] guessed.  Accept while the guesses hold. */
+     * block[i+1] guessed. */
     const qw_cand *sel = qw_buf_contents(s->sel_out);
+    const bool sampled = sp && sp->temperature > 0.0f && rng;
+    const float  *lg    = qw_buf_contents(s->verify_logits);
+    const int32_t vocab = s->cfg->vocab_size;
     int32_t j = 0;
-    while (j < n_draft && (int32_t)sel[j].index == block[j + 1]) j++;
+    if (!sampled) {
+        /* Accept while the guesses match the argmax. */
+        while (j < n_draft && (int32_t)sel[j].index == block[j + 1]) j++;
+    } else {
+        /* Accept draft block[j+1] with the probability the filtered target
+         * distribution gives it.  The draft is a point mass (the head proposed
+         * exactly one token), so this acceptance rule plus the residual
+         * resample below emits the filtered distribution exactly. */
+        while (j < n_draft) {
+            const float p = qwasar_sample_prob(lg + (size_t)j * vocab, vocab,
+                                               sp, block[j + 1]);
+            if (qwasar_rng_uniform(rng) >= p) break;
+            j++;
+        }
+    }
 
-    /* The accepted drafts, plus the token row j predicts.  That last one is
-     * free: the pass computed it whether or not anything was accepted, which is
-     * why even a fully rejected round still advances by one. */
+    /* The accepted drafts, plus the token row j decides.  That last one is
+     * free: the pass computed row j's logits whether or not anything was
+     * accepted, which is why even a fully rejected round still advances by
+     * one.  Greedy takes the argmax; sampled takes the residual max(0, p - q)
+     * renormalised on a rejection -- with a point-mass draft that is p with
+     * the rejected token removed -- and a plain sample when every draft held. */
     for (int32_t i = 0; i < j; i++) out[i] = block[i + 1];
-    out[j] = (int32_t)sel[j].index;
+    if (!sampled) {
+        out[j] = (int32_t)sel[j].index;
+    } else if (j < n_draft) {
+        out[j] = qwasar_sample_excluding(lg + (size_t)j * vocab, vocab,
+                                         sp, rng, block[j + 1]);
+    } else {
+        out[j] = qwasar_sample(lg + (size_t)j * vocab, vocab, sp, rng);
+    }
     s->mtp_margin = (double)sel[j].best - (double)sel[j].second;
 
     /* Update the acceptance estimates.  Position i was only put to the test if
@@ -1210,6 +1241,18 @@ int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n
         for (int32_t i = 0; i < j; i++) s->mtp_owed_tokens[i] = block[i + 1];
     }
     return j + 1;
+}
+
+int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n_block,
+                              int32_t *out, char *err, size_t errcap) {
+    return qw_verify(s, block, n_block, NULL, NULL, out, err, errcap);
+}
+
+int32_t qwasar_session_verify_sampled(qwasar_session *s, const int32_t *block,
+                                      int32_t n_block, const qwasar_sampling *sp,
+                                      uint64_t *rng, int32_t *out,
+                                      char *err, size_t errcap) {
+    return qw_verify(s, block, n_block, sp, rng, out, err, errcap);
 }
 
 /* Commits head rows a verify left owed, when something other than a draft comes

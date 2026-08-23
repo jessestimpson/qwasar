@@ -216,18 +216,23 @@ Two practical consequences:
 # Performance
 
 All numbers from one machine: **MacBook Air, Apple M4**, 10 CPU / 10 GPU cores,
-32 GB, macOS 26.5.1. It's fanless; measured thermal drift over several minutes
-of sustained GPU load was 1.4%, so these are close to sustained figures.
+32 GB, macOS 26.5.1, fanless. Measured 2026-08-23, after the compact draft
+head, the re-measured depth table, and the decode-timer fix (earlier readmes
+carried figures whose speculative decode excluded drafting time; these do not).
+
+Prefill in 256-token chunks; decode over 24 greedy tokens at the stated depth:
 
 | Context | Prefill | Decode |
 | ---: | ---: | ---: |
-| 512 | 42.6 t/s | 5.71 t/s |
-| 2048 | 41.1 t/s | 5.53 t/s |
-| 4096 | 36.4 t/s | 5.21 t/s |
+| 506 | 43.1 t/s | 6.32 t/s |
+| 2007 | 41.0 t/s | 6.21 t/s |
+| 4002 | 31.3 t/s | 4.98 t/s |
 
 Serial decode is at the memory-bandwidth roof: a dense 27B reads all 14.95 GB
 of weights per token, which at ~120 GB/s caps out around 8 t/s by arithmetic.
-Decode holding steady across context is the hybrid schedule earning its keep.
+The 4K row ran directly after two minutes of continuous prefill on a fanless
+chassis, so it carries thermal load the short rows do not; the depth cost
+itself is small, which is the hybrid schedule earning its keep.
 
 Prefill reaches ~80% of MLX's quantised matmul throughput (2.25 vs 2.73–2.82
 TFLOP/s on identical shapes), which is the honest target. The optimization
@@ -242,12 +247,21 @@ qwasar --mtp ./qwasar-mtp --spec -p "..."
 qwasar-agent --mtp ./qwasar-mtp        # on by default once the head is given
 ```
 
-**1.65x on prose from cold**, falling toward ~1.4x as the fanless chassis warms
-(speculation trades memory traffic for arithmetic, and throttling takes
-arithmetic first). Draft depth adapts per round from observed acceptance;
-`--mtp-depth <n>` overrides, `0` disables. The target verifies every draft, so
-output is guaranteed identical to greedy decoding — `tests/test_verify` pins
-that exactly. Details — the pruned draft vocabulary, the depth model, the
+**1.5x on prose, sustained.** Three alternating serial/speculative pairs of
+200 tokens, so both share thermal state: serial 5.41 / 5.64 / 5.63 t/s,
+speculative 8.32 / 8.42 / 8.38 t/s — ratios 1.54, 1.49, 1.49, with 2.58
+tokens committed per round at mean depth 2.63 and drafting costing 1.3 s of a
+24 s run. The stability is new: before the compact draft head and the
+re-measured depth table this faded from 1.65x toward 1.4x as the chassis
+warmed, and the 1.65x itself came from a timer that excluded drafting.
+
+Draft depth adapts per round from observed acceptance; `--mtp-depth <n>`
+overrides, `0` disables. The target verifies every draft, so output is
+guaranteed identical to greedy decoding — `tests/test_verify` pins that
+exactly. For sampling callers there is `qwasar_session_verify_sampled`, a
+rejection-sampling verify whose output is distributed exactly as serial
+sampling (Crucible uses it); the CLI and agent decode greedily and stay on
+the exact verify. Details — the pruned draft vocabulary, the depth model, the
 depth-4 ceiling — are in `PLAN.md`.
 
 Startup: engine load 6–9 s, agent cold start 46.7 s, 21.1 s with the system

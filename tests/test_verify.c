@@ -54,9 +54,11 @@ static int serial(qwasar_engine *e, const int32_t *prompt, int32_t n_prompt,
 }
 
 /* The same thing through the draft head: propose a block, verify it in one
- * pass, keep the longest correct prefix. */
+ * pass, keep the longest correct prefix.  With `sp` non-NULL the verify is
+ * the sampled one and `seed` feeds its generator; NULL is the greedy path. */
 static int speculative(qwasar_engine *e, const int32_t *prompt, int32_t n_prompt,
-                       int32_t depth, int32_t *out, int max_out,
+                       int32_t depth, const qwasar_sampling *sp, uint64_t seed,
+                       int32_t *out, int max_out,
                        int64_t *rounds, int64_t *committed, int64_t *rejected) {
     char err[256];
     qwasar_session *s = qwasar_session_new(e, err, sizeof err);
@@ -67,7 +69,9 @@ static int speculative(qwasar_engine *e, const int32_t *prompt, int32_t n_prompt
     if (!logits) { fprintf(stderr, "eval: %s\n", err); qwasar_session_free(s); return -1; }
 
     const int32_t vocab = qwasar_vocab_size(e);
-    int32_t next = argmax(logits, vocab);
+    uint64_t rng = seed;
+    int32_t next = sp ? qwasar_sample(logits, vocab, sp, &rng)
+                      : argmax(logits, vocab);
     int n = 0;
 
     while (n < max_out) {
@@ -82,7 +86,7 @@ static int speculative(qwasar_engine *e, const int32_t *prompt, int32_t n_prompt
         if (want == 0) {
             const float *lg = qwasar_session_eval(s, &next, 1, err, sizeof err);
             if (!lg) { fprintf(stderr, "eval: %s\n", err); qwasar_session_free(s); return -1; }
-            next = argmax(lg, vocab);
+            next = sp ? qwasar_sample(lg, vocab, sp, &rng) : argmax(lg, vocab);
             continue;
         }
 
@@ -91,7 +95,9 @@ static int speculative(qwasar_engine *e, const int32_t *prompt, int32_t n_prompt
         int32_t nd = qwasar_session_draft(s, next, blk + 1, want, err, sizeof err);
         if (nd < 0) { fprintf(stderr, "draft: %s\n", err); qwasar_session_free(s); return -1; }
 
-        int32_t nc = qwasar_session_verify(s, blk, nd + 1, got, err, sizeof err);
+        int32_t nc = sp
+            ? qwasar_session_verify_sampled(s, blk, nd + 1, sp, &rng, got, err, sizeof err)
+            : qwasar_session_verify(s, blk, nd + 1, got, err, sizeof err);
         if (nc < 0) { fprintf(stderr, "verify: %s\n", err); qwasar_session_free(s); return -1; }
         (*rounds)++;
         *committed += nc;
@@ -162,7 +168,7 @@ int main(int argc, char **argv) {
          * flushing owed head rows. */
         for (int32_t depth = 0; depth <= 4; depth++) {
             int64_t rounds = 0, committed = 0, rejected = 0;
-            int n_got = speculative(e, prompt, n_prompt, depth, got, MAX_GEN,
+            int n_got = speculative(e, prompt, n_prompt, depth, NULL, 0, got, MAX_GEN,
                                     &rounds, &committed, &rejected);
             if (n_got == -2) { fprintf(stderr, "skip: no MTP head bound\n"); return 0; }
             if (n_got < 0) return 1;
@@ -184,6 +190,43 @@ int main(int argc, char **argv) {
                          : "adaptive:", n_got,
                    (long long)rounds, rounds ? (double)committed / (double)rounds : 0.0,
                    (long long)rejected);
+        }
+        /* The sampled verify.  Its law is held by tests/test_sample without a
+         * model; what the engine has to prove is narrower and exact:
+         * temperature 0 through the sampled entry point IS the greedy verify,
+         * and a sampled run is deterministic under its seed -- any state the
+         * rewind corrupted would show up as the second run diverging. */
+        {
+            qwasar_sampling sp;
+            qwasar_sampling_defaults(&sp);
+            sp.temperature = 0.0f;
+            int64_t rounds = 0, committed = 0, rejected = 0;
+            int32_t got2[MAX_GEN];
+            int n_got = speculative(e, prompt, n_prompt, 3, &sp, 7, got2, MAX_GEN,
+                                    &rounds, &committed, &rejected);
+            if (n_got < 0) return 1;
+            CHECK(n_got == n_want, "sampled verify at temp 0: %d tokens, "
+                  "serial %d", n_got, n_want);
+            for (int i = 0; i < (n_got < n_want ? n_got : n_want); i++)
+                CHECK(got2[i] == want[i],
+                      "sampled verify at temp 0 diverges at %d", i);
+
+            qwasar_sampling_defaults(&sp);           /* temp 1, the real thing */
+            int32_t a[MAX_GEN], b[MAX_GEN];
+            int64_t r1 = 0, c1 = 0, x1 = 0, r2 = 0, c2 = 0, x2 = 0;
+            int na = speculative(e, prompt, n_prompt, 3, &sp, 42, a, MAX_GEN,
+                                 &r1, &c1, &x1);
+            int nb = speculative(e, prompt, n_prompt, 3, &sp, 42, b, MAX_GEN,
+                                 &r2, &c2, &x2);
+            if (na < 0 || nb < 0) return 1;
+            CHECK(na == nb, "sampled runs with one seed differ in length: %d, %d",
+                  na, nb);
+            for (int i = 0; i < (na < nb ? na : nb); i++)
+                CHECK(a[i] == b[i], "sampled runs with one seed diverge at %d", i);
+            total_rejected += x1;
+            printf("  prompt %zu sampled:  temp 0 identical; temp 1 seeded run "
+                   "reproduces, %.2f per round, %lld rewound\n",
+                   pi, r1 ? (double)c1 / (double)r1 : 0.0, (long long)x1);
         }
         free(prompt);
     }

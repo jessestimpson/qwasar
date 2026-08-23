@@ -1318,6 +1318,34 @@ of the thing being measured, and a calibration table left behind by the kernels
 it described. The compact head was worth 2.6%; believing the instruments was
 worth more.
 
+### Full sweep with everything landed — measured 2026-08-23
+
+The numbers the README now carries, from one scripted run: prefill + 24 greedy
+decode tokens at three depths, then three alternating serial/speculative pairs
+of 200 prose tokens so the two share thermal state.
+
+| context | prefill | decode |
+| ---: | ---: | ---: |
+| 506 | 43.1 t/s | 6.32 t/s |
+| 2007 | 41.0 t/s | 6.21 t/s |
+| 4002 | 31.3 t/s | 4.98 t/s |
+
+The 4K row ran straight after two minutes of continuous prefill, so it is the
+thermally loaded case; the short-context rows are the best serial decode this
+tree has measured (6.3 against the 8.0 bandwidth identity).
+
+| pair | serial | speculative | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 5.41 t/s | 8.32 t/s | 1.54 |
+| 2 | 5.64 t/s | 8.42 t/s | 1.49 |
+| 3 | 5.63 t/s | 8.38 t/s | 1.49 |
+
+2.58 tokens per round at mean depth 2.63, drafting 1.3 s of a 24 s run.  Two
+things worth naming.  The ratio no longer fades across pairs the way the
+pre-compact-head 1.65x → 1.39x sequence did — drafting is cheap enough now
+that warmth has less arithmetic to take.  And these ratios are honest in a way
+the old ones were not: the decode timer now contains drafting.
+
 ### Batched matvec width is a register cliff, not a work curve
 
 From the challenge's public cross-row study, and consistent with qwasar's own
