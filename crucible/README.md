@@ -20,26 +20,29 @@ The design lives in [the spec](spec/README.md), one topic per file; the measurem
 
 ## The one thing to understand first
 
-> **Nothing the agent does reaches your files.** Your project folder is
-> mounted read-only, copied into the guest at boot, and unmounted. The agent
-> works against *that copy* — it will tell you, accurately, that it edited a
-> file, and your file will be byte-identical.
+> **The agent works in your working tree — and only there.** Your project
+> folder is mounted into the VM read-write: every edit lands live, as an
+> ordinary uncommitted change your own `git status` shows you, and you can
+> edit right beside it. Nothing else of your machine is reachable from
+> inside. Review with `git diff`, commit what you like, `git checkout` what
+> you don't.
 
-Work crosses back through **Review Changes…** in the session header. For a
-git project it crosses as git: the agent's commits arrive as verified
-objects plus one branch — `crucible/<session>` — and nothing else in your
-repository is touched; your files change only when *you* `git merge`, with
-your own tools and your own conflict resolution. (A dirty tree at session
-start gets one question: include your uncommitted changes, or work from
-HEAD.) Non-git projects keep the per-file approval sheet: every file shown
-with its diff, nothing written until you tick and apply. Either way the
-architecture puts a person at this one point.
+The one thing the agent can never touch is your real `.git`. At boot the
+guest takes a private copy of it onto the VM disk and **bind-mounts that
+shadow over `/work/.git`** — so git inside the sandbox works normally (log,
+blame, diff, even private commits), while your hooks, config, and history
+sit physically behind the mount, unreachable by anything the tools do. There
+is no patch step, no approval sheet, and no `crucible/*` branch any more:
+there is nothing left to cross, because the edits are already in your tree
+and your own git is the review.
 
 The guest has **no network device at all** — an absence, not a firewall rule.
-It gets a copy-on-write clone of the guest disk per session, the read-only
-project copy, and one vsock channel to the host. So a prompt injection in a
-file the model reads degrades from *arbitrary code execution on your laptop*
-to *a bad edit inside a VM you can throw away*.
+It gets a copy-on-write clone of the guest disk per session, your mounted
+tree, and one vsock channel to the host. So a prompt injection in a file the
+model reads degrades from *arbitrary code execution on your laptop* to *bad
+uncommitted edits, in plain sight of your own `git status`* — recoverable
+for tracked files with your own `git checkout`; keep untracked work you care
+about committed or backed up.
 
 **Sandbox settings overlay in three layers** — global, per-project,
 per-session; field-wise, the most specific value wins, replace not merge
@@ -62,8 +65,9 @@ off. The reasoning is spec §8.3.
 **Status:** milestones 0–5 built and gated, plus markdown with syntax
 highlighting, session parking with verified warm/cold indicators, delegation
 (remote sub-agents under a budget), the config project, project-owned
-skills, and the git crossing (agent work arrives as a real branch you
-merge). Not yet built: `crucible-cli` and the inspector (M6 remainder), and
+skills, and the direct tree (the agent edits your working copy live, with
+your real `.git` shadowed out of its reach). Not yet built: `crucible-cli`
+and the inspector (M6 remainder), and
 vision (M7). The full map is
 [spec/12-roadmap.md](spec/12-roadmap.md).
 

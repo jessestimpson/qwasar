@@ -36,15 +36,23 @@ Notes that matter:
 instructions embedded in a file it reads — taking an action the user did not
 intend on the user's machine.
 
-**How:** it has no ability to. The tool implementations do not exist on the
-host. `shell` runs in a guest with no network device, whose only view of the
-user's files is a read-only mount of one directory the user picked, and whose
-only channel out is a patch the user reads and approves file by file.
+**How:** it has almost none, and the remainder is stated. The tool
+implementations do not exist on the host. `shell` runs in a guest with no
+network device. The one thing it can write to outside its own disk is the
+project's working tree — framework-confined to that single directory by the
+virtiofs share (§7.4), with the real `.git` bind-mounted out of reach, so
+hooks, config, and history — the things the user's own git *executes* and
+trusts — cannot be planted or rewritten.
 
 Prompt injection therefore degrades from *arbitrary code execution on the
-developer's laptop* to *a bad patch, shown to a human, in a diff view*. That is
-the entire argument for the architecture, and it is worth stating in one
-sentence because everything expensive in this document is bought with it.
+developer's laptop* to *bad uncommitted edits in the working tree, sitting in
+plain sight of the user's own `git status`*. That sentence is deliberately
+weaker than the previous design's ("a bad branch, reviewed in your own git"):
+the direct tree trades write isolation of the working copy for collaboration,
+and the trade is made honestly. Tracked files are recoverable with the user's
+own `git checkout`; **untracked files are not** — an overwritten untracked
+file is gone. Code the agent writes still executes on the host only when the
+user's normal workflow runs it, exactly as merging a bad branch would have.
 
 **What we do not defend against:**
 
@@ -54,10 +62,14 @@ sentence because everything expensive in this document is bought with it.
   legible; it cannot make the user read it.
 - Model output that is simply wrong. Different problem.
 
-**The attack surface we actually own** is the vsock protocol and the patch
-applier. Both are small, both are pure functions over untrusted input, and both
-are tested adversarially. Warden validates every host message; the host
-validates every guest path (§7.4 step 8).
+**The attack surface we actually own** is the vsock protocol and the `.git`
+shadow. Warden validates every host message. The shadow — a private copy of
+the real `.git`, bind-mounted over `/work/.git` on every boot (§7.4) — is
+what keeps the one guest-writable directory from containing anything the
+user's own git executes; `test_mount_work.sh` pins the seeding and mounting
+contract, and the gate proves the mounted result from the host side: a guest
+commit and a guest-written hook must leave the real `.git` without a new
+byte and HEAD unmoved.
 
 ### 8.3 Network: host-mediated egress, never a NIC
 

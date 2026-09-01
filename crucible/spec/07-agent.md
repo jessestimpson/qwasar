@@ -90,7 +90,6 @@ warden  (Elixir, :warden@guest)      workspace (Elixir, :workspace@guest)
   Warden.Registry  tool manifest       Crucible.Shell (eval binding)
   Warden.Fs        /work primitives    Crucible.Fs    (the six file tools)
   Warden.Workspace spawn / monitor     ...every module the agent writes
-  Warden.Diff      git plumbing
 ```
 
 They are **separate OS processes**, connected by Erlang distribution over
@@ -139,204 +138,116 @@ into workspace's `mod.run(args)` under a timeout, marshal the return. A tool tha
 throws returns its exception and stacktrace as the tool result. A tool that
 hangs is killed at the timeout and says so.
 
-### 7.4a Leaning into git — the crossing as an object exchange *(built)*
+### 7.4 The tree, direct — and the vault over `.git` *(rebuilt 2026-08-31)*
 
-*Built 2026-08-23, to this section's design: `Warden.Git` exports
-base-bounded objects over the vsock (the base is recorded by init before any
-agent runs, so the host has everything at or below it by construction);
-`GitImport` verifies each object against its own name and writes it loose —
-zlib framed by hand over Apple's raw DEFLATE — then points
-`refs/heads/crucible/<slug>`. The dirty-tree question is asked exactly as
-specified, once per session, re-applied per boot because seeding re-syncs.
-The agent is briefed to commit as it goes. `GitImportSuite` replays this
-section's original verification with real git on every `make test`: fsck
---strict, log, a clean merge applying edit+add+delete, a tampered object
-refused by name, and the concurrent edit landing as a line-level conflict
-with markers. §7.4's sheet remains, demoted to the non-git fallback; gutting
-its now-redundant drift machinery is recorded cleanup, not a blocker.*
+*Third design at this number, each recorded in the git log. M5's
+materialisation moved bytes under approval; the shared-workspace design
+moved the tree to a host copy and history across a verified object
+crossing. Living with the copy showed the remaining seam: the workspace and
+the project were still two directories, so "the changes are right there"
+was true of the copy and false of the project, and the crossing existed
+only to bridge a gap the copy itself had created. Pre-release, so this
+replaces both wholesale.*
 
-§7.4 below describes what M5 built: a baseline manifest, per-file SHAs, drift
-detection, size caps, and a host that writes bytes under approval. It works, and
-it is on a path that ends badly.
+**`/work` is the user's project directory**, mounted read-write into the
+guest. There is no copy, no seeding, no export, no import, no `crucible/*`
+branch — the agent's edit lands in the user's working tree as it happens,
+where their own git shows it as an ordinary uncommitted change. Review is
+`git diff` in their own repo; acceptance is their own `git commit`; undo is
+their own `git checkout`. The integration surface is zero new concepts.
 
-Look at what it has already grown: baseline hashes per file, a *conflict* state
-distinct from a *rejection*, an added-file-now-exists case, a
-modification-to-a-deleted-file case, a backup directory, a re-baseline step. Each
-one is a thing git does properly. Keep going and the next asks are conflict
-resolution, then "take only these two files", then "the model made three logical
-changes, split them" — **merge, cherry-pick and rebase, arriving one bad
-reimplementation at a time**.
+What survives of the second design is its best idea, applied at the only
+boundary left: **the real `.git` is never guest-writable.**
 
-The 2 MB/6 MB caps are the tell. There is no principled reason for them except
-that whole file bodies are being shipped; git would send a few KB of compressed
-delta for the same change.
+```
+host   project/                 the user's own tree — the agent edits it live
+         src/…                  uncommitted changes, in their own git status
+         .git/                  REAL: hooks, config, history — see below
+guest  /work                    the same directory, virtiofs, read-write
+       /var/crucible/git        the SHADOW: a private copy of .git on the VM
+                                disk, bind-mounted over /work/.git every boot
+```
 
-#### The reframe
+At first boot, `mount-work` copies the real `.git` (visible through the
+mount) onto the VM disk; on **every** boot, before the warden starts, it
+bind-mounts that shadow over `/work/.git`. Git inside the guest is
+completely ordinary — log, blame, diff, even commits, all against the
+private copy — while the mountpoint physically stands between the agent and
+the user's real `.git`: nothing written through `/work/.git` can reach it,
+and even `rm -rf /work/.git/*` empties only the shadow. Hooks, config,
+filters — the things the user's own git *executes* — cannot be planted.
+The gate proves it from the host side: the guest commits and writes a hook,
+and the real `.git` must not gain a byte.
 
-**The VM boundary is a network boundary, and git is already a distributed VCS.**
-Two repositories that cannot share a filesystem, exchanging work, is the problem
-git was built to solve. The guest already holds a full clone — `.git` is copied
-in with everything else — it simply is not being treated as one.
+Four consequences, stated:
 
-So the crossing stops being a file copy:
-
-    guest commits  ->  sends (sha, type, content) for BASE..TIP
-                   ->  host writes loose objects + one ref
-
-and the user gets a **real branch in their real repo**. Merge, rebase,
-cherry-pick, stash, `git log -p`, blame, their own mergetool and their own
-config — none of it written here.
-
-A `git worktree` would be the obvious thing to reach for and does not work: `git
-worktree add` writes a `.git` *file* pointing at an absolute path inside the main
-repository's `.git/worktrees/`, so objects, refs and index all stay in a repo the
-worktree must be able to reach and write. The guest has no path to the host's
-`.git` — the share is unmounted before the agent runs, which is the property the
-entire sandbox rests on (§8.2). Restoring a writable mount to enable worktrees
-would trade away exactly what the sandbox is for. A *clone* exchanging *objects*
-is the right primitive for this topology, and it is the one git was designed
-around.
-
-#### No libgit2, and no child process
-
-The host cannot spawn `git`: security-scoped access does not survive into a child
-process, which is why `git apply` was rejected for §7.4 in the first place.
-libgit2 was the obvious answer and is **not needed**.
-
-A loose object is `<type> <len>\0<content>`, zlib-deflated, stored at
-`.git/objects/<sha[0:2]>/<sha[2:]>` where the sha names the *uncompressed* form.
-That is zlib, SHA-1, and a file write — `Insecure.SHA1` from CryptoKit and `-lz`,
-a system library. Nothing to vendor, nothing for a user to install, which is the
-same bar the rest of this project holds (`make`, and nothing else).
-
-Verified before writing this section, against a real repository: objects written
-by hand, `git fsck --strict` clean, `git log`/`git diff` correct across a
-modification, an addition, a deletion and a nested path, `git merge` clean. And
-with a concurrent edit to the same line on the host, `git merge` produced a
-proper **line-level** conflict with markers — where §7.4 can only detect drift at
-*file* granularity and offer a checkbox.
-
-**The hash is the verification, and it is free.** A wrong type, a wrong length or
-a truncated transfer all land as a refusal rather than as a corrupt repository.
-That is a stronger guarantee than the byte path has, not a weaker one.
-
-**The import is additive.** Objects, plus one ref. Never HEAD, never the index,
-never a branch the user owns, never a working file. The worst outcome of a bug is
-unreferenced objects that `git gc` collects. The destructive step — changing
-files — moves to the user's own `git merge`, which they already trust and which
-already handles conflicts.
-
-#### Decisions taken
-
-**Refs land at `refs/heads/crucible/<slug>`.** A real branch: it shows in `git
-branch`, in every GUI, and merges by short name. The hidden `refs/crucible/*`
-namespace avoids clutter at the cost of being forgettable and unmergeable without
-typing a full ref, which is the wrong trade for something the user is meant to
-act on. Stale ones are deleted like any other branch.
-
-**The agent makes its own commits.** It already has git through `bash`; the
-system prompt will say so. A reviewable series beats one flat blob, and it is
-what makes cherry-picking a *part* of the work possible at all. The harness
-commits any uncommitted remainder at proposal time so nothing is lost.
-
-**A dirty worktree is the user's choice, at session start.** If the project has
-uncommitted changes when a session begins, they are copied into `/work` like
-everything else — and would end up inside the agent's commit, so merging would
-commit the user's own work under the agent's name. Rather than pick a policy, the
-session-creation flow asks, because the real question underneath is *should the
-agent see my uncommitted work at all* and both answers are right sometimes:
-
-  - **Include** — `/work` is the working tree as it stands, and the guest commits
-    that state first, on its own, as "local changes before this session". The
-    user's work stays visibly theirs in the log. Right when they are mid-change
-    and want help with it.
-  - **Exclude** — `/work` is reset to HEAD after the copy, so the uncommitted
-    changes never enter the sandbox at all. Right when they want the agent
-    working from a known, committed base.
-
-The prompt appears only when the tree is actually dirty, and only for git
-projects.
+- **The shadow is a snapshot, refreshed on request.** The agent's view of
+  history is the session's first boot — until the user clicks **Refresh
+  Git**: the `git_refresh` op drops the seed stamp (the one thing a running
+  guest can do about a `.git` it cannot see), the session parks, and the
+  next message boots a guest whose `mount-work` re-seeds from the repo's
+  current state while nothing but init is running. Refresh discards the
+  shadow's private commits and never touches the tree or the real `.git`;
+  the transcript notes it, and the button is disabled mid-turn (a reboot
+  under a running tool call would read as a crashed sandbox). The rejected
+  alternative — unmounting the shadow on a live VM to copy fresh bytes —
+  would put agent code and the real `.git` alive at the same time, which is
+  the invariant, so it stays rejected.
+- **The model is briefed away from git entirely, for now.** Version control
+  is the user's: they review edits with their own tools and commit what
+  they accept; the model's job is the files. The shadow's purpose is
+  therefore pure enforcement — briefings are advisory and injection ignores
+  them, so the guest's git *working* against a private copy is what makes a
+  disobedient `git` command harmless rather than merely discouraged.
+- **A non-git project gets nothing** — no shadow, no repo, and git in the
+  guest says "not a repository", which is the truth. A `.git` *file* (a
+  worktree or submodule checkout) is treated the same way, because the real
+  git dir it points to is not reachable and must not be guessed at.
+- **Sessions of one project share the tree.** Two sessions no longer have
+  two copies; §4.3's one-live-session rule is what keeps them from typing
+  over each other, and it is now load-bearing for the tree, not just for
+  memory.
 
 #### What this deletes
 
-The honest test of the idea. Of the ~936 lines across `Materialise.swift`,
-`materialise.ex`, `ApprovalSheet.swift` and their suites, roughly two thirds go:
-the per-file SHA baselining, drift detection, conflict and rejection states, size
-caps, the backup directory, the re-baseline step, and most of the approval
-sheet's per-file machinery. A large net removal is the signal that this is the
-right shape.
-
-What remains is §7.4 itself, **demoted to the fallback** for projects that are not
-git repositories. That case is genuinely simple — no history to reconcile — and
-is where a byte copy under approval is the proportionate answer.
+The entire crossing: `GitImport` and its suite (the loose-object writer,
+the zlib framing, the SHA verification), `Warden.Git` and the
+`git_info`/`git_export`/`git_objects` ops, the crossing sheet, the
+automatic per-turn export, the `crucible/*` ref namespace, and the branch
+walkthrough. Also the host-side workspace seeder and its suite, the
+`gitseed` share, and the *Open Workspace* affordance — the workspace is the
+project; the user already has it open.
 
 #### Risks worth naming
 
-  - **It writes into the user's `.git`.** Confined to new objects and
-    `refs/heads/crucible/*`; `git fsck` is the check, and it runs in the tests.
-  - **`.git` is copied into the guest**, so its size is a boot cost. 6.2 MB for
-    this repository, which is nothing; a repository with large history is a case
-    to measure rather than assume.
-  - **The agent can rewrite history inside the guest.** Harmless: only objects
-    reachable from the proposed tip are exported, and import cannot move a ref
-    the user owns.
-  - **Submodules and LFS are untested.** Gitlinks and LFS pointers should
-    transfer as the SHAs and pointer files they are, which is correct, but that
-    is reasoning rather than evidence.
+- **The write boundary moved from the repo to the working tree.** A bad or
+  injected agent can now vandalise uncommitted files directly. For tracked
+  files the user's own git is the recovery (`git status` shows the damage,
+  `git checkout` reverts it); **untracked files have no such net** — an
+  overwritten untracked file is gone. This is the trade the direct tree
+  buys collaboration with, chosen deliberately; §8.2 carries the honest
+  threat-model statement.
+- **The bind mount is load-bearing.** If it ever failed to attach on a git
+  project, the real `.git` would be exposed; `mount-work` seeds the shadow
+  *before* mounting, warns loudly on failure, and the gate asserts the
+  mounted result. A failed seed still mounts an empty shadow — protection
+  over functionality.
+- **virtiofs write performance**, unchanged from the second design: builds
+  that hammer the tree do it over the share; the escape hatch is build
+  output on guest-local `/tmp`, and the number to watch is a real build's
+  wall clock.
+- **Concurrent edits are last-write-wins at the file level.** Now genuinely
+  two hands on one checkout — the user's own working tree. Same statement,
+  sharper teeth.
 
-### 7.4 Materialisation — the only thing that crosses back
-
-**At sandbox creation:**
-
-1. Host walks the session's working directory, honouring `.gitignore` plus
-   `Project.excludeGlobs`, capped at a configurable size (default 512 MB) and
-   file count. What was excluded is *stated*, in a transcript item — an agent
-   that cannot see `node_modules` should know it cannot see `node_modules`.
-2. Host records `baseline.json`: every included path → SHA-256 + mode.
-3. `/base` is mounted read-only over virtiofs. The guest's init does
-   `cp -a /base/. /work/` — a local copy inside the guest, fast, and after it the
-   host share is not touched again.
-4. Guest runs, with a **separate git dir so a real repo is never disturbed**:
-   ```
-   git --git-dir=/work/.crucible-git --work-tree=/work init
-   git --git-dir=/work/.crucible-git --work-tree=/work add -A
-   git --git-dir=/work/.crucible-git --work-tree=/work commit -m baseline
-   ```
-   Git is the diff engine because it already solves renames, modes, binary
-   files, and patch application, and because the guest image is carrying it
-   anyway.
-
-**When the model calls `propose` (or the user asks for changes):**
-
-5. Guest produces `git diff --binary baseline` plus a structured summary: files
-   added / modified / deleted / renamed, insertions, deletions.
-6. Patch and summary come over vsock.
-7. **Host verifies before showing anything.** For every path the patch touches,
-   re-hash the current file on disk and compare to `baseline.json`. Any mismatch
-   means the real tree changed while the agent worked; the file is flagged
-   *conflicted* in the sheet and defaults to unchecked.
-8. **Every path is validated** — this is the security boundary, so it is
-   explicit and it is tested adversarially (§10):
-   - reject absolute paths;
-   - reject any path whose normalised form escapes the session root;
-   - reject paths traversing a symlink that leaves the root;
-   - reject `.git/` unless the user opted in;
-   - reject the session root itself being a symlink resolved differently than at
-     baseline.
-9. **The approval sheet.** Unified diff per file, syntax-highlighted,
-   per-file checkboxes, Apply Selected / Reject / Open in External Diff. The
-   patch is *not* applied by anything the model can call. There is no `--yes`
-   flag for this, at any level, ever. The C agent has `--yes` for host writes;
-   Crucible's equivalent is that writes inside the sandbox need no confirmation
-   at all — the confirmation moved to the boundary where it means something.
-10. **Apply.** Snapshot the touched files into `undo/<n>/` first. Then
-    `git apply --3way` if the project is a git repo, else write files with an
-    atomic rename per file. Report per-file success; a partial application is
-    reported as a partial application, not as success.
-11. **Undo** restores from the snapshot. It is a menu item and a transcript
-    affordance, not a hidden folder.
-12. The guest re-baselines: the applied state becomes the new baseline commit,
-    so the next proposal is a diff against what the user actually accepted.
+**Correctness bar:** `test_mount_work.sh` pins the guest contract — shadow
+seeded once per disk and never re-seeded over the agent's commits *unless
+the stamp was dropped* (the refresh path, which must discard private
+commits and re-stamp), the bind mount asked for on every boot, non-git and
+gitfile projects left alone — and gates the image build. The sandbox gate
+proves the mounted result end to end: a guest write visible in the host
+tree, a guest commit and a guest-written hook absent from the real `.git`,
+HEAD unmoved, and `git_refresh` actually dropping the stamp.
 
 ### 7.5 Sampling, and speculation under it
 

@@ -59,30 +59,6 @@ final class AppState {
     var generatedThisTurn = 0
     var liveSessionID: UUID?
 
-    // Materialisation (PLAN.md 7.4). Nothing here writes anything; `applyApproved`
-    // is the only thing that does, and only for paths the user ticked.
-    var showingApproval = false
-    var isProposing = false
-    var proposal: Proposal?
-    var proposalError: String?
-    var approvedPaths: Set<String> = []
-    var lastUndoDirectory: URL?
-
-    // The git crossing (spec 7.4a): work leaves the sandbox as objects and a
-    // ref, and the user merges a real branch. Presented when non-nil.
-    struct GitCrossing {
-        var branch: String
-        var tip: String
-        var commits: [(sha: String, author: String, message: String)]
-        var objectCount: Int
-    }
-    var gitCrossing: GitCrossing?
-    var showingGitCrossing = false
-    /// The dirty-tree question (spec 7.4a), blocking a session's first boot
-    /// on a dirty git project until the user picks a base.
-    var showingDirtyPrompt = false
-    private var dirtyChoice: CheckedContinuation<String, Never>?
-
     private let engine = EngineHost()
     private let access = ModelAccess()
     /// The MTP draft head, granted separately. Under App Sandbox `~` is the
@@ -736,7 +712,6 @@ final class AppState {
                             // 7.2): what one session defined, every sibling
                             // has from its first token.
                             await replaySkillLibrary(p, channel: ready.channel)
-                            await applyDirtyPolicy(rec, channel: ready.channel)
                         } catch {
                             sandboxStatus = "read-only — the sandbox did not start"
                         }
@@ -948,6 +923,49 @@ final class AppState {
         }
     }
 
+    // MARK: Refreshing the .git shadow (spec 7.4)
+
+    /// Whether Refresh Git makes sense right now: a git project, its
+    /// sandbox up, nothing generating. The refresh needs the channel (to
+    /// arm the re-seed) and ends in a park, so both gates are hard.
+    var canRefreshGit: Bool {
+        guard phase != .generating, let rec = selectedSession,
+              sandboxes?.channel(for: rec.id) != nil,
+              let root = root(of: rec) else { return false }
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: root.appendingPathComponent(".git").path,
+                                              isDirectory: &isDir) && isDir.boolValue
+    }
+
+    /// Re-seeds the sandbox's private .git copy from the repository's
+    /// current state. A running guest cannot see the real .git -- the bind
+    /// mount is the point -- so refresh is a reboot: arm the re-seed (the
+    /// guest drops its seed stamp), then park; the next message boots a
+    /// guest whose mount-work re-seeds while nothing but init is running.
+    /// The shadow's private commits are discarded; the user's tree and
+    /// real .git are untouched.
+    func refreshGit() {
+        guard canRefreshGit, let rec = selectedSession,
+              let channel = sandboxes?.channel(for: rec.id) else { return }
+        Task {
+            let r = try? await channel.send(op: "git_refresh", timeout: 30)
+            guard r?.ok == true else {
+                engineNote = "refresh failed: \(r?.error ?? "the guest gave no reason")"
+                return
+            }
+            let item = TranscriptItem(.note("git refresh armed: the sandbox reboots on "
+                + "your next message and re-seeds its private .git copy from the "
+                + "repository's current state. Your files and your real .git are untouched."))
+            if selectedSessionID == rec.id { transcript.append(item) }
+            store?.appendTranscript(rec.id, [item])
+            if liveSessionID == rec.id {
+                park(rec.id)
+            } else if let sandboxes {
+                await sandboxes.stop(session: rec.id)
+            }
+        }
+    }
+
     /// Idle autosave (spec 4.4): a few minutes after a turn ends with the
     /// session still live, checkpoint it in place -- the user who walked away
     /// is who checkpoints exist for. Cancelled by the next send or a park.
@@ -961,214 +979,6 @@ final class AppState {
             await self.engine.checkpointLive(id)
             self.refreshWarm()
         }
-    }
-
-    // MARK: The git crossing (spec 7.4a)
-
-    private func askDirtyChoice() async -> String {
-        await withCheckedContinuation { c in
-            dirtyChoice = c
-            showingDirtyPrompt = true
-        }
-    }
-
-    func resolveDirtyChoice(_ choice: String) {
-        showingDirtyPrompt = false
-        dirtyChoice?.resume(returning: choice)
-        dirtyChoice = nil
-    }
-
-    /// On every boot of a git project: if the seeded copy is dirty, apply the
-    /// session's stored answer -- asking the user first if there is none.
-    /// Re-applied per boot because seeding re-syncs from the host (spec 7.4a).
-    private func applyDirtyPolicy(_ rec: SessionRecord, channel: VsockChannel) async {
-        guard let info = try? await channel.send(op: "git_info", timeout: 30),
-              let s = info.result, s.contains("repo=true"), s.contains("dirty=true")
-        else { return }
-        var choice = rec.gitLocalChoice
-        if choice == nil {
-            choice = await askDirtyChoice()
-            if let i = sessions.firstIndex(where: { $0.id == rec.id }) {
-                sessions[i].gitLocalChoice = choice
-                store?.save(sessions[i])
-            }
-        }
-        let op = choice == "exclude" ? "git_exclude_local" : "git_include_local"
-        _ = try? await channel.send(op: op, timeout: 60)
-    }
-
-    private func slug(_ rec: SessionRecord) -> String {
-        let base = rec.title.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" }
-        let trimmed = String(base).split(separator: "-").joined(separator: "-").prefix(32)
-        let short = rec.id.uuidString.prefix(6).lowercased()
-        return trimmed.isEmpty ? String(short) : "\(trimmed)-\(short)"
-    }
-
-    /// The crossing: export from the guest, verify-and-write loose objects,
-    /// point one ref. Additive by construction -- never HEAD, never the
-    /// index, never a working file (spec 7.4a).
-    private func gitCross(_ rec: SessionRecord, root: URL, channel: VsockChannel) async {
-        do {
-            let importer = try GitImport(repoRoot: root)
-            guard let exp = try? await channel.send(op: "git_export", timeout: 180),
-                  exp.ok == true, let manifest = exp.result else {
-                engineNote = "export failed: \((try? await channel.send(op: "git_export", timeout: 5))?.error ?? "the guest gave no reason")"
-                return
-            }
-            var parts = manifest.split(separator: " ").map(String.init)
-            guard parts.count >= 2 else { engineNote = "export returned nothing"; return }
-            let tip = parts[1]
-            let shas = Array(parts.dropFirst(2))
-            if shas.isEmpty {
-                gitCrossing = GitCrossing(branch: "crucible/\(slug(rec))", tip: tip,
-                                          commits: [], objectCount: 0)
-                showingGitCrossing = true
-                return
-            }
-
-            var commits: [(String, String, String)] = []
-            var written = 0
-            var batch = shas
-            while !batch.isEmpty {
-                let take = Array(batch.prefix(16))
-                batch = Array(batch.dropFirst(16))
-                let r = try await channel.send(op: "git_objects",
-                                               args: ["shas": .string(take.joined(separator: " "))],
-                                               timeout: 120)
-                guard r.ok == true, let body = r.result else {
-                    engineNote = "object transfer failed: \(r.error ?? "?")"
-                    return
-                }
-                for line in body.split(separator: "\n") {
-                    let f = line.split(separator: " ")
-                    guard f.count == 3, let data = Data(base64Encoded: String(f[2])) else {
-                        if f.count == 2, f[1] == "missing" { continue }
-                        engineNote = "undecodable object line"; return
-                    }
-                    let sha = String(f[0]), type = String(f[1])
-                    try importer.write(sha: sha, type: type, content: data)
-                    written += 1
-                    if type == "commit", let sum = GitImport.commitSummary(data) {
-                        commits.append((sha, sum.author, sum.message))
-                    }
-                }
-            }
-            let branch = "crucible/\(slug(rec))"
-            try importer.updateRef(branch: branch, to: tip)
-            gitCrossing = GitCrossing(branch: branch, tip: tip,
-                                      commits: commits, objectCount: written)
-            showingGitCrossing = true
-        } catch {
-            // The hash refusal lands here too: nothing was written past the
-            // object that failed, and nothing references what was.
-            engineNote = "git crossing refused: \(error)"
-        }
-    }
-
-    // MARK: Materialisation
-
-    /// Whether there is a sandbox to ask. Reviewing changes is meaningless
-    /// against the read-only host tools, which cannot have made any.
-    var canReviewChanges: Bool {
-        guard let rec = selectedSession else { return false }
-        return sandboxes?.channel(for: rec.id) != nil
-    }
-
-    func reviewChanges() {
-        guard let rec = selectedSession,
-              let root = root(of: rec),
-              let channel = sandboxes?.channel(for: rec.id) else { return }
-
-        // A git project crosses as a branch (spec 7.4a); the byte-copy sheet
-        // is the fallback for everything else.
-        var isGitDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: root.appendingPathComponent(".git").path,
-                                          isDirectory: &isGitDir), isGitDir.boolValue {
-            Task {
-                if let info = try? await channel.send(op: "git_info", timeout: 30),
-                   (info.result ?? "").contains("repo=true") {
-                    await gitCross(rec, root: root, channel: channel)
-                } else {
-                    reviewChangesFallback(rec: rec, root: root, channel: channel)
-                }
-            }
-            return
-        }
-        reviewChangesFallback(rec: rec, root: root, channel: channel)
-    }
-
-    private func reviewChangesFallback(rec: SessionRecord, root: URL, channel: VsockChannel) {
-        proposal = nil
-        proposalError = nil
-        approvedPaths = []
-        isProposing = true
-        showingApproval = true
-
-        Task {
-            let m = Materialiser(channel: channel, projectRoot: root)
-            do {
-                let p = try await m.propose()
-                proposal = p
-                // Pre-ticked, except anything the user should look at twice.
-                // A conflict starts off because applying over an edit they made
-                // themselves is the worst outcome this sheet can produce.
-                approvedPaths = Set(p.changes
-                    .filter { $0.isApplicable && $0.conflict == nil }
-                    .map(\.path))
-            } catch {
-                proposalError = "\(error)"
-            }
-            isProposing = false
-        }
-    }
-
-    func toggleApproval(_ c: ProposedChange) {
-        guard c.isApplicable else { return }
-        if approvedPaths.contains(c.path) { approvedPaths.remove(c.path) }
-        else { approvedPaths.insert(c.path) }
-    }
-
-    func applyApproved() async {
-        guard let rec = selectedSession,
-              let root = root(of: rec),
-              let channel = sandboxes?.channel(for: rec.id),
-              let p = proposal, let store else { return }
-
-        let m = Materialiser(channel: channel, projectRoot: root)
-        let undoRoot = store.root
-            .appendingPathComponent("sessions/\(rec.id.uuidString)/undo")
-
-        do {
-            let r = try m.apply(p, paths: approvedPaths, undoRoot: undoRoot)
-            lastUndoDirectory = r.undoDirectory
-
-            // Reported honestly: a partial application is a partial application.
-            var note = "applied \(r.applied.count) of \(approvedPaths.count) file(s)"
-            if !r.failed.isEmpty {
-                note += " — failed: " + r.failed.map { "\($0.path) (\($0.reason))" }
-                                              .joined(separator: "; ")
-            }
-            if let dir = r.undoDirectory {
-                note += ". The previous versions are in \(dir.lastPathComponent)."
-            }
-            recordNote(note, for: rec.id)
-
-            // The sandbox re-baselines only on what actually landed, so the
-            // next proposal is a diff against what the user accepted.
-            if r.isComplete { try? await m.acceptBaseline() }
-        } catch {
-            recordNote("could not apply: \(error)", for: rec.id)
-        }
-        proposal = nil
-        approvedPaths = []
-    }
-
-    /// Puts an outcome in the transcript, because applying a change to the
-    /// user's files is part of the session's history and not a passing alert.
-    private func recordNote(_ text: String, for id: UUID) {
-        let item = TranscriptItem(.note(text))
-        if selectedSessionID == id { transcript.append(item) }
-        store?.appendTranscript(id, [item])
     }
 
     private func appendItem(_ i: TranscriptItem) {

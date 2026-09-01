@@ -22,7 +22,9 @@ What a spec needs is the map: what exists, and what is next.
 | — | delegation E1+E2: budgeted, embedded, steerable; the remote agent drives the sandbox by proxy; one feature under one name, user- or model-initiated (§15) |
 | — | session parking: boundary autosave, Park, verified warm/cold indicators (§4.4) |
 | — | the project SKILL library: defines captured host-side, replayed into every sibling session's guest; skills named apart from tools everywhere (§7.2, §7.3) |
-| — | the git crossing: work leaves the sandbox as verified objects + one ref, merged as a real branch (§7.4a) |
+| — | the git crossing: work left the sandbox as verified objects + one ref (superseded, same day, by the direct tree) |
+| — | the shared workspace: `/work` a host copy mounted rw, crossing continuous (superseded by the direct tree) |
+| — | the direct tree: `/work` IS the user's project, edits land live as uncommitted changes; the real `.git` behind a bind-mounted shadow; crossing, refs, and workspace copy all deleted (§7.4) |
 
 ## Next
 
@@ -33,9 +35,6 @@ What a spec needs is the map: what exists, and what is next.
 - **M7 — vision, and speculation in the app's gates.** Images into the
   session (§2's mrope machinery is already in the engine); `gate-mtp`
   promoted into CI.
-- **§7.4 cleanup.** The git crossing is built (§7.4a); the byte-copy sheet
-  survives as the non-git fallback and still carries drift machinery the
-  crossing obsoleted — a net-removal pass is owed.
 - **§6.6 — provisioning.** Specified: `guest_packages` as an overlay key, a
   host-side native resolver with a content-addressed cache, a `/provision`
   virtiofs overlay at first boot. Closes "the sandbox lacks the tools this

@@ -1,9 +1,8 @@
 // TestMain.swift -- `make test`.
 //
-// Three suites, in order of how much they cost to run:
+// The suites, in order of how much they cost to run:
 //   pathguard  no I/O beyond a temp tree; the security boundary
 //   store      persistence, including what survives a crash mid-turn
-//   materialise the only code that writes to the user's own files (PLAN.md 7.4)
 //   utf8       pure; the transcript's silent corruption bug
 //   markdown   blocks out of Foundation's parse; the highlighter's reconstruction
 //   prefix     loads the tokenizer; the invariant the KV checkpoint rests on
@@ -25,8 +24,6 @@ struct TestMain {
         print("== overlay");    failures += SandboxOverlaySuite.run()
         print("== delegation");  failures += EscalationSuite.run()
         print("== store");      failures += StoreSuite.run()
-        print("== materialise"); failures += MaterialiseSuite.run()
-        print("== gitimport");  failures += GitImportSuite.run()
         print("== guestimage"); failures += GuestImageSuite.run()
         print("== utf8");       failures += UTF8Suite.run()
         print("== toolparse");  failures += ToolParserSuite.run()

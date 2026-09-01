@@ -12,8 +12,9 @@
 - A per-session Linux guest running two BEAM nodes, reachable over vsock.
 - A self-modification tool surface: define an Elixir module, load it into the
   running node, register it as a tool, call it on the next step.
-- A materialisation step: diff the sandbox against its baseline, show the user,
-  apply to the real tree on approval, with undo.
+- Direct collaboration on the user's own tree: the agent edits the working
+  copy live, the user reviews and commits with their own git, and the real
+  `.git` stays behind a guest-side shadow it can never write (§7.4).
 
 ### 1.2 What we are not building
 

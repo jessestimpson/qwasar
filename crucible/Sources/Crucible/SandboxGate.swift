@@ -45,10 +45,45 @@ enum SandboxGate {
         print("  golden allocates \(GuestImage.allocatedBytes(golden) / 1_000_000) MB, "
               + "the clone \(GuestImage.allocatedBytes(disk) / 1_000_000) MB")
 
+        // --- the stand-in project -----------------------------------------
+        //
+        // The gate plays the user: a temp copy of `projectDir` with a
+        // hand-built minimal .git (HEAD on an unborn main, empty objects and
+        // refs -- exactly what `git init` leaves, written with FileManager
+        // because the gate binary is sandboxed and spawns nothing). The
+        // guest must seed its shadow from it, bind-mount the shadow over
+        // /work/.git, and leave this real .git untouched by everything the
+        // tools do -- which the checks below read back from the host side.
+        var project: URL?
+        if let projectDir {
+            do {
+                let p = scratch.appendingPathComponent("project")
+                try fm.copyItem(at: projectDir, to: p)
+                let git = p.appendingPathComponent(".git")
+                try fm.createDirectory(at: git.appendingPathComponent("objects"),
+                                       withIntermediateDirectories: true)
+                try fm.createDirectory(at: git.appendingPathComponent("refs/heads"),
+                                       withIntermediateDirectories: true)
+                try fm.createDirectory(at: git.appendingPathComponent("hooks"),
+                                       withIntermediateDirectories: true)
+                try "ref: refs/heads/main\n"
+                    .write(to: git.appendingPathComponent("HEAD"),
+                           atomically: true, encoding: .utf8)
+                try "[core]\n\trepositoryformatversion = 0\n\tbare = false\n"
+                    .write(to: git.appendingPathComponent("config"),
+                           atomically: true, encoding: .utf8)
+                project = p
+                print("\n-- stand-in project")
+                print("  copied \(projectDir.lastPathComponent), gave it a real .git (unborn main)")
+            } catch {
+                print("  fixture FAILED: \(error)"); return 1
+            }
+        }
+
         // --- boot ---------------------------------------------------------
         let console = scratch.appendingPathComponent("console.log")
         var cfg = SandboxConfig(diskImage: disk, kernel: kernel, initramfs: initramfs,
-                                consoleLog: console, baseDirectory: projectDir)
+                                consoleLog: console, workDirectory: project)
         cfg.memoryBytes = 2 * 1024 * 1024 * 1024
         cfg.cpuCount = 2
 
@@ -115,7 +150,7 @@ enum SandboxGate {
             print("  info → \(info.result ?? info.error ?? "?")")
             if info.ok != true { failures += 1 }
 
-            if projectDir != nil {
+            if let project {
                 let ls = try await channel.send(op: "list", args: ["path": .string(".")], timeout: 10)
                 let n = (ls.result ?? "").split(separator: "\n").count
                 print("  list . → \(n) entries in /work")
@@ -127,11 +162,11 @@ enum SandboxGate {
                 print("  list ../../etc → \(refused ? "refused: \(esc.error ?? "")" : "NOT REFUSED")")
                 if !refused { failures += 1 }
 
-                // The six tools, end to end over the wire (PLAN.md 12, M3).
-                // Every one of them writes into the guest's own copy, so none
-                // of it is visible to the user's tree -- which is the whole
-                // point of the milestone.
-                failures += try await exerciseTools(channel)
+                // The six tools, end to end over the wire, against the user's
+                // own tree (spec 7.4): every write lands in the mounted
+                // project as it happens, and the real .git must not gain a
+                // byte -- both read back from the host side below.
+                failures += try await exerciseTools(channel, project: project)
             }
 
             // The agent's node (PLAN.md 7.3): reachable, usable, and — the
@@ -243,11 +278,13 @@ enum SandboxGate {
     }
 
 
-    /// The six file tools, over the wire, against the guest's copy of the
-    /// project. Written as a round trip -- create, search, read, edit, verify --
+    /// The six file tools, over the wire, against the mounted tree.
+    /// Written as a round trip -- create, search, read, edit, verify --
     /// because each tool checked in isolation proves less than the sequence an
-    /// agent actually performs.
-    private static func exerciseTools(_ channel: VsockChannel) async throws -> Int {
+    /// agent actually performs. `project` is the HOST side of the same
+    /// directory, read directly: writes must be there, and the real .git
+    /// must not be.
+    private static func exerciseTools(_ channel: VsockChannel, project: URL) async throws -> Int {
         var bad = 0
         func check(_ label: String, _ ok: Bool, _ detail: String) {
             print("  \(label) → \(detail)")
@@ -297,21 +334,62 @@ enum SandboxGate {
         check("shell", sh.ok == true && inWork,
               (sh.result ?? sh.error ?? "?").replacingOccurrences(of: "\n", with: " "))
 
-        // The git crossing's guest half (spec 7.4a): the ops answer, and the
-        // export refuses in bounded, stated ways rather than guessing.
-        let gi = try await channel.send(op: "git_info", timeout: 15)
-        check("git_info (no repo)", (gi.result ?? "").contains("repo=false"),
-              gi.result ?? gi.error ?? "?")
+        // The property everything above now rests on (spec 7.4): the guest's
+        // write is on the HOST, in the user's tree, as it happens. One
+        // guest-side sync first, so the check tests the sharing rather than
+        // racing the page cache.
         _ = try await channel.send(op: "shell",
-                                   args: ["command": .string("cd /work && git init -q -b main && git add -A && git -c user.name=t -c user.email=t@t commit -qm base")],
-                                   timeout: 30)
-        let gi2 = try await channel.send(op: "git_info", timeout: 15)
-        check("git_info (repo)", (gi2.result ?? "").contains("repo=true"),
-              gi2.result ?? gi2.error ?? "?")
-        let ge = try await channel.send(op: "git_export", timeout: 30)
-        check("git_export refuses without a boot base",
-              (ge.error ?? "").contains("no base commit"),
-              ge.result ?? ge.error ?? "?")
+                                   args: ["command": .string("sync")], timeout: 20)
+        let hostCopy = try? String(contentsOf: project.appendingPathComponent("m3probe.txt"),
+                                   encoding: .utf8)
+        check("a guest write is visible on the host", hostCopy == "alpha\nBETA\ngamma\n",
+              hostCopy.map { "host sees \($0.count) bytes" } ?? "NOT ON THE HOST")
+
+        // The vault (spec 7.4): git inside the guest is a live, private copy
+        // of the project's history -- usable enough to commit to -- while
+        // the REAL .git on the host must not gain a single byte from any of
+        // it, hooks included. This is the property the bind mount buys, and
+        // the reason a compromised agent cannot plant anything the user's
+        // own git would execute.
+        let gs = try await channel.send(op: "shell",
+                                        args: ["command": .string("cd /work && git status --porcelain >/dev/null && echo repo-ok")],
+                                        timeout: 30)
+        check("the guest has a working repo (the shadow)",
+              (gs.result ?? "").contains("repo-ok"),
+              (gs.result ?? gs.error ?? "?").trimmingCharacters(in: .whitespacesAndNewlines))
+
+        let commit = try await channel.send(op: "shell",
+                                            args: ["command": .string("cd /work && git add -A && git commit -qm probe && echo hook > .git/hooks/gate-probe && sync && git rev-parse --short HEAD")],
+                                            timeout: 30)
+        check("the agent commits into the shadow", commit.ok == true,
+              (commit.result ?? commit.error ?? "?").trimmingCharacters(in: .whitespacesAndNewlines))
+
+        let realGit = project.appendingPathComponent(".git")
+        let objects = (try? FileManager.default
+            .contentsOfDirectory(atPath: realGit.appendingPathComponent("objects").path)) ?? []
+        check("the real .git gained no objects", objects.isEmpty,
+              objects.isEmpty ? "objects/ still empty" : "\(objects.count) entries appeared")
+        let hookLanded = FileManager.default
+            .fileExists(atPath: realGit.appendingPathComponent("hooks/gate-probe").path)
+        check("a guest-written hook never reaches the real .git", !hookLanded,
+              hookLanded ? "IT LANDED" : "hooks/ untouched")
+        let head = try? String(contentsOf: realGit.appendingPathComponent("HEAD"),
+                               encoding: .utf8)
+        check("the real HEAD never moved", head == "ref: refs/heads/main\n",
+              head?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "?")
+
+        // Refresh Git's guest half (spec 7.4): the op drops the seed stamp,
+        // arming a re-seed for the next boot. The re-seed behaviour itself
+        // is pinned by test_mount_work.sh; here the op must answer and the
+        // stamp must actually be gone.
+        let refresh = try await channel.send(op: "git_refresh", timeout: 15)
+        check("git_refresh arms a re-seed", refresh.ok == true,
+              refresh.result ?? refresh.error ?? "?")
+        let stamp = try await channel.send(op: "shell",
+                                           args: ["command": .string("test -f /var/lib/crucible/git-seeded && echo present || echo gone")],
+                                           timeout: 15)
+        check("the seed stamp is dropped", (stamp.result ?? "").contains("gone"),
+              (stamp.result ?? stamp.error ?? "?").trimmingCharacters(in: .whitespacesAndNewlines))
 
         // And the baked-in BEAM is actually usable by the agent.
         let elixir = try await channel.send(op: "shell",

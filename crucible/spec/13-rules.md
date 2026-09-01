@@ -21,8 +21,12 @@ Inherited from the parent, which inherited them from ds4, plus what this app add
   deadline) rather than sleeping and hoping (§10's invariants).
 - **The host runs no model-requested tool.** If a feature seems to need one,
   it does not; it needs a guest tool and a patch.
-- **No `--yes` for materialisation.** Sandbox writes are unconfirmed; the
-  boundary crossing never is.
+- **The real `.git` is never guest-writable.** The working tree is the
+  agent's to edit — that is the product — but hooks, config, and history
+  stay behind the bind-mounted shadow (§7.4), because they are what the
+  user's own git *executes*. Sandbox writes are unconfirmed; the mounted
+  tree is the framework-confined extent of them, and the user's own git is
+  the review.
 - **Correctness before speed**, and never keep a faster path with unexplained
   drift. Same rule, one layer up: the speculation equivalence test in §10 is the
   same promise `tests/test_verify` makes.

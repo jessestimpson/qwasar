@@ -38,9 +38,11 @@ public struct SandboxConfig: Sendable {
     /// unified pool, so it is small on purpose.
     public var memoryBytes: UInt64 = 2 * 1024 * 1024 * 1024
     public var cpuCount: Int = 2
-    /// The session's working directory, mounted read-only as `base`. The guest
-    /// copies it into its own disk and never writes here.
-    public var baseDirectory: URL?
+    /// The user's project directory, mounted read-write as `work` for the
+    /// life of the session (spec 7.4): the agent works in the user's own
+    /// tree, and the guest's init shadows the real `.git` with a private
+    /// copy before anything else runs.
+    public var workDirectory: URL?
     /// Copy-on-write clone of the golden image (PLAN.md 6.3).
     public var diskImage: URL
     /// Kernel and initramfs, taken from the host rather than the disk.
@@ -56,12 +58,12 @@ public struct SandboxConfig: Sendable {
         "root=/dev/vda rw rootfstype=ext4 console=hvc0 init=/sbin/crucible-init quiet"
 
     public init(diskImage: URL, kernel: URL, initramfs: URL,
-                consoleLog: URL, baseDirectory: URL? = nil) {
+                consoleLog: URL, workDirectory: URL? = nil) {
         self.diskImage = diskImage
         self.kernel = kernel
         self.initramfs = initramfs
         self.consoleLog = consoleLog
-        self.baseDirectory = baseDirectory
+        self.workDirectory = workDirectory
     }
 }
 
@@ -161,13 +163,15 @@ public final class SandboxHost: NSObject {
             throw SandboxError.configuration("disk: \(error.localizedDescription)")
         }
 
-        // The project, read-only. Enforced by the framework rather than by our
-        // code, which is why this is a share and not a copy over the wire.
-        if let base = config.baseDirectory {
-            let share = VZSingleDirectoryShare(directory: VZSharedDirectory(url: base, readOnly: true))
-            let fsDevice = VZVirtioFileSystemDeviceConfiguration(tag: "base")
-            fsDevice.share = share
-            c.directorySharingDevices = [fsDevice]
+        // The user's tree, read-write -- the framework confines the guest's
+        // writes to exactly this directory, which is why it is a share and
+        // not a protocol (spec 7.4). The real .git inside it is the guest
+        // init's problem: shadowed by a bind mount before the warden starts.
+        if let work = config.workDirectory {
+            let dev = VZVirtioFileSystemDeviceConfiguration(tag: "work")
+            dev.share = VZSingleDirectoryShare(directory: VZSharedDirectory(url: work,
+                                                                            readOnly: false))
+            c.directorySharingDevices = [dev]
         }
 
         // The control channel.

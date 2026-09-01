@@ -55,10 +55,10 @@ sessions/<uuid>/
   tokens.bin                       raw Int32 LE
   transcript.jsonl                 append-only; survives a crash mid-turn
   checkpoint.bin                   parked session state — up to ~8.2 GB (§4.4)
-  baseline.json                    path → sha256 + mode, at sandbox creation
-  disk.img                         APFS clone of the golden guest image
+  disk.img                         APFS clone of the golden guest image; holds
+                                   the .git shadow — /work is the user's own
+                                   tree, mounted, never copied (§7.4)
   modules/                         agent-written source, one file per module
-  undo/<n>/                        pre-application snapshot of touched files
 images/
   golden-<version>.img             the guest image, cloned per session
 ```
@@ -92,8 +92,8 @@ twice.
                           │
                           ▼   one RUNNING, ever (§2.1)
    .parked ──restore──▶ .live ──▶ .running ──▶ .idle
-      ▲                   │                      │
-      └──── park ─────────┘                      └──▶ .awaitingApproval (§7.4)
+      ▲                   │
+      └──── park ─────────┘
             when the live set is over budget
 ```
 

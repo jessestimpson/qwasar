@@ -43,10 +43,11 @@ public final class SandboxManager {
 
     public func channel(for id: UUID) -> VsockChannel? { live[id]?.channel }
 
-    /// Boots a guest for `id`, sharing `projectRoot` into it read-only.
-    ///
-    /// The guest copies that share into `/work` and unmounts it, so the tools
-    /// operate on the copy and the user's tree is never writable from inside.
+    /// Boots a guest for `id` against the user's own tree (spec 7.4):
+    /// `projectRoot` is mounted read-write, so the agent's edits land in
+    /// the working tree as ordinary uncommitted changes the user's git
+    /// shows immediately. The guest's init shadows the real `.git` with a
+    /// private copy on the VM disk before the warden starts.
     public func start(session id: UUID, projectRoot: URL,
                       settings: SandboxSettings = .defaults) async throws -> Ready {
         if let existing = live[id] {
@@ -62,8 +63,8 @@ public final class SandboxManager {
         let scratch = stateDir.appendingPathComponent("sandboxes/\(id.uuidString)")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
 
-        // A session's disk is the model's work: /work lives on it, and so does
-        // the git baseline that `propose` diffs against. It is CLONED ONCE, on
+        // A session's disk holds the model's state -- the git shadow seeded
+        // at first boot, installed packages, scratch. It is CLONED ONCE, on
         // the session's first boot, and reused for every boot after that.
         //
         // Re-cloning here unconditionally -- which is what this did -- silently
@@ -81,7 +82,7 @@ public final class SandboxManager {
                                    kernel: guestDir.appendingPathComponent("Image"),
                                    initramfs: guestDir.appendingPathComponent("initramfs"),
                                    consoleLog: scratch.appendingPathComponent("console.log"),
-                                   baseDirectory: projectRoot)
+                                   workDirectory: projectRoot)
         // From the resolved sandbox settings (PLAN.md 8.5): session over
         // project over global over the defaults these used to hard-code.
         config.memoryBytes = UInt64(settings.guestMemoryMB) * 1024 * 1024
@@ -118,8 +119,10 @@ public final class SandboxManager {
         await l.host.stop()
     }
 
-    /// Removes a session's guest disk. Its own command, because it is the one
-    /// action here that destroys work the model did.
+    /// Removes a session's guest disk -- and with it the git shadow, the
+    /// only place the guest's own commits live. Its own command, because it
+    /// is the one action here that destroys state the model built. The
+    /// user's tree is not touched: the work itself is already in it.
     public func discard(session id: UUID) async {
         await stop(session: id)
         let scratch = stateDir.appendingPathComponent("sandboxes/\(id.uuidString)")

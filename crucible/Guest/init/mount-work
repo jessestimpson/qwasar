@@ -1,0 +1,85 @@
+# mount-work -- attach the user's tree, and shadow its .git.
+#
+# Sourced by crucible-init. Spec 7.4: /work IS the user's project directory,
+# mounted read-write over virtiofs -- every edit the agent makes lands in the
+# user's working tree as it happens, as ordinary uncommitted changes their
+# own git shows them. What must never be guest-writable is the REAL .git --
+# hooks, config, history, the things the user's own git executes and trusts.
+#
+# So the git dir is shadowed: on first boot the real .git (visible through
+# the mount) is copied to $GITDIR on the VM disk, and on EVERY boot $GITDIR
+# is bind-mounted over $WORK/.git. Git inside the guest is completely
+# ordinary -- log, blame, diff, even commits, all against the private copy --
+# while the mountpoint physically stands between the agent and the user's
+# real .git: nothing written through /work/.git can reach it, and even
+# `rm -rf /work/.git/*` empties only the shadow.
+#
+# A separate file so test_mount_work.sh can run it against a temp tree: this
+# is the code that decides whether the user's repository can be damaged, and
+# "we reasoned about it carefully" is not the standard that deserves.
+#
+# Every path and every mount command is overridable for that reason, and for
+# no other. In the guest they are the defaults.
+: "${WORK:=/work}"
+: "${GITDIR:=/var/crucible/git}"
+: "${STAMP:=/var/lib/crucible/git-seeded}"
+: "${WORK_MOUNT:=mount -t virtiofs work $WORK}"
+: "${SHADOW_MOUNT:=mount --bind $GITDIR $WORK/.git}"
+
+# Stand-alone when the caller has no log of its own.
+command -v log >/dev/null 2>&1 || log() { echo "$*"; }
+
+mount_work() {
+    mkdir -p "$WORK" "$(dirname "$STAMP")" "$(dirname "$GITDIR")"
+
+    # The tree. Mounted for the life of the session -- never copied, never
+    # unmounted: the whole point is that the user's working tree and the
+    # agent's are the same directory. A boot with no share attached (the
+    # gate's bare boot) is a boot with an empty /work, said out loud rather
+    # than failed.
+    if $WORK_MOUNT 2>/dev/null; then
+        log "project mounted ($(find "$WORK" -type f 2>/dev/null | wc -l | tr -d ' ') files, the user's own tree)"
+    else
+        log "no project share attached; $WORK is empty"
+    fi
+
+    # Not a git project (or a .git FILE -- a worktree or submodule checkout,
+    # whose real git dir is not reachable here): no shadow, no repo, and git
+    # in the guest says "not a repository", which is the truth.
+    if [ ! -d "$WORK/.git" ]; then
+        [ -e "$WORK/.git" ] && log "$WORK/.git is not a directory; treating the project as non-git"
+        return 0
+    fi
+
+    # Seed the shadow ONCE per session disk, from the real .git while it is
+    # still visible. The stamp lives beside the shadow it vouches for, so
+    # they survive and die together; a stamp without a shadow (a half-seeded
+    # crash) re-seeds. Never re-seeded on a later boot UNLESS asked: the
+    # host's Refresh Git button arms this path deliberately -- the
+    # git_refresh op drops the stamp, the session parks, and the next boot
+    # lands here to re-seed from the repository's current state, discarding
+    # the shadow's private commits.
+    if [ ! -f "$STAMP" ] || [ ! -d "$GITDIR" ]; then
+        rm -rf "$GITDIR"
+        mkdir -p "$GITDIR"
+        if cp -a "$WORK/.git/." "$GITDIR/" 2>/dev/null; then
+            log "git shadow seeded ($(du -sk "$GITDIR" 2>/dev/null | cut -f1)K)"
+            : >"$STAMP" && sync
+        else
+            rm -rf "$GITDIR"
+            log "WARNING: could not seed the git shadow; leaving the real .git UNPROTECTED is not an option, so /work/.git will be empty"
+            mkdir -p "$GITDIR"
+        fi
+    else
+        log "git shadow kept from the first boot"
+    fi
+
+    # The vault door, every boot, before anything else runs: after this line
+    # every path through $WORK/.git resolves to the VM disk, and the real
+    # .git underneath is unreachable until the VM is gone.
+    if $SHADOW_MOUNT 2>/dev/null; then
+        log "real .git shadowed; the guest's git is a private copy"
+    else
+        log "WARNING: could not shadow $WORK/.git -- the REAL .git is exposed"
+    fi
+}

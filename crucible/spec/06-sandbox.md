@@ -6,10 +6,12 @@
   rather than `VZLinuxBootLoader` + kernel/initrd, because it lets the guest own
   its own kernel updates and lets `mkimage.sh` produce a single artefact.
 - **`VZVirtioBlockDeviceConfiguration`** — the per-session disk (§6.3).
-- **`VZVirtioFileSystemDeviceConfiguration`** with a `VZSharedDirectory` marked
-  **read-only**, tag `base`. This is the project tree going in. Read-only is
-  enforced by the framework, not by our code, and that is why we use it rather
-  than streaming a tarball.
+- **`VZVirtioFileSystemDeviceConfiguration`**, tag `work` (§7.4): the user's
+  project directory, shared **read-write** — the guest's `/work` for the
+  life of the session, and the framework, not our code, is what confines the
+  agent's writes to it. The real `.git` inside it is the guest init's
+  problem: shadowed by a bind mount of a private copy before the warden
+  starts.
 - **`VZVirtioSocketDeviceConfiguration`** — vsock. The control channel.
 - **`VZVirtioConsoleDeviceSerialPortConfiguration`** — boot log to a file, for
   the inspector and for support.
@@ -97,15 +99,15 @@ bought, with fewer moving parts.
 Alpine rather than Debian: musl, no systemd, and a boot-to-BEAM path measured
 in hundreds of milliseconds — **0.54 s to warden-ready with the native-built
 image**, matching the containerised build it replaced. `git` is in the image
-because the diff engine is git (§7.4) — that is the one dependency worth its
-size.
+so the agent can read history and keep private checkpoints in the `.git`
+shadow (§7.4) — that is the one dependency worth its size.
 
 OTP 27 specifically, for two reasons beyond currency: its built-in `json`
 module removes the last dependency from the guest (§6.4). One language and
 one build tool across the guest — warden and workspace are both `mix`.
 
 Init is not OpenRC. `/sbin/init` is a ~40-line shell script that mounts
-`/proc`, `/sys`, `/base` (virtiofs), starts the warden, and execs. Target: **VM
+`/proc`, `/sys`, `/work` (virtiofs), starts the warden, and execs. Target: **VM
 boot to warden-ready under 2 seconds.** Every second here is a second a user
 waits before the model can do anything, on every resume.
 
@@ -125,6 +127,12 @@ clones in microseconds and consumes only what the session actually writes.
 Sessions get real isolation — their own filesystem, their own installed
 packages, their own everything — at the cost of the delta. Deleting a session is
 deleting the clone.
+
+What lives on the clone changed with §7.4: the session's `.git` shadow
+(`/var/crucible/git`), its seed marker, and whatever the agent does to the
+OS — but **not** `/work`, which is the user's own tree mounted from the
+host. Losing the disk loses only the shadow's private commits; the work
+itself is already in the user's working tree, where it always was.
 
 Fall back to a plain copy if `clonefile` fails (non-APFS volume), and say so in
 the inspector rather than silently taking 2 GB per session.
@@ -174,12 +182,12 @@ applies to a refused confirmation: the model gets told and chooses again.
 - **Capped**: `maxRunningVMs`, default 2, derived from physical memory. In
   practice the live session's VM plus at most one lingering VM, since only one
   session is live at a time (§4.3) — a VM outlives its session's parking only
-  long enough to finish an in-flight `propose`.
+  long enough to finish an in-flight tool call.
 - **Crash**: `VZVirtualMachineDelegate.guestDidStop` / `didStopWithError`. The
   session goes to `.parked` with a transcript item saying so; the next tool call
   re-boots and replays. The model sees a tool result explaining that the sandbox
   restarted and that in-memory state is gone but `/work` survived — because it
-  did, it is on the disk.
+  did: it is the user's own tree, on the host (§7.4).
 
 ---
 
@@ -212,9 +220,8 @@ requests already have a surface.
 Two facts the codebase already established do all the work. Alpine packages
 are tarballs, and the HOST knows how to resolve and extract them natively —
 that is precisely what `mkrootfs.py` does at image-build time. And the guest
-already has a boot-time ingestion path — virtiofs, copy, unmount — the
-`/base` pattern whose security argument (§8.2) is unchanged by a second
-read-only share.
+already has a boot-time ingestion path — virtiofs, copy, unmount — whose
+security argument (§8.2) is unchanged by a read-only share.
 
 1. **Resolve and cache, host-side.** The dependency closure is computed
    against APKINDEX (the ~100-line resolver from `mkrootfs.py`, ported to
@@ -226,7 +233,7 @@ read-only share.
    golden image already carries are excluded from the closure.
 2. **Overlay at boot.** The cache directory rides into the guest as a second
    read-only virtiofs share (`/provision`); `crucible-init` copies it into
-   `/` once per session disk — a marker file, the seed-work pattern — and
+   `/` once per session disk — a marker file, the mount-work pattern — and
    unmounts. Session disks persist, so later boots skip the copy. apk
    install scripts do not run; the busybox precedent (§6.2) says how to
    handle the rare package that needs one, and most need nothing.

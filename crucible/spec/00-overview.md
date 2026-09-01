@@ -5,8 +5,10 @@ no HTTP, no `qwasar-server`, no subprocess — and gives the model an agent loop
 whose tools do not run on your machine. They run on a **BEAM (Erlang/Elixir)
 node inside a macOS Virtualization.framework guest**, where the model is allowed
 to hot-load Elixir and Erlang modules and thereby rewrite its own tool surface
-mid-task. The session's working directory is copied in; nothing comes back out
-except a patch, and only with your approval.
+mid-task. The session works directly in your own working tree — edits land
+live, as ordinary uncommitted changes your git shows you — while your real
+`.git` (hooks, config, history) sits behind a bind-mounted shadow the guest
+can never write. You review with `git diff` and commit when you say.
 
 > **Codename.** `Crucible` is provisional — a vessel you melt things in, sealed
 > from the room. Rename before the first commit that ships a bundle identifier.

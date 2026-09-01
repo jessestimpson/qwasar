@@ -2,8 +2,9 @@
 //
 // PLAN.md 3.1: the host never runs a model-requested tool. This is what makes
 // that true. A call the model produced is validated, sent over the vsock, and
-// run by the warden against `/work` -- the guest's own copy -- so nothing it
-// does is visible in the user's tree until M5's patch, under approval.
+// run by the warden against `/work` -- the user's own tree, mounted
+// read-write (spec 7.4) -- so its writes are framework-confined to that one
+// directory, and the real .git inside it is shadowed out of reach.
 //
 // The interface is deliberately synchronous. `Session.runTurn` runs on the
 // engine queue and has nothing else to do while a tool executes, and making it
@@ -59,11 +60,11 @@ public struct SandboxToolRunner: ToolExecuting {
 
     public var environmentDescription: String {
         """
-        You are working inside a sandbox: a virtual machine with no network, holding a COPY of the user's project at /work. Read, write, edit, search and shell commands all act on that copy, so nothing you do can damage the user's files or reach anything outside the sandbox.
+        You are working inside a sandbox: a virtual machine with no network. /work IS the user's real project directory, mounted read-write: every edit you make lands in their working tree immediately, and they may be editing files right beside you. Nothing else of their machine is reachable from here.
 
-        Work directly. Make the change, then verify it by reading the file back or running a command. Do not ask permission to edit a file or run something -- that is what the sandbox is for.
+        Work directly. Make the change, then verify it by reading the file back or running a command. Do not ask permission to edit a file or run something -- editing the working tree is exactly what you are here for.
 
-        If /work is a git repository, COMMIT YOUR WORK with git as you go, in small reviewable commits with real messages: your commits become a branch in the user's own repository, and a good series is what makes your work mergeable, cherry-pickable, and reviewable. Anything you leave uncommitted is swept into a single catch-all commit at proposal time.
+        Version control is the user's, not yours: they review your edits with their own tools and commit what they accept. Do not commit, branch, stage, or otherwise operate git -- your job is the files themselves.
 
         You can also extend yourself: `define` compiles and hot-loads an Elixir module, and one implementing the Crucible.Skill behaviour becomes a SKILL -- invokable through `invoke`, listed by `skills`, and owned by the project, so every session here has it. Worth doing for something you will need repeatedly; not worth it for one-off work, since writing a module costs far more than doing the task by hand.
 

@@ -20,15 +20,15 @@ level up: a session with MTP enabled and one without must emit identical token
 sequences from the same prompt at `temperature = 0`. If Crucible's Swift
 draft/verify loop breaks this, it is broken.
 
-**Patch application, adversarially.** A table-driven suite over hostile patch
-paths: `../../etc/hosts`, `/etc/hosts`, `a/../../b`, a path through a symlink
-that leaves the root, a path with a NUL, a path that differs only by Unicode
-normalisation, `.git/hooks/pre-commit`, a rename whose destination escapes. Each
-must be **rejected**, and the test asserts on the rejection reason, not just on
-failure. This is the security boundary; it gets the most tests in the project.
-
-**Baseline drift.** Apply a patch after mutating the working tree underneath;
-assert the conflict is detected and the file defaults to unchecked.
+**The `.git` vault.** `test_mount_work.sh` pins the guest contract that
+decides whether the user's repository can be damaged: the shadow is seeded
+once per disk and never re-seeded over the agent's commits, the bind mount
+is asked for on **every** boot with the shadow in place first, and non-git
+or gitfile projects are left entirely alone. It gates the image build. The
+sandbox gate then proves the mounted result end to end from the host side:
+a guest write is in the mounted tree; a guest commit and a guest-written
+hook leave the real `.git` without a new byte; HEAD never moves. This is
+the security boundary; it gets the most tests in the project.
 
 **Guest, warden — the control-plane invariants.** Numbered, because code
 comments cite them by number:

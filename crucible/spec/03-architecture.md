@@ -18,7 +18,7 @@
 │                    │  ToolRequest / ToolResult (JSON)          │
 │                    ▼                                          │
 │  ┌─ SandboxHost ─ one per session ─────────────────────────┐  │
-│  │   VZVirtualMachine  ·  vsock  ·  virtiofs (read-only)    │  │
+│  │   VZVirtualMachine  ·  vsock  ·  virtiofs                │  │
 │  └──────────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────────┘
                      │ AF_VSOCK, port 1024
@@ -26,8 +26,10 @@
 │  warden    (Elixir)  immutable control plane, owns the bridge  │
 │     │ Erlang distribution over loopback                        │
 │  workspace (Elixir)  the agent's node — hot-loadable, restarts │
-│  /base   virtiofs, read-only, the project as it was            │
-│  /work   guest disk, writable, where everything happens        │
+│  /work   virtiofs, read-write: the user's OWN tree — edits     │
+│          land there live, as uncommitted changes               │
+│  /var/crucible/git   guest disk: a private copy of .git,       │
+│          bind-mounted over /work/.git every boot (§7.4)        │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -35,8 +37,9 @@ Two rules this diagram encodes:
 
 - The **host never runs a tool**. Not `bash`, not `write`. If the model wants a
   command run, it runs in the guest.
-- The **guest never writes the host**. `/base` is mounted read-only and `/work`
-  is the guest's own disk. The only path back is a patch through §7.4.
+- The **guest never writes the real `.git`**. The working tree is the agent's
+  to edit — that is the product — but hooks, config, and history sit behind
+  the bind-mounted shadow, out of reach of everything the tools do (§7.4).
 - **Two nodes, not one**: warden must survive anything the agent does, so
   the agent's code never runs on the node that owns the wire (§7.3).
 

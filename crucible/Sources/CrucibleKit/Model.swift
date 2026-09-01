@@ -196,11 +196,6 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
     /// What this session's delegations have cost (spec §15.3), summed. The
     /// escalation budget is enforced against this, so it persists.
     public var spentUSD: Double?
-    /// The dirty-tree answer (spec 7.4a): "include" commits the user's
-    /// uncommitted changes as their own commit, "exclude" resets the copy to
-    /// HEAD. Asked once, on first boot of a dirty git project; re-applied on
-    /// every reboot because seeding re-syncs from the host.
-    public var gitLocalChoice: String?
 
     public var effort: ReasoningEffort { storedEffort ?? .medium }
 

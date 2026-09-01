@@ -111,24 +111,20 @@ defmodule Warden.Dispatch do
 
   def run(%{"op" => "invoke"}), do: {:error, "args", "invoke requires a name"}
 
-  # ---- materialisation (PLAN.md 7.4) ---------------------------------------
+  # ---- the .git shadow (spec 7.4) ------------------------------------------
   #
-  # Not part of the ten tools (PLAN.md 7.1). The model does not propose its
-  # own work for approval -- the USER asks to see what changed, from the host.
-  # Keeping it off the model's surface means the frozen list stays frozen, and
-  # that the one thing which crosses out of the sandbox is something a person
-  # initiated.
-  def run(%{"op" => "propose"}), do: Warden.Materialise.propose()
-  def run(%{"op" => "accept_baseline"}), do: Warden.Materialise.accept()
-
-  # ---- the git crossing (spec 7.4a) ----------------------------------------
-  #
-  # Host-only ops, like propose: the model does not put its own work forward.
-  def run(%{"op" => "git_info"}), do: Warden.Git.info()
-  def run(%{"op" => "git_include_local"}), do: Warden.Git.include_local()
-  def run(%{"op" => "git_exclude_local"}), do: Warden.Git.exclude_local()
-  def run(%{"op" => "git_export"}), do: Warden.Git.export()
-  def run(%{"op" => "git_objects", "args" => %{"shas" => shas}}), do: Warden.Git.objects(shas)
+  # Host-only, off the model's surface: arms a re-seed of the shadow for the
+  # NEXT boot by dropping the seed stamp mount-work checks. A running guest
+  # cannot see the real .git -- the bind mount is the point -- so refresh is
+  # a reboot: the host parks the session after this, and the next boot
+  # re-seeds while nothing but init is running.
+  def run(%{"op" => "git_refresh"}) do
+    case File.rm("/var/lib/crucible/git-seeded") do
+      :ok -> {:ok, "armed: the shadow re-seeds on the next boot"}
+      {:error, :enoent} -> {:ok, "no shadow was seeded; nothing to refresh"}
+      {:error, r} -> {:error, "git_refresh", "could not drop the seed stamp: #{r}"}
+    end
+  end
 
   # Deliberately available: the only honest way to test that a workspace crash
   # is survivable is to cause one. It kills the agent's node, never warden's.

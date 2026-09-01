@@ -413,7 +413,7 @@ def install_elixir(cache, rootfs):
 def install_local(rootfs, guest_dir, vsock_port, warden_build):
     sbin = os.path.join(rootfs, "sbin")
     os.makedirs(sbin, exist_ok=True)
-    for script in ["crucible-init", "seed-work"]:
+    for script in ["crucible-init", "mount-work"]:
         dst = os.path.join(sbin, script)
         shutil.copy(os.path.join(guest_dir, "init", script), dst)
         os.chmod(dst, 0o755)
@@ -430,12 +430,14 @@ def install_local(rootfs, guest_dir, vsock_port, warden_build):
     shutil.copytree(os.path.join(guest_dir, "warden/lib"), os.path.join(warden, "lib"))
     shutil.copy(os.path.join(guest_dir, "warden/mix.exs"), warden)
 
-    # The agent commits its work (spec 7.4a), and git refuses to commit
+    # The agent commits its work (spec 7.4), and git refuses to commit
     # without an identity; the answer must not depend on the model
-    # remembering to configure one.
+    # remembering to configure one. safe.directory is a wildcard because the
+    # workspace arrives over virtiofs with whatever ownership the host
+    # mapped, and the git dir lives at /var/crucible/git besides.
     with open(os.path.join(rootfs, "root/.gitconfig"), "w") as f:
         f.write("[user]\n\tname = Crucible Agent\n\temail = agent@crucible.invalid\n"
-                "[safe]\n\tdirectory = /work\n")
+                "[safe]\n\tdirectory = *\n")
 
     # The one apk trigger this build cares about, done by hand: a shell at
     # /bin/sh so crucible-init can start at all. crucible-init's first act is

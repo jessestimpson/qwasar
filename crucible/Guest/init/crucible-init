@@ -5,10 +5,11 @@
 # the model can do anything, on every session resume, so this does the four
 # things that must happen and then hands over.
 #
-# It is also the last line of defence for a property the host cares about: the
-# project tree arrives read-only over virtiofs and is COPIED into the guest's
-# own disk. Nothing after this point can write to what the host shared, because
-# nothing after this point has it mounted writable.
+# It is also where the tree contract starts (spec 7.4): /work IS the user's
+# project directory, mounted read-write for the life of the session -- the
+# agent's edits land in the user's working tree as they happen -- while the
+# real .git is shadowed by a bind mount of a private copy on the VM disk, so
+# hooks, config and history stay physically out of the agent's reach.
 
 set -u
 
@@ -57,22 +58,31 @@ for m in virtio_rng rng_core vsock vmw_vsock_virtio_transport_common vmw_vsock_v
     modprobe "$m" 2>/dev/null && log "loaded $m" || true
 done
 
-# /work is the guest's own copy. /base is the host's tree, read-only, and is
-# unmounted as soon as the copy is done so it cannot be reached later.
-#
-# The logic lives in seed-work, sourced rather than inlined, so that
-# test_seed_work.sh can run it against a temp tree -- it decides whether an
-# hour of the model's work survives a restart, and the build gates on it.
-. /sbin/seed-work
-seed_work
+# PID 1 inherits whatever PATH the kernel gave it, which is close to nothing.
+# Anything that shells out needs this spelled out, or it fails with a "command
+# not found" that gets reported as the feature being absent.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
-# The base of the git crossing (spec 7.4a): the commit /work arrived with,
-# recorded before any agent runs. Every export is bounded by it, and the
-# host by construction has everything at or below it.
-mkdir -p /run 2>/dev/null || true
-git -C /work rev-parse HEAD > /run/crucible-base-head 2>/dev/null \
-    && log "git base $(cat /run/crucible-base-head | cut -c1-12)" \
-    || : > /run/crucible-base-head
+# HOME must be set before any BEAM starts: distribution nodes authenticate with
+# $HOME/.erlang.cookie, which the first node creates and the second reads. With
+# no HOME they disagree and the workspace is unreachable for a reason that
+# reports itself as `nodedown`. It must also precede mount-work, whose git
+# commands read /root/.gitconfig (identity, safe.directory) baked by the
+# image build.
+export HOME=/root
+mkdir -p /root
+
+# /work IS the user's project, mounted read-write (spec 7.4): edits land in
+# their working tree as ordinary uncommitted changes, live. The real .git is
+# shadowed -- seeded once to the VM disk, bind-mounted over /work/.git on
+# every boot -- so the guest's git is a private copy and the user's is
+# untouchable from in here.
+#
+# The logic lives in mount-work, sourced rather than inlined, so that
+# test_mount_work.sh can run it against a temp tree -- it decides whether
+# the user's repository can be damaged, and the build gates on it.
+. /sbin/mount-work
+mount_work
 
 # Loopback, and only loopback.
 #
@@ -99,17 +109,6 @@ hostname crucible 2>/dev/null || true
 # candidate and was tested separately. It made no difference; this did.
 printf '127.0.0.1 localhost crucible\n::1 localhost crucible\n' > /etc/hosts 2>/dev/null || true
 
-# PID 1 inherits whatever PATH the kernel gave it, which is close to nothing.
-# Anything that shells out needs this spelled out, or it fails with a "command
-# not found" that gets reported as the feature being absent.
-export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-
-# HOME must be set before any BEAM starts: distribution nodes authenticate with
-# $HOME/.erlang.cookie, which the first node creates and the second reads. With
-# no HOME they disagree and the workspace is unreachable for a reason that
-# reports itself as `nodedown`.
-export HOME=/root
-mkdir -p /root
 
 log "starting warden"
 cd /opt/warden || exit 1

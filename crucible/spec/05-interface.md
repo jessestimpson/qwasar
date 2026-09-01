@@ -5,8 +5,8 @@
 `NavigationSplitView`, three columns, the shape every macOS user already knows:
 
 - **Sidebar** — Projects, each expanding to its Sessions. Session rows carry a
-  state dot: hot (filled), parked (hollow), queued (pulsing), awaiting approval
-  (amber). Badge for unread completion when the app is backgrounded.
+  state dot: hot (filled), parked (hollow), queued (pulsing). Badge for unread
+  completion when the app is backgrounded.
 - **Content** — the transcript.
 - **Inspector** (toggleable, ⌥⌘I) — the sandbox: VM state, `/work` tree, the
   registry of agent-defined tools, and a live log tail from the warden. This
@@ -25,7 +25,6 @@ Items, not a text stream:
 | tool call | a card: tool name, arguments (long values elided to one line), status |
 | tool result | inside the call's card, collapsed past 3 lines — the same cut `TOOL_RESULT_LINES` makes in the TUI, for the same reason |
 | module load | a distinct card: module name, diff against the previous version, purge outcome (§7.3) |
-| patch proposal | a card that opens the approval sheet (§7.4) |
 | turn end | dim footnote: tokens, tok/s, spec acceptance, context used |
 
 The model **always** reasons — this is a thinking model with `enable_thinking`

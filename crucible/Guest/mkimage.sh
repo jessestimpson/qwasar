@@ -53,10 +53,10 @@ mise exec "$ZIG_PIN" -- zig cc -target aarch64-linux-musl -static -O2 \
     -o "$CACHE/vsock_port" "$HERE/vsock_port/vsock_port.c" \
     || fail "zig cross-compile failed; mise install $ZIG_PIN"
 
-# ---- seed-work: the gate that decides whether work survives a restart -------
-echo "mkimage: seed-work contract"
-SEED_WORK="$HERE/init/seed-work" sh "$HERE/init/test_seed_work.sh" \
-    || fail "seed-work failed its contract; the image would silently revert edits"
+# ---- mount-work: the gate that decides whether the user's repo is safe ------
+echo "mkimage: mount-work contract"
+MOUNT_WORK="$HERE/init/mount-work" sh "$HERE/init/test_mount_work.sh" \
+    || fail "mount-work failed its contract; the image could expose the real .git"
 
 # ---- warden: tested, then compiled, on the host's pinned toolchain ----------
 #

@@ -62,17 +62,8 @@ struct SessionView: View {
             }
             Composer(state: state)
         }
-        .sheet(isPresented: $state.showingApproval) {
-            ApprovalSheet(state: state)
-        }
         .sheet(isPresented: $state.showingDelegateSheet) {
             DelegateSheet(state: state)
-        }
-        .sheet(isPresented: $state.showingGitCrossing) {
-            GitCrossingSheet(state: state)
-        }
-        .sheet(isPresented: $state.showingDirtyPrompt) {
-            DirtyPromptSheet(state: state).interactiveDismissDisabled()
         }
     }
 }
@@ -105,14 +96,16 @@ struct SessionHeader: View {
                           + "delegating interrupts it. The result also rides along "
                           + "with your next message.")
                 }
-                if state.canReviewChanges {
+                if state.canRefreshGit {
                     Button {
-                        state.reviewChanges()
+                        state.refreshGit()
                     } label: {
-                        Label("Review Changes…", systemImage: "arrow.left.arrow.right")
+                        Label("Refresh Git", systemImage: "arrow.clockwise")
                     }
-                    .help("See what the sandbox changed, and choose what to apply to your "
-                          + "own files. Nothing is written until you approve it.")
+                    .help("Re-seed the sandbox's private .git copy from this "
+                          + "repository's current state. Parks the session; your next "
+                          + "message reboots the sandbox (~2s) with fresh history. "
+                          + "Your files and your real .git are untouched.")
                 }
                 if let status = state.sandboxStatus {
                     Label(status, systemImage: status.hasPrefix("sandboxed")
@@ -120,7 +113,7 @@ struct SessionHeader: View {
                         .font(.caption)
                         .foregroundStyle(status.hasPrefix("sandboxed") ? .green : .secondary)
                         .help(status.hasPrefix("sandboxed")
-                              ? "Tools run on a copy of this folder inside a VM with no network. Nothing they do touches your files."
+                              ? "Tools run in a VM with no network, editing this project's working tree directly — your git shows the edits as uncommitted changes, and your real .git is shadowed out of the VM's reach. Review and commit with your own git."
                               : "Tools can read your files but cannot change anything.")
                 }
             }

@@ -16,7 +16,7 @@ invariants live in §10.
 | [04-sessions.md](04-sessions.md) | sessions, projects, the scheduler, checkpoints |
 | [05-interface.md](05-interface.md) | the window and the transcript |
 | [06-sandbox.md](06-sandbox.md) | the guest: image, boot, disks, the native build |
-| [07-agent.md](07-agent.md) | the tool surface, self-modification, the two nodes, materialisation |
+| [07-agent.md](07-agent.md) | the tool surface, self-modification, the two nodes, the direct tree and the `.git` vault |
 | [08-security.md](08-security.md) | threat model, network (`fetch`), sandbox configuration layers, the config project |
 | [10-correctness.md](10-correctness.md) | the test strategy and the control-plane invariants |
 | [11-risks.md](11-risks.md) | interaction risks worth naming |
