@@ -40,3 +40,6 @@ crucible/vendor/highlight.js/highlight.bundle.js
 # mix.lock is NOT ignored -- it pins what Docker resolves.
 crucible/Guest/warden/_build/
 crucible/Guest/warden/deps/
+tools/venv/
+tests/fixtures/flashnext-tiny/
+tests/fixtures/flashnext-tiny-deq/

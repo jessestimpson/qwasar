@@ -86,6 +86,8 @@ void qw_config_derive(const qw_config *c, qw_shape *s) {
     s->conv_dim  = 2 * s->key_dim + s->value_dim;
     s->gdn_gqa_factor = c->linear_num_key_heads
                       ? c->linear_num_value_heads / c->linear_num_key_heads : 0;
+    s->hc_hidden = c->family == QW_FAMILY_QWEN4_EXP ? c->hc_count * c->hidden_size
+                                                    : c->hidden_size;
 }
 
 /* ---- name arena ---------------------------------------------------------- */
@@ -242,6 +244,8 @@ struct qwasar_engine {
     qw_layer  layers[QW_MAX_LAYERS];
     qw_qlinear embed_tokens, lm_head;
     const qw_tensor *final_norm;
+    qw_hc     final_hc;        /* qwen4_exp: the mixer in place of a final norm */
+    qw_ple    ple;             /* qwen4_exp: the one engram layer's weights */
     qw_mtp    mtp;
     qw_vision vision;
 
@@ -464,21 +468,30 @@ static bool qw_load_config(qwasar_engine *e, char *err, size_t errcap) {
     char model_type[64] = "";
     qj_str_copy(&d, root, "model_type", model_type, sizeof model_type);
     const qj_node *tc = qj_get(&d, root, "text_config");
+    if (!tc && !strcmp(model_type, "qwen4_exp_text")) {
+        /* A text-only Flash-Next checkpoint keeps the text fields at the root. */
+        tc = root;
+        snprintf(model_type, sizeof model_type, "qwen4_exp");
+    }
     if (!tc) {
         qw_errf(err, errcap, "config.json has no text_config -- is this a Qwen3.8 VLM checkpoint?");
         qj_free(&d);
         return false;
     }
-    if (strcmp(model_type, "qwen3_5") != 0) {
+    qw_family family;
+    if (!strcmp(model_type, "qwen3_5"))       family = QW_FAMILY_QWEN3_5;
+    else if (!strcmp(model_type, "qwen4_exp")) family = QW_FAMILY_QWEN4_EXP;
+    else {
         qw_errf(err, errcap,
-                "unsupported model_type \"%s\" (qwasar implements qwen3_5 / Qwen3.8 only)",
-                model_type);
+                "unsupported model_type \"%s\" (qwasar implements the Qwen3.8 family: "
+                "qwen3_5 and qwen4_exp)", model_type);
         qj_free(&d);
         return false;
     }
 
     qw_config *c = &e->config;
     memset(c, 0, sizeof *c);
+    c->family = family;
 
     c->hidden_size             = (int32_t)qj_int_or(&d, tc, "hidden_size", 0);
     c->intermediate_size       = (int32_t)qj_int_or(&d, tc, "intermediate_size", 0);
@@ -498,6 +511,60 @@ static bool qw_load_config(qwasar_engine *e, char *err, size_t errcap) {
     c->linear_key_head_dim     = (int32_t)qj_int_or(&d, tc, "linear_key_head_dim", 0);
     c->linear_value_head_dim   = (int32_t)qj_int_or(&d, tc, "linear_value_head_dim", 0);
     c->linear_conv_kernel_dim  = (int32_t)qj_int_or(&d, tc, "linear_conv_kernel_dim", 4);
+
+    /* An explicit schedule wins over the interval when the config carries
+     * one.  qwen4_exp spells its sparse layers "full_attention"; either
+     * name that is not linear_attention is the attention kind. */
+    const qj_node *lt = qj_get(&d, tc, "layer_types");
+    if (lt && lt->type == QJ_ARRAY) {
+        int i = 0;
+        for (const qj_node *v = qj_first(&d, lt); v && i < QW_MAX_LAYERS; v = qj_next(&d, v), i++) {
+            const char *sv = v->type == QJ_STRING ? d.text + v->u.str.off : "";
+            const uint32_t sl = v->type == QJ_STRING ? v->u.str.len : 0;
+            c->layer_linear[i] = (sl == 16 && !memcmp(sv, "linear_attention", 16)) ? 1 : 0;
+        }
+        c->layer_types_given = i > 0;
+    }
+
+    if (family == QW_FAMILY_QWEN4_EXP) {
+        /* PLAN-flash-next.md, Phase 0: every one of these is a fact from the
+         * modular source, and the shapes bound below are where a wrong one
+         * shows up first. */
+        c->attn_output_gate               = true;      /* q_proj is [q | gate] per head */
+        c->num_experts                    = (int32_t)qj_int_or(&d, tc, "num_experts", 0);
+        c->num_experts_per_tok            = (int32_t)qj_int_or(&d, tc, "num_experts_per_tok", 0);
+        c->moe_intermediate_size          = (int32_t)qj_int_or(&d, tc, "moe_intermediate_size", 0);
+        c->shared_expert_intermediate_size= (int32_t)qj_int_or(&d, tc, "shared_expert_intermediate_size", 0);
+        c->norm_topk_prob                 = qj_bool_or(&d, tc, "norm_topk_prob", true);
+        c->hc_count                       = (int32_t)qj_int_or(&d, tc, "hc_count", 4);
+        c->hc_lowrank                     = (int32_t)qj_int_or(&d, tc, "hc_lowrank", 320);
+        c->indexer_n_heads                = (int32_t)qj_int_or(&d, tc, "indexer_n_heads", 0);
+        c->indexer_kv_heads               = (int32_t)qj_int_or(&d, tc, "indexer_kv_heads", 1);
+        c->indexer_head_dim               = (int32_t)qj_int_or(&d, tc, "indexer_head_dim", 0);
+        c->indexer_budget                 = (int32_t)qj_int_or(&d, tc, "indexer_budget", 0);
+        c->indexer_compress_ratio         = (int32_t)qj_int_or(&d, tc, "indexer_compress_ratio", 1);
+        c->ple_embed_dim                  = (int32_t)qj_int_or(&d, tc, "ple_embed_dim", c->hidden_size);
+        c->ple_conv_kernel_size           = (int32_t)qj_int_or(&d, tc, "ple_conv_kernel_size", 4);
+        c->ngram_size                     = (int32_t)qj_int_or(&d, tc, "ngram_size", 3);
+        c->heads_per_ngram                = (int32_t)qj_int_or(&d, tc, "heads_per_ngram", 8);
+        c->ngram_vocab_size_base          = (int64_t)qj_num_or(&d, tc, "ngram_vocab_size_base", 20000000);
+        c->ngram_divisor                  = (int32_t)qj_int_or(&d, tc, "make_ngram_vocab_size_divisible_by", 128);
+        c->ngram_seed                     = (int32_t)qj_int_or(&d, tc, "seed", 1234);
+        c->ple_layer = -1;
+        const qj_node *pl = qj_get(&d, tc, "ple_layer_ids");
+        if (pl && pl->type == QJ_ARRAY) {
+            const qj_node *v = qj_first(&d, pl);
+            if (v && v->type == QJ_NUMBER) c->ple_layer = (int32_t)v->u.num - 1;   /* one-indexed */
+        }
+        char gate[32] = "";
+        qj_str_copy(&d, tc, "output_gate_type", gate, sizeof gate);
+        c->gdn_gate_sigmoid = !strcmp(gate, "sigmoid");
+        if (c->indexer_kv_heads != 1) {
+            qw_errf(err, errcap, "qwen4_exp: indexer_kv_heads must be 1, got %d", c->indexer_kv_heads);
+            qj_free(&d);
+            return false;
+        }
+    }
 
     const qj_node *rp = qj_get(&d, tc, "rope_parameters");
     c->rope_theta            = (float)qj_num_or(&d, rp, "rope_theta", 10000.0);
@@ -525,6 +592,7 @@ static bool qw_load_config(qwasar_engine *e, char *err, size_t errcap) {
     c->vision_end_token_id    = (int32_t)qj_int_or(&d, root, "vision_end_token_id", -1);
 
     const qj_node *eos = qj_get(&d, root, "eos_token_id");
+    if (!eos) eos = qj_get(&d, tc, "eos_token_id");
     if (eos && eos->type == QJ_ARRAY) {
         for (const qj_node *v = qj_first(&d, eos); v && c->n_eos < 8; v = qj_next(&d, v))
             c->eos_token_ids[c->n_eos++] = (int32_t)v->u.num;
@@ -1002,9 +1070,245 @@ static bool qw_bind_vision(qwasar_engine *e, char *err, size_t errcap) {
     return true;
 }
 
+/* ---- qwen4_exp binding ------------------------------------------------------ */
+
+/* A bank of `count` quantised matrices in one 3-D tensor, quantised along
+ * the input axis: weight [count, out, in/8], scales/biases [count, out, in/64]. */
+static bool qw_bind_qbank(qwasar_engine *e, qw_qlinear *ql, const char *prefix, int32_t count,
+                          int32_t in_features, int32_t out_features, char *err, size_t errcap) {
+    ql->weight = qw_table_findf(&e->tensors, "%s.weight", prefix);
+    ql->scales = qw_table_findf(&e->tensors, "%s.scales", prefix);
+    ql->biases = qw_table_findf(&e->tensors, "%s.biases", prefix);
+    if (!ql->weight || !ql->scales || !ql->biases) {
+        qw_errf(err, errcap, "missing quantised bank %s", prefix);
+        return false;
+    }
+    ql->in_features = in_features;
+    ql->out_features = out_features;
+    const int32_t words = in_features / 8, groups = in_features / e->config.quant_group_size;
+    if (ql->weight->ndim != 3 || ql->weight->shape[0] != count
+        || ql->weight->shape[1] != out_features || ql->weight->shape[2] != words) {
+        qw_errf(err, errcap, "%s.weight is [%lld,%lld,%lld], expected [%d,%d,%d]", prefix,
+                (long long)ql->weight->shape[0], (long long)ql->weight->shape[1],
+                (long long)ql->weight->shape[2], count, out_features, words);
+        return false;
+    }
+    if (ql->scales->ndim != 3 || ql->scales->shape[2] != groups) {
+        qw_errf(err, errcap, "%s.scales has %lld groups, expected %d", prefix,
+                (long long)ql->scales->shape[2], groups);
+        return false;
+    }
+    e->weight_bytes_text += ql->weight->nbytes + ql->scales->nbytes + ql->biases->nbytes;
+    return true;
+}
+
+static const qw_tensor *qw_bind_bf16(qwasar_engine *e, const char *name, int ndim,
+                                     int64_t d0, int64_t d1, char *err, size_t errcap) {
+    const qw_tensor *t = qw_table_find(&e->tensors, name);
+    if (!t) { qw_errf(err, errcap, "missing tensor %s", name); return NULL; }
+    if (t->dtype != QW_DT_BF16 || t->ndim != ndim || t->shape[0] != d0
+        || (ndim > 1 && t->shape[1] != d1)) {
+        qw_errf(err, errcap, "%s is %s [%lld,%lld], expected bf16 [%lld,%lld]", name,
+                qw_dtype_name(t->dtype), (long long)t->shape[0], (long long)t->shape[1],
+                (long long)d0, (long long)d1);
+        return NULL;
+    }
+    e->weight_bytes_text += t->nbytes;
+    return t;
+}
+
+static bool qw_bind_hc(qwasar_engine *e, qw_hc *hc, const char *prefix, bool inject,
+                       char *err, size_t errcap) {
+    const qw_config *c = &e->config;
+    const int32_t HH = e->shape.hc_hidden;
+    char p[300];
+    snprintf(p, sizeof p, "%s.hc_norm.weight", prefix);
+    if (!(hc->hc_norm = qw_bind_bf16(e, p, 1, HH, 0, err, errcap))) return false;
+    snprintf(p, sizeof p, "%s.input_mix_weight_down", prefix);
+    if (!qw_bind_qlinear(e, &hc->mix_down, p, HH, c->hc_lowrank, err, errcap)) return false;
+    snprintf(p, sizeof p, "%s.input_mix_weight_up", prefix);
+    if (!qw_bind_qlinear(e, &hc->mix_up, p, c->hc_lowrank, HH, err, errcap)) return false;
+    hc->block_inject = NULL;
+    if (inject) {
+        snprintf(p, sizeof p, "%s.block_inject_weight.weight", prefix);
+        if (!(hc->block_inject = qw_bind_bf16(e, p, 2, c->hc_count, HH, err, errcap))) return false;
+    }
+    return true;
+}
+
+static bool qw_bind_moe(qwasar_engine *e, qw_moe *m, const char *prefix, char *err, size_t errcap) {
+    const qw_config *c = &e->config;
+    const int32_t H = c->hidden_size, I = c->moe_intermediate_size, SI = c->shared_expert_intermediate_size;
+    char p[300];
+    m->n_experts = c->num_experts;
+    snprintf(p, sizeof p, "%s.gate.weight", prefix);
+    if (!(m->router = qw_bind_bf16(e, p, 2, c->num_experts, H, err, errcap))) return false;
+    snprintf(p, sizeof p, "%s.experts.gate_up_proj", prefix);
+    if (!qw_bind_qbank(e, &m->gate_up, p, c->num_experts, H, 2 * I, err, errcap)) return false;
+    snprintf(p, sizeof p, "%s.experts.down_proj", prefix);
+    if (!qw_bind_qbank(e, &m->down, p, c->num_experts, I, H, err, errcap)) return false;
+    snprintf(p, sizeof p, "%s.shared_expert.gate_proj", prefix);
+    if (!qw_bind_qlinear(e, &m->sh_gate, p, H, SI, err, errcap)) return false;
+    snprintf(p, sizeof p, "%s.shared_expert.up_proj", prefix);
+    if (!qw_bind_qlinear(e, &m->sh_up, p, H, SI, err, errcap)) return false;
+    snprintf(p, sizeof p, "%s.shared_expert.down_proj", prefix);
+    if (!qw_bind_qlinear(e, &m->sh_down, p, SI, H, err, errcap)) return false;
+    snprintf(p, sizeof p, "%s.shared_expert_gate.weight", prefix);
+    if (!(m->sh_gate_w = qw_bind_bf16(e, p, 2, 1, H, err, errcap))) return false;
+    return true;
+}
+
+/* Sieve-free primality is fine here: sixteen primes near 2e7 by trial
+ * division is milliseconds, once, at load. */
+static bool qw_is_prime(int64_t v) {
+    if (v < 2) return false;
+    if (v % 2 == 0) return v == 2;
+    for (int64_t d = 3; d * d <= v; d += 2) if (v % d == 0) return false;
+    return true;
+}
+
+static bool qw_bind_ple(qwasar_engine *e, qw_ple *P, const char *prefix, char *err, size_t errcap) {
+    const qw_config *c = &e->config;
+    const int32_t H = c->hidden_size, HH = e->shape.hc_hidden, E = c->ple_embed_dim;
+    char p[300];
+    P->n_heads = (c->ngram_size - 1) * c->heads_per_ngram;
+    if (P->n_heads <= 0 || P->n_heads > QW_MAX_NGRAM_HEADS || E % P->n_heads != 0) {
+        qw_errf(err, errcap, "qwen4_exp: bad n-gram head count %d for ple_embed_dim %d", P->n_heads, E);
+        return false;
+    }
+    P->head_dim = E / P->n_heads;
+
+    /* head h's vocabulary is the (h+1)-th prime after base-1; the table is
+     * their sum padded to the divisor.  Only one PLE layer exists, so the
+     * global head index is the local one. */
+    int64_t prime = c->ngram_vocab_size_base - 1;
+    P->table_rows = 0;
+    for (int32_t h = 0; h < P->n_heads; h++) {
+        prime++;
+        while (!qw_is_prime(prime)) prime++;
+        P->head_size[h] = prime;
+        P->head_off[h] = P->table_rows;
+        P->table_rows += prime;
+    }
+    P->table_rows = (P->table_rows + c->ngram_divisor - 1) / c->ngram_divisor * c->ngram_divisor;
+    qw_ple_multipliers(P->mult, c->vocab_size, c->ngram_size, 0, c->ngram_seed);
+
+    snprintf(p, sizeof p, "%s.ple_embedding.ngram_embedding.weight", prefix);
+    if (!(P->table = qw_bind_bf16(e, p, 2, P->table_rows, P->head_dim, err, errcap))) return false;
+    snprintf(p, sizeof p, "%s.key_proj", prefix);
+    if (!qw_bind_qlinear(e, &P->key_proj, p, E, HH, err, errcap)) return false;
+    snprintf(p, sizeof p, "%s.value_proj", prefix);
+    if (!qw_bind_qlinear(e, &P->value_proj, p, E, H, err, errcap)) return false;
+    snprintf(p, sizeof p, "%s.norm_key.weight", prefix);
+    if (!(P->norm_key = qw_bind_bf16(e, p, 1, HH, 0, err, errcap))) return false;
+    snprintf(p, sizeof p, "%s.norm_query.weight", prefix);
+    if (!(P->norm_query = qw_bind_bf16(e, p, 1, HH, 0, err, errcap))) return false;
+    snprintf(p, sizeof p, "%s.norm_conv.weight", prefix);
+    if (!(P->norm_conv = qw_bind_bf16(e, p, 1, HH, 0, err, errcap))) return false;
+    snprintf(p, sizeof p, "%s.conv1d.weight", prefix);
+    P->conv1d = qw_table_find(&e->tensors, p);
+    if (!P->conv1d || P->conv1d->ndim != 3 || P->conv1d->shape[0] != HH
+        || P->conv1d->shape[1] != c->ple_conv_kernel_size || P->conv1d->shape[2] != 1) {
+        qw_errf(err, errcap, "%s is missing or not [%d,%d,1]", p, HH, c->ple_conv_kernel_size);
+        return false;
+    }
+    e->weight_bytes_text += P->conv1d->nbytes;
+    return true;
+}
+
+static bool qw_bind_weights_qwen4(qwasar_engine *e, char *err, size_t errcap) {
+    const qw_config *c = &e->config;
+    const qw_shape  *s = &e->shape;
+    char p[300];
+
+    if (!qw_bind_qlinear(e, &e->embed_tokens, "language_model.model.embed_tokens",
+                         c->hidden_size, c->vocab_size, err, errcap)) return false;
+    if (!qw_bind_qlinear(e, &e->lm_head, "language_model.lm_head",
+                         c->hidden_size, c->vocab_size, err, errcap)) return false;
+    if (!qw_bind_hc(e, &e->final_hc, "language_model.model.hyper_connection_mixer", false, err, errcap))
+        return false;
+    e->final_norm = NULL;   /* there is none; the mixer feeds lm_head */
+
+    for (int i = 0; i < c->num_hidden_layers; i++) {
+        qw_layer *L = &e->layers[i];
+        memset(L, 0, sizeof *L);
+        L->is_linear_attn = qw_layer_is_linear(c, i);
+
+        snprintf(p, sizeof p, "language_model.model.layers.%d.attn_hyper_connection", i);
+        if (!qw_bind_hc(e, &L->attn_hc, p, true, err, errcap)) return false;
+        snprintf(p, sizeof p, "language_model.model.layers.%d.mlp_hyper_connection", i);
+        if (!qw_bind_hc(e, &L->mlp_hc, p, true, err, errcap)) return false;
+
+        if (L->is_linear_attn) {
+            snprintf(p, sizeof p, "language_model.model.layers.%d.linear_attn.in_proj_qkv", i);
+            if (!qw_bind_qlinear(e, &L->in_proj_qkv, p, c->hidden_size, s->conv_dim, err, errcap)) return false;
+            snprintf(p, sizeof p, "language_model.model.layers.%d.linear_attn.in_proj_z", i);
+            if (!qw_bind_qlinear(e, &L->in_proj_z, p, c->hidden_size, s->value_dim, err, errcap)) return false;
+            snprintf(p, sizeof p, "language_model.model.layers.%d.linear_attn.in_proj_b", i);
+            if (!qw_bind_qlinear(e, &L->in_proj_b, p, c->hidden_size, c->linear_num_value_heads, err, errcap)) return false;
+            snprintf(p, sizeof p, "language_model.model.layers.%d.linear_attn.in_proj_a", i);
+            if (!qw_bind_qlinear(e, &L->in_proj_a, p, c->hidden_size, c->linear_num_value_heads, err, errcap)) return false;
+            snprintf(p, sizeof p, "language_model.model.layers.%d.linear_attn.out_proj", i);
+            if (!qw_bind_qlinear(e, &L->out_proj, p, s->value_dim, c->hidden_size, err, errcap)) return false;
+            L->conv1d  = qw_table_findf(&e->tensors, "language_model.model.layers.%d.linear_attn.conv1d.weight", i);
+            L->A_log   = qw_table_findf(&e->tensors, "language_model.model.layers.%d.linear_attn.A_log", i);
+            L->dt_bias = qw_table_findf(&e->tensors, "language_model.model.layers.%d.linear_attn.dt_bias", i);
+            L->gdn_norm = qw_bind_norm(e, "language_model.model.layers.%d.linear_attn.norm.weight", i,
+                                       c->linear_value_head_dim, err, errcap);
+            if (!L->conv1d || !L->A_log || !L->dt_bias || !L->gdn_norm) {
+                qw_errf(err, errcap, "layer %d: missing gated-delta tensors", i);
+                return false;
+            }
+            if (L->conv1d->ndim != 3 || L->conv1d->shape[0] != s->conv_dim
+                || L->conv1d->shape[1] != c->linear_conv_kernel_dim || L->conv1d->shape[2] != 1) {
+                qw_errf(err, errcap, "layer %d: conv1d.weight is not [%d,%d,1]", i,
+                        s->conv_dim, c->linear_conv_kernel_dim);
+                return false;
+            }
+            e->weight_bytes_text += L->conv1d->nbytes + L->A_log->nbytes + L->dt_bias->nbytes;
+        } else {
+            snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.q_proj", i);
+            if (!qw_bind_qlinear(e, &L->q_proj, p, c->hidden_size, s->q_proj_out, err, errcap)) return false;
+            snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.k_proj", i);
+            if (!qw_bind_qlinear(e, &L->k_proj, p, c->hidden_size, s->kv_dim, err, errcap)) return false;
+            snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.v_proj", i);
+            if (!qw_bind_qlinear(e, &L->v_proj, p, c->hidden_size, s->kv_dim, err, errcap)) return false;
+            snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.o_proj", i);
+            if (!qw_bind_qlinear(e, &L->o_proj, p, s->q_dim, c->hidden_size, err, errcap)) return false;
+            L->q_norm = qw_bind_norm(e, "language_model.model.layers.%d.self_attn.q_norm.weight", i, c->head_dim, err, errcap);
+            L->k_norm = qw_bind_norm(e, "language_model.model.layers.%d.self_attn.k_norm.weight", i, c->head_dim, err, errcap);
+            if (!L->q_norm || !L->k_norm) return false;
+
+            const int32_t idim = c->indexer_head_dim;
+            snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.indexer.index_qk_proj", i);
+            if (!qw_bind_qlinear(e, &L->indexer.qk_proj, p, c->hidden_size,
+                                 (c->indexer_n_heads + c->indexer_kv_heads) * idim, err, errcap)) return false;
+            L->indexer.q_norm = qw_bind_norm(e, "language_model.model.layers.%d.self_attn.indexer.q_layernorm.weight", i, idim, err, errcap);
+            L->indexer.k_norm = qw_bind_norm(e, "language_model.model.layers.%d.self_attn.indexer.k_layernorm.weight", i, idim, err, errcap);
+            if (!L->indexer.q_norm || !L->indexer.k_norm) return false;
+        }
+
+        snprintf(p, sizeof p, "language_model.model.layers.%d.mlp", i);
+        if (!qw_bind_moe(e, &L->moe, p, err, errcap)) return false;
+
+        if (i == c->ple_layer) {
+            snprintf(p, sizeof p, "language_model.model.layers.%d.ple", i);
+            if (!qw_bind_ple(e, &e->ple, p, err, errcap)) return false;
+            L->ple = &e->ple;
+        }
+    }
+
+    for (uint32_t i = 0; i < e->tensors.count; i++)
+        if (!strncmp(e->tensors.v[i].name, "vision_tower.", 13))
+            e->weight_bytes_vision += e->tensors.v[i].nbytes;
+    e->weight_bytes = e->weight_bytes_text + e->weight_bytes_vision;
+    return true;   /* the vision tower is not bound for this family yet */
+}
+
 static bool qw_bind_weights(qwasar_engine *e, char *err, size_t errcap) {
     const qw_config *c = &e->config;
     const qw_shape  *s = &e->shape;
+    if (c->family == QW_FAMILY_QWEN4_EXP) return qw_bind_weights_qwen4(e, err, errcap);
 
     if (!qw_bind_qlinear(e, &e->embed_tokens, "language_model.model.embed_tokens",
                          c->hidden_size, c->vocab_size, err, errcap)) return false;
@@ -1207,6 +1511,7 @@ const qw_config *qwasar_engine_config(const qwasar_engine *e) { return &e->confi
 const qw_qlinear *qwasar_engine_embed(const qwasar_engine *e) { return &e->embed_tokens; }
 const qw_qlinear *qwasar_engine_head (const qwasar_engine *e) { return &e->lm_head; }
 const qw_tensor  *qwasar_engine_final_norm(const qwasar_engine *e) { return e->final_norm; }
+const qw_hc      *qwasar_engine_final_hc(const qwasar_engine *e) { return &e->final_hc; }
 const qw_mtp     *qwasar_engine_mtp(const qwasar_engine *e) { return &e->mtp; }
 const qw_vision  *qwasar_engine_vision(const qwasar_engine *e) { return &e->vision; }
 int32_t qwasar_engine_context_size (const qwasar_engine *e) { return e->context_size; }

@@ -13,7 +13,8 @@
 
 #define QW_MAX_LAYERS      128
 #define QW_MAX_VIS_BLOCKS   64
-#define QW_MAX_SHARDS       16
+#define QW_MAX_SHARDS      256   /* Flash-Next: 131 in, sharded out */
+#define QW_MAX_NGRAM_HEADS  64
 #define QW_MAX_DIMS          6
 
 /* ---- the draft head's vocabulary -------------------------------------------
@@ -105,6 +106,54 @@ typedef struct {
     const qw_tensor *bias;
 } qw_lnorm;
 
+/* ---- Flash-Next (qwen4_exp) pieces -----------------------------------------
+ *
+ * PLAN-flash-next.md, Phase 0.  The residual stream is `hc_count` streams
+ * wide, and every sublayer is wrapped by a GatedResidual: a grouped RMSNorm
+ * over the streams, a low-rank sigmoid mixer that collapses them to one
+ * input, and per-stream injection weights for the output.  The final mixer
+ * has no injection and feeds lm_head directly -- there is no final norm. */
+typedef struct {
+    const qw_tensor *hc_norm;        /* BF16 [hc*hidden], +1 folded */
+    qw_qlinear mix_down;             /* [hc_lowrank, hc*hidden] */
+    qw_qlinear mix_up;               /* [hc*hidden, hc_lowrank] */
+    const qw_tensor *block_inject;   /* BF16 [hc, hc*hidden]; NULL on the final mixer */
+} qw_hc;
+
+/* Experts are BANKS: one quantised tensor holding every expert, quantised
+ * along the input axis, so expert e is the contiguous slice
+ * [e*out, (e+1)*out) of rows.  The router stays BF16 -- it decides top-k. */
+typedef struct {
+    const qw_tensor *router;         /* BF16 [n_experts, hidden] */
+    qw_qlinear gate_up;              /* bank [E, 2*inter, hidden]; gate rows first */
+    qw_qlinear down;                 /* bank [E, hidden, inter] */
+    qw_qlinear sh_gate, sh_up, sh_down;   /* the shared expert, an ordinary SwiGLU */
+    const qw_tensor *sh_gate_w;      /* BF16 [1, hidden]: sigmoid scales the shared expert */
+    int32_t n_experts;
+} qw_moe;
+
+/* QSA's indexer: a few query heads and ONE key head, whose raw keys are
+ * cached per token and pooled per block of `compress_ratio` tokens. */
+typedef struct {
+    qw_qlinear qk_proj;              /* [(n_heads + 1) * head_dim, hidden] */
+    const qw_tensor *q_norm, *k_norm;/* BF16 [head_dim], +1 folded */
+} qw_indexer;
+
+/* The engram (PLE) layer: hashed n-gram embeddings gated into every stream.
+ * The hash constants are derived from config at bind time; the checkpoint's
+ * own copies are the cross-check. */
+typedef struct {
+    const qw_tensor *table;          /* BF16 [rows, head_dim]; cold, gathered by row */
+    qw_qlinear key_proj, value_proj;
+    const qw_tensor *norm_key, *norm_query, *norm_conv;   /* BF16 [hc*hidden], +1 folded */
+    const qw_tensor *conv1d;         /* BF16 [hc*hidden, K, 1], tap 0 oldest, dilated */
+    int64_t mult[8];                 /* per n-gram position, ngram_size of them */
+    int64_t head_size[QW_MAX_NGRAM_HEADS];
+    int64_t head_off[QW_MAX_NGRAM_HEADS];
+    int32_t n_heads, head_dim;
+    int64_t table_rows;
+} qw_ple;
+
 typedef struct {
     bool is_linear_attn;   /* gated delta if true, full attention otherwise */
 
@@ -124,6 +173,12 @@ typedef struct {
 
     /* mlp */
     qw_qlinear gate_proj, up_proj, down_proj;
+
+    /* ---- qwen4_exp (Flash-Next) only; zero for the 27B ---- */
+    qw_hc      attn_hc, mlp_hc;   /* the hyper-connections around each sublayer */
+    qw_moe     moe;               /* replaces the dense mlp */
+    qw_indexer indexer;           /* QSA's block selector, attention layers only */
+    qw_ple    *ple;               /* the engram layer, on exactly one layer */
 } qw_layer;
 
 /* The multi-token-prediction draft head.
@@ -198,7 +253,11 @@ typedef struct {
     qw_dense  merger_fc1, merger_fc2;
 } qw_vision;
 
+typedef enum { QW_FAMILY_QWEN3_5 = 0, QW_FAMILY_QWEN4_EXP = 1 } qw_family;
+
 typedef struct {
+    qw_family family;
+
     /* text */
     int32_t hidden_size;
     int32_t intermediate_size;
@@ -226,6 +285,24 @@ typedef struct {
     int32_t mrope_section[3];
     bool    mrope_interleaved;
     int32_t max_position_embeddings;
+
+    /* explicit layer schedule, when config.json carries `layer_types` */
+    bool    layer_types_given;
+    uint8_t layer_linear[QW_MAX_LAYERS];
+
+    /* ---- qwen4_exp (Flash-Next) ---- */
+    int32_t num_experts, num_experts_per_tok;
+    int32_t moe_intermediate_size, shared_expert_intermediate_size;
+    bool    norm_topk_prob;
+    int32_t hc_count, hc_lowrank;
+    int32_t indexer_n_heads, indexer_kv_heads, indexer_head_dim;
+    int32_t indexer_budget, indexer_compress_ratio;
+    int32_t ple_layer;               /* zero-indexed; -1 for none */
+    int32_t ple_embed_dim, ple_conv_kernel_size;
+    int32_t ngram_size, heads_per_ngram;
+    int64_t ngram_vocab_size_base;
+    int32_t ngram_divisor, ngram_seed;
+    bool    gdn_gate_sigmoid;        /* output_gate_type == "sigmoid" */
 
     /* quantisation */
     int32_t quant_bits;
@@ -264,10 +341,12 @@ typedef struct {
     int32_t value_dim;      /* linear_num_value_heads * linear_value_head_dim */
     int32_t conv_dim;       /* 2*key_dim + value_dim */
     int32_t gdn_gqa_factor;
+    int32_t hc_hidden;      /* hc_count * hidden_size (qwen4_exp), else hidden_size */
 } qw_shape;
 
 void qw_config_derive(const qw_config *c, qw_shape *s);
 static inline bool qw_layer_is_linear(const qw_config *c, int i) {
+    if (c->layer_types_given) return c->layer_linear[i] != 0;
     return ((i + 1) % c->full_attention_interval) != 0;
 }
 
@@ -285,6 +364,8 @@ const qw_tensor *qwasar_engine_tensor(const qwasar_engine *e, const char *name);
 const qw_qlinear *qwasar_engine_embed(const qwasar_engine *e);
 const qw_qlinear *qwasar_engine_head (const qwasar_engine *e);
 const qw_tensor  *qwasar_engine_final_norm(const qwasar_engine *e);
+/* qwen4_exp: the final hyper-connection mixer (no injection), read by lm_head. */
+const qw_hc      *qwasar_engine_final_hc(const qwasar_engine *e);
 
 /* The MTP draft head; `present` is false unless --mtp named a head directory. */
 const qw_mtp     *qwasar_engine_mtp(const qwasar_engine *e);
@@ -431,5 +512,24 @@ void qw_cpu_attn_decode(float *out, const float *q, const uint16_t *kc,
 /* Dequantises one full row of a quantised linear into `out` (length k). */
 void qw_cpu_dequant_row(float *out, const uint32_t *w, const uint16_t *scales,
                         const uint16_t *biases, int32_t k, int32_t row);
+
+/* ---- Flash-Next CPU reference (qwasar_flash_cpu.c) -------------------------
+ *
+ * A whole-model scalar forward for the qwen4_exp family, one token at a
+ * time, over the engine's bound (quantised) tensors.  It is the twin every
+ * Metal op for this family is checked against, and at the toy fixture's size
+ * it runs in milliseconds; at 125B it is not meant to run at all. */
+typedef struct qw_flash_ref qw_flash_ref;
+qw_flash_ref *qw_flash_ref_new(const qwasar_engine *e, int32_t max_ctx);
+void          qw_flash_ref_free(qw_flash_ref *r);
+/* Appends `n` tokens; writes logits for every one into `logits` [n, vocab].
+ * `hidden_last`, if given, receives the final token's residual after each
+ * layer: [num_hidden_layers, hc_hidden]. */
+bool qw_flash_ref_forward(qw_flash_ref *r, const int32_t *tokens, int32_t n,
+                          float *logits, float *hidden_last, char *err, size_t errcap);
+/* The engram hash, exposed for the cross-check against the checkpoint's
+ * own multipliers. */
+void qw_ple_multipliers(int64_t out[8], int64_t unigram_vocab, int32_t ngram_size,
+                        int32_t ple_layer_index, int32_t seed);
 
 #endif /* QWASAR_MODEL_H */
