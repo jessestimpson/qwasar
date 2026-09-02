@@ -1370,6 +1370,14 @@ Todo tracking and a `glob` tool in the agent, `/v1/responses` and
 `/v1/completions` in the server, concurrent requests, NFC normalisation in the
 tokenizer, a disk-cached aligned repack of the misaligned shard (§3.3).
 
+### Planned in detail elsewhere
+
+**Qwen3.8-Flash-Next (`qwen4_exp`)** — the 6B-active MoE sibling: same
+DeltaNet geometry and hybrid schedule, new MoE/sparse-attention/engram
+pieces, targets the M5 Max 128 GB. The port plan, phase gates, and the
+honest ceiling arithmetic live in [PLAN-flash-next.md](PLAN-flash-next.md);
+the "single-model engine" rule becomes "single-family" there, with reasons.
+
 ---
 
 ## 6. Rules for this codebase
