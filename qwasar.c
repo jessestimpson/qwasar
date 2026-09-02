@@ -1622,8 +1622,10 @@ void qwasar_engine_print_info(const qwasar_engine *e, FILE *out) {
     fprintf(out, "text       hidden %d  layers %d  vocab %d  ffn %d  eps %.0e\n",
             c->hidden_size, c->num_hidden_layers, c->vocab_size,
             c->intermediate_size, (double)c->rms_norm_eps);
-    fprintf(out, "schedule   full attention every %d layers -> %d full, %d gated-delta\n",
-            c->full_attention_interval, s->n_full_attn_layers, s->n_linear_attn_layers);
+    fprintf(out, "schedule   %s attention every %d layers -> %d %s, %d gated-delta\n",
+            c->family == QW_FAMILY_QWEN4_EXP ? "sparse" : "full",
+            c->full_attention_interval, s->n_full_attn_layers,
+            c->family == QW_FAMILY_QWEN4_EXP ? "sparse" : "full", s->n_linear_attn_layers);
     fprintf(out, "attention  %d q heads x %d dim, %d kv heads (gqa %d), output gate %s\n",
             c->num_attention_heads, c->head_dim, c->num_key_value_heads,
             s->gqa_factor, c->attn_output_gate ? "on" : "off");
@@ -1639,6 +1641,25 @@ void qwasar_engine_print_info(const qwasar_engine *e, FILE *out) {
             s->gdn_gqa_factor, c->linear_conv_kernel_dim, s->conv_dim);
     fprintf(out, "quant      MLX affine %d-bit, group %d\n",
             c->quant_bits, c->quant_group_size);
+
+    if (c->family == QW_FAMILY_QWEN4_EXP) {
+        const qw_ple *P = &e->ple;
+        fprintf(out, "residual   %d streams x %d = %d wide, mixers through rank %d\n",
+                c->hc_count, c->hidden_size, s->hc_hidden, c->hc_lowrank);
+        fprintf(out, "moe        %d experts x %d wide, top %d%s, shared expert %d wide\n",
+                c->num_experts, c->moe_intermediate_size, c->num_experts_per_tok,
+                c->norm_topk_prob ? " renormalised" : "",
+                c->shared_expert_intermediate_size);
+        fprintf(out, "qsa        indexer %d heads x %d, budget %d tokens in blocks of %d\n",
+                c->indexer_n_heads, c->indexer_head_dim, c->indexer_budget,
+                c->indexer_compress_ratio);
+        if (c->ple_layer >= 0)
+            fprintf(out, "engram     layer %d: %d heads x %d, %lld rows in %d host shard%s "
+                         "(%.2f GB, not on the device)\n",
+                    c->ple_layer, P->n_heads, P->head_dim, (long long)P->table_rows,
+                    P->n_shards, P->n_shards == 1 ? "" : "s",
+                    qw_gb((size_t)P->table_rows * P->head_dim * 2));
+    }
 
     if (c->has_vision)
         fprintf(out, "vision     %d blocks x %d, %d heads, patch %d (t%d), merge %d -> %d\n",
