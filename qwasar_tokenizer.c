@@ -16,7 +16,7 @@
  * result is itself a vocabulary entry, so a merge is a lookup on a pair of ids
  * instead of a string concatenation and hash.
  *
- * Known gap: tokenizer.json specifies an NFC normalizer, which is not applied.
+ * NFC is applied when tokenizer.json declares it (both families do); see qw_nfc.
  * For ASCII and already-normalised text -- which is nearly everything -- it is
  * a no-op; decomposed input would tokenize differently from the reference. */
 
@@ -49,6 +49,9 @@ static bool qw_is_number(uint32_t cp) {
 }
 static bool qw_is_space(uint32_t cp) {
     return qw_in_ranges(qw_space_ranges, QW_SPACE_COUNT, cp);
+}
+static bool qw_is_mark(uint32_t cp) {
+    return qw_in_ranges(qw_mark_ranges, QW_MARK_COUNT, cp);
 }
 
 /* Decodes one UTF-8 codepoint; returns bytes consumed, 0 on malformed input. */
@@ -103,6 +106,15 @@ struct qwasar_tokenizer {
     int32_t   n_special;
 
     int32_t byte_token[256];   /* single-byte token per byte value */
+
+    /* Flash-Next's split regex: [\p{L}\p{M}]+ where the 27B's has \p{L}+,
+     * so combining marks ride with the letters they attach to instead of
+     * splitting off.  Read from tokenizer.json's own pattern, not from the
+     * model family, because it is the tokenizer's fact. */
+    bool marks_join;
+    /* tokenizer.json declares an NFC normalizer (both families do); decomposed
+     * input composes before it is split, or the ids differ. */
+    bool nfc;
 };
 
 static uint64_t qw_fnv(const char *s, size_t n) {
@@ -210,6 +222,17 @@ qwasar_tokenizer *qwasar_tokenizer_load(const char *model_path, char *err, size_
 
     const qj_node *root   = qj_root(&d);
     const qj_node *vocab  = qj_path(&d, root, "model.vocab");
+    bool marks_join = false;
+    {
+        const qj_node *pre = qj_path(&d, root, "pre_tokenizer.pretokenizers");
+        const qj_node *first = pre ? qj_idx(&d, pre, 0) : NULL;
+        const qj_node *rx = first ? qj_path(&d, first, "pattern.Regex") : NULL;
+        if (rx && rx->type == QJ_STRING) {
+            const char *p = d.text + rx->u.str.off;
+            for (uint32_t i = 0; i + 4 <= rx->u.str.len; i++)
+                if (!memcmp(p + i, "p{M}", 4)) { marks_join = true; break; }
+        }
+    }
     const qj_node *merges = qj_path(&d, root, "model.merges");
     const qj_node *added  = qj_get(&d, root, "added_tokens");
     if (!vocab) {
@@ -234,6 +257,13 @@ qwasar_tokenizer *qwasar_tokenizer_load(const char *model_path, char *err, size_
     qwasar_tokenizer *t = calloc(1, sizeof *t);
     if (!t) { qj_free(&d); snprintf(err, errcap, "out of memory"); return NULL; }
     t->n = max_id + 1;
+    t->marks_join = marks_join;
+    {
+        char ntype[16] = "";
+        const qj_node *norm = qj_get(&d, root, "normalizer");
+        if (norm) qj_str_copy(&d, norm, "type", ntype, sizeof ntype);
+        t->nfc = !strcmp(ntype, "NFC");
+    }
     t->off     = calloc((size_t)t->n, sizeof *t->off);
     t->len     = calloc((size_t)t->n, sizeof *t->len);
     t->special = calloc((size_t)t->n, sizeof *t->special);
@@ -397,7 +427,13 @@ int32_t qwasar_token_id(const qwasar_tokenizer *t, const char *literal) {
  * \p{N} has no quantifier: digits are emitted one at a time, which is what
  * makes this Qwen's variant rather than the more common \p{N}{1,3}. */
 
-typedef struct { const char *s; size_t len, pos; } qw_scan;
+typedef struct { const char *s; size_t len, pos; bool marks; } qw_scan;
+
+/* A letter for the purposes of a run: \p{L}, or \p{M} too under
+ * Flash-Next's pattern. */
+static bool qw_run_char(const qw_scan *sc, uint32_t cp) {
+    return qw_is_letter(cp) || (sc->marks && qw_is_mark(cp));
+}
 
 static uint32_t qw_peek(const qw_scan *sc, size_t at, int *adv) {
     uint32_t cp = 0;
@@ -431,16 +467,18 @@ static size_t qw_next_piece(qw_scan *sc) {
             if (qw_ci_match(s, len, p, forms[i])) return p + strlen(forms[i]);
     }
 
-    /* 2. [^\r\n\p{L}\p{N}]? \p{L}+ */
+    /* 2. [^\r\n\p{L}\p{N}]? \p{L}+   -- or [\p{L}\p{M}]+ with marks joining.
+     * A leading mark is then part of the run, never the optional character:
+     * the regex would backtrack to the same answer. */
     {
         size_t q = p;
         uint32_t cp = qw_peek(sc, q, &adv);
-        if (adv && cp != '\r' && cp != '\n' && !qw_is_letter(cp) && !qw_is_number(cp))
+        if (adv && cp != '\r' && cp != '\n' && !qw_run_char(sc, cp) && !qw_is_number(cp))
             q += (size_t)adv;   /* optional single leading character */
         size_t letters = q;
         for (;;) {
             uint32_t c2 = qw_peek(sc, letters, &adv);
-            if (!adv || !qw_is_letter(c2)) break;
+            if (!adv || !qw_run_char(sc, c2)) break;
             letters += (size_t)adv;
         }
         if (letters > q) return letters;   /* needs at least one letter */
@@ -452,14 +490,14 @@ static size_t qw_next_piece(qw_scan *sc) {
         if (adv && qw_is_number(cp)) return p + (size_t)adv;
     }
 
-    /* 4. " ?" [^\s\p{L}\p{N}]+ [\r\n]* */
+    /* 4. " ?" [^\s\p{L}\p{N}]+ [\r\n]*   -- marks excluded too when they join */
     {
         size_t q = p;
         if (s[q] == ' ') q++;
         size_t body = q;
         for (;;) {
             uint32_t cp = qw_peek(sc, body, &adv);
-            if (!adv || qw_is_space(cp) || qw_is_letter(cp) || qw_is_number(cp)) break;
+            if (!adv || qw_is_space(cp) || qw_run_char(sc, cp) || qw_is_number(cp)) break;
             body += (size_t)adv;
         }
         if (body > q) {
@@ -564,9 +602,184 @@ static bool qw_bpe_piece(const qwasar_tokenizer *t, const char *s, size_t n,
     return ok;
 }
 
+
+/* ---- NFC ---------------------------------------------------------------------
+ *
+ * Canonical decomposition, canonical ordering, canonical composition -- UAX
+ * #15's three steps, over tables tools/gen_unicode.py derived from Python's
+ * unicodedata (NFD strings for the decompositions, so no recursion here;
+ * primary composites only, so the exclusions are already applied).  Hangul
+ * syllables are arithmetic, as the standard specifies.  Compatibility forms
+ * are not NFC's business and pass through. */
+
+static const qw_nfd_entry *qw_nfd_find(uint32_t cp) {
+    size_t lo = 0, hi = QW_NFD_COUNT;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (qw_nfd_index[mid].cp < cp) lo = mid + 1;
+        else if (qw_nfd_index[mid].cp > cp) hi = mid;
+        else return &qw_nfd_index[mid];
+    }
+    return NULL;
+}
+
+static uint8_t qw_ccc(uint32_t cp) {
+    size_t lo = 0, hi = QW_CCC_COUNT;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (qw_ccc_table[mid].cp < cp) lo = mid + 1;
+        else if (qw_ccc_table[mid].cp > cp) hi = mid;
+        else return qw_ccc_table[mid].ccc;
+    }
+    return 0;
+}
+
+#define QW_HANGUL_S     0xAC00
+#define QW_HANGUL_L     0x1100
+#define QW_HANGUL_V     0x1161
+#define QW_HANGUL_T     0x11A7
+#define QW_HANGUL_LCNT  19
+#define QW_HANGUL_VCNT  21
+#define QW_HANGUL_TCNT  28
+#define QW_HANGUL_NCNT  (QW_HANGUL_VCNT * QW_HANGUL_TCNT)
+#define QW_HANGUL_SCNT  (QW_HANGUL_LCNT * QW_HANGUL_NCNT)
+
+/* A starter that can be the second of a composing pair (jamo, and a few
+ * others); the reason already-composed text cannot be recognised by the
+ * absence of combining marks alone. */
+static bool qw_composes_as_second(uint32_t cp) {
+    if (cp >= QW_HANGUL_V && cp < QW_HANGUL_T + QW_HANGUL_TCNT) return true;
+    size_t lo = 0, hi = QW_COMPOSE_SECOND_COUNT;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (qw_compose_second[mid] < cp) lo = mid + 1;
+        else if (qw_compose_second[mid] > cp) hi = mid;
+        else return true;
+    }
+    return false;
+}
+
+/* The primary composite of a and b, or 0. */
+static uint32_t qw_compose_pair(uint32_t a, uint32_t b) {
+    /* Hangul: L + V, then LV + T. */
+    if (a >= QW_HANGUL_L && a < QW_HANGUL_L + QW_HANGUL_LCNT
+        && b >= QW_HANGUL_V && b < QW_HANGUL_V + QW_HANGUL_VCNT)
+        return QW_HANGUL_S + ((a - QW_HANGUL_L) * QW_HANGUL_VCNT + (b - QW_HANGUL_V)) * QW_HANGUL_TCNT;
+    if (a >= QW_HANGUL_S && a < QW_HANGUL_S + QW_HANGUL_SCNT && (a - QW_HANGUL_S) % QW_HANGUL_TCNT == 0
+        && b > QW_HANGUL_T && b < QW_HANGUL_T + QW_HANGUL_TCNT)
+        return a + (b - QW_HANGUL_T);
+    size_t lo = 0, hi = QW_COMPOSE_COUNT;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        const qw_compose_entry *e = &qw_compose_table[mid];
+        if (e->a < a || (e->a == a && e->b < b)) lo = mid + 1;
+        else if (e->a > a || e->b > b) hi = mid;
+        else return e->c;
+    }
+    return 0;
+}
+
+static size_t qw_utf8_put(char *out, uint32_t cp) {
+    if (cp < 0x80)    { out[0] = (char)cp; return 1; }
+    if (cp < 0x800)   { out[0] = (char)(0xC0 | (cp >> 6)); out[1] = (char)(0x80 | (cp & 0x3F)); return 2; }
+    if (cp < 0x10000) { out[0] = (char)(0xE0 | (cp >> 12)); out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[2] = (char)(0x80 | (cp & 0x3F)); return 3; }
+    out[0] = (char)(0xF0 | (cp >> 18)); out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (char)(0x80 | (cp & 0x3F)); return 4;
+}
+
+/* NFC of `s`, malloc'd; NULL if the input is already composed (the common
+ * case, detected cheaply: nothing decomposable and no combining marks). */
+static char *qw_nfc(const char *s, size_t len, size_t *out_len) {
+    /* Decode, decomposing as we go.  Worst-case growth is a Hangul syllable
+     * into three jamo or a decomposition of four codepoints. */
+    size_t cap = len * 4 + 8, n = 0;
+    uint32_t *d = malloc(cap * sizeof *d);
+    bool touched = false;
+    for (size_t i = 0; i < len; ) {
+        uint32_t cp;
+        int adv = qw_utf8_next(s + i, len - i, &cp);
+        if (adv <= 0) { cp = 0xFFFD; adv = 1; }
+        i += (size_t)adv;
+        if (cp >= QW_HANGUL_S && cp < QW_HANGUL_S + QW_HANGUL_SCNT) {
+            const uint32_t si = cp - QW_HANGUL_S;
+            d[n++] = QW_HANGUL_L + si / QW_HANGUL_NCNT;
+            d[n++] = QW_HANGUL_V + (si % QW_HANGUL_NCNT) / QW_HANGUL_TCNT;
+            if (si % QW_HANGUL_TCNT) d[n++] = QW_HANGUL_T + si % QW_HANGUL_TCNT;
+            touched = true;
+            continue;
+        }
+        const qw_nfd_entry *e = qw_nfd_find(cp);
+        if (e) {
+            for (uint32_t k = 0; k < e->len; k++) d[n++] = qw_nfd_data[e->off + k];
+            touched = true;
+        } else {
+            d[n++] = cp;
+            if (qw_ccc(cp) || qw_composes_as_second(cp)) touched = true;
+        }
+    }
+    if (!touched) { free(d); return NULL; }
+
+    /* Canonical ordering: stable sort of every run of non-starters by class. */
+    for (size_t i = 0; i < n; ) {
+        if (!qw_ccc(d[i])) { i++; continue; }
+        size_t j = i;
+        while (j < n && qw_ccc(d[j])) j++;
+        for (size_t a = i + 1; a < j; a++)
+            for (size_t b = a; b > i && qw_ccc(d[b - 1]) > qw_ccc(d[b]); b--) {
+                uint32_t t = d[b]; d[b] = d[b - 1]; d[b - 1] = t;
+            }
+        i = j;
+    }
+
+    /* Canonical composition, the sample algorithm from UAX #15. */
+    if (n > 0) {
+        size_t starter = 0, w = 1;
+        uint32_t starter_cp = d[0];
+        int last_class = qw_ccc(starter_cp) ? 256 : 0;
+        for (size_t i = 1; i < n; i++) {
+            const uint32_t ch = d[i];
+            const int cls = qw_ccc(ch);
+            const uint32_t comp = qw_compose_pair(starter_cp, ch);
+            if (comp && (last_class < cls || last_class == 0)) {
+                d[starter] = comp;
+                starter_cp = comp;
+            } else {
+                if (cls == 0) { starter = w; starter_cp = ch; }
+                last_class = cls;
+                d[w++] = ch;
+            }
+        }
+        n = w;
+    }
+
+    char *out = malloc(n * 4 + 1);
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++) w += qw_utf8_put(out + w, d[i]);
+    out[w] = 0;
+    free(d);
+    *out_len = w;
+    return out;
+}
+
+static bool qw_encode_pieces(const qwasar_tokenizer *t, const char *text, size_t len, qw_tokvec *out);
+
 static bool qw_encode_into(const qwasar_tokenizer *t, const char *text, size_t len,
                            qw_tokvec *out) {
-    qw_scan sc = { text, len, 0 };
+    char *normed = NULL;
+    if (t->nfc) {
+        size_t nlen = 0;
+        normed = qw_nfc(text, len, &nlen);
+        if (normed) { text = normed; len = nlen; }
+    }
+    bool ok = qw_encode_pieces(t, text, len, out);
+    free(normed);
+    return ok;
+}
+
+static bool qw_encode_pieces(const qwasar_tokenizer *t, const char *text, size_t len,
+                             qw_tokvec *out) {
+    qw_scan sc = { text, len, 0, t->marks_join };
     while (sc.pos < len) {
         size_t end = qw_next_piece(&sc);
         if (end <= sc.pos) end = sc.pos + 1;

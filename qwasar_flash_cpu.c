@@ -103,6 +103,16 @@ void qw_ple_multipliers(int64_t out[8], int64_t unigram_vocab, int32_t ngram_siz
     }
 }
 
+const uint16_t *qw_ple_row(const qw_ple *P, int64_t row) {
+    int32_t lo = 0, hi = P->n_shards - 1;
+    while (lo < hi) {
+        const int32_t mid = (lo + hi + 1) / 2;
+        if (P->shard_start[mid] <= row) lo = mid; else hi = mid - 1;
+    }
+    const qw_tensor *t = P->shard[lo];
+    return (const uint16_t *)qw_tensor_data(t) + (size_t)(row - P->shard_start[lo]) * P->head_dim;
+}
+
 /* torch.remainder: the result takes the divisor's sign, i.e. non-negative. */
 static int64_t pymod(int64_t a, int64_t p) {
     int64_t r = a % p;
@@ -528,10 +538,10 @@ static void ple_step(qw_flash_ref *r, const qw_ple *P, const float *h4, float *o
     int64_t ids[QW_MAX_NGRAM_HEADS];
     qw_ple_ids(P, c, r->hist, pos - 1 - r->last_eos, ids);
     float *emb = malloc((size_t)E * sizeof(float));
-    const uint16_t *table = (const uint16_t *)tdata(P->table);
-    for (int32_t h = 0; h < NH; h++)
-        for (int32_t i = 0; i < HD; i++)
-            emb[(size_t)h * HD + i] = qw_bf16_to_f32_c(table[(size_t)ids[h] * HD + i]);
+    for (int32_t h = 0; h < NH; h++) {
+        const uint16_t *row = qw_ple_row(P, ids[h]);
+        for (int32_t i = 0; i < HD; i++) emb[(size_t)h * HD + i] = qw_bf16_to_f32_c(row[i]);
+    }
     (void)per; (void)eos;
 
     float *key = malloc((size_t)HH * sizeof(float));

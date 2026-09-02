@@ -63,15 +63,20 @@ typedef enum {
 const char *qw_dtype_name(qw_dtype d);
 size_t      qw_dtype_size(qw_dtype d);
 
-/* One tensor, addressed as an offset into the buffer wrapping its shard. */
+/* One tensor, addressed as an offset into the buffer wrapping its shard --
+ * or, for a shard placed on the host only (the engram table: read by row,
+ * never a GPU operand, and too large for one device buffer), a plain
+ * pointer into its mapping with no buffer at all. */
 typedef struct {
     const char *name;      /* points into the owned name arena */
-    qw_buf      buf;
+    qw_buf      buf;       /* NULL for a host-only shard */
     size_t      offset;    /* byte offset within buf */
     size_t      nbytes;
     qw_dtype    dtype;
     int         ndim;
     int64_t     shape[QW_MAX_DIMS];
+    const void *cpu;       /* the bytes, for a host-only shard; last, so the
+                              positional initialisers elsewhere stay valid */
 } qw_tensor;
 
 /* A quantised linear: MLX affine, 4 bits, group_size 64.
@@ -142,8 +147,15 @@ typedef struct {
 /* The engram (PLE) layer: hashed n-gram embeddings gated into every stream.
  * The hash constants are derived from config at bind time; the checkpoint's
  * own copies are the cross-check. */
+#define QW_MAX_ENGRAM_SHARDS 512
+
 typedef struct {
-    const qw_tensor *table;          /* BF16 [rows, head_dim]; cold, gathered by row */
+    /* The table, BF16 [rows, head_dim], in row-contiguous shards -- 128 of
+     * ~2.5M rows in the real checkpoint, host-only (see qw_tensor.cpu).
+     * shard_start[i] is the first global row of shard i; [n_shards] the total. */
+    const qw_tensor *shard[QW_MAX_ENGRAM_SHARDS];
+    int64_t shard_start[QW_MAX_ENGRAM_SHARDS + 1];
+    int32_t n_shards;
     qw_qlinear key_proj, value_proj;
     const qw_tensor *norm_key, *norm_query, *norm_conv;   /* BF16 [hc*hidden], +1 folded */
     const qw_tensor *conv1d;         /* BF16 [hc*hidden, K, 1], tap 0 oldest, dilated */
@@ -550,5 +562,7 @@ void qw_ple_multipliers(int64_t out[8], int64_t unigram_vocab, int32_t ngram_siz
  * back, `in_seg` its position within the EOS-delimited segment. */
 void qw_ple_ids(const qw_ple *P, const qw_config *c, const int32_t *hist, int32_t in_seg,
                 int64_t *ids);
+/* One row of the engram table, wherever its shard is. */
+const uint16_t *qw_ple_row(const qw_ple *P, int64_t row);
 
 #endif /* QWASAR_MODEL_H */

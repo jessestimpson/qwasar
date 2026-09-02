@@ -34,11 +34,85 @@ def is_number(cp):
     return unicodedata.category(chr(cp)).startswith("N")
 
 
+def is_mark(cp):
+    # Category M: combining marks.  Flash-Next's split regex lets these ride
+    # with the letters they attach to ([\p{L}\p{M}]+); the 27B's does not.
+    return unicodedata.category(chr(cp)).startswith("M")
+
+
 def is_space(cp):
     ch = chr(cp)
     # Matches what a regex engine treats as \s: Unicode whitespace plus the
     # ASCII control whitespace that isspace() already covers.
     return ch.isspace() or unicodedata.category(ch) in ("Zs", "Zl", "Zp")
+
+
+def emit_nfc():
+    """Canonical decomposition, combining classes, and the primary composites:
+    the three tables NFC needs.  Hangul is algorithmic and not tabulated."""
+    nfd_index, nfd_data = [], []
+    ccc = []
+    compose = []
+    for cp in range(MAX):
+        if 0xD800 <= cp <= 0xDFFF or 0xAC00 <= cp <= 0xD7A3:
+            continue
+        ch = chr(cp)
+        d = unicodedata.normalize("NFD", ch)
+        if d != ch:
+            cps = [ord(c) for c in d]
+            nfd_index.append((cp, len(nfd_data), len(cps)))
+            nfd_data.extend(cps)
+            # A primary composite: its full decomposition composes back to it
+            # (composition exclusions and singletons do not), and its
+            # canonical decomposition is a pair.
+            raw = unicodedata.decomposition(ch)
+            if raw and not raw.startswith("<"):
+                parts = [int(x, 16) for x in raw.split()]
+                if len(parts) == 2 and unicodedata.normalize("NFC", chr(parts[0]) + chr(parts[1])) == ch:
+                    compose.append((parts[0], parts[1], cp))
+        c = unicodedata.combining(ch)
+        if c:
+            ccc.append((cp, c))
+    compose.sort()
+    print(f"/* NFC: {len(nfd_index)} decompositions, {len(ccc)} combining classes, "
+          f"{len(compose)} composites */", file=sys.stderr)
+
+    print("typedef struct { uint32_t cp, off, len; } qw_nfd_entry;")
+    print("static const qw_nfd_entry qw_nfd_index[] = {")
+    for i in range(0, len(nfd_index), 4):
+        print("    " + "".join("{0x%05X,%d,%d}," % e for e in nfd_index[i:i + 4]))
+    print("};")
+    print("#define QW_NFD_COUNT (sizeof qw_nfd_index / sizeof *qw_nfd_index)")
+    print("static const uint32_t qw_nfd_data[] = {")
+    for i in range(0, len(nfd_data), 8):
+        print("    " + "".join("0x%05X," % v for v in nfd_data[i:i + 8]))
+    print("};")
+    print()
+    print("typedef struct { uint32_t cp; uint8_t ccc; } qw_ccc_entry;")
+    print("static const qw_ccc_entry qw_ccc_table[] = {")
+    for i in range(0, len(ccc), 6):
+        print("    " + "".join("{0x%05X,%d}," % e for e in ccc[i:i + 6]))
+    print("};")
+    print("#define QW_CCC_COUNT (sizeof qw_ccc_table / sizeof *qw_ccc_table)")
+    print()
+    print("typedef struct { uint32_t a, b, c; } qw_compose_entry;")
+    print("static const qw_compose_entry qw_compose_table[] = {")
+    for i in range(0, len(compose), 3):
+        print("    " + "".join("{0x%05X,0x%05X,0x%05X}," % e for e in compose[i:i + 3]))
+    print("};")
+    print("#define QW_COMPOSE_COUNT (sizeof qw_compose_table / sizeof *qw_compose_table)")
+    print()
+    # Every character that can be the second of a composing pair and is not
+    # itself a combining mark: the fast path that skips NFC for already-
+    # composed text has to know these (Hangul jamo are algorithmic, handled
+    # in code).
+    seconds = sorted({b for _, b, _ in compose if not unicodedata.combining(chr(b))})
+    print("static const uint32_t qw_compose_second[] = {")
+    for i in range(0, len(seconds), 8):
+        print("    " + "".join("0x%05X," % v for v in seconds[i:i + 8]))
+    print("};")
+    print("#define QW_COMPOSE_SECOND_COUNT (sizeof qw_compose_second / sizeof *qw_compose_second)")
+    print()
 
 
 def emit(name, rs):
@@ -58,10 +132,11 @@ def main():
     print()
     print("typedef struct { uint32_t lo, hi; } qw_cp_range;")
     print()
-    for name, pred in (("letter", is_letter), ("number", is_number), ("space", is_space)):
+    for name, pred in (("letter", is_letter), ("number", is_number), ("space", is_space), ("mark", is_mark)):
         rs = ranges(pred)
         print(f"/* \\p{{{name[0].upper()}}}: {len(rs)} ranges */", file=sys.stderr)
         emit(name, rs)
+    emit_nfc()
 
 
 if __name__ == "__main__":
