@@ -903,3 +903,196 @@ void qw_op_argmax_top2(qw_cmd c, qw_ref out, qw_ref scratch, qw_ref logits,
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
+
+/* ---- Flash-Next (qwen4_exp) -- metal/sparse.metal --------------------------- */
+
+typedef struct { uint32_t rows, H, S; } qw_hc_args;
+typedef struct { uint32_t dim, groups, rows; float eps; } qw_gnorm_args;
+typedef struct { uint32_t n; float scale; } qw_scale_args;
+typedef struct { uint32_t rows, E, K, norm; } qw_route_args;
+typedef struct { uint32_t k, n, pairs, K, x_by_pair; } qw_bank_args;
+typedef struct { uint32_t pairs, I; } qw_swiglu_split_args;
+typedef struct { uint32_t rows, K, H; } qw_combine_args;
+typedef struct { uint32_t rows, dim; } qw_rowscale_args;
+typedef struct { uint32_t rows, nq, d, ratio, base_pos, rotary_dim, max_blocks; float eps; } qw_qsa_score_args;
+typedef struct { uint32_t rows, ratio, base_pos, block_topk, max_ctx, max_blocks; } qw_qsa_select_args;
+typedef struct { uint32_t channels, rows; } qw_dconv_args;
+
+/* The elementwise kernels share one launch shape. */
+static void qw_dispatch_threads(id<MTLComputeCommandEncoder> enc, NSUInteger n) {
+    [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+#define QW_BEGIN(name) \
+    if (!c || !c->enc) return; \
+    id<MTLComputePipelineState> ps = qw_pipeline(@name); \
+    if (!ps) return; \
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc; \
+    [enc setComputePipelineState:ps];
+
+void qw_op_repeat_cols(qw_cmd c, qw_ref h4, qw_ref x, int32_t rows, int32_t H, int32_t S) {
+    QW_BEGIN("qw_repeat_cols")
+    qw_set(enc, x, 0); qw_set(enc, h4, 1);
+    qw_hc_args args = { (uint32_t)rows, (uint32_t)H, (uint32_t)S };
+    [enc setBytes:&args length:sizeof args atIndex:2];
+    qw_dispatch_threads(enc, (NSUInteger)rows * H * S);
+}
+
+void qw_op_rms_norm_grouped(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight,
+                            int32_t dim, int32_t groups, int32_t rows, float eps) {
+    QW_BEGIN("qw_rms_norm_grouped")
+    qw_set(enc, x, 0); qw_set(enc, weight, 1); qw_set(enc, y, 2);
+    qw_gnorm_args args = { (uint32_t)dim, (uint32_t)groups, (uint32_t)rows, eps };
+    [enc setBytes:&args length:sizeof args atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows * groups, 1, 1)
+        threadsPerThreadgroup:qw_norm_threads(dim)];
+}
+
+void qw_op_silu_scale(qw_cmd c, qw_ref y, int32_t n, float scale) {
+    QW_BEGIN("qw_silu_scale")
+    qw_set(enc, y, 0);
+    qw_scale_args args = { (uint32_t)n, scale };
+    [enc setBytes:&args length:sizeof args atIndex:1];
+    qw_dispatch_threads(enc, (NSUInteger)n);
+}
+
+void qw_op_hc_mix(qw_cmd c, qw_ref x, qw_ref n, qw_ref m, int32_t rows, int32_t H, int32_t S) {
+    QW_BEGIN("qw_hc_mix")
+    qw_set(enc, n, 0); qw_set(enc, m, 1); qw_set(enc, x, 2);
+    qw_hc_args args = { (uint32_t)rows, (uint32_t)H, (uint32_t)S };
+    [enc setBytes:&args length:sizeof args atIndex:3];
+    qw_dispatch_threads(enc, (NSUInteger)rows * H);
+}
+
+void qw_op_hc_inject(qw_cmd c, qw_ref h4, qw_ref out, qw_ref inj, int32_t rows, int32_t H, int32_t S) {
+    QW_BEGIN("qw_hc_inject")
+    qw_set(enc, h4, 0); qw_set(enc, out, 1); qw_set(enc, inj, 2);
+    qw_hc_args args = { (uint32_t)rows, (uint32_t)H, (uint32_t)S };
+    [enc setBytes:&args length:sizeof args atIndex:3];
+    qw_dispatch_threads(enc, (NSUInteger)rows * H * S);
+}
+
+void qw_op_moe_route(qw_cmd c, qw_ref idx, qw_ref w, qw_ref logits,
+                     int32_t rows, int32_t E, int32_t K, bool norm) {
+    if (K > 32) { fprintf(stderr, "qwasar: moe top-k %d unsupported (max 32)\n", K); return; }
+    QW_BEGIN("qw_moe_route")
+    qw_set(enc, logits, 0); qw_set(enc, idx, 1); qw_set(enc, w, 2);
+    qw_route_args args = { (uint32_t)rows, (uint32_t)E, (uint32_t)K, norm ? 1u : 0u };
+    [enc setBytes:&args length:sizeof args atIndex:3];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+void qw_op_qmv_q4_bank(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
+                       qw_ref w, qw_ref scales, qw_ref biases,
+                       int32_t k, int32_t n, int32_t pairs, int32_t K, bool x_by_pair) {
+    QW_BEGIN("qw_qmv_q4_bank")
+    qw_set(enc, w, 0); qw_set(enc, scales, 1); qw_set(enc, biases, 2);
+    qw_set(enc, x, 3); qw_set(enc, idx, 4); qw_set(enc, y, 5);
+    qw_bank_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)pairs, (uint32_t)K, x_by_pair ? 1u : 0u };
+    [enc setBytes:&args length:sizeof args atIndex:6];
+    const NSUInteger kRows = 4, nsg = 8, per_tg = nsg * kRows;
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + per_tg - 1) / per_tg, (NSUInteger)pairs, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+}
+
+void qw_op_swiglu_split(qw_cmd c, qw_ref act, qw_ref gu, int32_t pairs, int32_t I) {
+    QW_BEGIN("qw_swiglu_split")
+    qw_set(enc, gu, 0); qw_set(enc, act, 1);
+    qw_swiglu_split_args args = { (uint32_t)pairs, (uint32_t)I };
+    [enc setBytes:&args length:sizeof args atIndex:2];
+    qw_dispatch_threads(enc, (NSUInteger)pairs * I);
+}
+
+void qw_op_moe_combine(qw_cmd c, qw_ref out, qw_ref y, qw_ref w, int32_t rows, int32_t K, int32_t H) {
+    QW_BEGIN("qw_moe_combine")
+    qw_set(enc, y, 0); qw_set(enc, w, 1); qw_set(enc, out, 2);
+    qw_combine_args args = { (uint32_t)rows, (uint32_t)K, (uint32_t)H };
+    [enc setBytes:&args length:sizeof args atIndex:3];
+    qw_dispatch_threads(enc, (NSUInteger)rows * H);
+}
+
+void qw_op_scale_rows_sigmoid(qw_cmd c, qw_ref y, qw_ref g, int32_t rows, int32_t dim) {
+    QW_BEGIN("qw_scale_rows_sigmoid")
+    qw_set(enc, y, 0); qw_set(enc, g, 1);
+    qw_rowscale_args args = { (uint32_t)rows, (uint32_t)dim };
+    [enc setBytes:&args length:sizeof args atIndex:2];
+    qw_dispatch_threads(enc, (NSUInteger)rows * dim);
+}
+
+void qw_op_rms_norm_gated_sigmoid(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight, qw_ref gate,
+                                  int32_t dim, int32_t rows, float eps, float out_scale) {
+    QW_BEGIN("qw_rms_norm_gated_sigmoid")
+    qw_set(enc, x, 0); qw_set(enc, weight.buf ? weight : x, 1); qw_set(enc, gate, 2); qw_set(enc, y, 3);
+    qw_norm_args args = { (uint32_t)dim, (uint32_t)rows, eps, out_scale, weight.buf ? 1u : 0u };
+    [enc setBytes:&args length:sizeof args atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:qw_norm_threads(dim)];
+}
+
+void qw_op_qsa_scores(qw_cmd c, qw_ref scores, qw_ref qn, qw_ref ikeys, qw_ref k_norm,
+                      qw_ref inv_freq, int32_t rows, int32_t nq, int32_t d, int32_t ratio,
+                      int32_t base_pos, int32_t rotary_dim, int32_t max_blocks, float eps) {
+    /* Lane strips of 32 put a rotary pair (j, j+32) in one lane; see the
+     * kernel.  The real model is 64/128, and so is the toy. */
+    if (rotary_dim != 64 || d % 32 != 0 || d > 256) {
+        fprintf(stderr, "qwasar: QSA indexer shape (rotary %d, head %d) unsupported\n", rotary_dim, d);
+        return;
+    }
+    QW_BEGIN("qw_qsa_scores")
+    qw_set(enc, qn, 0); qw_set(enc, ikeys, 1); qw_set(enc, k_norm, 2); qw_set(enc, inv_freq, 3); qw_set(enc, scores, 4);
+    qw_qsa_score_args args = { (uint32_t)rows, (uint32_t)nq, (uint32_t)d, (uint32_t)ratio,
+                               (uint32_t)base_pos, (uint32_t)rotary_dim, (uint32_t)max_blocks, eps };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+    const NSUInteger nsg = 8;
+    const NSUInteger blocks = (NSUInteger)((base_pos + rows) / ratio);
+    if (blocks == 0) return;
+    [enc dispatchThreadgroups:MTLSizeMake((blocks + nsg - 1) / nsg, (NSUInteger)rows, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+}
+
+void qw_op_qsa_select(qw_cmd c, qw_ref mask, qw_ref scores, int32_t rows, int32_t ratio,
+                      int32_t base_pos, int32_t block_topk, int32_t max_ctx, int32_t max_blocks) {
+    QW_BEGIN("qw_qsa_select")
+    qw_set(enc, scores, 0); qw_set(enc, mask, 1);
+    qw_qsa_select_args args = { (uint32_t)rows, (uint32_t)ratio, (uint32_t)base_pos,
+                                (uint32_t)block_topk, (uint32_t)max_ctx, (uint32_t)max_blocks };
+    [enc setBytes:&args length:sizeof args atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache, qw_ref mask,
+                       int32_t rows, int32_t q_heads, int32_t kv_heads, int32_t head_dim,
+                       int32_t max_ctx, int32_t base_pos, float scale) {
+    if (head_dim != 256) {
+        fprintf(stderr, "qwasar: attention head_dim %d unsupported (kernel is built for 256)\n", head_dim);
+        return;
+    }
+    QW_BEGIN("qw_attn_masked")
+    qw_set(enc, q, 0); qw_set(enc, kcache, 1); qw_set(enc, vcache, 2); qw_set(enc, out, 3); qw_set(enc, mask, 4);
+    qw_attn_args args = { (uint32_t)rows, (uint32_t)q_heads, (uint32_t)kv_heads,
+                          (uint32_t)(q_heads / kv_heads), (uint32_t)max_ctx, (uint32_t)base_pos, scale };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows * q_heads), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * 32, 1, 1)];
+}
+
+void qw_op_ple_gate(qw_cmd c, qw_ref gv, qw_ref keyn, qw_ref qn, qw_ref value,
+                    int32_t rows, int32_t H, int32_t S) {
+    QW_BEGIN("qw_ple_gate")
+    qw_set(enc, keyn, 0); qw_set(enc, qn, 1); qw_set(enc, value, 2); qw_set(enc, gv, 3);
+    qw_hc_args args = { (uint32_t)rows, (uint32_t)H, (uint32_t)S };
+    [enc setBytes:&args length:sizeof args atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(32 * (NSUInteger)S, 1, 1)];
+}
+
+void qw_op_conv1d_dilated_silu(qw_cmd c, qw_ref y, qw_ref x, qw_ref state, qw_ref weight,
+                               int32_t channels, int32_t rows, int32_t ksize, int32_t dilation) {
+    if (ksize != 4 || dilation != 3) {
+        fprintf(stderr, "qwasar: dilated conv %d/%d unsupported (kernel is built for 4/3)\n", ksize, dilation);
+        return;
+    }
+    QW_BEGIN("qw_conv1d_dilated_silu")
+    qw_set(enc, x, 0); qw_set(enc, state, 1); qw_set(enc, weight, 2); qw_set(enc, y, 3);
+    qw_dconv_args args = { (uint32_t)channels, (uint32_t)rows };
+    [enc setBytes:&args length:sizeof args atIndex:4];
+    qw_dispatch_threads(enc, (NSUInteger)channels);
+}

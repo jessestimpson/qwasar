@@ -11,9 +11,7 @@
  * same code path as decode with rows > 1.  That is why there is no separate
  * prefill graph. */
 
-#include "qwasar.h"
-#include "qwasar_gpu.h"
-#include "qwasar_model.h"
+#include "qwasar_session.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -29,128 +27,7 @@ static void qw_gerrf(char *err, size_t cap, const char *fmt, ...) {
     va_end(ap);
 }
 
-/* Scratch buffers, named by role rather than pooled.  At the default chunk size
- * these total a couple of hundred megabytes against a 25 GB budget, and keeping
- * them distinct makes the forward pass readable and debuggable. */
-struct qwasar_session {
-    qwasar_engine  *e;
-    const qw_config *cfg;
-    const qw_shape  *shape;
-
-    int32_t max_ctx;
-    int32_t max_rows;     /* prefill chunk */
-    int32_t n_past;
-
-    /* Per-layer state, packed across layers of the same kind. */
-    qw_buf kcache, vcache;   /* [n_full, kv_heads, max_ctx, head_dim] fp16 */
-    qw_buf ssm_state;        /* [n_linear, hv, dv, dk] fp32 */
-    qw_buf conv_state;       /* [n_linear, ksize-1, conv_dim] fp32 */
-    int32_t *kind_index;     /* layer -> index among its own kind */
-
-    /* rope tables */
-    qw_buf rope_axis, rope_inv_freq, positions;
-
-    /* activations */
-    qw_buf tokens, h, hn, hn2;
-    qw_buf qkv, z, a_proj, b_proj, g, beta;      /* gated delta */
-    qw_buf gq, gk, gv, gdn_y, gdn_norm;
-    qw_buf qg, q, gate, k, v, attn_out;          /* full attention */
-    qw_buf mlp_gate, mlp_up, mlp_act;            /* mlp */
-    qw_buf logits;
-
-    /* ---- MTP draft head -------------------------------------------------
-     *
-     * The head runs only after a base forward has completed, so it borrows
-     * that pass's scratch (hn, hn2, qg, q, gate, k, v, attn_out, mlp_*) and
-     * needs its own storage only for what has to outlive a step.
-     *
-     * `mtp_hidden` is [1 + max_rows, hidden].  Row 0 is the PENDING slot and
-     * the rest are the last forward's post-norm hidden states, and the offset
-     * is the whole bookkeeping: head row p is
-     *
-     *     fused(embed(token_{p+1}), hidden_p)
-     *
-     * so a position's hidden state pairs with the NEXT token, and the last
-     * position of any forward cannot be committed until that token exists.
-     * It waits in row 0 for the following step to supply it. */
-    /* Speculative verify: how many leading rows of the current forward should
-     * have their recurrent state saved, and where.  Zero on every ordinary
-     * pass, so nothing is written and nothing is allocated until a verify
-     * needs it.  Layout is [row][layer], so committing a boundary is one
-     * contiguous copy rather than a walk. */
-    int32_t n_snap;
-    qw_buf  ssm_snap, conv_snap, verify_logits;
-    int32_t snap_capacity;   /* rows the snapshot buffers were sized for */
-    bool    mtp_defer;       /* a verify hands its head upkeep to the next draft */
-
-    /* Committed head rows a verify left owed, carried to the next draft so the
-     * two become one pass over the head's weights instead of two.  Head row p
-     * needs token p+1, and after a verify the last of those tokens is the one
-     * the verify itself produced -- so the rows the verify could not commit and
-     * the row the draft wants are contiguous, with contiguous tokens. */
-    /* Adaptive depth.  `mtp_p[i]` estimates P(draft i accepted | 0..i-1 were),
-     * so these are conditional and multiply into a reach.  `mtp_margin` is the
-     * target's own top-2 logit gap at the boundary, which is evidence about the
-     * very next token that no amount of history has. */
-    double  mtp_p[QWASAR_MAX_DRAFT];
-    double  mtp_margin;
-    bool    mtp_p_seeded;
-
-    bool    mtp_after_verify;   /* the owed rows' hidden start at mtp_hidden[1] */
-    int32_t mtp_owed;           /* how many of them there are; may be zero */
-    int32_t mtp_owed_tokens[QWASAR_MAX_DRAFT + 1];
-
-    bool    mtp_on;
-    qw_buf  mtp_kcache, mtp_vcache;   /* [kv_heads, max_ctx, head_dim] fp16 */
-    int32_t mtp_n_past;               /* committed head rows */
-    qw_buf  mtp_hidden;               /* [1 + max_rows, hidden] fp32 */
-    bool    mtp_pending;              /* row 0 holds a hidden awaiting its token */
-    int32_t mtp_pending_pos;
-    qw_buf  mtp_tokens, mtp_positions;
-    qw_buf  mtp_embed, mtp_fused, mtp_h, mtp_out, mtp_logits;
-
-    /* Selection results, written by the GPU and read back once the command
-     * buffer they were encoded into has completed.  `sel_scratch` is the
-     * partial pass's workspace; neither is ever touched by the host between
-     * dispatch and wait.  Four kilobytes, so they are not worth deferring. */
-    qw_buf  sel_out, sel_scratch;
-
-    /* Acceptance, counted per draft position.  Drafting is free of the
-     * exactness surface, so these are the only way to know it is working. */
-    int64_t mtp_drafted[QWASAR_MAX_DRAFT];
-    int64_t mtp_accepted[QWASAR_MAX_DRAFT];
-
-    qwasar_progress_fn progress;
-    void              *progress_ud;
-
-    /* ---- images ---------------------------------------------------------
-     *
-     * An image reaches the text model as a run of already-encoded rows that
-     * replace the embeddings of its <|image_pad|> tokens, and as a stretch of
-     * positions where the three MRoPE axes stop agreeing.  Both are prepared
-     * for a whole prompt at once and consumed a chunk at a time, because the
-     * positions of a later chunk depend on every image before it. */
-    qw_buf   img_rows;        /* [total rows, hidden] fp32, all images */
-    int32_t  n_img_rows;
-    int32_t  img_cursor;      /* rows consumed, so a split run resumes right */
-    int32_t *mrope;           /* [3, n] for the attached prompt, or NULL */
-    int32_t  mrope_len;
-    /* Position bookkeeping only matters once an image has been seen.  Until
-     * then all three axes are the token index and n_past is the whole story,
-     * which is why this could be deferred for three milestones. */
-    bool     mrope_active;
-    int32_t  mrope_next;      /* the position a following text token takes */
-
-    /* Every token evaluated, in order.  Needed to key a disk checkpoint and to
-     * tell how much of an incoming prompt a checkpoint already covers. */
-    int32_t *history;
-    int32_t  n_history;
-
-    /* diagnostic capture (see qwasar_session_set_capture) */
-    int32_t *capture_layers;
-    int32_t  n_capture;
-    qw_buf   capture;
-};
+#include "qwasar_session.h"
 
 static bool qw_alloc_all(qwasar_session *s, char *err, size_t errcap) {
     const qw_config *c = s->cfg;
@@ -284,6 +161,10 @@ qwasar_session *qwasar_session_new(qwasar_engine *e, char *err, size_t errcap) {
         s->kind_index[i] = qw_layer_is_linear(s->cfg, i) ? lin++ : full++;
 
     if (!qw_alloc_all(s, err, errcap)) goto fail;
+    if (s->cfg->family == QW_FAMILY_QWEN4_EXP) {
+        s->flash = qw_flash_state_new(s, err, errcap);
+        if (!s->flash) goto fail;
+    }
     return s;
 
 fail:
@@ -308,6 +189,7 @@ void qwasar_session_free(qwasar_session *s) {
         &s->ssm_snap, &s->conv_snap, &s->verify_logits, &s->img_rows,
     };
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) qw_buf_free(*all[i]);
+    qw_flash_state_free(s->flash);
     qw_buf_free(s->capture);
     free(s->capture_layers);
     free(s->history);
@@ -317,6 +199,7 @@ void qwasar_session_free(qwasar_session *s) {
 }
 
 int32_t qwasar_session_n_past(const qwasar_session *s) { return s ? s->n_past : 0; }
+bool    qwasar_session_is_flash(const qwasar_session *s) { return s && s->flash; }
 
 const float *qwasar_session_logits(const qwasar_session *s) {
     return (s && s->n_past > 0) ? (const float *)qw_buf_contents(s->logits) : NULL;
@@ -470,10 +353,10 @@ const int32_t *qw_session_history(const qwasar_session *s, int32_t *n) {
 
 /* ---- the forward pass ------------------------------------------------------ */
 
-static qw_ref qw_off(qw_buf b, size_t elems) { return qw_ref_at(b, elems * 4); }
+qw_ref qw_off(qw_buf b, size_t elems) { return qw_ref_at(b, elems * 4); }
 
-static void qw_encode_qlinear(qw_cmd c, const qw_qlinear *ql, qw_ref out, qw_ref in,
-                              int32_t rows) {
+void qw_encode_qlinear(qw_cmd c, const qw_qlinear *ql, qw_ref out, qw_ref in,
+                       int32_t rows) {
     qw_op_qmat_q4(c, out, in, qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
                   qw_tensor_ref(ql->biases), ql->in_features, ql->out_features, rows);
 }
@@ -493,8 +376,8 @@ static void qw_encode_qlinear_rows(qw_cmd c, const qw_qlinear *ql, qw_ref out, q
                   ql->in_features, n_rows, rows);
 }
 
-static void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
-                                        const qw_layer *L, int32_t li, int32_t rows) {
+void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
+                                 const qw_layer *L, int32_t li, int32_t rows) {
     const qw_config *cfg = s->cfg;
     const qw_shape  *sh  = s->shape;
     const int32_t hv = cfg->linear_num_value_heads, hk = cfg->linear_num_key_heads;
@@ -526,12 +409,21 @@ static void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
                      2 * sh->key_dim, sh->value_dim);
 
     /* k = l2norm(k);  q = l2norm(q)/sqrt(dk).  Expressed as an unweighted RMS
-     * norm with a trailing scale -- see metal/norm.metal. */
+     * norm with a trailing scale -- see metal/norm.metal.
+     *
+     * Where the epsilon sits is a reference-convention question, and the two
+     * families' references disagree: mlx-vlm (the 27B's oracle) writes the
+     * l2norm as an RMS norm, eps inside the mean; transformers (Flash-Next's)
+     * writes x / sqrt(sum x^2 + 1e-6), eps on the sum.  The same kernel does
+     * either -- eps/dk in the mean is eps on the sum -- and each family gets
+     * its own oracle's convention, because on small vectors the two differ
+     * by more than the tolerance (measured at 0.7% on the toy). */
     const qw_ref no_weight = qw_ref_at(NULL, 0);
+    const float l2eps = cfg->family == QW_FAMILY_QWEN4_EXP ? 1e-6f / (float)dk : 1e-6f;
     qw_op_rms_norm(c, qw_ref_at(s->gq, 0), qw_ref_at(s->gq, 0), no_weight,
-                   dk, rows * hk, 1e-6f, 1.0f / (float)dk);
+                   dk, rows * hk, l2eps, 1.0f / (float)dk);
     qw_op_rms_norm(c, qw_ref_at(s->gk, 0), qw_ref_at(s->gk, 0), no_weight,
-                   dk, rows * hk, 1e-6f, 1.0f / sqrtf((float)dk));
+                   dk, rows * hk, l2eps, 1.0f / sqrtf((float)dk));
 
     qw_op_gdn_gates(c, qw_ref_at(s->g, 0), qw_ref_at(s->beta, 0),
                     qw_ref_at(s->a_proj, 0), qw_ref_at(s->b_proj, 0),
@@ -543,10 +435,16 @@ static void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
                       qw_off(s->ssm_snap, ssm_stride * li), s->n_snap,
                       (int32_t)(ssm_stride * sh->n_linear_attn_layers));
 
-    /* Output norm is per value head and gated by silu(z). */
-    qw_op_rms_norm_gated(c, qw_ref_at(s->gdn_norm, 0), qw_ref_at(s->gdn_y, 0),
-                         qw_tensor_ref(L->gdn_norm), qw_ref_at(s->z, 0),
-                         dv, rows * hv, cfg->rms_norm_eps, 1.0f);
+    /* Output norm is per value head and gated by the family's activation of
+     * z: silu for the 27B, sigmoid for Flash-Next (output_gate_type). */
+    if (cfg->gdn_gate_sigmoid)
+        qw_op_rms_norm_gated_sigmoid(c, qw_ref_at(s->gdn_norm, 0), qw_ref_at(s->gdn_y, 0),
+                                     qw_tensor_ref(L->gdn_norm), qw_ref_at(s->z, 0),
+                                     dv, rows * hv, cfg->rms_norm_eps, 1.0f);
+    else
+        qw_op_rms_norm_gated(c, qw_ref_at(s->gdn_norm, 0), qw_ref_at(s->gdn_y, 0),
+                             qw_tensor_ref(L->gdn_norm), qw_ref_at(s->z, 0),
+                             dv, rows * hv, cfg->rms_norm_eps, 1.0f);
 
     qw_encode_qlinear(c, &L->out_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->gdn_norm, 0), rows);
 }
@@ -752,6 +650,8 @@ static void qw_encode_mtp_upkeep(qwasar_session *s, qw_cmd c, int32_t rows) {
 static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool want_logits) {
     const qw_config *cfg = s->cfg;
     qwasar_engine *e = s->e;
+
+    if (s->flash) { qw_flash_encode_forward(s, c, rows, want_logits); return; }
 
     qw_op_embed_q4(c, qw_ref_at(s->h, 0), qw_ref_at(s->tokens, 0),
                    qw_tensor_ref(qwasar_engine_embed(e)->weight),
@@ -1245,6 +1145,7 @@ static int32_t qw_verify(qwasar_session *s, const int32_t *block, int32_t n_bloc
 
 int32_t qwasar_session_verify(qwasar_session *s, const int32_t *block, int32_t n_block,
                               int32_t *out, char *err, size_t errcap) {
+    if (s && s->flash) { qw_gerrf(err, errcap, "speculation is not implemented for qwen4_exp yet"); return -1; }
     return qw_verify(s, block, n_block, NULL, NULL, out, err, errcap);
 }
 
@@ -1252,6 +1153,7 @@ int32_t qwasar_session_verify_sampled(qwasar_session *s, const int32_t *block,
                                       int32_t n_block, const qwasar_sampling *sp,
                                       uint64_t *rng, int32_t *out,
                                       char *err, size_t errcap) {
+    if (s && s->flash) { qw_gerrf(err, errcap, "speculation is not implemented for qwen4_exp yet"); return -1; }
     return qw_verify(s, block, n_block, sp, rng, out, err, errcap);
 }
 
@@ -1410,6 +1312,10 @@ static bool qw_build_mrope(qwasar_session *s, const int32_t *tokens, int32_t n,
 const float *qwasar_session_eval_images(qwasar_session *s, const int32_t *tokens,
                                         int32_t n, const qwasar_image_input *im,
                                         int32_t n_images, char *err, size_t errcap) {
+    if (s && s->flash && n_images > 0) {
+        qw_gerrf(err, errcap, "vision is not implemented for qwen4_exp yet (PLAN-flash-next.md)");
+        return NULL;
+    }
     if (n_images > 0) {
         if (!qwasar_session_attach_images(s, im, n_images, err, errcap)) return NULL;
         if (!qw_build_mrope(s, tokens, n, im, n_images, err, errcap)) return NULL;
@@ -1470,6 +1376,8 @@ const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32
         /* The array already accounts for the whole prompt, so only the plain
          * path advances the counter. */
         if (!from_array && s->mrope_active) s->mrope_next += rows;
+
+        if (s->flash) qw_flash_prepare_chunk(s, tokens + done, rows);
 
         qw_cmd c = qw_cmd_begin();
         if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return NULL; }

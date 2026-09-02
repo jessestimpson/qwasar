@@ -21,7 +21,7 @@ LDLIBS   ?= -lm -pthread -framework Foundation -framework Metal \
 # files are concatenated into a single translation unit, so it must come first.
 METAL_SRCS := metal/common.metal \
               $(filter-out metal/common.metal,$(sort $(wildcard metal/*.metal)))
-CORE_OBJS  := qwasar.o qwasar_graph.o qwasar_kvstore.o qwasar_tokenizer.o qwasar_flash_cpu.o \
+CORE_OBJS  := qwasar.o qwasar_graph.o qwasar_kvstore.o qwasar_tokenizer.o qwasar_flash_cpu.o qwasar_flash_graph.o \
               qwasar_toolcall.o qwasar_sample.o qwasar_json.o qwasar_cpu.o \
               qwasar_image.o qwasar_video.o qwasar_vision.o qwasar_metal.o
 
@@ -72,7 +72,7 @@ qwasar_metal.o: qwasar_metal.m qwasar_gpu.h qwasar_metal_src.inc
 	$(CC) $(OBJCFLAGS) -c -o $@ $<
 
 qwasar.o:      qwasar.c qwasar.h qwasar_gpu.h qwasar_json.h qwasar_model.h
-qwasar_graph.o: qwasar_graph.c qwasar.h qwasar_gpu.h qwasar_model.h
+qwasar_graph.o: qwasar_graph.c qwasar.h qwasar_gpu.h qwasar_model.h qwasar_session.h
 qwasar_image.o: qwasar_image.c qwasar_model.h qwasar.h vendor/stb_image.h
 qwasar_video.o: qwasar_video.m qwasar_model.h
 	$(CC) $(OBJCFLAGS) -c -o $@ $<
@@ -82,6 +82,8 @@ qwasar_sample.o: qwasar_sample.c qwasar.h
 qwasar_tokenizer.o: qwasar_tokenizer.c qwasar.h qwasar_json.h qwasar_unicode.inc
 qwasar_toolcall.o: qwasar_toolcall.c qwasar_toolcall.h
 qwasar_cpu.o:  qwasar_cpu.c qwasar_model.h
+qwasar_flash_cpu.o: qwasar_flash_cpu.c qwasar_model.h qwasar_gpu.h
+qwasar_flash_graph.o: qwasar_flash_graph.c qwasar_session.h qwasar_model.h qwasar_gpu.h
 qwasar_json.o: qwasar_json.c qwasar_json.h
 qwasar_cli.o:  qwasar_cli.c qwasar.h qwasar_gpu.h
 
@@ -95,10 +97,13 @@ QWASAR_TEST_MTP ?= $(HOME)/.cache/qwasar/mtp/Qwen3.8-27B-MTP-bf16
 
 TESTS := tests/test_json tests/test_toolcall tests/test_sample tests/test_tokenizer tests/test_qmv tests/test_ops \
          tests/test_gdn tests/test_attn tests/test_kvstore tests/test_mtp tests/test_verify tests/test_vision tests/test_forward \
-         tests/test_select tests/test_tui tests/test_flashnext
+         tests/test_select tests/test_tui tests/test_flashnext tests/test_sparse
 
 tests/test_flashnext: tests/test_flashnext.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_flashnext.c $(CORE_OBJS) $(LDLIBS)
+
+tests/test_sparse: tests/test_sparse.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_sparse.c $(CORE_OBJS) $(LDLIBS)
 
 tests/test_tui: tests/test_tui.c qwasar_tui.o linenoise.o qwasar_tui.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_tui.c qwasar_tui.o linenoise.o $(LDLIBS)

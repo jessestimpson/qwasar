@@ -559,6 +559,9 @@ static bool qw_load_config(qwasar_engine *e, char *err, size_t errcap) {
         char gate[32] = "";
         qj_str_copy(&d, tc, "output_gate_type", gate, sizeof gate);
         c->gdn_gate_sigmoid = !strcmp(gate, "sigmoid");
+        /* The dense-MLP scratch is sized from this; the family has no dense
+         * MLP, so it gets the expert width and the buffers stay small. */
+        if (c->intermediate_size <= 0) c->intermediate_size = c->moe_intermediate_size;
         if (c->indexer_kv_heads != 1) {
             qw_errf(err, errcap, "qwen4_exp: indexer_kv_heads must be 1, got %d", c->indexer_kv_heads);
             qj_free(&d);
@@ -1482,6 +1485,11 @@ qwasar_engine *qwasar_engine_load(const qwasar_options *opts, char *err, size_t 
     if (!qw_load_shards(e, err, errcap))   goto fail;
     if (!qw_table_index(&e->tensors))      { qw_errf(err, errcap, "out of memory"); goto fail; }
     if (!qw_bind_weights(e, err, errcap))  goto fail;
+    if (opts->mtp_path && *opts->mtp_path && e->config.family == QW_FAMILY_QWEN4_EXP) {
+        qw_errf(err, errcap, "the MTP draft head is not implemented for qwen4_exp yet "
+                             "(PLAN-flash-next.md, Phase 7)");
+        goto fail;
+    }
     if (opts->mtp_path && *opts->mtp_path
         && !qw_load_mtp(e, opts->mtp_path, err, errcap)) goto fail;
     return e;

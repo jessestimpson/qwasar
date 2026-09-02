@@ -513,6 +513,15 @@ void qw_cpu_attn_decode(float *out, const float *q, const uint16_t *kc,
 void qw_cpu_dequant_row(float *out, const uint32_t *w, const uint16_t *scales,
                         const uint16_t *biases, int32_t k, int32_t row);
 
+/* Diagnostics for the Metal forward: stop after `layer` (-1 runs it all),
+ * and read the residual streams of the last chunk, [rows, hc_hidden]. */
+void         qw_flash_debug_stop(qwasar_session *s, int32_t layer);
+const float *qw_flash_debug_h4(const qwasar_session *s);
+
+/* Whether a session runs the qwen4_exp family (its state includes the
+ * indexer and engram caches the checkpoint format does not carry yet). */
+bool qwasar_session_is_flash(const qwasar_session *s);
+
 /* ---- Flash-Next CPU reference (qwasar_flash_cpu.c) -------------------------
  *
  * A whole-model scalar forward for the qwen4_exp family, one token at a
@@ -527,9 +536,19 @@ void          qw_flash_ref_free(qw_flash_ref *r);
  * layer: [num_hidden_layers, hc_hidden]. */
 bool qw_flash_ref_forward(qw_flash_ref *r, const int32_t *tokens, int32_t n,
                           float *logits, float *hidden_last, char *err, size_t errcap);
+/* Diagnostics: what the reference chose (experts per token, the QSA mask
+ * per query) and how decisively (the k-th minus (k+1)-th block score). */
+void           qw_flash_ref_debug(qw_flash_ref *r, bool on);
+const int32_t *qw_flash_ref_routes(const qw_flash_ref *r, int32_t layer, int32_t pos);
+const uint8_t *qw_flash_ref_mask(const qw_flash_ref *r, int32_t layer, int32_t pos);
+float          qw_flash_ref_select_gap(const qw_flash_ref *r, int32_t layer, int32_t pos);
 /* The engram hash, exposed for the cross-check against the checkpoint's
  * own multipliers. */
 void qw_ple_multipliers(int64_t out[8], int64_t unigram_vocab, int32_t ngram_size,
                         int32_t ple_layer_index, int32_t seed);
+/* The n-gram ids for one token; `hist[0]` is the token, hist[s] the token s
+ * back, `in_seg` its position within the EOS-delimited segment. */
+void qw_ple_ids(const qw_ple *P, const qw_config *c, const int32_t *hist, int32_t in_seg,
+                int64_t *ids);
 
 #endif /* QWASAR_MODEL_H */

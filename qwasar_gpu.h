@@ -337,4 +337,53 @@ void qw_op_argmax_top2(qw_cmd c, qw_ref out, qw_ref scratch, qw_ref logits,
                        int32_t n, int32_t rows, qw_ref token_out,
                        int32_t prefix, int32_t tail_base);
 
+/* ---- Flash-Next (qwen4_exp) -- metal/sparse.metal ---------------------------
+ *
+ * The family's own kernels; each is a transcription of qwasar_flash_cpu.c and
+ * is held to it by tests/test_flashnext.  Shapes follow PLAN-flash-next.md. */
+
+/* h4[r, s*H+i] = x[r, i]: the embedding repeated into every stream. */
+void qw_op_repeat_cols(qw_cmd c, qw_ref h4, qw_ref x, int32_t rows, int32_t H, int32_t S);
+/* Grouped RMS norm: `groups` streams of `dim` per row, weight [groups*dim]. */
+void qw_op_rms_norm_grouped(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight,
+                            int32_t dim, int32_t groups, int32_t rows, float eps);
+/* y = silu(y * scale) in place. */
+void qw_op_silu_scale(qw_cmd c, qw_ref y, int32_t n, float scale);
+/* x[r] = mean over streams of sigmoid(m) * n. */
+void qw_op_hc_mix(qw_cmd c, qw_ref x, qw_ref n, qw_ref m, int32_t rows, int32_t H, int32_t S);
+/* h4 += out (x) 2*sigmoid(inj / S), per stream. */
+void qw_op_hc_inject(qw_cmd c, qw_ref h4, qw_ref out, qw_ref inj, int32_t rows, int32_t H, int32_t S);
+/* Softmax over E router logits in fp32, top-K, renormalised when `norm`. */
+void qw_op_moe_route(qw_cmd c, qw_ref idx, qw_ref w, qw_ref logits,
+                     int32_t rows, int32_t E, int32_t K, bool norm);
+/* y[p] = bank[idx[p]] . x[x_by_pair ? p : p / K] for `pairs` (token, slot) pairs. */
+void qw_op_qmv_q4_bank(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
+                       qw_ref w, qw_ref scales, qw_ref biases,
+                       int32_t k, int32_t n, int32_t pairs, int32_t K, bool x_by_pair);
+/* act[p, i] = silu(gu[p, i]) * gu[p, I+i]. */
+void qw_op_swiglu_split(qw_cmd c, qw_ref act, qw_ref gu, int32_t pairs, int32_t I);
+/* out[r] = sum_k w[r, k] * y[r*K + k]. */
+void qw_op_moe_combine(qw_cmd c, qw_ref out, qw_ref y, qw_ref w, int32_t rows, int32_t K, int32_t H);
+/* y[r, :] *= sigmoid(g[r]). */
+void qw_op_scale_rows_sigmoid(qw_cmd c, qw_ref y, qw_ref g, int32_t rows, int32_t dim);
+/* rms_norm(x, weight) * sigmoid(gate): the family's delta-net output gate. */
+void qw_op_rms_norm_gated_sigmoid(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight, qw_ref gate,
+                                  int32_t dim, int32_t rows, float eps, float out_scale);
+/* QSA: block scores for `rows` queries against a layer's raw index-key
+ * cache; then the top-k blocks (plus the tail) into a byte mask over cache
+ * positions; then attention that sees only masked-in positions. */
+void qw_op_qsa_scores(qw_cmd c, qw_ref scores, qw_ref qn, qw_ref ikeys, qw_ref k_norm,
+                      qw_ref inv_freq, int32_t rows, int32_t nq, int32_t d, int32_t ratio,
+                      int32_t base_pos, int32_t rotary_dim, int32_t max_blocks, float eps);
+void qw_op_qsa_select(qw_cmd c, qw_ref mask, qw_ref scores, int32_t rows, int32_t ratio,
+                      int32_t base_pos, int32_t block_topk, int32_t max_ctx, int32_t max_blocks);
+void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache, qw_ref mask,
+                       int32_t rows, int32_t q_heads, int32_t kv_heads, int32_t head_dim,
+                       int32_t max_ctx, int32_t base_pos, float scale);
+/* PLE: the per-stream gate, and the dilated depthwise conv (kernel 4, dilation 3). */
+void qw_op_ple_gate(qw_cmd c, qw_ref gv, qw_ref keyn, qw_ref qn, qw_ref value,
+                    int32_t rows, int32_t H, int32_t S);
+void qw_op_conv1d_dilated_silu(qw_cmd c, qw_ref y, qw_ref x, qw_ref state, qw_ref weight,
+                               int32_t channels, int32_t rows, int32_t ksize, int32_t dilation);
+
 #endif /* QWASAR_GPU_H */

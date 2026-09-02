@@ -9,15 +9,15 @@
   "eos_token_id": 251,
   "hc_count": 4,
   "hc_lowrank": 64,
-  "head_dim": 16,
+  "head_dim": 256,
   "heads_per_ngram": 8,
   "hidden_act": "silu",
   "hidden_size": 64,
   "indexer_budget": 8,
   "indexer_compress_ratio": 4,
-  "indexer_head_dim": 8,
+  "indexer_head_dim": 128,
   "indexer_kv_heads": 1,
-  "indexer_n_heads": 2,
+  "indexer_n_heads": 16,
   "initializer_range": 0.02,
   "layer_types": [
     "linear_attention",
@@ -30,10 +30,10 @@
     "qwen_sparse_attention"
   ],
   "linear_conv_kernel_dim": 4,
-  "linear_key_head_dim": 16,
+  "linear_key_head_dim": 128,
   "linear_num_key_heads": 2,
   "linear_num_value_heads": 4,
-  "linear_value_head_dim": 16,
+  "linear_value_head_dim": 128,
   "make_ngram_vocab_size_divisible_by": 128,
   "max_position_embeddings": 4096,
   "model_type": "qwen4_exp_text",
@@ -59,9 +59,9 @@
   "rope_parameters": {
     "mrope_interleaved": true,
     "mrope_section": [
-      1,
-      1,
-      0
+      11,
+      11,
+      10
     ],
     "partial_rotary_factor": 0.25,
     "rope_theta": 10000000.0,

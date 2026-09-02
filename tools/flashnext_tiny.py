@@ -10,7 +10,8 @@ the sigmoid gate, QSA with an indexer whose budget is small enough that a
 n-gram table -- and saves it as an HF safetensors checkpoint.
 
 Every "in" dimension is a multiple of 64 because that is the engine's
-quantisation group, and the QSA budget is 8 tokens (2 blocks of 4) so
+quantisation group, the head geometry is the real model's because the
+production attention and delta-rule kernels are compiled for it, and the QSA budget is 8 tokens (2 blocks of 4) so
 sparse selection engages after 11 visible tokens.
 
     tools/venv/bin/python tools/flashnext_tiny.py tests/fixtures/flashnext-tiny
@@ -29,16 +30,16 @@ cfg = Qwen4ExpTextConfig(
     full_attention_interval=4,          # 3 linear : 1 sparse, twice
     num_attention_heads=4,
     num_key_value_heads=1,
-    head_dim=16,
+    head_dim=256,                       # the production attention kernel is built for 256
     rms_norm_eps=1e-6,
     hidden_act="silu",
     output_gate_type="sigmoid",
     attention_bias=False,
-    # gated delta: 2 key heads x 16, 4 value heads x 16, conv 4
+    # gated delta: 2 key heads x 128, 4 value heads x 128, conv 4
     linear_num_key_heads=2,
-    linear_key_head_dim=16,
+    linear_key_head_dim=128,            # and the delta-rule kernel for 128 x 128
     linear_num_value_heads=4,
-    linear_value_head_dim=16,
+    linear_value_head_dim=128,
     linear_conv_kernel_dim=4,
     # moe: 8 experts, top 2, 64-wide experts and shared expert
     num_experts=8,
@@ -49,10 +50,14 @@ cfg = Qwen4ExpTextConfig(
     # hyper-connections
     hc_count=4,
     hc_lowrank=64,
-    # QSA indexer: 2 q heads x 8, 1 k head, budget 8 tokens in blocks of 4
-    indexer_n_heads=2,
+    # QSA indexer: 16 q heads x 128, 1 k head, budget 8 tokens in blocks of 4.
+    # Sixteen rather than the real model's four: a block's score is a sum of
+    # ReLU'd dots, so with h heads it is exactly zero with probability 2^-h
+    # and two such blocks at the cut are a tie torch.topk breaks in an
+    # unspecified order.  At 2^-16 the fixture is decisive.
+    indexer_n_heads=16,
     indexer_kv_heads=1,
-    indexer_head_dim=8,
+    indexer_head_dim=128,
     indexer_budget=8,
     indexer_compress_ratio=4,
     # PLE on layer 2 (one-indexed): 16 heads x 4 dims, tiny prime vocabs
@@ -65,11 +70,11 @@ cfg = Qwen4ExpTextConfig(
     make_ngram_vocab_size_divisible_by=128,
     seed=1234,
     split_ngram_parts=1,
-    # rope: partial 0.25 of 16 = 4 dims, interleaved mrope like the real one
+    # rope: partial 0.25 of 256 = 64 dims, interleaved mrope like the real one
     max_position_embeddings=4096,
     rope_parameters={"rope_type": "default", "rope_theta": 10000000.0,
                      "partial_rotary_factor": 0.25,
-                     "mrope_section": [1, 1, 0], "mrope_interleaved": True},
+                     "mrope_section": [11, 11, 10], "mrope_interleaved": True},
     tie_word_embeddings=False,
     bos_token_id=250,
     eos_token_id=251,
