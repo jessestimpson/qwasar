@@ -95,7 +95,10 @@ QWASAR_TEST_MTP ?= $(HOME)/.cache/qwasar/mtp/Qwen3.8-27B-MTP-bf16
 
 TESTS := tests/test_json tests/test_toolcall tests/test_sample tests/test_tokenizer tests/test_qmv tests/test_ops \
          tests/test_gdn tests/test_attn tests/test_kvstore tests/test_mtp tests/test_verify tests/test_vision tests/test_forward \
-         tests/test_select
+         tests/test_select tests/test_tui
+
+tests/test_tui: tests/test_tui.c qwasar_tui.o linenoise.o qwasar_tui.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_tui.c qwasar_tui.o linenoise.o $(LDLIBS)
 
 tests/test_json: tests/test_json.c qwasar_json.o qwasar_json.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_json.c qwasar_json.o $(LDLIBS)

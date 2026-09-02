@@ -44,8 +44,18 @@ void    tui_free(qw_tui *t);
 bool    tui_is_tty(const qw_tui *t);
 int     tui_width(const qw_tui *t);
 
-/* Reads one line.  Returns NULL on end of input.  Caller frees. */
+/* Reads one line.  Returns NULL on end of input.  Caller frees.
+ *
+ * `prompt` becomes the footer's resting prompt: it is what shows while the
+ * model generates and what anything typed ahead is composed under.  A line
+ * submitted during generation is returned by the next call without waiting. */
 char   *tui_readline(qw_tui *t, const char *prompt);
+
+/* Asks a one-off question mid-turn -- a tool confirmation -- and reads the
+ * answer.  Unlike tui_readline it is a detour, not a change of prompt: the
+ * resting prompt and any half-typed message come back afterwards, and a
+ * message queued during generation is never mistaken for the answer. */
+char   *tui_ask(qw_tui *t, const char *prompt);
 
 /* Streams output into the scrolling region above the footer.  Safe to call as
  * often as one token at a time. */

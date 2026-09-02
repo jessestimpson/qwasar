@@ -449,30 +449,49 @@ void tui_free(qw_tui *t) {
 bool tui_is_tty(const qw_tui *t) { return t && t->tty; }
 int  tui_width(const qw_tui *t) { return (t && t->cols > 0) ? t->cols : 80; }
 
-char *tui_readline(qw_tui *t, const char *prompt) {
-    if (!t->tty) {
-        /* Piped input: read a line and echo the prompt so a transcript still
-         * shows what was asked. */
-        char *line = NULL;
-        size_t cap = 0;
-        ssize_t n = getline(&line, &cap, stdin);
-        if (n <= 0) { free(line); return NULL; }
-        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
-        /* Echo through the same filter as everything else, so a transcript
-         * shows the prompt without its colour codes. */
-        write_plain(prompt, strlen(prompt));
-        write_plain(line, (size_t)n);
-        fputc('\n', stdout);
-        fflush(stdout);
-        return line;
-    }
+/* Piped input: read a line and echo the prompt so a transcript still shows
+ * what was asked. */
+static char *readline_plain(const char *prompt) {
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n = getline(&line, &cap, stdin);
+    if (n <= 0) { free(line); return NULL; }
+    while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
+    /* Echo through the same filter as everything else, so a transcript
+     * shows the prompt without its colour codes. */
+    write_plain(prompt, strlen(prompt));
+    write_plain(line, (size_t)n);
+    fputc('\n', stdout);
+    fflush(stdout);
+    return line;
+}
 
+/* Resets the editor for a new read.  `keep` carries a half-typed message
+ * across the reset -- composed while the model was writing, it belongs to the
+ * next prompt, and the clear that resets linenoise's completion and fold
+ * state used to drop it on the floor at every turn boundary. */
+static void edit_reset(qw_tui *t, bool keep) {
+    char held[sizeof t->buf];
+    snprintf(held, sizeof held, "%s", keep ? t->buf : "");
+    linenoiseEditClear(&t->ls);
+    if (held[0]) {
+        snprintf(t->buf, sizeof t->buf, "%s", held);
+        t->ls.len = t->ls.pos = strlen(t->buf);
+    }
+}
+
+/* The interactive read.  `prompt` becomes the footer's prompt for the
+ * duration; whether it STAYS the footer's prompt afterwards is the caller's
+ * business -- tui_readline leaves it, tui_ask restores what was there.
+ * `keep_text` is whether a half-typed line survives into this read. */
+static char *readline_tty(qw_tui *t, const char *prompt, bool take_queued, bool keep_text) {
     snprintf(t->prompt, sizeof t->prompt, "%s", prompt);
 
     /* Composed while the model was still writing, so it is already what the
      * user asked for next; making them press return again would be asking
-     * twice. */
-    if (t->n_queued > 0) {
+     * twice.  Never for a question: a message typed ahead is an answer to
+     * nothing but the prompt it was typed at. */
+    if (take_queued && t->n_queued > 0) {
         char *line = t->queued[0];
         for (int i = 1; i < t->n_queued; i++) t->queued[i - 1] = t->queued[i];
         t->n_queued--;
@@ -493,7 +512,7 @@ char *tui_readline(qw_tui *t, const char *prompt) {
         if (linenoiseEditStart(&t->ls, STDIN_FILENO, STDOUT_FILENO,
                                t->buf, sizeof t->buf, t->prompt) != 0) {
             t->tty = false;
-            return tui_readline(t, prompt);
+            return readline_plain(prompt);
         }
         t->started = true;
         if (t->region) {
@@ -515,12 +534,12 @@ char *tui_readline(qw_tui *t, const char *prompt) {
         csi_move(t->prompt_row, 1);
         t->ls.prompt = t->prompt;
         t->ls.plen = strlen(t->prompt);
-        linenoiseEditClear(&t->ls);
+        edit_reset(t, keep_text);
         t->hidden = true;
     } else {
         t->ls.prompt = t->prompt;
         t->ls.plen = strlen(t->prompt);
-        linenoiseEditClear(&t->ls);
+        edit_reset(t, keep_text);
         t->hidden = true;
     }
 
@@ -542,16 +561,48 @@ char *tui_readline(qw_tui *t, const char *prompt) {
         if (!line) return NULL;                 /* ctrl-D */
         char *copy = strdup(line);
         linenoiseFree(line);
-        /* Echo the submitted line into the transcript.  The footer is
-         * ephemeral, so without this the scrollback would be a list of answers
-         * with nothing to say what was asked. */
+        /* Echo the submitted line into the transcript, under the prompt it
+         * answered.  The footer is ephemeral, so without this the scrollback
+         * would be a list of answers with nothing to say what was asked. */
         if (t->region && copy) {
-            tui_puts(t, "\x1b[1;32m> \x1b[0m");
+            tui_puts(t, prompt);
             tui_puts(t, copy);
             tui_puts(t, "\n");
         }
         return copy;
     }
+}
+
+char *tui_readline(qw_tui *t, const char *prompt) {
+    if (!t->tty) return readline_plain(prompt);
+    return readline_tty(t, prompt, true, true);
+}
+
+char *tui_ask(qw_tui *t, const char *prompt) {
+    if (!t->tty) return readline_plain(prompt);
+
+    /* What the footer showed before the question, and whatever was being
+     * typed into it.  Both come back afterwards: the question is a detour,
+     * not a change of prompt -- leaving its label in place was how
+     * "proceed? [y/N]" used to sit in the footer for the rest of the turn,
+     * long after it had been answered. */
+    char prompt_before[sizeof t->prompt];
+    char text_before[sizeof t->buf];
+    snprintf(prompt_before, sizeof prompt_before, "%s", t->prompt);
+    snprintf(text_before, sizeof text_before, "%s", t->started ? t->buf : "");
+
+    char *line = readline_tty(t, prompt, false, false);
+
+    snprintf(t->prompt, sizeof t->prompt, "%s", prompt_before);
+    if (t->started) {
+        t->ls.prompt = t->prompt;
+        t->ls.plen = strlen(t->prompt);
+        /* ls.buf IS t->buf; the answer was cleared out of it already. */
+        snprintf(t->buf, sizeof t->buf, "%s", text_before);
+        t->ls.len = t->ls.pos = strlen(t->buf);
+        t->ls.oldpos = 0;
+    }
+    return line;
 }
 
 /* Drops CSI sequences.  Callers write with colour unconditionally and this is

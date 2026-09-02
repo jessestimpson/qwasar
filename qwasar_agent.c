@@ -163,7 +163,8 @@ typedef struct {
  * a tool result rather than aborting, so it can choose something else. */
 /* Asking mid-turn has to go through the same output path as everything else,
  * or the question lands on top of the pinned footer.  The reply is read with
- * the line editor for the same reason. */
+ * the line editor for the same reason -- as a question, not a prompt change,
+ * so the footer goes back to what it showed once it is answered. */
 static qw_tui *g_tui;
 
 static bool confirm(const agent_cfg *cfg, const char *what, const char *detail) {
@@ -171,7 +172,7 @@ static bool confirm(const agent_cfg *cfg, const char *what, const char *detail) 
     const bool tty = tui_is_tty(g_tui);
     tui_printf(g_tui, "\n  %s%s%s %s\n", tty ? "\x1b[1;33m" : "", what,
                tty ? "\x1b[0m" : "", detail);
-    char *ans = tui_readline(g_tui, "  proceed? [y/N] ");
+    char *ans = tui_ask(g_tui, "  proceed? [y/N] ");
     bool ok = ans && (ans[0] == 'y' || ans[0] == 'Y');
     free(ans);
     return ok;
