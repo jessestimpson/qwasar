@@ -259,10 +259,28 @@ final class AppState {
             : "Draft head accepted — reloading with speculation; context becomes "
               + "\(profile.contextSize)." 
         Task {
-            engine.unload()
+            // A turn in flight would otherwise hold the engine queue, and the
+            // unload behind it would look like the app hanging.
+            await settleTurn()
+            await engine.unload()
             engineInfo = nil
             liveSessionID = nil
             await load(model)
+        }
+    }
+
+    /// Winds down a running turn before something that needs the engine
+    /// queue idle: sets the cancel flag (the decode loop polls it every
+    /// token) and waits for `send()` to finish persisting the turn. Bounded,
+    /// because a tool call in flight is not interruptible and the caller
+    /// must not hang behind it; `send()` guards its own persistence against
+    /// a session closed out from under it.
+    private func settleTurn(within seconds: Double = 8) async {
+        guard phase == .generating else { return }
+        interrupt()
+        let deadline = Date().addingTimeInterval(seconds)
+        while phase == .generating, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
         }
     }
 
@@ -643,6 +661,13 @@ final class AppState {
     /// zero on the next open.
     func shutdown() async {
         shuttingDown = true
+        // AppKit has stopped delivering events by now (terminateLater), so a
+        // turn still generating would sit in front of the checkpoint on the
+        // serial engine queue for as long as it runs -- minutes, for an
+        // agent loop -- with the app beach-balling the whole way, until the
+        // user force-quits and the guest loses its page cache. Interrupt it
+        // first; it stops at the next token.
+        await settleTurn()
         if let id = liveSessionID { await engine.closeAndCheckpoint(id) }
         if let sandboxes { await sandboxes.stopAll() }
     }
@@ -799,10 +824,15 @@ final class AppState {
             // else (PLAN.md 4.2).
             store?.appendTranscript(rec.id, pendingItems)
             pendingItems = []
+            // Empty means the session was closed out from under this turn
+            // (a shutdown or an unload that settled it), not that it has no
+            // history: writing [] here would truncate tokens.bin and turn
+            // the next open into a cold rebuild of a conversation the
+            // checkpoint still holds. The record keeps its last count.
             let toks = await engine.tokens(of: rec.id)
-            store?.saveTokens(rec.id, toks)
+            if !toks.isEmpty { store?.saveTokens(rec.id, toks) }
             if let i = sessions.firstIndex(where: { $0.id == rec.id }) {
-                sessions[i].tokenCount = toks.count
+                if !toks.isEmpty { sessions[i].tokenCount = toks.count }
                 sessions[i].state = .live
                 if sessions[i].title == "New session" {
                     sessions[i].title = String(text.prefix(48))

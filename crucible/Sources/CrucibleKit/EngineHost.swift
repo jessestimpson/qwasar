@@ -147,13 +147,22 @@ public final class EngineHost: @unchecked Sendable {
         return i
     }
 
-    public func unload() {
-        queue.sync {
-            Self.assertOnEngineQueue()
-            sessions.removeAll()
-            tokenizer = nil
-            if let e = engine { qwasar_engine_free(e); engine = nil }
-            info = nil
+    /// Frees every session and the engine. Async, never `queue.sync`: this is
+    /// called from the main actor, and a synchronous wait there blocks the UI
+    /// for however long the engine queue is busy -- a whole turn, a
+    /// multi-gigabyte checkpoint -- and can deadlock outright against the
+    /// config runner and the delegation-log provider, which `main.sync` FROM
+    /// the engine thread. The main thread must never wait on this queue.
+    public func unload() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            queue.async {
+                Self.assertOnEngineQueue()
+                self.sessions.removeAll()
+                self.tokenizer = nil
+                if let e = self.engine { qwasar_engine_free(e); self.engine = nil }
+                self.info = nil
+                c.resume()
+            }
         }
     }
 
