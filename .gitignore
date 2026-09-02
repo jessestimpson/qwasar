@@ -45,3 +45,8 @@ crucible/Guest/warden/deps/
 
 # Menu bar app build products
 menubar/build/
+
+# Flash-Next dev tooling: the oracle venv and the regenerable toy fixtures
+tools/venv/
+tests/fixtures/flashnext-tiny/
+tests/fixtures/flashnext-tiny-deq/

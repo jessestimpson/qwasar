@@ -163,6 +163,141 @@ spec assumed 6 t/s, it only endured it.
 Order is dependency order, but Phases 2–5 interleave freely: twins are Air
 work, kernels are Max work, and each twin unblocks its kernel.
 
+## Phase 0 — answered (2026-09-02, from source)
+
+Every "verify" above, resolved against `transformers` main
+(`modular_qwen4_exp.py`, which composes `qwen3_5`, `qwen3_5_moe` and
+`qwen3_next`), the repo's `config.json`, and the safetensors headers of all
+131 shards (fetched by HTTP range, no weights downloaded). The M4 Air did all
+of this; nothing below needed the model.
+
+**The oracle and the weights.**
+- `transformers` supports `qwen4_exp` natively; the checkpoint says
+  `transformers_version 5.8.0.dev0`, so the oracle is **main**, not a
+  release. Installed in `tools/venv` (dev-only, never required to build).
+- **mlx-lm has no `qwen4_exp`** (404 on 2026-09-02). There will be no
+  MLX-sanitised checkpoint to lean on: `tools/flashnext_convert.py` is ours,
+  HF BF16 in, MLX-affine 4-bit (group 64) out, in the engine's own tensor
+  naming, so the existing quantised kernels and loader conventions carry.
+- 180.0B parameters on disk in BF16 (359,999,963,128 bytes): **125.1B text
+  model** plus the engram table, plus a vision tower and the MTP layer.
+  Everything is BF16 except three I64 buffers per PLE layer, which are
+  derived from config and need not be loaded.
+- **The MTP layer's weights ARE in the main shards** (`mtp.*`): one QSA
+  layer with MoE and hyper-connections, `fc_embedding` [2560,2560],
+  `fc_hidden` [2560,2560], `pre_fc_norm_embedding` [2560],
+  `pre_fc_norm_hidden` [10240], its own `hyper_connection_mixer`.
+  **Open**: how 10240 becomes 2560 before `fc_hidden` is not in
+  `transformers` (MTP is not part of its forward); Phase 7 needs Qwen's own
+  MTP code. Everything else about the head is a normal decoder layer.
+
+**Tokenizer and template.** Vocab (248,044 + 33 added), merges (247,587)
+and the chat template are **identical** to the 27B's, byte for byte modulo
+JSON formatting and a trailing newline. One real change: the pre-tokenizer
+split regex is `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` and
+` ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*` — combining marks (`\p{M}`) now attach to
+letters instead of splitting off. A config-driven switch in
+`qwasar_tokenizer.c`, and a golden case with combining marks.
+`generation_config` is the 27B's exactly (eos 248046/248044, temp 1.0,
+top-k 20, top-p 0.95).
+
+**The residual stream is four streams** (`hc_count: 4`). The token
+embedding is repeated ×4 into a 10240-wide residual; there is **no
+`input_layernorm`, no `post_attention_layernorm`, and no final `norm`** —
+none exist in the checkpoint. Every sublayer is wrapped by a
+`GatedResidual` (`attn_hyper_connection`, `mlp_hyper_connection`):
+
+    n   = grouped_rmsnorm(h4)                  # 4 groups of 2560, (1+w)
+    m   = sigmoid(up(silu(down(n) / 4)))       # 10240→320→10240, sigmoid
+    x   = mean over streams of (m ⊙ n)         # the sublayer's 2560 input
+    inj = 2·sigmoid(block_inject(n) / 4)       # [4], one weight per stream
+    h4 += out ⊗ inj                            # inject the 2560 output
+
+and the model ends with `hyper_connection_mixer` — the same mixer without
+`block_inject` — whose 2560 output goes **straight to `lm_head`**.
+Per-token cost of the mixers: ~13M MACs per layer, an expert's worth.
+
+**Layer schedule.** 36 `linear_attention` + 12 `qwen_sparse_attention`
+(the config spells the latter "full_attention"; the modular code renames
+it). PLE lives on **one** layer, zero-indexed 1 (`ple_layer_ids: [2]` is
+one-indexed).
+
+**Gated DeltaNet**: geometry identical to the 27B (16 K × 128, 48 V × 128,
+conv 4; `in_proj_qkv` [10240,2560], `in_proj_z` [6144,2560], `in_proj_b/a`
+[48,2560], `out_proj` [2560,6144], `conv1d` [10240,1,4]). **One change**:
+`output_gate_type: "sigmoid"` — the gated norm is `rmsnorm(y)·sigmoid(z)`,
+not `·silu(z)`. `mamba_ssm_dtype: float32`, as we already do.
+
+**MoE** (`Qwen3NextSparseMoeBlock`, verbatim):
+- router: `probs = softmax(W·x)` in **float over all 512**; top-10;
+  `norm_topk_prob: true` → the ten are renormalised to sum 1; cast to the
+  activation dtype. `gate.weight` [512,2560].
+- experts fused: `gate_up_proj` **[512, 1280, 2560]** (gate is the first
+  640 rows of each expert, up the second), `down_proj` **[512, 2560, 640]**;
+  `silu(gate)·up`, then down, scaled by the routing weight, summed.
+- shared expert: an ordinary 640-wide SwiGLU MLP, scaled by
+  `sigmoid(shared_expert_gate · x)` (`shared_expert_gate.weight` [1,2560]);
+  `out = routed + gated_shared`.
+
+**Qwen Sparse Attention** = the 27B's gated attention plus an indexer.
+- attention: `q_proj` [12288,2560] (per head `[q(256) | gate(256)]`,
+  output × `sigmoid(gate)` — exactly the 27B's `attn_output_gate` layout),
+  `k_proj`/`v_proj` [512,2560] (2 KV heads), `o_proj` [2560,6144],
+  `q_norm`/`k_norm` [256] (+1), partial RoPE 64 of 256, θ=1e7,
+  interleaved MRoPE [11,11,10] (text-only collapses, as before).
+- indexer: `index_qk_proj` [640,2560] = 4 query heads × 128 + **1** key
+  head × 128; `q_layernorm`/`k_layernorm` [128] (+1). Per query: q →
+  norm → RoPE on its first 64 dims at the query's position. Keys are cached
+  **raw** (pre-norm, pre-RoPE), one 128-vector per token. The visible
+  tokens are grouped into blocks of `indexer_compress_ratio = 4`
+  consecutive tokens; per block, key = RoPE(norm(mean_fp32(4 raw keys)))
+  at the **block's first position**; score = Σ_heads relu(q_h·k) / √128;
+  the top `2048/4 = 512` blocks are selected, and the **tail** — the
+  leftover <4 tokens of an incomplete block — is always included.
+  Attention runs over selected ∪ tail via the mask. **Corollary**: with
+  ≤ 2051 visible tokens every block is selected, so QSA is *exactly* dense
+  causal attention below that — the dense path is the correct oracle for
+  short prompts and wrong beyond 2K, which is where the selection test
+  must live.
+
+**PLE — the engram table**, exactly:
+- `ngram_size 3` → context 2 previous tokens; `heads_per_ngram 8` → 16
+  heads (8 bigram, 8 trigram); `head_dim = ple_embed_dim/16 = 160`.
+- head `h` (global index `h`, one PLE layer) has vocab size = the
+  `(h+1)`-th prime after 19,999,999; offsets cumulative; total padded up
+  to a multiple of 128 = **320,001,536 rows × 160** = 51.2B params, stored
+  as 128 shards `ngram_embedding.shard_i.weight` [2500012,160],
+  concatenated along dim 0.
+- multipliers `m[0..2]`: `base = 1234 + 10007·0`; `v_i = (base +
+  γ·(i+1)) mod 2⁶⁴` with γ = 0x9E3779B97F4A7C15; `m_i = 2·(splitmix64(v_i)
+  mod half) + 1`, `half = max(1, ((2⁶³−1) // 248320) // 2)`; splitmix64
+  is the standard finalizer (0xBF58476D1CE4E5B9, 0x94D049BB133111EB,
+  shifts 30/27/31). The checkpoint stores the result too (I64 [3]) — the
+  Max cross-checks our C against it.
+- token context is **EOS-segmented**: `shift_s(t)` = the token `s` back
+  within the same segment, else `eos` (248044); a fresh sequence starts
+  with two virtual `eos`. `mixed_2 = t₀·m₀ ⊕ t₁·m₁`, `mixed_3 = mixed_2 ⊕
+  t₂·m₂` in wrapping int64; id = `remainder(mixed, size_h) + offset_h`
+  with **torch remainder semantics** (non-negative). Gather 16 rows of
+  160, flatten to 2560.
+- the layer: `key = grouped_norm(key_proj(e))` [4×2560], `value =
+  value_proj(e)` [2560], `qn = grouped_norm(h4)`; per stream `g =
+  (key_s·qn_s)/√2560`, `g = sign(g)·√max(|g|,1e-6)`; `gv_s = sigmoid(g)·
+  value`; `out = gv + silu(dilated_depthwise_conv1d(grouped_norm(gv)))`
+  with kernel 4, dilation 3, 10240 groups, state length 9;
+  `h4 += out`, applied **before** the attention hyper-connection of layer
+  1. Weights: `key_proj` [10240,2560], `value_proj` [2560,2560], three
+  [10240] norms, `conv1d` [10240,1,4].
+
+**Vision**: 27 blocks, hidden 1152, MLP 4304, out 2560 — the 27B's tower
+shape. Deferred, as planned.
+
+**RMSNorm conventions.** All `Qwen4ExpTextRMSNorm` (q/k norms, indexer
+norms, every `hc_norm`, PLE norms) are `(1 + w)`; `linear_attn.norm` is
+the gated norm and is **not** (+1) — same split as the 27B. The HF
+checkpoint stores raw weights; the converter applies the +1 where MLX would
+have, so the engine's existing convention holds.
+
 ## 4. Risks, named
 
 - **The engram hash** (silent quality rot; caught only by Phase 5's gate —
