@@ -15,16 +15,27 @@ production attention and delta-rule kernels are compiled for it, and the QSA bud
 sparse selection engages after 11 visible tokens.
 
     tools/venv/bin/python tools/flashnext_tiny.py tests/fixtures/flashnext-tiny
+
+With --vocab 248320 --eos <id> it takes the real model's vocabulary (an
+embedding of 248320 x 64, a few dozen MB), so the real tokenizer's ids are
+in range and the qwasar binary can be driven end to end -- template,
+prompt, sampling, stop -- through a model that knows nothing.
 """
-import sys, json, os
+import sys, json, os, argparse
 import torch
 from transformers import Qwen4ExpTextConfig, Qwen4ExpForCausalLM
 
-out = sys.argv[1] if len(sys.argv) > 1 else "tests/fixtures/flashnext-tiny"
-seed = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+ap = argparse.ArgumentParser()
+ap.add_argument("out", nargs="?", default="tests/fixtures/flashnext-tiny")
+ap.add_argument("seed", nargs="?", type=int, default=1)
+ap.add_argument("--vocab", type=int, default=256)
+ap.add_argument("--bos", type=int, default=250)
+ap.add_argument("--eos", type=int, default=251)
+args = ap.parse_args()
+out, seed = args.out, args.seed
 
 cfg = Qwen4ExpTextConfig(
-    vocab_size=256,
+    vocab_size=args.vocab,
     hidden_size=64,
     num_hidden_layers=8,
     full_attention_interval=4,          # 3 linear : 1 sparse, twice
@@ -76,9 +87,9 @@ cfg = Qwen4ExpTextConfig(
                      "partial_rotary_factor": 0.25,
                      "mrope_section": [11, 11, 10], "mrope_interleaved": True},
     tie_word_embeddings=False,
-    bos_token_id=250,
-    eos_token_id=251,
-    pad_token_id=250,
+    bos_token_id=args.bos,
+    eos_token_id=args.eos,
+    pad_token_id=args.bos,
     dtype="bfloat16",
 )
 

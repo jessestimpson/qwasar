@@ -359,6 +359,31 @@ Three things learned that the plan did not know:
    `placement: cpu`, which the loader maps without a device buffer; the
    toy fixture is now five model files and one engram file, and the
    reference and Metal paths read the table through `qw_ple_row`.
+   The converter **streams** — tensors are opened lazily and written out
+   as each output file fills, so a 360 GB input converts on a 128 GB
+   machine; `--device mps` quantises on the GPU. The `qwasar` binary has
+   been driven end to end on a toy built with `--vocab 248320` and the
+   real tokenizer (template, prefill, sampling, budget stop; `--info`
+   prints the family's lines). Nothing else on the Air is in the way.
+
+**Where the Air stops.** Everything left needs the weights, and the
+weights need the Max:
+
+1. Download `Qwen/Qwen3.8-Flash-Next` (360 GB, 131 shards) and convert:
+   `tools/venv/bin/python tools/flashnext_convert.py <hf> <out> --device mps`.
+   Expect ~70 GB of model files and ~102 GB of engram files (the table
+   stays BF16), so ~530 GB of disk with the input; the input can go once
+   `./qwasar -m <out> --info` binds every tensor and the engram
+   cross-check passes (`test_flashnext`'s hash-constant check runs at
+   bind time against the checkpoint's own buffers).
+2. Phase 6: the first real prompt, then goldens. `transformers` cannot
+   hold the bf16 model in 128 GB, so the real-weight oracle is per layer
+   (the fp32 `--dequant` copy is a toy-only tool); the practical gate is
+   coherent text, the agreed tokenizer, and a perplexity sanity check
+   against the published figures. Then the numbers that decide the two
+   kernels named under "Speed" above.
+3. Phase 7 (MTP), the checkpoint format for the indexer cache and engram
+   state, and Crucible's `MemoryProfile` for a 70 GB model (Phase 8).
 
 ## 4. Risks, named
 
