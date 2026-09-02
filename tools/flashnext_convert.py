@@ -14,9 +14,12 @@ converter did there, in the engine's own naming:
   * `(1 + w)` RMSNorms get the +1 folded in, as MLX did; the gated
     `linear_attn.norm` does not, as before.
   * the depthwise conv taps are transposed to [C, K, 1], as MLX did.
-  * the PLE n-gram table's shards are concatenated and kept BF16: its rows
-    are 160 wide, not a multiple of 64, and it is read a few rows per token
-    off a cold mmap, so quantising it buys disk and nothing else.
+  * the PLE n-gram table stays in row shards and BF16, in files of its own
+    marked `placement: cpu` that the engine maps without a GPU buffer: its
+    rows are 160 wide, not a multiple of 64, it is read a few rows per token
+    off a cold mmap, and at 102 GB it could not be one device buffer anyway.
+  * the output is split into files under --shard-bytes with an index, since
+    Metal caps a single buffer far below the model's size.
   * the I64 hash buffers are dropped; the engine derives them from config
     and the Max cross-checks the derivation against them.
 
@@ -38,6 +41,10 @@ ap = argparse.ArgumentParser()
 ap.add_argument("src")
 ap.add_argument("dst")
 ap.add_argument("--dequant", default=None)
+ap.add_argument("--shard-bytes", type=int, default=8 * 1024 ** 3,
+                help="split the output into files of at most this many bytes (Metal caps one buffer well below the model)")
+ap.add_argument("--engram-parts", type=int, default=0,
+                help="re-split the engram table into this many row shards (0: keep the checkpoint's)")
 args = ap.parse_args()
 
 cfg = json.load(open(os.path.join(args.src, "config.json")))
@@ -163,16 +170,57 @@ for name in sorted(tensors):
     deq[name] = dq                            # fp32: exactly what the engine computes
     q_bytes += packed.numel() * 4 + scales.numel() * 2 + biases.numel() * 2
 
+# The engram table stays in row shards, BF16, in files of its own that the
+# engine maps without a GPU buffer: it is read by row on the host, and at
+# 102 GB it could not be one device buffer anyway.
+engram = {}
 for base, parts in ngram_parts.items():
     parts.sort()
-    table = torch.cat([p for _, p in parts], dim=0).to(torch.bfloat16)
-    out[rename(base) + ".weight"] = table
     for i, p in parts:
         deq[f"{base}.shard_{i}.weight"] = p
-    print(f"engram table {base}: {tuple(table.shape)} from {len(parts)} shards")
+    if args.engram_parts > 0:
+        table = torch.cat([p for _, p in parts], dim=0)
+        rows = table.shape[0]
+        per = (rows + args.engram_parts - 1) // args.engram_parts
+        parts = [(i, table[i * per:(i + 1) * per]) for i in range(args.engram_parts) if i * per < rows]
+    for i, p in parts:
+        engram[f"{rename(base)}.shard_{i}.weight"] = p.to(torch.bfloat16).contiguous()
+    print(f"engram table {base}: {sum(p.shape[0] for _, p in parts)} rows in {len(parts)} shards")
+
+
+def nbytes(t):
+    return t.numel() * t.element_size()
+
+
+def pack(tensors, limit):
+    """Greedy split of a name->tensor dict into files under `limit` bytes,
+    one tensor per file when a tensor alone exceeds it."""
+    files, cur, cur_b = [], {}, 0
+    for name in sorted(tensors):
+        b = nbytes(tensors[name])
+        if cur and cur_b + b > limit:
+            files.append(cur); cur, cur_b = {}, 0
+        cur[name] = tensors[name]; cur_b += b
+    if cur: files.append(cur)
+    return files
+
 
 os.makedirs(args.dst, exist_ok=True)
-save_file(out, os.path.join(args.dst, "model.safetensors"), metadata={"format": "qwasar"})
+weight_map = {}
+model_files = pack(out, args.shard_bytes)
+for i, group in enumerate(model_files):
+    fname = f"model-{i + 1:05d}-of-{len(model_files):05d}.safetensors"
+    save_file(group, os.path.join(args.dst, fname), metadata={"format": "qwasar"})
+    for k in group: weight_map[k] = fname
+engram_files = pack(engram, args.shard_bytes) if engram else []
+for i, group in enumerate(engram_files):
+    fname = f"engram-{i + 1:05d}-of-{len(engram_files):05d}.safetensors"
+    save_file(group, os.path.join(args.dst, fname), metadata={"format": "qwasar", "placement": "cpu"})
+    for k in group: weight_map[k] = fname
+json.dump({"metadata": {"total_size": sum(nbytes(t) for t in out.values()) + sum(nbytes(t) for t in engram.values())},
+           "weight_map": weight_map},
+          open(os.path.join(args.dst, "model.safetensors.index.json"), "w"), indent=1)
+print(f"wrote {len(model_files)} model file(s) and {len(engram_files)} engram file(s)")
 qcfg = dict(cfg)
 qcfg["quantization"] = {"bits": BITS, "group_size": GROUP, "mode": "affine"}
 json.dump(qcfg, open(os.path.join(args.dst, "config.json"), "w"), indent=2)

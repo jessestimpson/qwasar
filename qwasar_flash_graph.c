@@ -142,7 +142,6 @@ void qw_flash_prepare_chunk(qwasar_session *s, const int32_t *tokens, int32_t ro
     const qw_layer *L = qwasar_engine_layer(s->e, c->ple_layer);
     const qw_ple *P = L->ple;
     const int32_t HD = P->head_dim, E = c->ple_embed_dim;
-    const uint16_t *table = (const uint16_t *)((const char *)qw_buf_contents(P->table->buf) + P->table->offset);
     float *emb = fcontents(f->ple_emb);
     int64_t ids[QW_MAX_NGRAM_HEADS];
 
@@ -153,10 +152,11 @@ void qw_flash_prepare_chunk(qwasar_session *s, const int32_t *tokens, int32_t ro
         f->hist[0] = tok;
 
         qw_ple_ids(P, c, f->hist, pos - 1 - f->last_eos, ids);
-        for (int32_t h = 0; h < P->n_heads; h++)
+        for (int32_t h = 0; h < P->n_heads; h++) {
+            const uint16_t *row = qw_ple_row(P, ids[h]);
             for (int32_t i = 0; i < HD; i++)
-                emb[(size_t)r * E + (size_t)h * HD + i] =
-                    qw_bf16_to_f32_c(table[(size_t)ids[h] * HD + i]);
+                emb[(size_t)r * E + (size_t)h * HD + i] = qw_bf16_to_f32_c(row[i]);
+        }
 
         for (int32_t k = 0; k < c->n_eos; k++)
             if (tok == c->eos_token_ids[k]) { f->last_eos = pos; break; }

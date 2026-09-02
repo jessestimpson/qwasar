@@ -496,7 +496,9 @@ static void test_reused(qwasar_engine *e) {
             qw_cpu_qmv_q4(ref, xp, qw_tensor_data(q->weight), qw_tensor_data(q->scales), qw_tensor_data(q->biases), k, n, rows);
             char label[64];
             snprintf(label, sizeof label, "qmat_q4 %s rows=%d", names[i], rows);
-            report(label, qw_buf_contents(y), ref, (size_t)rows * n, 1e-4);
+            /* From QW_QMM_MIN_ROWS the tiled matmul runs, with fp16 operand
+             * tiles by design (metal/qmm.metal): ~2e-4, not 1e-7. */
+            report(label, qw_buf_contents(y), ref, (size_t)rows * n, rows >= QW_QMM_MIN_ROWS ? 1e-3 : 1e-4);
             free(ref);
             qw_buf_free(x); qw_buf_free(y);
         }

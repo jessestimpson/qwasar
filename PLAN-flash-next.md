@@ -346,9 +346,19 @@ Three things learned that the plan did not know:
    family. Sessions work, parking's warm resume does not.
 3. *Speculation, vision, images*: refused with a message (Phases 7, and
    the deferred tower).
-4. *The tokenizer's `\p{M}` regex switch* and the sharded converter for
-   a 360 GB input are the two remaining Air-side items before the Max can
-   load anything.
+4. ~~The tokenizer's regex switch and the sharded converter~~ — done. The
+   tokenizer reads its split pattern and its normalizer from
+   `tokenizer.json`: `\p{M}` joins letters when the pattern says so, and
+   **NFC is now applied** when declared (both families declare it; it was
+   a known gap of the 27B's too). `tests/test_tokenizer_marks` holds
+   seventeen cases from Flash-Next's own tokenizer, five of which differ
+   from the 27B's pattern and several of which only NFC gets right
+   (decomposed Latin, ordering of stacked marks, decomposed Hangul jamo).
+   The converter shards its output under `--shard-bytes` with an index,
+   and writes the engram table as separate row-shard files marked
+   `placement: cpu`, which the loader maps without a device buffer; the
+   toy fixture is now five model files and one engram file, and the
+   reference and Metal paths read the table through `qw_ple_row`.
 
 ## 4. Risks, named
 

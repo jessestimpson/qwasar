@@ -97,10 +97,13 @@ QWASAR_TEST_MTP ?= $(HOME)/.cache/qwasar/mtp/Qwen3.8-27B-MTP-bf16
 
 TESTS := tests/test_json tests/test_toolcall tests/test_sample tests/test_tokenizer tests/test_qmv tests/test_ops \
          tests/test_gdn tests/test_attn tests/test_kvstore tests/test_mtp tests/test_verify tests/test_vision tests/test_forward \
-         tests/test_select tests/test_tui tests/test_flashnext tests/test_sparse
+         tests/test_select tests/test_tui tests/test_flashnext tests/test_sparse tests/test_tokenizer_marks
 
 tests/test_flashnext: tests/test_flashnext.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_flashnext.c $(CORE_OBJS) $(LDLIBS)
+
+tests/test_tokenizer_marks: tests/test_tokenizer_marks.c qwasar_tokenizer.o qwasar_json.o qwasar.h qwasar_json.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_tokenizer_marks.c qwasar_tokenizer.o qwasar_json.o $(LDLIBS)
 
 tests/test_sparse: tests/test_sparse.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_sparse.c $(CORE_OBJS) $(LDLIBS)

@@ -324,7 +324,33 @@ static bool qw_load_shard(qwasar_engine *e, const char *path, char *err, size_t 
     const size_t data_base = 8 + header_len;
     const size_t data_len  = sh->file_len - data_base;
 
-    if (data_base % QW_TENSOR_ALIGN == 0) {
+    /* The header first: a shard can ask to stay on the host.  The engram
+     * table's files do (converter: `placement: cpu`) -- read by row, never
+     * a GPU operand, and beyond any single device buffer at 102 GB.  Such a
+     * shard is the mapping and nothing else. */
+    qj_doc doc;
+    if (!qj_parse(&doc, header, header_len)) {
+        qw_errf(err, errcap, "bad safetensors header in %s: %s", path, doc.err);
+        qj_free(&doc);
+        free(header);
+        munmap(map, map_len);
+        return false;
+    }
+    bool host_only = false;
+    {
+        const qj_node *meta = qj_get(&doc, qj_root(&doc), "__metadata__");
+        char placement[16] = "";
+        if (meta) qj_str_copy(&doc, meta, "placement", placement, sizeof placement);
+        host_only = !strcmp(placement, "cpu");
+    }
+
+    if (host_only) {
+        sh->addr      = map;
+        sh->len       = map_len;
+        sh->data_base = data_base;
+        sh->buf       = NULL;
+        e->bytes_mapped += data_len;
+    } else if (data_base % QW_TENSOR_ALIGN == 0) {
         sh->addr      = map;
         sh->len       = map_len;
         sh->data_base = data_base;
@@ -349,21 +375,14 @@ static bool qw_load_shard(qwasar_engine *e, const char *path, char *err, size_t 
         munmap(map, map_len);
     }
 
-    if (!sh->buf) {
+    if (!sh->buf && !host_only) {
         free(header);
+        qj_free(&doc);
         if (sh->addr) { munmap(sh->addr, sh->len); sh->addr = NULL; }
         qw_errf(err, errcap, "cannot bind %s as a device buffer", path);
         return false;
     }
     e->n_shards++;
-
-    qj_doc doc;
-    if (!qj_parse(&doc, header, header_len)) {
-        qw_errf(err, errcap, "bad safetensors header in %s: %s", path, doc.err);
-        qj_free(&doc);
-        free(header);
-        return false;
-    }
     free(header);
 
     const qj_node *root = qj_root(&doc);
@@ -386,6 +405,7 @@ static bool qw_load_shard(qwasar_engine *e, const char *path, char *err, size_t 
         t->buf    = sh->buf;
         t->offset = sh->data_base + (size_t)o0->u.num;
         t->nbytes = (size_t)o1->u.num - (size_t)o0->u.num;
+        t->cpu    = host_only ? (const char *)sh->addr + t->offset : NULL;
         t->dtype  = qw_dtype_parse(doc.text + dt->u.str.off, dt->u.str.len);
         t->ndim   = 0;
         for (const qj_node *d = qj_first(&doc, shp); d && t->ndim < QW_MAX_DIMS;
@@ -393,7 +413,7 @@ static bool qw_load_shard(qwasar_engine *e, const char *path, char *err, size_t 
             t->shape[t->ndim++] = (int64_t)d->u.num;
 
         if (!t->name) { qj_free(&doc); qw_errf(err, errcap, "out of memory"); return false; }
-        if (t->offset + t->nbytes > qw_buf_length(sh->buf)) {
+        if (t->offset + t->nbytes > (host_only ? sh->file_len : qw_buf_length(sh->buf))) {
             qw_errf(err, errcap, "tensor %s runs past end of %s", t->name, path);
             qj_free(&doc);
             return false;
@@ -808,9 +828,9 @@ static void qw_quant_dense(qwasar_engine *e, qw_qlinear *ql, const qw_dense *d,
 
     char *base = qw_buf_contents(buf);
     qw_tensor *tw = &slots[0], *ts = &slots[1], *tb = &slots[2];
-    *tw = (qw_tensor){ "mtp.weight", buf, *off,            w_bytes,  QW_DT_U32,  2, { out, words } };
-    *ts = (qw_tensor){ "mtp.scales", buf, *off + w_bytes,  sb_bytes, QW_DT_BF16, 2, { out, groups } };
-    *tb = (qw_tensor){ "mtp.biases", buf, *off + w_bytes + sb_bytes, sb_bytes, QW_DT_BF16, 2, { out, groups } };
+    *tw = (qw_tensor){ "mtp.weight", buf, *off,            w_bytes,  QW_DT_U32,  2, { out, words }, NULL };
+    *ts = (qw_tensor){ "mtp.scales", buf, *off + w_bytes,  sb_bytes, QW_DT_BF16, 2, { out, groups }, NULL };
+    *tb = (qw_tensor){ "mtp.biases", buf, *off + w_bytes + sb_bytes, sb_bytes, QW_DT_BF16, 2, { out, groups }, NULL };
 
     const uint16_t *src = qw_tensor_data(d->weight);
     uint32_t *w  = (uint32_t *)(base + tw->offset);
@@ -1196,8 +1216,35 @@ static bool qw_bind_ple(qwasar_engine *e, qw_ple *P, const char *prefix, char *e
     P->table_rows = (P->table_rows + c->ngram_divisor - 1) / c->ngram_divisor * c->ngram_divisor;
     qw_ple_multipliers(P->mult, c->vocab_size, c->ngram_size, 0, c->ngram_seed);
 
-    snprintf(p, sizeof p, "%s.ple_embedding.ngram_embedding.weight", prefix);
-    if (!(P->table = qw_bind_bf16(e, p, 2, P->table_rows, P->head_dim, err, errcap))) return false;
+    /* The table's shards, in order, until the names run out; together they
+     * must be exactly the padded row count the hash was sized for. */
+    P->n_shards = 0;
+    P->shard_start[0] = 0;
+    for (;;) {
+        snprintf(p, sizeof p, "%s.ple_embedding.ngram_embedding.shard_%d.weight", prefix, P->n_shards);
+        const qw_tensor *t = qw_table_find(&e->tensors, p);
+        if (!t) break;
+        if (P->n_shards >= QW_MAX_ENGRAM_SHARDS) {
+            qw_errf(err, errcap, "qwen4_exp: more than %d engram shards", QW_MAX_ENGRAM_SHARDS);
+            return false;
+        }
+        if (t->dtype != QW_DT_BF16 || t->ndim != 2 || t->shape[1] != P->head_dim) {
+            qw_errf(err, errcap, "%s is not bf16 [rows, %d]", p, P->head_dim);
+            return false;
+        }
+        P->shard[P->n_shards] = t;
+        P->shard_start[P->n_shards + 1] = P->shard_start[P->n_shards] + t->shape[0];
+        P->n_shards++;
+    }
+    if (P->n_shards == 0) {
+        qw_errf(err, errcap, "missing engram table %s.ple_embedding.ngram_embedding.shard_0.weight", prefix);
+        return false;
+    }
+    if (P->shard_start[P->n_shards] != P->table_rows) {
+        qw_errf(err, errcap, "engram table has %lld rows across %d shards, expected %lld",
+                (long long)P->shard_start[P->n_shards], P->n_shards, (long long)P->table_rows);
+        return false;
+    }
     snprintf(p, sizeof p, "%s.key_proj", prefix);
     if (!qw_bind_qlinear(e, &P->key_proj, p, E, HH, err, errcap)) return false;
     snprintf(p, sizeof p, "%s.value_proj", prefix);
@@ -1547,6 +1594,7 @@ const qw_tensor *qwasar_engine_tensor(const qwasar_engine *e, const char *name) 
 
 const void *qw_tensor_data(const qw_tensor *t) {
     if (!t) return NULL;
+    if (!t->buf) return t->cpu;               /* host-only shard */
     const char *base = qw_buf_contents(t->buf);
     return base ? base + t->offset : NULL;
 }
