@@ -173,6 +173,11 @@ static void qw_kv_evict(const char *dir, uint64_t budget) {
 
 bool qwasar_session_save(qwasar_session *s, const qwasar_engine *e,
                          char *err, size_t errcap) {
+    if (qwasar_session_is_flash(s)) {
+        snprintf(err, errcap, "checkpoints are not implemented for qwen4_exp yet "
+                              "(the indexer and engram state have no format)");
+        return false;
+    }
     int32_t n = 0;
     const int32_t *tokens = qw_session_history(s, &n);
     if (!tokens || n < QW_KV_MIN_TOKENS) {
@@ -325,6 +330,7 @@ int32_t qwasar_kv_probe(const qwasar_engine *e, const int32_t *tokens, int32_t n
 int32_t qwasar_session_restore(qwasar_session *s, const qwasar_engine *e,
                                const int32_t *tokens, int32_t n) {
     if (!tokens || n <= 0 || qwasar_session_n_past(s) != 0) return 0;
+    if (qwasar_session_is_flash(s)) return 0;
 
     char dir[1024];
     if (!qw_kv_dir(dir, sizeof dir)) return 0;

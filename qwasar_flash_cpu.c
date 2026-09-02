@@ -109,6 +109,29 @@ static int64_t pymod(int64_t a, int64_t p) {
     return r < 0 ? r + p : r;
 }
 
+/* The n-gram ids for one token.  `hist[0]` is the token itself and hist[s]
+ * the token s back; `in_seg` is its position within the EOS-delimited
+ * segment, so a context that reaches past the segment start reads as EOS --
+ * the reference's _shift_right_ignore_eos.  Heads for n-gram order n are
+ * contiguous: bigram heads first, then trigram. */
+void qw_ple_ids(const qw_ple *P, const qw_config *c, const int32_t *hist, int32_t in_seg,
+                int64_t *ids) {
+    const int32_t eos = c->eos_token_ids[0];
+    const int32_t per = c->heads_per_ngram;
+    int64_t shifted[8];
+    for (int32_t s = 0; s < c->ngram_size && s < 8; s++)
+        shifted[s] = (in_seg >= s) ? hist[s] : eos;
+    for (int32_t ng = 2; ng <= c->ngram_size; ng++) {
+        int64_t mixed = (int64_t)((uint64_t)shifted[0] * (uint64_t)P->mult[0]);
+        for (int32_t p = 1; p < ng; p++)
+            mixed ^= (int64_t)((uint64_t)shifted[p] * (uint64_t)P->mult[p]);
+        for (int32_t k = 0; k < per; k++) {
+            const int32_t h = (ng - 2) * per + k;
+            ids[h] = pymod(mixed, P->head_size[h]) + P->head_off[h];
+        }
+    }
+}
+
 /* ---- state ----------------------------------------------------------------- */
 
 typedef struct {
@@ -134,7 +157,32 @@ struct qw_flash_ref {
     /* rope */
     uint8_t axis[128];
     float   inv_freq[128];
+
+    /* diagnostics (qw_flash_ref_debug): what was chosen, and how decisively */
+    bool     dbg;
+    int32_t *dbg_routes;     /* [layers][max_ctx][K] */
+    uint8_t *dbg_mask;       /* [layers][max_ctx][max_ctx] */
+    float   *dbg_gap;        /* [layers][max_ctx]: k-th minus (k+1)-th block score */
+    int32_t  cur_layer;
 };
+
+void qw_flash_ref_debug(qw_flash_ref *r, bool on) {
+    const int32_t NL = r->c->num_hidden_layers, C = r->max_ctx, K = r->c->num_experts_per_tok;
+    r->dbg = on;
+    if (!on) return;
+    if (!r->dbg_routes) r->dbg_routes = calloc((size_t)NL * C * K, sizeof(int32_t));
+    if (!r->dbg_mask)   r->dbg_mask   = calloc((size_t)NL * C * C, 1);
+    if (!r->dbg_gap)    r->dbg_gap    = calloc((size_t)NL * C, sizeof(float));
+}
+const int32_t *qw_flash_ref_routes(const qw_flash_ref *r, int32_t layer, int32_t pos) {
+    return r->dbg_routes ? r->dbg_routes + ((size_t)layer * r->max_ctx + pos) * r->c->num_experts_per_tok : NULL;
+}
+const uint8_t *qw_flash_ref_mask(const qw_flash_ref *r, int32_t layer, int32_t pos) {
+    return r->dbg_mask ? r->dbg_mask + ((size_t)layer * r->max_ctx + pos) * r->max_ctx : NULL;
+}
+float qw_flash_ref_select_gap(const qw_flash_ref *r, int32_t layer, int32_t pos) {
+    return r->dbg_gap ? r->dbg_gap[(size_t)layer * r->max_ctx + pos] : 0.0f;
+}
 
 qw_flash_ref *qw_flash_ref_new(const qwasar_engine *e, int32_t max_ctx) {
     const qw_config *c = qwasar_engine_config(e);
@@ -173,7 +221,9 @@ void qw_flash_ref_free(qw_flash_ref *r) {
         free(r->L[i].conv_state); free(r->L[i].ssm);
         free(r->L[i].kc); free(r->L[i].vc); free(r->L[i].ikeys);
     }
-    free(r->L); free(r->ple_conv_state); free(r);
+    free(r->L); free(r->ple_conv_state);
+    free(r->dbg_routes); free(r->dbg_mask); free(r->dbg_gap);
+    free(r);
 }
 
 /* ---- the pieces ------------------------------------------------------------ */
@@ -288,6 +338,8 @@ static void qsa_select(qw_flash_ref *r, const qw_layer *L, ref_layer *l,
     const int32_t visible = pos + 1;
     const int32_t n_blocks = visible / ratio;
     memset(allowed, 0, (size_t)visible);
+    /* No complete block yet: nothing to select, so nothing to be tied about. */
+    if (r->dbg) r->dbg_gap[(size_t)r->cur_layer * r->max_ctx + pos] = FLT_MAX;
     /* the tail: an incomplete trailing block is always attended */
     for (int32_t t = n_blocks * ratio; t < visible; t++) allowed[t] = 1;
 
@@ -313,16 +365,27 @@ static void qsa_select(qw_flash_ref *r, const qw_layer *L, ref_layer *l,
             scores[bidx] = sc / sqrtf((float)d);
         }
         const int32_t take = block_topk < n_blocks ? block_topk : n_blocks;
+        float kth = 0.0f, next = -FLT_MAX;
         for (int32_t n = 0; n < take; n++) {
             int32_t best = -1;
             for (int32_t bidx = 0; bidx < n_blocks; bidx++)
                 if (scores[bidx] > -FLT_MAX && (best < 0 || scores[bidx] > scores[best])) best = bidx;
             if (best < 0) break;
             for (int32_t t = 0; t < ratio; t++) allowed[best * ratio + t] = 1;
+            kth = scores[best];
             scores[best] = -FLT_MAX;
         }
+        /* How decisive the cut was: the last selected score against the
+         * best unselected one.  Zero means a tie the reference implementation
+         * breaks by an order nothing specifies. */
+        for (int32_t bidx = 0; bidx < n_blocks; bidx++)
+            if (scores[bidx] > next) next = scores[bidx];
+        if (r->dbg) r->dbg_gap[(size_t)r->cur_layer * r->max_ctx + pos] =
+            (take < n_blocks) ? kth - next : FLT_MAX;
         free(scores); free(pooled); free(kn);
     }
+    if (r->dbg) memcpy(r->dbg_mask + ((size_t)r->cur_layer * r->max_ctx + pos) * r->max_ctx,
+                       allowed, (size_t)visible);
     free(qk); free(qn);
 }
 
@@ -421,6 +484,8 @@ static void moe_step(qw_flash_ref *r, const qw_moe *M, const float *x, float *ou
         logits[best] = -1.0f;
     }
     if (c->norm_topk_prob) for (int32_t n = 0; n < K; n++) w[n] /= wsum;
+    if (r->dbg) memcpy(r->dbg_routes + ((size_t)r->cur_layer * r->max_ctx + r->n_past) * K,
+                       idx, (size_t)K * sizeof(int32_t));
 
     for (int32_t i = 0; i < H; i++) out[i] = 0.0f;
     float *gu = malloc((size_t)2 * I * sizeof(float));
@@ -459,27 +524,15 @@ static void ple_step(qw_flash_ref *r, const qw_ple *P, const float *h4, float *o
     const int32_t pos = r->n_past;                 /* current position */
     const int32_t eos = c->eos_token_ids[0];
 
-    /* shifted tokens: the token s back within the EOS-delimited segment */
-    const int32_t in_seg = pos - 1 - r->last_eos;  /* position within segment */
-    int64_t shifted[8];
-    for (int32_t s = 0; s < c->ngram_size; s++)
-        shifted[s] = (in_seg >= s) ? r->hist[s] : eos;
-
-    /* hashed ids, one per head; heads for n-gram order n are contiguous */
+    /* hashed ids, one per head, then the gather */
+    int64_t ids[QW_MAX_NGRAM_HEADS];
+    qw_ple_ids(P, c, r->hist, pos - 1 - r->last_eos, ids);
     float *emb = malloc((size_t)E * sizeof(float));
     const uint16_t *table = (const uint16_t *)tdata(P->table);
-    for (int32_t ng = 2; ng <= c->ngram_size; ng++) {
-        int64_t mixed = (int64_t)((uint64_t)shifted[0] * (uint64_t)P->mult[0]);
-        for (int32_t p = 1; p < ng; p++)
-            mixed ^= (int64_t)((uint64_t)shifted[p] * (uint64_t)P->mult[p]);
-        for (int32_t k = 0; k < per; k++) {
-            const int32_t h = (ng - 2) * per + k;
-            const int64_t id = pymod(mixed, P->head_size[h]) + P->head_off[h];
-            for (int32_t i = 0; i < HD; i++)
-                emb[(size_t)h * HD + i] = qw_bf16_to_f32_c(table[(size_t)id * HD + i]);
-        }
-    }
-    (void)NH;
+    for (int32_t h = 0; h < NH; h++)
+        for (int32_t i = 0; i < HD; i++)
+            emb[(size_t)h * HD + i] = qw_bf16_to_f32_c(table[(size_t)ids[h] * HD + i]);
+    (void)per; (void)eos;
 
     float *key = malloc((size_t)HH * sizeof(float));
     float *keyn = malloc((size_t)HH * sizeof(float));
@@ -560,6 +613,7 @@ bool qw_flash_ref_forward(qw_flash_ref *r, const int32_t *tokens, int32_t n,
         for (int32_t i = 0; i < c->num_hidden_layers; i++) {
             const qw_layer *L = qwasar_engine_layer(e, i);
             ref_layer *l = &r->L[i];
+            r->cur_layer = i;
 
             if (L->ple) {
                 ple_step(r, L->ple, h4, out);

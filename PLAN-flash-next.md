@@ -298,6 +298,58 @@ the gated norm and is **not** (+1) — same split as the 27B. The HF
 checkpoint stores raw weights; the converter applies the +1 where MLX would
 have, so the engine's existing convention holds.
 
+## Status — 2026-09-02, on the M4 Air
+
+**Phases 1–5 met, on the toy.** With no real weights on the machine, the
+whole port was built against `tests/fixtures/flashnext-tiny-q4`: a seeded
+random Qwen4Exp at the real model's head geometry (256-dim attention heads,
+128×128 delta heads, 128-dim index heads, 64 rotary dims — the production
+kernels are compiled for those) with every feature on. Two twins hold it:
+
+- `tests/test_flashnext`: the loader binds every tensor with shape checks;
+  the engram hash constants equal the checkpoint's own buffers; the CPU
+  reference (`qwasar_flash_cpu.c`) matches `transformers` to **5e-7 per
+  layer at every position** and 1e-6 on logits, with every expert choice
+  and every QSA mask entry equal; and the **Metal forward matches the
+  reference to ~1e-4** (fp16 KV cache rounding) token-by-token and as one
+  prefill, with a per-layer debug stop that names a divergence by layer.
+- `tests/test_sparse`: all sixteen new kernels (`metal/sparse.metal`) and
+  the reused dense/quantised matmuls at the family's shapes, each against
+  scalar code, ~1e-7.
+
+Three things learned that the plan did not know:
+
+- **The l2norm epsilon convention differs between the two families'
+  oracles.** mlx-vlm (the 27B's) puts eps inside the mean; transformers
+  (this family's) puts it on the sum of squares. Identical on the 27B's
+  vectors, 0.7% on the toy's small ones. The same kernel expresses either
+  (`eps/dk`), and each family gets its own oracle's; the 27B path is
+  unchanged.
+- **Selection ties are real.** A block's index score is a sum of ReLU'd
+  dots, exactly zero with probability 2⁻ʰ per block, and `torch.topk`
+  breaks ties in an unspecified order. The test measures the cut's gap and
+  refuses an indecisive fixture; the toy has 16 index heads for that
+  reason. In production a tie at the cut will resolve differently from
+  torch, and nothing can be done about that but knowing it.
+- **`save_pretrained` writes experts per-expert, the real checkpoint
+  fused.** The converter accepts both and emits banks.
+
+**What the Metal path does not do yet**, in the order it will matter:
+
+1. *Speed.* `qw_qsa_select` is k rounds of a parallel argmax per query
+   (O(k·n_blocks): ~33M ops per query per layer at 262K context) and the
+   expert matvec is per (token, slot) pair with no weight reuse across
+   tokens. Both are the simplest correct shapes; both need the Max's
+   numbers before a replacement is designed (§3, Phase 6).
+2. *Checkpoints.* The indexer key cache and the engram state have no
+   place in the kvstore format; `qwasar_session_save/restore` refuse the
+   family. Sessions work, parking's warm resume does not.
+3. *Speculation, vision, images*: refused with a message (Phases 7, and
+   the deferred tower).
+4. *The tokenizer's `\p{M}` regex switch* and the sharded converter for
+   a 360 GB input are the two remaining Air-side items before the Max can
+   load anything.
+
 ## 4. Risks, named
 
 - **The engram hash** (silent quality rot; caught only by Phase 5's gate —
