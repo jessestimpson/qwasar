@@ -457,6 +457,8 @@ static void test_qsa(qwasar_engine *e) {
 static void test_reused(qwasar_engine *e) {
     static const struct { int32_t k, n, rows; } shapes[] = {
         { 64, 1, 1 }, { 64, 8, 1 }, { 256, 4, 1 }, { 256, 4, 5 }, { 64, 8, 7 }, { 2560, 512, 3 },
+        /* the real model's block-inject and shared-expert gate: the small-n kernel */
+        { 10240, 4, 1 }, { 10240, 4, 256 }, { 2560, 1, 5 },
     };
     for (size_t i = 0; i < sizeof shapes / sizeof *shapes; i++) {
         const int32_t k = shapes[i].k, n = shapes[i].n, rows = shapes[i].rows;
@@ -502,6 +504,67 @@ static void test_reused(qwasar_engine *e) {
             free(ref);
             qw_buf_free(x); qw_buf_free(y);
         }
+}
+
+/* Block selection at the real model's scale: thousands of blocks, a budget
+ * of 512, and scores rounded coarsely so that many tie at the cut -- where a
+ * selection is most likely to be subtly wrong.  Held to a plain sort: score
+ * descending, index ascending. */
+static int cmp_desc_then_index(const void *pa, const void *pb, void *ctx) {
+    const float *sc = ctx;
+    const int a = *(const int *)pa, b = *(const int *)pb;
+    if (sc[a] != sc[b]) return sc[a] > sc[b] ? -1 : 1;
+    return a - b;
+}
+
+static void test_select_scale(void) {
+    const int32_t ratio = 4, topk = 512;
+    static const int32_t ctxs[] = { 2047, 2051, 2052, 4164, 9000, 40001 };
+    for (size_t ci = 0; ci < sizeof ctxs / sizeof *ctxs; ci++) {
+        const int32_t rows = 3, base = ctxs[ci], max_ctx = base + rows + 8;
+        const int32_t max_blocks = max_ctx / ratio;
+        qw_buf sb = mkbuf((size_t)rows * max_blocks * 4), mb = mkbuf((size_t)rows * max_ctx);
+        float *sc = qw_buf_contents(sb);
+        uint32_t st = 1234567u + (uint32_t)ci;
+        for (int32_t i = 0; i < rows * max_blocks; i++) {
+            st = st * 1664525u + 1013904223u;
+            sc[i] = (float)((st >> 8) % 97) * 0.25f;     /* 97 levels: ties everywhere */
+        }
+        float *copy = malloc((size_t)rows * max_blocks * 4);
+        memcpy(copy, sc, (size_t)rows * max_blocks * 4);
+        qw_cmd c = qw_cmd_begin();
+        qw_op_qsa_select(c, qw_ref_at(mb, 0), qw_ref_at(sb, 0), rows, ratio, base, topk, max_ctx, max_blocks);
+        run(c, "qsa_select at scale");
+        const uint8_t *m = qw_buf_contents(mb);
+        int32_t bad = 0;
+        int *order = malloc((size_t)max_blocks * sizeof *order);
+        uint8_t *want = malloc((size_t)max_ctx);
+        for (int32_t r = 0; r < rows; r++) {
+            const int32_t n_keys = base + r + 1, n_blocks = n_keys / ratio;
+            const float *row = copy + (size_t)r * max_blocks;
+            for (int32_t b = 0; b < n_blocks; b++) order[b] = b;
+            /* insertion sort: qsort_r's argument order differs by platform */
+            for (int32_t i = 1; i < n_blocks; i++) {
+                const int v = order[i];
+                int32_t j = i - 1;
+                while (j >= 0 && cmp_desc_then_index(&order[j], &v, (void *)row) > 0) { order[j + 1] = order[j]; j--; }
+                order[j + 1] = v;
+            }
+            memset(want, 0, (size_t)n_keys);
+            for (int32_t t = n_blocks * ratio; t < n_keys; t++) want[t] = 1;
+            const int32_t take = n_blocks < topk ? n_blocks : topk;
+            for (int32_t i = 0; i < take; i++)
+                for (int32_t t = 0; t < ratio; t++) want[order[i] * ratio + t] = 1;
+            for (int32_t t = 0; t < n_keys; t++)
+                if ((m[(size_t)r * max_ctx + t] != 0) != (want[t] != 0)) bad++;
+        }
+        char label[64];
+        snprintf(label, sizeof label, "qsa_select %d keys", base + rows);
+        printf("  %-28s mismatches %d\n", label, bad);
+        CHECK(bad == 0, "%s: %d mask entries differ from a sort", label, bad);
+        free(order); free(want); free(copy);
+        qw_buf_free(sb); qw_buf_free(mb);
+    }
 }
 
 /* MLX's layout: split gate and up banks and a group-32 embedding, each
@@ -567,6 +630,7 @@ int main(void) {
     printf("== moe\n");               test_moe(e);
     printf("== norm, conv\n");        test_gated_and_conv();
     printf("== qsa\n");               test_qsa(e);
+    printf("== qsa selection at scale\n"); test_select_scale();
     printf("== reused ops\n");        test_reused(e);
 
     qwasar_engine_free(e);

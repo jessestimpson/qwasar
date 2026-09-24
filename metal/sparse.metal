@@ -100,43 +100,88 @@ kernel void qw_hc_inject(
 
 /* ---- mixture of experts --------------------------------------------------- */
 
-/* Softmax in fp32 over every expert, top-k, renormalised: one thread per
- * token.  K is small and E is a few hundred, so the scans are nothing. */
+/* Softmax in fp32 over every expert, top-k, renormalised.  One threadgroup
+ * of QW_ROUTE_THREADS per token: the logits go to threadgroup memory, max and
+ * sum are tree reductions, and each of the K picks is a parallel argmax --
+ * highest probability, ties to the lowest expert index, the order a serial
+ * scan with `>` would pick in.  (It was one thread per token, recomputing
+ * every exp in every round: 72% of a decode step.) */
 struct qw_route_args { uint rows, E, K, norm; };
+#define QW_ROUTE_THREADS 256
+#define QW_ROUTE_MAX_E   1024
 
 kernel void qw_moe_route(
     device const float *logits [[buffer(0)]],   /* [rows, E] */
     device       int   *idx    [[buffer(1)]],   /* [rows, K] */
     device       float *w      [[buffer(2)]],   /* [rows, K] */
     constant qw_route_args &a  [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
 {
-    if (gid >= a.rows) return;
-    device const float *l = logits + (ulong)gid * a.E;
-    float m = -FLT_MAX;
-    for (uint e = 0; e < a.E; ++e) m = max(m, l[e]);
-    float sum = 0.0f;
-    for (uint e = 0; e < a.E; ++e) sum += exp(l[e] - m);
+    threadgroup float p[QW_ROUTE_MAX_E];
+    threadgroup float red[QW_ROUTE_THREADS / 32];
+    threadgroup int   redi[QW_ROUTE_THREADS / 32];
+    threadgroup float picked_w[32];
+    threadgroup int   picked_i[32];
+    const uint NSG = QW_ROUTE_THREADS / 32;
 
-    int   chosen[32];
-    float wsum = 0.0f;
+    device const float *l = logits + (ulong)tgid * a.E;
+
+    /* max */
+    float m = -FLT_MAX;
+    for (uint e = tid; e < a.E; e += QW_ROUTE_THREADS) { const float v = l[e]; p[e] = v; m = max(m, v); }
+    m = simd_max(m);
+    if (lane == 0) red[sgid] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = red[0];
+    for (uint i = 1; i < NSG; ++i) m = max(m, red[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* sum of exps, then the probabilities */
+    float sum = 0.0f;
+    for (uint e = tid; e < a.E; e += QW_ROUTE_THREADS) { const float x = exp(p[e] - m); p[e] = x; sum += x; }
+    sum = simd_sum(sum);
+    if (lane == 0) red[sgid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum = 0.0f;
+    for (uint i = 0; i < NSG; ++i) sum += red[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < a.E; e += QW_ROUTE_THREADS) p[e] = p[e] / sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* K rounds of argmax; a pick is struck out as -1, below any probability */
     for (uint k = 0; k < a.K; ++k) {
-        int best = -1;
         float bv = -1.0f;
-        for (uint e = 0; e < a.E; ++e) {
-            bool taken = false;
-            for (uint j = 0; j < k; ++j) taken = taken || (chosen[j] == (int)e);
-            if (taken) continue;
-            const float p = exp(l[e] - m) / sum;
-            if (p > bv) { bv = p; best = (int)e; }
+        int   bi = 0x7fffffff;
+        for (uint e = tid; e < a.E; e += QW_ROUTE_THREADS) {
+            const float v = p[e];
+            if (v > bv || (v == bv && (int)e < bi)) { bv = v; bi = (int)e; }
         }
-        chosen[k] = best;
-        w[gid * a.K + k] = bv;
-        wsum += bv;
+        const float sv = simd_max(bv);
+        int si = simd_min(bv == sv ? bi : 0x7fffffff);
+        if (lane == 0) { red[sgid] = sv; redi[sgid] = si; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float gv = red[0];
+            int   gi = redi[0];
+            for (uint i = 1; i < NSG; ++i)
+                if (red[i] > gv || (red[i] == gv && redi[i] < gi)) { gv = red[i]; gi = redi[i]; }
+            picked_w[k] = gv;
+            picked_i[k] = gi;
+            p[gi] = -1.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (uint k = 0; k < a.K; ++k) {
-        idx[gid * a.K + k] = chosen[k];
-        if (a.norm) w[gid * a.K + k] /= wsum;
+
+    if (tid == 0) {
+        float wsum = 0.0f;
+        for (uint k = 0; k < a.K; ++k) wsum += picked_w[k];
+        for (uint k = 0; k < a.K; ++k) {
+            idx[tgid * a.K + k] = picked_i[k];
+            w[tgid * a.K + k] = a.norm ? picked_w[k] / wsum : picked_w[k];
+        }
     }
 }
 
@@ -352,47 +397,104 @@ kernel void qw_qsa_scores(
  * the simplest correct shape, and the one to measure before replacing. */
 struct qw_qsa_select_args { uint rows, ratio, base_pos, block_topk, max_ctx, max_blocks; };
 
+/* Block selection: mark the `block_topk` best-scoring complete blocks (ties to
+ * the lower index) and the incomplete tail as visible.
+ *
+ * A radix select, one threadgroup of QW_SEL_THREADS per query: scores map to
+ * unsigned keys that order as the floats do, four 8-bit passes of a
+ * threadgroup histogram narrow to the exact key T of the k-th best, and then
+ * everything above T is taken and the rest of the budget filled from keys
+ * equal to T in index order.  Four passes over the blocks, where the version
+ * this replaced ran one round per selected block -- 512 of them per layer on
+ * every step past the budget, 7 t/s at 4K context. */
+#define QW_SEL_THREADS 1024
+
+static inline uint qw_order_key(float v) {
+    const uint u = as_type<uint>(v + 0.0f);          /* -0 -> +0 */
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+static inline void qw_sel_mark(device uchar *mr, uint b, uint ratio) {
+    for (uint t = 0; t < ratio; ++t) mr[b * ratio + t] = 1;
+}
+
 kernel void qw_qsa_select(
-    device       float *scores [[buffer(0)]],   /* [rows, max_blocks], consumed */
+    device       float *scores [[buffer(0)]],   /* [rows, max_blocks] */
     device       uchar *mask   [[buffer(1)]],   /* [rows, max_ctx] */
     constant qw_qsa_select_args &a [[buffer(2)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]],
     uint ntg  [[threads_per_threadgroup]])
 {
-    threadgroup float bv[256];
-    threadgroup int   bi[256];
+    threadgroup atomic_uint hist[256];
+    threadgroup uint counts[QW_SEL_THREADS];
+    threadgroup uint sh_prefix, sh_need;
 
     const uint r = tgid;
     const uint n_keys = a.base_pos + r + 1;
     const uint n_blocks = n_keys / a.ratio;
-    device float *sc = scores + (ulong)r * a.max_blocks;
+    device const float *sc = scores + (ulong)r * a.max_blocks;
     device uchar *mr = mask + (ulong)r * a.max_ctx;
 
     for (uint t = tid; t < n_keys; t += ntg) mr[t] = (t >= n_blocks * a.ratio) ? 1 : 0;
     threadgroup_barrier(mem_flags::mem_device);
 
     const uint take = min(a.block_topk, n_blocks);
-    for (uint it = 0; it < take; ++it) {
-        float lv = -FLT_MAX;
-        int   li = -1;
+    if (take == 0) return;
+    if (take == n_blocks) {
+        for (uint b = tid; b < n_blocks; b += ntg) qw_sel_mark(mr, b, a.ratio);
+        return;
+    }
+
+    /* The k-th best key, eight bits at a time from the top. */
+    uint prefix = 0, known = 0, need = take;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (uint i = tid; i < 256; i += ntg) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint b = tid; b < n_blocks; b += ntg) {
-            const float v = sc[b];
-            if (v > lv || (v == lv && li >= 0 && (int)b < li)) { lv = v; li = (int)b; }
+            const uint key = qw_order_key(sc[b]);
+            if ((key & known) == prefix)
+                atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
         }
-        bv[tid] = lv; bi[tid] = li;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid == 0) {
-            float gv = -FLT_MAX; int gi = -1;
-            for (uint t = 0; t < ntg; ++t)
-                if (bi[t] >= 0 && (bv[t] > gv || (bv[t] == gv && bi[t] < gi))) { gv = bv[t]; gi = bi[t]; }
-            if (gi >= 0) {
-                sc[gi] = -FLT_MAX;
-                for (uint t = 0; t < a.ratio; ++t) mr[gi * a.ratio + t] = 1;
+            uint above = 0;
+            int d = 255;
+            for (; d > 0; --d) {
+                const uint h = atomic_load_explicit(&hist[d], memory_order_relaxed);
+                if (above + h >= need) break;
+                above += h;
             }
+            sh_prefix = prefix | ((uint)d << shift);
+            sh_need = need - above;
         }
-        threadgroup_barrier(mem_flags::mem_device);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix = sh_prefix;
+        need = sh_need;
+        known |= 255u << shift;
     }
+    const uint T = prefix;           /* `need` of the keys equal to T are still to take */
+
+    /* Everything above T; then the first `need` equal to T, by index.  Each
+     * thread owns a contiguous run of blocks so index order is a prefix sum. */
+    const uint per = (n_blocks + ntg - 1) / ntg;
+    const uint lo = min(tid * per, n_blocks), hi = min(lo + per, n_blocks);
+    uint eq = 0;
+    for (uint b = lo; b < hi; ++b) {
+        const uint key = qw_order_key(sc[b]);
+        if (key > T) qw_sel_mark(mr, b, a.ratio);
+        else if (key == T) eq++;
+    }
+    counts[tid] = eq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint run = 0;
+        for (uint t = 0; t < ntg; ++t) { const uint c = counts[t]; counts[t] = run; run += c; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint rank = counts[tid];
+    for (uint b = lo; b < hi && rank < need; ++b)
+        if (qw_order_key(sc[b]) == T) { qw_sel_mark(mr, b, a.ratio); rank++; }
 }
 
 /* qw_attn_decode with a per-(query, position) byte mask: a masked key

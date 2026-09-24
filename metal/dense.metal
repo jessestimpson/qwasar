@@ -177,3 +177,40 @@ kernel void qw_dmm_bf16(
         if (gm < a.rows && gn < a.n) y[(ulong)gm * a.n + gn] = Cs[idx];
     }
 }
+
+/* y[r, o] = w[o, :] . x[r, :] for a BF16 weight with few outputs and a long
+ * input -- Flash-Next's block-inject weights are 4 x 10240, the shared-expert
+ * gate 1 x 2560.  Parallelism over outputs, which is what the row-blocked
+ * kernels above have, is nothing here: one threadgroup per (row, output),
+ * its threads splitting the dot product.  (At prefill the blocked kernel ran
+ * these as dozens of back-to-back single-threadgroup dispatches: a fifth of
+ * the prompt's GPU time.) */
+struct qw_dmv_small_args { uint k, n, rows; };
+
+kernel void qw_dmv_small_bf16(
+    device const ushort *w [[buffer(0)]],   /* [n, k] bf16 */
+    device const float  *x [[buffer(1)]],   /* [rows, k] */
+    device       float  *y [[buffer(2)]],   /* [rows, n] */
+    constant qw_dmv_small_args &a [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint ntg  [[threads_per_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint nsg  [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float partial[32];
+    const uint r = tgid / a.n, o = tgid % a.n;
+    device const ushort *wr = w + (ulong)o * a.k;
+    device const float  *xr = x + (ulong)r * a.k;
+    float acc = 0.0f;
+    for (uint i = tid; i < a.k; i += ntg) acc = fma(qw_bf16_to_f32(wr[i]), xr[i], acc);
+    acc = simd_sum(acc);
+    if (lane == 0) partial[sgid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < nsg; ++i) s += partial[i];
+        y[(ulong)r * a.n + o] = s;
+    }
+}

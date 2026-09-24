@@ -250,6 +250,10 @@ int main(int argc, char **argv) {
     }
     if (!logits) { fprintf(stderr, "qwasar: %s\n", err); return 1; }
     double t_prefill = now_sec() - t0;
+    /* QWASAR_PROFILE: the prompt's table now, per prompt token; the one
+     * printed at the end is decode only. */
+    if (qw_prof_enabled()) { fprintf(stderr, "prefill -- "); qw_prof_report(stderr, n_prompt); }
+    qw_prof_reset();
 
     const int32_t vocab = qwasar_vocab_size(e);
     const int32_t think_close = qwasar_token_id(tok, "</think>");
@@ -406,6 +410,7 @@ int main(int argc, char **argv) {
                     "decode %d tokens in %.2fs (%.2f tok/s)\n",
             n_prompt, t_prefill, n_prompt / t_prefill,
             generated, t_decode, generated > 0 ? generated / t_decode : 0.0);
+    if (qw_prof_enabled()) qw_prof_report(stderr, generated);
 
     free(prompt);
     qwasar_session_free(s);

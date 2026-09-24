@@ -295,6 +295,7 @@ struct qwasar_engine {
     int32_t     n_derived, cap_derived;
     size_t      bytes_derived;
     bool        norm_add_one;  /* the checkpoint's (1+w) gains are stored centred at 0 */
+    qw_residency residency;    /* keeps every weight buffer resident while loaded */
     bool        mlx_experts;   /* experts stored as split switch_mlp banks */
 };
 
@@ -488,6 +489,16 @@ static bool qw_load_shard(qwasar_engine *e, const char *path, char *err, size_t 
             t->buf    = NULL;
             t->offset = data_base + (size_t)o0->u.num;       /* into the mapping */
             t->cpu    = (const char *)sh->addr + t->offset;
+            /* Read a few rows at a time, anywhere: no read-ahead.  Without
+             * this each fault pulls in a cluster of neighbouring pages, and a
+             * long prompt's ~16,000 scattered faults flood memory with cache
+             * faster than it can be reclaimed -- enough to push the weights
+             * themselves out to swap. */
+            if (t->nbytes >= page) {
+                const uintptr_t lo = (uintptr_t)t->cpu & ~(uintptr_t)(page - 1);
+                const uintptr_t hi = ((uintptr_t)t->cpu + t->nbytes) & ~(uintptr_t)(page - 1);
+                if (hi > lo) madvise((void *)lo, hi - lo, MADV_RANDOM);
+            }
         } else if (sh->materialized) {
             t->buf    = sh->buf;
             t->offset = packed_at;
@@ -1956,6 +1967,22 @@ qwasar_engine *qwasar_engine_load(const qwasar_options *opts, char *err, size_t 
     }
     if (opts->mtp_path && *opts->mtp_path
         && !qw_load_mtp(e, opts->mtp_path, err, errcap)) goto fail;
+
+    /* Every weight buffer -- shards, repacked copies, what the loader made --
+     * held resident while the model is loaded (qw_residency_new). */
+    {
+        qw_buf bufs[QW_MAX_SHARDS + 1];
+        int32_t n = 0;
+        for (int i = 0; i < e->n_shards; i++) if (e->shards[i].buf) bufs[n++] = e->shards[i].buf;
+        if (e->mtp.q4) bufs[n++] = e->mtp.q4;
+        qw_buf *all = malloc(((size_t)n + (size_t)e->n_derived) * sizeof *all);
+        if (all) {
+            memcpy(all, bufs, (size_t)n * sizeof *all);
+            memcpy(all + n, e->derived_bufs, (size_t)e->n_derived * sizeof *all);
+            e->residency = qw_residency_new(all, n + e->n_derived);
+            free(all);
+        }
+    }
     return e;
 
 fail:
@@ -1965,6 +1992,7 @@ fail:
 
 void qwasar_engine_free(qwasar_engine *e) {
     if (!e) return;
+    qw_residency_free(e->residency);
     for (int32_t i = 0; i < e->n_derived; i++) {
         qw_buf_free(e->derived_bufs[i]);
         free(e->derived[i]);

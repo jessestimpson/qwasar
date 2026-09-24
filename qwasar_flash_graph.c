@@ -16,6 +16,8 @@
 
 #include "qwasar_session.h"
 
+#include <dispatch/dispatch.h>
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,31 +136,53 @@ void qw_flash_state_free(struct qw_flash_state *f) {
  *
  * The hash needs the token history and the EOS bookkeeping, and the gather
  * reads a few rows of a table that is never a GPU operand, so both happen
- * here, per chunk, before the command buffer is encoded. */
+ * here, per chunk, before the command buffer is encoded.
+ *
+ * The hash is sequential (each token's context is the tokens before it) and
+ * cheap; the gather is neither.  Its rows are scattered over a 30 GB table on
+ * disk, and a cold row is a page fault served from the SSD -- one after
+ * another, a third of a long prefill with the GPU idle.  An SSD serves many
+ * random reads at once far faster than in turn, so the ids are computed first
+ * and the rows then read in parallel, one work item per token. */
+struct ple_gather {
+    const qw_ple *P;
+    const int64_t *ids;      /* [rows][n_heads] */
+    float *emb;              /* [rows][E] */
+    int32_t E;
+};
+
+static void ple_gather_token(void *ctx, size_t r) {
+    const struct ple_gather *g = ctx;
+    const int32_t NH = g->P->n_heads, HD = g->P->head_dim;
+    for (int32_t h = 0; h < NH; h++)
+        qw_ple_row(g->P, g->ids[r * NH + h], g->emb + r * g->E + (size_t)h * HD);
+}
+
 void qw_flash_prepare_chunk(qwasar_session *s, const int32_t *tokens, int32_t rows) {
     struct qw_flash_state *f = s->flash;
     const qw_config *c = s->cfg;
     if (c->ple_layer < 0) return;
     const qw_layer *L = qwasar_engine_layer(s->e, c->ple_layer);
     const qw_ple *P = L->ple;
-    const int32_t HD = P->head_dim, E = c->ple_embed_dim;
-    float *emb = fcontents(f->ple_emb);
-    int64_t ids[QW_MAX_NGRAM_HEADS];
+    int64_t *ids = malloc((size_t)rows * P->n_heads * sizeof *ids);
+    if (!ids) return;
 
     for (int32_t r = 0; r < rows; r++) {
         const int32_t tok = tokens[r];
         const int32_t pos = s->n_past + r;
         for (int i = 7; i > 0; i--) f->hist[i] = f->hist[i - 1];
         f->hist[0] = tok;
-
-        qw_ple_ids(P, c, f->hist, pos - 1 - f->last_eos, ids);
-        for (int32_t h = 0; h < P->n_heads; h++)
-            qw_ple_row(P, ids[h], emb + (size_t)r * E + (size_t)h * HD);
-
+        qw_ple_ids(P, c, f->hist, pos - 1 - f->last_eos, ids + (size_t)r * P->n_heads);
         /* A segment ends at the model's own EOS only -- not at <|im_end|>,
          * which closes every chat turn and is ordinary n-gram context. */
         if (tok == c->model_eos) f->last_eos = pos;
     }
+
+    struct ple_gather g = { P, ids, fcontents(f->ple_emb), c->ple_embed_dim };
+    if (rows == 1) ple_gather_token(&g, 0);
+    else dispatch_apply_f((size_t)rows, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                          &g, ple_gather_token);
+    free(ids);
 }
 
 /* ---- the pieces --------------------------------------------------------------- */
@@ -172,13 +196,18 @@ static void encode_hc(qwasar_session *s, qw_cmd c, const qw_hc *hc, int32_t rows
 
     qw_op_rms_norm_grouped(c, qw_ref_at(f->n4, 0), qw_ref_at(f->h4, 0), qw_tensor_ref(hc->hc_norm),
                            H, S, rows, cfg->rms_norm_eps);
+    qw_cmd_mark(c, "hc: norm");
     qw_encode_qlinear(c, &hc->mix_down, qw_ref_at(f->mixd, 0), qw_ref_at(f->n4, 0), rows);
     qw_op_silu_scale(c, qw_ref_at(f->mixd, 0), rows * cfg->hc_lowrank, 1.0f / (float)S);
+    qw_cmd_mark(c, "hc: mix down");
     qw_encode_qlinear(c, &hc->mix_up, qw_ref_at(f->mixu, 0), qw_ref_at(f->mixd, 0), rows);
     qw_op_hc_mix(c, qw_ref_at(s->hn, 0), qw_ref_at(f->n4, 0), qw_ref_at(f->mixu, 0), rows, H, S);
-    if (hc->block_inject)
+    qw_cmd_mark(c, "hc: mix up");
+    if (hc->block_inject) {
         qw_op_dmat_bf16(c, qw_ref_at(f->inj, 0), qw_ref_at(f->n4, 0),
                         qw_tensor_ref(hc->block_inject), HH, S, rows);
+        qw_cmd_mark(c, "hc: inject weights");
+    }
 }
 
 static void encode_inject(qwasar_session *s, qw_cmd c, int32_t rows) {
@@ -240,18 +269,39 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
                    qw_ref_at(s->k, 0), qw_ref_at(s->v, 0),
                    rows, cfg->num_key_value_heads, hd, s->max_ctx, s->n_past);
 
-    /* The indexer: query heads normed and rotated at their own positions;
-     * raw keys appended to this layer's key cache. */
+    /* The indexer: raw keys appended to this layer's key cache, always --
+     * selection past the budget needs every one of them. */
     const qw_ref ikeys = qw_off(f->ikeys, (size_t)fi * s->max_ctx * d);
     qw_encode_qlinear(c, &L->indexer.qk_proj, qw_ref_at(f->iqk, 0), qw_ref_at(s->hn, 0), rows);
+    qw_op_slice_rows(c, qw_ref_offset(ikeys, (size_t)s->n_past * d * 4), qw_ref_at(f->iqk, 0),
+                     rows, (nq + 1) * d, nq * d, d);
+
+    /* While every visible block fits the budget -- the last row of the chunk
+     * sees the most -- selection picks all of them plus the tail, which is
+     * exactly causal attention.  So below the budget (2048 tokens in the real
+     * model) the scores and the selection are skipped, not merely made cheap:
+     * they were a round per block per layer on every step. */
+    const int32_t ratio = cfg->indexer_compress_ratio;
+    const int32_t topk = cfg->indexer_budget / ratio;
+    if ((s->n_past + rows) / ratio <= topk) {
+        qw_op_attn_decode(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->q, 0),
+                          qw_ref_at(s->kcache, kv_stride * fi * sizeof(uint16_t)),
+                          qw_ref_at(s->vcache, kv_stride * fi * sizeof(uint16_t)),
+                          rows, cfg->num_attention_heads, cfg->num_key_value_heads,
+                          hd, s->max_ctx, s->n_past, 1.0f / sqrtf((float)hd));
+        qw_op_mul_sigmoid(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->gate, 0), rows * sh->q_dim);
+        qw_encode_qlinear(c, &L->o_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->attn_out, 0), rows);
+        return;
+    }
+
+    /* Past the budget: query heads normed and rotated at their own positions,
+     * blocks scored against the cached keys, the budget's worth selected. */
     qw_op_slice_rows(c, qw_ref_at(f->iq, 0), qw_ref_at(f->iqk, 0), rows, (nq + 1) * d, 0, nq * d);
     qw_op_rms_norm(c, qw_ref_at(f->iq, 0), qw_ref_at(f->iq, 0), qw_tensor_ref(L->indexer.q_norm),
                    d, rows * nq, cfg->rms_norm_eps, 1.0f);
     qw_op_rope_partial(c, qw_ref_at(f->iq, 0), qw_ref_at(s->positions, 0),
                        qw_ref_at(s->rope_axis, 0), qw_ref_at(s->rope_inv_freq, 0),
                        rows, nq, d, cfg->rotary_dim);
-    qw_op_slice_rows(c, qw_ref_offset(ikeys, (size_t)s->n_past * d * 4), qw_ref_at(f->iqk, 0),
-                     rows, (nq + 1) * d, nq * d, d);
     qw_op_qsa_scores(c, qw_ref_at(f->iscores, 0), qw_ref_at(f->iq, 0), ikeys,
                      qw_tensor_ref(L->indexer.k_norm), qw_ref_at(s->rope_inv_freq, 0),
                      rows, nq, d, cfg->indexer_compress_ratio, s->n_past, cfg->rotary_dim,
@@ -282,6 +332,7 @@ static void encode_moe(qwasar_session *s, qw_cmd c, const qw_moe *M, int32_t row
                     qw_tensor_ref(M->router), H, M->n_experts, rows);
     qw_op_moe_route(c, qw_ref_at(f->route_idx, 0), qw_ref_at(f->route_w, 0),
                     qw_ref_at(f->route_logits, 0), rows, M->n_experts, K, cfg->norm_topk_prob);
+    qw_cmd_mark(c, "moe router");
     if (M->split) {
         /* Gate and up as two banks (MLX's layout), into the two halves of the
          * scratch the fused bank fills: [pairs, I] of gate, then of up. */
@@ -306,6 +357,7 @@ static void encode_moe(qwasar_session *s, qw_cmd c, const qw_moe *M, int32_t row
                       qw_tensor_ref(M->down.biases), I, H, pairs, K, true, M->down.group_size);
     qw_op_moe_combine(c, qw_ref_at(s->hn2, 0), qw_ref_at(f->exp_y, 0), qw_ref_at(f->route_w, 0),
                       rows, K, H);
+    qw_cmd_mark(c, "moe routed experts");
 
     qw_encode_qlinear(c, &M->sh_gate, qw_ref_at(f->sh_g, 0), qw_ref_at(s->hn, 0), rows);
     qw_encode_qlinear(c, &M->sh_up,   qw_ref_at(f->sh_u, 0), qw_ref_at(s->hn, 0), rows);
@@ -331,19 +383,28 @@ void qw_flash_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wan
                    qw_tensor_ref(qwasar_engine_embed(e)->biases), H, rows,
                    qwasar_engine_embed(e)->group_size);
     qw_op_repeat_cols(c, qw_ref_at(f->h4, 0), qw_ref_at(s->h, 0), rows, H, S);
+    qw_cmd_mark(c, "embed");
 
     for (int32_t i = 0; i < cfg->num_hidden_layers; i++) {
         const qw_layer *L = qwasar_engine_layer(e, i);
-        if (L->ple) encode_ple(s, c, L->ple, rows);
+        if (L->ple) { encode_ple(s, c, L->ple, rows); qw_cmd_mark(c, "engram"); }
 
         encode_hc(s, c, &L->attn_hc, rows);
-        if (L->is_linear_attn) qw_encode_gated_delta_layer(s, c, L, s->kind_index[i], rows);
-        else                   encode_qsa_layer(s, c, L, s->kind_index[i], rows);
+        qw_cmd_mark(c, "hyper-connections");
+        if (L->is_linear_attn) {
+            qw_encode_gated_delta_layer(s, c, L, s->kind_index[i], rows);
+            qw_cmd_mark(c, "gated delta");
+        } else {
+            encode_qsa_layer(s, c, L, s->kind_index[i], rows);
+            qw_cmd_mark(c, "sparse attention");
+        }
         encode_inject(s, c, rows);
 
         encode_hc(s, c, &L->mlp_hc, rows);
+        qw_cmd_mark(c, "hyper-connections");
         encode_moe(s, c, &L->moe, rows);
         encode_inject(s, c, rows);
+        qw_cmd_mark(c, "moe shared expert");
 
         if (f->dbg_stop_layer == i) return;
     }
@@ -353,4 +414,5 @@ void qw_flash_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wan
     encode_hc(s, c, qwasar_engine_final_hc(e), rows);
     qw_encode_qlinear(c, qwasar_engine_head(e), qw_ref_at(s->logits, 0),
                       qw_off(s->hn, (size_t)(rows - 1) * H), 1);
+    qw_cmd_mark(c, "final mixer + lm_head");
 }

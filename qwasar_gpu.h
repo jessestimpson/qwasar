@@ -2,6 +2,7 @@
 #define QWASAR_GPU_H
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -58,6 +59,19 @@ void   qw_cmd_wait(qw_cmd c);     /* submit and block until done */
 void   qw_cmd_free(qw_cmd c);
 /* Error string from the last completed command buffer, or NULL. */
 const char *qw_cmd_error(qw_cmd c);
+
+/* Keeps `bufs` resident until freed: the model's weights, so an idle model
+ * is not compressed or swapped out.  NULL where unsupported (before macOS 15). */
+typedef void *qw_residency;
+qw_residency qw_residency_new(qw_buf *bufs, int32_t n);
+void         qw_residency_free(qw_residency r);
+
+/* Profiling (QWASAR_PROFILE=1): qw_cmd_mark ends and times the work since the
+ * last mark under `label` (a string literal); no-ops when profiling is off. */
+bool qw_prof_enabled(void);
+void qw_cmd_mark(qw_cmd c, const char *label);
+void qw_prof_report(FILE *out, long tokens);
+void qw_prof_reset(void);
 
 /* y[r][n] = sum_k dequant(w)[n][k] * x[r][k]
  *

@@ -272,6 +272,106 @@ void qw_cmd_wait(qw_cmd c) {
     }
 }
 
+/* ---- residency -------------------------------------------------------------
+ *
+ * The weights are kept resident for as long as a model is loaded.  Between
+ * command buffers a Metal buffer is ordinary memory to the VM, and weights
+ * copied out for alignment are anonymous memory: an idle server, or the gaps
+ * profiling leaves, and the system compresses and swaps them -- measured, with
+ * a third of memory free -- so the next token reads its weights back from
+ * disk.  A residency set attached to the queue holds them in place.  The load
+ * checked beforehand that they fit (qw_memory_check). */
+qw_residency qw_residency_new(qw_buf *bufs, int32_t n) {
+    if (!g_device || !g_queue || n <= 0) return NULL;
+    if (@available(macOS 15.0, *)) {
+        @autoreleasepool {
+            MTLResidencySetDescriptor *d = [MTLResidencySetDescriptor new];
+            d.label = @"qwasar weights";
+            d.initialCapacity = (NSUInteger)n;
+            NSError *err = nil;
+            id<MTLResidencySet> set = [g_device newResidencySetWithDescriptor:d error:&err];
+            if (!set) return NULL;
+            for (int32_t i = 0; i < n; i++)
+                if (bufs[i]) [set addAllocation:(__bridge id<MTLBuffer>)bufs[i]];
+            [set commit];
+            [set requestResidency];
+            [g_queue addResidencySet:set];
+            return (qw_residency)CFBridgingRetain(set);
+        }
+    }
+    return NULL;
+}
+
+void qw_residency_free(qw_residency r) {
+    if (!r) return;
+    if (@available(macOS 15.0, *)) {
+        id<MTLResidencySet> set = (id<MTLResidencySet>)CFBridgingRelease(r);
+        if (g_queue) [g_queue removeResidencySet:set];
+        [set endResidency];
+    }
+}
+
+/* ---- profiling -------------------------------------------------------------
+ *
+ * QWASAR_PROFILE=1: every qw_cmd_mark() ends the command buffer so far,
+ * submits it, waits, and charges its GPU time (GPUEndTime - GPUStartTime) to
+ * the mark's label, then carries on in a fresh buffer inside the same qw_cmd.
+ * The waits cost wall time, not GPU time, so the table measures the kernels.
+ * Off -- one getenv, then a flag test per mark -- it changes nothing. */
+#define QW_PROF_MAX 64
+static struct { const char *label; double seconds; long calls; } g_prof[QW_PROF_MAX];
+static int g_prof_n;
+static int g_prof_on = -1;
+
+bool qw_prof_enabled(void) {
+    if (g_prof_on < 0) {
+        const char *v = getenv("QWASAR_PROFILE");
+        g_prof_on = v && *v && strcmp(v, "0");
+    }
+    return g_prof_on == 1;
+}
+
+void qw_cmd_mark(qw_cmd c, const char *label) {
+    if (!c || !c->cb || !qw_prof_enabled()) return;
+    double gpu = 0.0;
+    qw_cmd_end_encoding(c);
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)c->cb;
+        [cb commit];
+        [cb waitUntilCompleted];
+        if ([cb error] && !c->err[0])
+            snprintf(c->err, sizeof c->err, "%s", [[[cb error] localizedDescription] UTF8String]);
+        gpu = [cb GPUEndTime] - [cb GPUStartTime];
+        CFBridgingRelease((CFTypeRef)c->cb);
+        id<MTLCommandBuffer> nb = [g_queue commandBuffer];
+        c->cb  = (void *)CFBridgingRetain(nb);
+        c->enc = (void *)CFBridgingRetain([nb computeCommandEncoder]);
+    }
+    int i = 0;
+    while (i < g_prof_n && strcmp(g_prof[i].label, label)) i++;
+    if (i == g_prof_n) {
+        if (g_prof_n == QW_PROF_MAX) return;
+        g_prof[g_prof_n++].label = label;
+    }
+    g_prof[i].seconds += gpu;
+    g_prof[i].calls++;
+}
+
+void qw_prof_report(FILE *out, long tokens) {
+    if (!g_prof_n) return;
+    double total = 0.0;
+    for (int i = 0; i < g_prof_n; i++) total += g_prof[i].seconds;
+    fprintf(out, "GPU time by section%s:\n", tokens > 0 ? ", per decoded token" : "");
+    for (int i = 0; i < g_prof_n; i++)
+        fprintf(out, "  %-22s %8.3f ms  %5.1f%%  (%ld marks)\n", g_prof[i].label,
+                1e3 * g_prof[i].seconds / (tokens > 0 ? (double)tokens : 1.0),
+                100.0 * g_prof[i].seconds / (total > 0 ? total : 1.0), g_prof[i].calls);
+    fprintf(out, "  %-22s %8.3f ms\n", "total",
+            1e3 * total / (tokens > 0 ? (double)tokens : 1.0));
+}
+
+void qw_prof_reset(void) { g_prof_n = 0; }
+
 const char *qw_cmd_error(qw_cmd c) {
     return (c && c->err[0]) ? c->err : NULL;
 }
@@ -417,9 +517,25 @@ void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
 }
 
 /* Dense bf16, blocked exactly like qw_op_qmvb_q4.  Only the MTP head uses it. */
+typedef struct { uint32_t k, n, rows; } qw_dmv_small_args;
+
 void qw_op_dmat_bf16(qw_cmd c, qw_ref y, qw_ref x, qw_ref w,
                      int32_t k, int32_t n, int32_t rows) {
     if (!c || !c->enc) return;
+    /* Few outputs and a long input: a threadgroup per (row, output) instead
+     * of per block of output rows (metal/dense.metal). */
+    if (n <= 16 && k >= 1024) {
+        id<MTLComputePipelineState> ps = qw_pipeline(@"qw_dmv_small_bf16");
+        if (!ps) return;
+        id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+        [enc setComputePipelineState:ps];
+        qw_set(enc, w, 0); qw_set(enc, x, 1); qw_set(enc, y, 2);
+        qw_dmv_small_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)rows };
+        [enc setBytes:&args length:sizeof args atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows * (NSUInteger)n, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return;
+    }
     id<MTLComputePipelineState> ps = qw_pipeline(@"qw_dmvb_bf16");
     if (!ps) return;
 
@@ -1010,12 +1126,16 @@ void qw_op_hc_inject(qw_cmd c, qw_ref h4, qw_ref out, qw_ref inj, int32_t rows, 
 
 void qw_op_moe_route(qw_cmd c, qw_ref idx, qw_ref w, qw_ref logits,
                      int32_t rows, int32_t E, int32_t K, bool norm) {
-    if (K > 32) { fprintf(stderr, "qwasar: moe top-k %d unsupported (max 32)\n", K); return; }
+    if (K > 32 || E > 1024) {
+        fprintf(stderr, "qwasar: moe top-%d of %d unsupported (max top-32 of 1024)\n", K, E);
+        return;
+    }
     QW_BEGIN("qw_moe_route")
     qw_set(enc, logits, 0); qw_set(enc, idx, 1); qw_set(enc, w, 2);
     qw_route_args args = { (uint32_t)rows, (uint32_t)E, (uint32_t)K, norm ? 1u : 0u };
     [enc setBytes:&args length:sizeof args atIndex:3];
-    [enc dispatchThreads:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    /* One threadgroup of 256 per token (metal/sparse.metal: QW_ROUTE_*). */
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
 void qw_op_qmv_q4_bank(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
@@ -1097,7 +1217,8 @@ void qw_op_qsa_select(qw_cmd c, qw_ref mask, qw_ref scores, int32_t rows, int32_
     qw_qsa_select_args args = { (uint32_t)rows, (uint32_t)ratio, (uint32_t)base_pos,
                                 (uint32_t)block_topk, (uint32_t)max_ctx, (uint32_t)max_blocks };
     [enc setBytes:&args length:sizeof args atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    /* One threadgroup of QW_SEL_THREADS (metal/sparse.metal) per query. */
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
 }
 
 void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache, qw_ref mask,
