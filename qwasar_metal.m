@@ -240,6 +240,8 @@ struct qw_cmd_s {
     void *flushed[QW_CMD_FLUSHED];   /* committed by qw_cmd_flush, +1 retained */
     int   n_flushed;
     int   parallel;   /* qw_cmd_parallel depth: >0, a concurrent encoder */
+    void *scratch;    /* id<MTLBuffer>, +1 retained: split-K partial sums */
+    size_t scratch_len;
     char  err[256];
 };
 
@@ -444,6 +446,7 @@ const char *qw_cmd_error(qw_cmd c) {
 
 void qw_cmd_free(qw_cmd c) {
     if (!c) return;
+    if (c->scratch) CFBridgingRelease((CFTypeRef)c->scratch);
     qw_cmd_end_encoding(c);
     /* Flushed and never waited for: let them finish before their buffers go. */
     for (int i = 0; i < c->n_flushed; i++)
@@ -579,6 +582,61 @@ void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
     [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
 }
 
+/* Too few output tiles to fill the GPU: split K across threadgroups, each
+ * slice's partial product into the command's scratch, then one pass to sum
+ * them (metal/qmm.metal).  Below QW_QMM_SPLIT_BELOW tiles, enough slices to
+ * make QW_QMM_SPLIT_TILES threadgroups, none shorter than QW_QMM_SPLIT_MIN_K.  Returns false, encoding
+ * nothing, where the plain tiles should run. */
+#define QW_QMM_SPLIT_BELOW 128
+#define QW_QMM_SPLIT_TILES 1024
+#define QW_QMM_SPLIT_MIN_K 512
+
+static bool qw_qmm_q4_splitk(qw_cmd c, qw_ref y, qw_ref x, qw_ref w, qw_ref scales, qw_ref biases,
+                             int32_t k, int32_t n, int32_t rows, int32_t group, NSUInteger tiles) {
+    if (tiles >= QW_QMM_SPLIT_BELOW) return false;
+    NSUInteger splits = (QW_QMM_SPLIT_TILES + tiles - 1) / tiles;
+    if (splits > (NSUInteger)k / QW_QMM_SPLIT_MIN_K) splits = (NSUInteger)k / QW_QMM_SPLIT_MIN_K;
+    if (splits < 2) return false;
+    /* Slices whole K steps and whole quantisation groups. */
+    const NSUInteger step = QW_QMM_BK > group ? QW_QMM_BK : (NSUInteger)group;
+    const uint32_t kslice = (uint32_t)((((NSUInteger)k + splits - 1) / splits + step - 1) / step * step);
+    splits = ((NSUInteger)k + kslice - 1) / kslice;
+
+    const size_t need = (size_t)splits * rows * n * sizeof(float);
+    if (c->scratch_len < need) {
+        /* Anything already encoded holds its own reference to the old one. */
+        if (c->scratch) CFBridgingRelease((CFTypeRef)c->scratch);
+        id<MTLBuffer> b = [g_device newBufferWithLength:need options:MTLResourceStorageModePrivate];
+        if (!b) { c->scratch = NULL; c->scratch_len = 0; return false; }
+        c->scratch = (void *)CFBridgingRetain(b);
+        c->scratch_len = need;
+    }
+    id<MTLBuffer> part = (__bridge id<MTLBuffer>)c->scratch;
+
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmm_q4_splitk", group);
+    id<MTLComputePipelineState> rs = qw_pipeline(@"qw_qmm_reduce");
+    if (!ps || !rs) return false;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, w, 0); qw_set(enc, scales, 1); qw_set(enc, biases, 2); qw_set(enc, x, 3);
+    [enc setBuffer:part offset:0 atIndex:4];
+    qw_matmul_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)rows };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+    [enc setBytes:&kslice length:sizeof kslice atIndex:6];
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + QW_QMM_BN - 1) / QW_QMM_BN,
+                                          ((NSUInteger)rows + QW_QMM_BM - 1) / QW_QMM_BM, splits)
+        threadsPerThreadgroup:MTLSizeMake(QW_QMM_THREADS, 1, 1)];
+    /* In a parallel region the sum has to wait for the slices all the same. */
+    if (c->parallel > 0) [enc memoryBarrierWithResources:&part count:1];
+    [enc setComputePipelineState:rs];
+    [enc setBuffer:part offset:0 atIndex:0];
+    qw_set(enc, y, 1);
+    const uint32_t ra[2] = { (uint32_t)((size_t)rows * n), (uint32_t)splits };
+    [enc setBytes:ra length:sizeof ra atIndex:2];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)rows * n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return true;
+}
+
 void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
                   int32_t k, int32_t n, int32_t rows, int32_t group) {
@@ -590,6 +648,9 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
         fprintf(stderr, "qwasar: qmm needs k divisible by %d, got %d\n", QW_QMM_BK, k);
         return;
     }
+    const NSUInteger tiles_n = ((NSUInteger)n + QW_QMM_BN - 1) / QW_QMM_BN;
+    const NSUInteger tiles_m = ((NSUInteger)rows + QW_QMM_BM - 1) / QW_QMM_BM;
+    if (qw_qmm_q4_splitk(c, y, x, w, scales, biases, k, n, rows, group, tiles_n * tiles_m)) return;
     id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmm_q4_g64", group);
     if (!ps) return;
 

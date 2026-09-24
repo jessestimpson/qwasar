@@ -29,16 +29,13 @@
  * it cost twice over: a transposing fragment load, and a strided threadgroup
  * write during staging.) */
 
-kernel void qw_qmm_q4_g64(
-    device const uint    *w       [[buffer(0)]],   /* [n, k/8]  packed nibbles */
-    device const ushort  *scales  [[buffer(1)]],   /* [n, k/64] bf16 */
-    device const ushort  *biases  [[buffer(2)]],   /* [n, k/64] bf16 */
-    device const float   *x       [[buffer(3)]],   /* [rows, k] */
-    device       float   *y       [[buffer(4)]],   /* [rows, n] */
-    constant qw_matmul_args &a    [[buffer(5)]],
-    uint3 tgid [[threadgroup_position_in_grid]],
-    uint  tid  [[thread_index_in_threadgroup]],
-    uint  sgid [[simdgroup_index_in_threadgroup]])
+/* One BM x BN output tile over the K range [kb, ke), written to y (row
+ * stride a.n).  The whole K range is qw_qmm_q4_g64; a slice of it, into a
+ * partial sum, is qw_qmm_q4_splitk. */
+static inline void qw_qmm_q4_tile(
+    device const uint *w, device const ushort *scales, device const ushort *biases,
+    device const float *x, device float *y, constant qw_matmul_args &a,
+    uint kb, uint ke, threadgroup float *pool, uint3 tgid, uint tid, uint sgid)
 {
     /* One pool, used as the two operand tiles during the K loop and then as the
      * output tile once the loop is done.
@@ -49,7 +46,6 @@ kernel void qw_qmm_q4_g64(
      * where this kernel spends its time.  The matrix units themselves are not
      * meaningfully faster for half on this hardware -- measured 16.5 against
      * 15.6 -- so the win is bandwidth, not arithmetic. */
-    threadgroup float pool[QW_QMM_POOL_F];
     threadgroup half *As = (threadgroup half *)pool;                     /* [BM][BK] */
     threadgroup half *Bs = (threadgroup half *)pool + QW_QMM_BK * QW_QMM_BM;
 
@@ -72,7 +68,7 @@ kernel void qw_qmm_q4_g64(
         for (uint j = 0; j < QW_QMM_FRAG_N; ++j)
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
 
-    for (uint k0 = 0; k0 < a.k; k0 += QW_QMM_BK) {
+    for (uint k0 = kb; k0 < ke; k0 += QW_QMM_BK) {
 
         /* Activations.  Consecutive threads take consecutive k for one token,
          * so each group of 32 reads one contiguous 128-byte span of x. */
@@ -158,5 +154,56 @@ kernel void qw_qmm_q4_g64(
         const uint nn = idx % QW_QMM_BN;
         const uint gm = row0 + mm, gn = col0 + nn;
         if (gm < a.rows && gn < a.n) y[(ulong)gm * a.n + gn] = Cs[idx];
-    }
+    }}
+
+kernel void qw_qmm_q4_g64(
+    device const uint    *w       [[buffer(0)]],   /* [n, k/8]  packed nibbles */
+    device const ushort  *scales  [[buffer(1)]],   /* [n, k/64] bf16 */
+    device const ushort  *biases  [[buffer(2)]],   /* [n, k/64] bf16 */
+    device const float   *x       [[buffer(3)]],   /* [rows, k] */
+    device       float   *y       [[buffer(4)]],   /* [rows, n] */
+    constant qw_matmul_args &a    [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float pool[QW_QMM_POOL_F];
+    qw_qmm_q4_tile(w, scales, biases, x, y, a, 0, a.k, pool, tgid, tid, sgid);
+}
+
+/* The same tiles with K split across threadgroups (tgid.z), each slice's
+ * partial product to its own [rows, n] plane of y; qw_qmm_reduce sums them.
+ * For outputs too narrow to fill the GPU with tiles: the mixer's 320-row
+ * down-projection is 80 tiles of 320 K steps at a 1024-token chunk, and
+ * the delta layer's 48-row gate projections 16 -- a few per core, at half
+ * the rate the wide projections reach. */
+kernel void qw_qmm_q4_splitk(
+    device const uint    *w       [[buffer(0)]],
+    device const ushort  *scales  [[buffer(1)]],
+    device const ushort  *biases  [[buffer(2)]],
+    device const float   *x       [[buffer(3)]],
+    device       float   *y       [[buffer(4)]],   /* [splits, rows, n] */
+    constant qw_matmul_args &a    [[buffer(5)]],
+    constant uint        &kslice  [[buffer(6)]],   /* K per slice, a multiple of BK */
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float pool[QW_QMM_POOL_F];
+    const uint kb = tgid.z * kslice, ke = min(kb + kslice, a.k);
+    qw_qmm_q4_tile(w, scales, biases, x, y + (ulong)tgid.z * a.rows * a.n, a, kb, ke,
+                   pool, tgid, tid, sgid);
+}
+
+/* y[i] = sum over the slices of part[s, i]. */
+kernel void qw_qmm_reduce(
+    device const float *part [[buffer(0)]],   /* [splits, count] */
+    device       float *y    [[buffer(1)]],
+    constant uint2     &a    [[buffer(2)]],   /* count, splits */
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= a.x) return;
+    float s = 0.0f;
+    for (uint i = 0; i < a.y; ++i) s += part[(ulong)i * a.x + gid];
+    y[gid] = s;
 }

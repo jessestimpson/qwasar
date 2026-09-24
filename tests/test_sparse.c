@@ -653,6 +653,8 @@ static void test_multi(void) {
 
 /* ---- fused decode kernels, against the ops they replace ------------------- */
 
+
+
 /* Random 4-bit weights, n rows of k, as the generators above. */
 static void mkq4(int32_t n, int32_t k, int32_t G, uint32_t st, qw_buf *w, qw_buf *sc, qw_buf *bi) {
     const size_t groups = (size_t)k / G;
@@ -673,6 +675,34 @@ static qw_buf copybuf(qw_buf b, size_t bytes) {
     qw_buf c = mkbuf(bytes);
     memcpy(qw_buf_contents(c), qw_buf_contents(b), bytes);
     return c;
+}
+
+/* Prefill matmuls too narrow to fill the GPU with tiles split K across
+ * threadgroups and sum the slices (qw_qmm_q4_splitk): the mixer's down
+ * projection and the delta layer's 48-row gate projections, at a chunk's
+ * worth of rows, against the cpu.  Operands are staged in half, as in every
+ * matmul tile, hence the tolerance. */
+static void test_qmm_splitk(void) {
+    static const struct { int32_t n, k, rows; } shapes[] = { { 320, 10240, 256 }, { 48, 2560, 1024 }, { 48, 2560, 100 } };
+    for (size_t i = 0; i < sizeof shapes / sizeof *shapes; i++) {
+        const int32_t n = shapes[i].n, k = shapes[i].k, rows = shapes[i].rows, G = 32;
+        qw_buf w, sc, bi;
+        mkq4(n, k, G, 51 + (uint32_t)i, &w, &sc, &bi);
+        qw_buf xb = mkbuf((size_t)rows * k * 4), yb = mkbuf((size_t)rows * n * 4);
+        float *xp = qw_buf_contents(xb);
+        fill_random(xp, (size_t)rows * k, 61 + (uint32_t)i);
+        qw_cmd c = qw_cmd_begin();
+        qw_op_qmat_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0), qw_ref_at(w, 0), qw_ref_at(sc, 0),
+                      qw_ref_at(bi, 0), k, n, rows, G);
+        run(c, "split-k matmul");
+        float *ref = malloc((size_t)rows * n * 4);
+        qw_cpu_qmv_q4(ref, xp, qw_buf_contents(w), qw_buf_contents(sc), qw_buf_contents(bi), k, n, rows, G);
+        char label[64];
+        snprintf(label, sizeof label, "matmul %dx%d, %d rows", n, k, rows);
+        report(label, qw_buf_contents(yb), ref, (size_t)rows * n, 5e-4);
+        free(ref);
+        qw_buf_free(w); qw_buf_free(sc); qw_buf_free(bi); qw_buf_free(xb); qw_buf_free(yb);
+    }
 }
 
 static void test_fused(void) {
@@ -1008,6 +1038,7 @@ int main(void) {
     printf("== decode banks, split\n"); test_bank_splitk();
     printf("== same-input matvecs, fused\n"); test_multi();
     printf("== fused decode kernels\n"); test_fused();
+    printf("== narrow prefill matmuls, split\n"); test_qmm_splitk();
     printf("== reused ops\n");        test_reused(e);
 
     qwasar_engine_free(e);

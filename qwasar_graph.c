@@ -432,11 +432,12 @@ void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
                          2 * sh->key_dim, sh->value_dim);
         qw_cmd_parallel(c, false);
     }
-    qw_cmd_mark(c, "delta: conv, norms, gates");
 
-    /* The recurrence normalises q and k and computes its gates itself
-     * (qw_op_gated_delta_prep): k = l2norm(k), q = l2norm(q)/sqrt(dk), as an
-     * unweighted RMS norm with a trailing scale.
+    /* k = l2norm(k), q = l2norm(q)/sqrt(dk), as an unweighted RMS norm with a
+     * trailing scale, and the gates from a and b.  For a few rows the
+     * recurrence does all of it itself (qw_op_gated_delta_prep), which saves
+     * three dispatches; over a prefill chunk the extra reductions sit in its
+     * serial loop and it is 20% slower than the separate kernels.
      *
      * Where the epsilon sits is a reference-convention question, and the two
      * families' references disagree: mlx-vlm (the 27B's oracle) writes the
@@ -445,16 +446,33 @@ void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
      * does either -- eps/dk in the mean is eps on the sum -- and each family
      * gets its own oracle's convention, because on small vectors the two
      * differ by more than the tolerance (measured at 0.7% on the toy). */
-    const qw_gdn_prep prep = {
-        qw_ref_at(s->a_proj, 0), qw_ref_at(s->b_proj, 0),
-        qw_tensor_ref(L->A_log), qw_tensor_ref(L->dt_bias),
-        cfg->family == QW_FAMILY_QWEN4_EXP ? 1e-6f / (float)dk : 1e-6f,
-        1.0f / (float)dk, 1.0f / sqrtf((float)dk),
-    };
-    qw_op_gated_delta_prep(c, qw_ref_at(s->gdn_y, 0), gq, gk, gv, &prep,
-                           qw_off(s->ssm_state, ssm_stride * li), hk, hv, dk, dv, rows,
-                           qw_off(s->ssm_snap, ssm_stride * li), s->n_snap,
-                           (int32_t)(ssm_stride * sh->n_linear_attn_layers));
+    const float l2eps = cfg->family == QW_FAMILY_QWEN4_EXP ? 1e-6f / (float)dk : 1e-6f;
+    const qw_ref state = qw_off(s->ssm_state, ssm_stride * li);
+    const qw_ref snap = qw_off(s->ssm_snap, ssm_stride * li);
+    const int32_t snap_stride = (int32_t)(ssm_stride * sh->n_linear_attn_layers);
+    if (rows < QW_QMM_MIN_ROWS) {
+        const qw_gdn_prep prep = {
+            qw_ref_at(s->a_proj, 0), qw_ref_at(s->b_proj, 0),
+            qw_tensor_ref(L->A_log), qw_tensor_ref(L->dt_bias),
+            l2eps, 1.0f / (float)dk, 1.0f / sqrtf((float)dk),
+        };
+        qw_cmd_mark(c, "delta: conv, norms, gates");
+        qw_op_gated_delta_prep(c, qw_ref_at(s->gdn_y, 0), gq, gk, gv, &prep, state,
+                               hk, hv, dk, dv, rows, snap, s->n_snap, snap_stride);
+    } else {
+        const qw_ref no_weight = qw_ref_at(NULL, 0);
+        qw_cmd_parallel(c, true);
+        qw_op_rms_norm(c, gq, gq, no_weight, dk, rows * hk, l2eps, 1.0f / (float)dk);
+        qw_op_rms_norm(c, gk, gk, no_weight, dk, rows * hk, l2eps, 1.0f / sqrtf((float)dk));
+        qw_op_gdn_gates(c, qw_ref_at(s->g, 0), qw_ref_at(s->beta, 0),
+                        qw_ref_at(s->a_proj, 0), qw_ref_at(s->b_proj, 0),
+                        qw_tensor_ref(L->A_log), qw_tensor_ref(L->dt_bias), hv, rows);
+        qw_cmd_parallel(c, false);
+        qw_cmd_mark(c, "delta: conv, norms, gates");
+        qw_op_gated_delta(c, qw_ref_at(s->gdn_y, 0), gq, gk, gv, qw_ref_at(s->g, 0),
+                          qw_ref_at(s->beta, 0), state, hk, hv, dk, dv, rows,
+                          snap, s->n_snap, snap_stride);
+    }
     qw_cmd_mark(c, "delta: recurrence");
 
     /* Output norm is per value head and gated by the family's activation of

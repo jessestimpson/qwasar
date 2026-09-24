@@ -471,6 +471,16 @@ decode, what got it here:
   injection into the next mixer's norm.  That took ~1,800 dispatches a token
   down to ~1,100, and decode to ~68 t/s on a quiet machine.
 
+**Prefill** (~485 t/s at 4K tokens) is matmul-bound.  The narrow matmuls
+(the mixer's 320-row down-projection, the delta layer's 48-row gate
+projections) now split K across threadgroups; at a 1024-token chunk they were
+80 and 16 tiles, a few per core.  The wide ones run at ~11.4 TFLOP/s, which is
+the ceiling of the 8x8 simdgroup-matrix tile.  Metal 4's tensor ops
+(`mpp::tensor_ops::matmul2d`, the M5's GPU neural accelerators) measured
+52.5 TFLOP/s on a dense half matmul of a delta projection's shape.  A
+quantised matmul on them is the next prefill step: the routed experts, the
+projections and attention are ~80% of a prefill chunk.
+
 **Not memory locality.** The routed experts read at ~350 GB/s, against ~490 GB/s
 for a large streaming matvec.  Random and consecutive expert ids measure the
 same, and an early 16-expert comparison was only the system cache.  The gap is
