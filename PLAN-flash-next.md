@@ -341,9 +341,13 @@ Three things learned that the plan did not know:
    expert matvec is per (token, slot) pair with no weight reuse across
    tokens. Both are the simplest correct shapes; both need the Max's
    numbers before a replacement is designed (§3, Phase 6).
-2. *Checkpoints.* The indexer key cache and the engram state have no
-   place in the kvstore format; `qwasar_session_save/restore` refuse the
-   family. Sessions work, parking's warm resume does not.
+2. ~~*Checkpoints.*~~ — done. A Flash-Next checkpoint carries the
+   indexer's key cache, the engram's dilated-conv window and its n-gram
+   context beside the attention caches and delta states (~127 MB fixed plus
+   ~28 KB a token); a restored session continues bit-identically
+   (tests/test_kvstore, both toy formats and the real weights).  The server
+   now writes them too: at the end of the system prompt, and at the last
+   complete turn of a long conversation (every ~4K new tokens).
 3. *Speculation, vision, images*: refused with a message (Phases 7, and
    the deferred tower).
 4. ~~The tokenizer's regex switch and the sharded converter~~ — done. The

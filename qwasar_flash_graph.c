@@ -161,6 +161,58 @@ void qw_flash_state_free(struct qw_flash_state *f) {
     free(f);
 }
 
+/* ---- checkpoints -------------------------------------------------------------
+ *
+ * What a Flash-Next session carries beyond the attention caches and the delta
+ * layers' states (qw_session_pack): the indexer's key cache, per position like
+ * the KV cache; the engram's dilated-conv window, a shift register of the
+ * last few inputs; and the n-gram context -- the last eight tokens and where
+ * the current segment began.  Scratch buffers are rebuilt by every step and
+ * are not state. */
+static size_t flash_ikeys_bytes(const qwasar_session *s, int32_t n) {
+    return (size_t)s->shape->n_full_attn_layers * (size_t)n * s->cfg->indexer_head_dim * 4;
+}
+
+static size_t flash_ple_bytes(const qwasar_session *s) {
+    return s->cfg->ple_layer >= 0 ? (size_t)s->flash->ple_state_len * s->shape->hc_hidden * 4 : 0;
+}
+
+size_t qw_flash_state_bytes(const qwasar_session *s, int32_t n) {
+    return flash_ikeys_bytes(s, n) + flash_ple_bytes(s) + 9 * sizeof(int32_t);
+}
+
+char *qw_flash_pack(const qwasar_session *s, char *out) {
+    const struct qw_flash_state *f = s->flash;
+    const int32_t n = s->n_past, d = s->cfg->indexer_head_dim;
+    const size_t used = (size_t)n * d * 4, stride = (size_t)s->max_ctx * d * 4;
+    const char *ik = qw_buf_contents(f->ikeys);
+    for (int32_t l = 0; l < s->shape->n_full_attn_layers; l++) {
+        memcpy(out, ik + (size_t)l * stride, used);
+        out += used;
+    }
+    const size_t ple = flash_ple_bytes(s);
+    if (ple) { memcpy(out, qw_buf_contents(f->ple_state), ple); out += ple; }
+    memcpy(out, f->hist, 8 * sizeof(int32_t)); out += 8 * sizeof(int32_t);
+    memcpy(out, &f->last_eos, sizeof(int32_t)); out += sizeof(int32_t);
+    return out;
+}
+
+const char *qw_flash_unpack(qwasar_session *s, const char *in, int32_t n) {
+    struct qw_flash_state *f = s->flash;
+    const int32_t d = s->cfg->indexer_head_dim;
+    const size_t used = (size_t)n * d * 4, stride = (size_t)s->max_ctx * d * 4;
+    char *ik = qw_buf_contents(f->ikeys);
+    for (int32_t l = 0; l < s->shape->n_full_attn_layers; l++) {
+        memcpy(ik + (size_t)l * stride, in, used);
+        in += used;
+    }
+    const size_t ple = flash_ple_bytes(s);
+    if (ple) { memcpy(qw_buf_contents(f->ple_state), in, ple); in += ple; }
+    memcpy(f->hist, in, 8 * sizeof(int32_t)); in += 8 * sizeof(int32_t);
+    memcpy(&f->last_eos, in, sizeof(int32_t)); in += sizeof(int32_t);
+    return in;
+}
+
 /* ---- the engram, host side ---------------------------------------------------
  *
  * The hash needs the token history and the EOS bookkeeping, and the gather

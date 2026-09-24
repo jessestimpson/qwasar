@@ -161,5 +161,10 @@ void qw_flash_state_free(struct qw_flash_state *f);
 /* Host-side work a chunk needs before encoding: the engram ids and rows. */
 void qw_flash_prepare_chunk(qwasar_session *s, const int32_t *tokens, int32_t rows);
 void qw_flash_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool want_logits);
+/* Checkpoint payload beyond qw_session_pack's: the indexer keys, the engram
+ * window and n-gram context.  pack/unpack return the cursor past it. */
+size_t      qw_flash_state_bytes(const qwasar_session *s, int32_t n_tokens);
+char       *qw_flash_pack(const qwasar_session *s, char *out);
+const char *qw_flash_unpack(qwasar_session *s, const char *in, int32_t n_tokens);
 
 #endif /* QWASAR_SESSION_H */

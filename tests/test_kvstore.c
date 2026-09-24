@@ -48,11 +48,9 @@ static void rm_cache(const char *home) {
     if (system(cmd) != 0) { /* best effort */ }
 }
 
-int main(int argc, char **argv) {
-    const char *model = getenv("QWASAR_TEST_MODEL");
-    if (argc > 1) model = argv[1];
-    if (!model) { fprintf(stderr, "skip: set QWASAR_TEST_MODEL\n"); return 0; }
-
+/* The whole round trip against one model, in a private HOME. */
+static int check_model(const char *model) {
+    printf("== %s\n", model);
     char home[] = "/tmp/qwasar_kvtest_XXXXXX";
     if (!mkdtemp(home)) { fprintf(stderr, "cannot make a temp HOME\n"); return 1; }
     setenv("HOME", home, 1);
@@ -63,13 +61,15 @@ int main(int argc, char **argv) {
     if (!e) { fprintf(stderr, "load failed: %s\n", err); return 1; }
 
     const int32_t vocab = qwasar_vocab_size(e);
+    /* Token ids wrap to the vocabulary: the Flash-Next toys have 256. */
+#define TOK(x) ((int32_t)((x) % vocab))
 
     /* Long enough to clear the store's minimum, and deliberately not a natural
      * sentence: the state must round-trip regardless of content. */
     const int32_t n = 300;
     int32_t *prompt = malloc((size_t)n * sizeof *prompt);
-    for (int32_t i = 0; i < n; i++) prompt[i] = 1000 + (i * 7919) % 40000;
-    const int32_t probe = 12345;      /* the token evaluated after the restore */
+    for (int32_t i = 0; i < n; i++) prompt[i] = TOK(1000 + (i * 7919) % 40000);
+    const int32_t probe = TOK(12345); /* the token evaluated after the restore */
 
     /* Reference: one session, straight through. */
     qwasar_session *a = qwasar_session_new(e, err, sizeof err);
@@ -128,7 +128,7 @@ int main(int argc, char **argv) {
     /* A longer prompt that begins with the checkpoint must reuse it. */
     int32_t *longer = malloc((size_t)(n + 50) * sizeof *longer);
     memcpy(longer, prompt, (size_t)n * sizeof *longer);
-    for (int32_t i = 0; i < 50; i++) longer[n + i] = 2000 + i;
+    for (int32_t i = 0; i < 50; i++) longer[n + i] = TOK(2000 + i);
     qwasar_session *c = qwasar_session_new(e, err, sizeof err);
     CHECK(qwasar_session_restore(c, e, longer, n + 50) == n,
           "a checkpoint should match a prompt that extends it");
@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
      * depends on the whole history, so a near-match is not a match. */
     int32_t *altered = malloc((size_t)n * sizeof *altered);
     memcpy(altered, prompt, (size_t)n * sizeof *altered);
-    altered[n / 2] ^= 1;
+    altered[n / 2] = TOK(altered[n / 2] + 1);
     qwasar_session *d2 = qwasar_session_new(e, err, sizeof err);
     CHECK(qwasar_session_restore(d2, e, altered, n) == 0,
           "a prompt differing mid-prefix must not restore");
@@ -173,6 +173,23 @@ int main(int argc, char **argv) {
     qwasar_engine_free(e);
     rm_cache(home);
     rmdir(home);
+
+#undef TOK
+    return 0;
+}
+
+/* The dense model when one is given; Flash-Next's toys always, in both
+ * formats -- its checkpoint carries the indexer keys and the engram's state
+ * too, and the toys' 8-token QSA budget puts a 300-token prompt well past
+ * the point where the indexer's keys decide what attention sees. */
+int main(int argc, char **argv) {
+    const char *model = getenv("QWASAR_TEST_MODEL");
+    if (argc > 1) model = argv[1];
+    if (model && *model) { if (check_model(model)) return 1; }
+    else printf("skip: dense model (set QWASAR_TEST_MODEL)\n");
+    const char *toys[] = { "tests/fixtures/flashnext-tiny-q4", "tests/fixtures/flashnext-tiny-mlx" };
+    for (size_t i = 0; i < sizeof toys / sizeof *toys; i++)
+        if (check_model(toys[i])) return 1;
 
     if (fails) { fprintf(stderr, "%d check(s) failed\n", fails); return 1; }
     printf("ok: kvstore\n");

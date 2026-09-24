@@ -260,7 +260,7 @@ size_t qw_session_state_bytes(const qwasar_session *s, int32_t n_tokens) {
                * c->linear_value_head_dim * c->linear_key_head_dim * sizeof(float);
     size_t conv = (size_t)sh->n_linear_attn_layers
                 * (size_t)(c->linear_conv_kernel_dim - 1) * sh->conv_dim * sizeof(float);
-    return kv + ssm + conv;
+    return kv + ssm + conv + (s->flash ? qw_flash_state_bytes(s, n_tokens) : 0);
 }
 
 bool qw_session_pack(const qwasar_session *s, void *dst, size_t cap) {
@@ -292,6 +292,8 @@ bool qw_session_pack(const qwasar_session *s, void *dst, size_t cap) {
     size_t conv = (size_t)sh->n_linear_attn_layers
                 * (size_t)(c->linear_conv_kernel_dim - 1) * sh->conv_dim * sizeof(float);
     memcpy(out, qw_buf_contents(s->conv_state), conv);
+    out += conv;
+    if (s->flash) qw_flash_pack(s, out);
     return true;
 }
 
@@ -325,6 +327,8 @@ bool qw_session_unpack(qwasar_session *s, const void *src, size_t len,
     size_t conv = (size_t)sh->n_linear_attn_layers
                 * (size_t)(c->linear_conv_kernel_dim - 1) * sh->conv_dim * sizeof(float);
     memcpy(qw_buf_contents(s->conv_state), in, conv);
+    in += conv;
+    if (s->flash) qw_flash_unpack(s, in, n_tokens);
 
     if (!s->history) s->history = malloc((size_t)s->max_ctx * sizeof *s->history);
     if (!s->history) return false;

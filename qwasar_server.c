@@ -10,7 +10,10 @@
  * What does carry over is prefix reuse, which is what actually matters for
  * stateless clients: an agent that resends a growing conversation on every turn
  * continues from wherever the live session already is, and falls back to a disk
- * checkpoint when the live session has moved on to something else. */
+ * checkpoint when the live session has moved on to something else.  The server
+ * writes those checkpoints itself: at the end of the system prompt, which every
+ * conversation with that prompt and those tools shares, and at the last complete
+ * turn of a long conversation (srv_eval_from). */
 
 #include "qwasar.h"
 #include "qwasar_json.h"
@@ -261,12 +264,56 @@ typedef struct {
     qwasar_session   *s;
     int32_t           ctx;
     bool              no_cache;
+    int32_t           ckpt_n;        /* longest checkpoint the live session's prefix has */
     uint64_t          rng;
     bool              verbose;
     pthread_mutex_t   lock;          /* held for the whole of a completion */
     int               n_conns;       /* live connections, under conns_lock */
     pthread_mutex_t   conns_lock;
 } server;
+
+/* Where the prompt is worth a disk checkpoint (srv_eval_from). */
+typedef struct {
+    int32_t sys_n;    /* end of the system prompt and tools: every conversation shares it */
+    int32_t hist_n;   /* end of the last complete turn, before the generation prompt */
+} ckpt_marks;
+
+/* A long conversation leaves a checkpoint at its last complete turn once this
+ * many tokens have gone by since the last one it has, so a conversation the
+ * live session was taken from -- by another client, a side request, a restart
+ * -- resumes near where it was.  A Flash-Next checkpoint is ~127 MB whatever
+ * its length, so not every turn. */
+#define QW_SRV_CKPT_SPAN 4096
+
+/* Evaluates tokens[from, n), stopping on the way at a checkpoint boundary
+ * to write one.  Same total work either way; a boundary past the end, or
+ * one already covered, is ignored. */
+static const float *srv_eval_from(server *sv, const int32_t *tokens, int32_t from, int32_t n,
+                                  const ckpt_marks *mk, char *err, size_t cap) {
+    int32_t stops[2], ns = 0;
+    if (mk && !sv->no_cache) {
+        if (mk->sys_n > from && mk->sys_n < n && mk->sys_n > sv->ckpt_n) stops[ns++] = mk->sys_n;
+        const int32_t last = ns ? stops[0] : sv->ckpt_n;
+        if (mk->hist_n > from && mk->hist_n < n && mk->hist_n - last >= QW_SRV_CKPT_SPAN)
+            stops[ns++] = mk->hist_n;
+    }
+    for (int i = 0; i < ns; i++) {
+        if (!qwasar_session_eval(sv->s, tokens + from, stops[i] - from, err, cap)) return NULL;
+        from = stops[i];
+        char serr[256];
+        struct timeval t0, t1;
+        gettimeofday(&t0, NULL);
+        const bool saved = qwasar_session_save(sv->s, sv->e, serr, sizeof serr);
+        gettimeofday(&t1, NULL);
+        if (saved) sv->ckpt_n = from;
+        if (sv->verbose) {
+            const double dt = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) * 1e-6;
+            if (saved) fprintf(stderr, "  checkpoint at %d tokens (%.2fs)\n", from, dt);
+            else fprintf(stderr, "  no checkpoint at %d tokens: %s\n", from, serr);
+        }
+    }
+    return qwasar_session_eval(sv->s, tokens + from, n - from, err, cap);
+}
 
 /* Evaluates `tokens`, reusing whatever the live session already covers.
  *
@@ -276,7 +323,7 @@ typedef struct {
  * and has to be replaced. */
 static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
                                 const qwasar_image_input *images, int32_t n_images,
-                                int32_t *reused, char *err, size_t cap) {
+                                const ckpt_marks *mk, int32_t *reused, char *err, size_t cap) {
     *reused = 0;
 
     /* Images defeat prefix reuse, and silently.  Two different pictures render
@@ -291,6 +338,7 @@ static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
      * a conversation about a picture. */
     if (n_images > 0) {
         if (sv->s) qwasar_session_free(sv->s);
+        sv->ckpt_n = 0;
         sv->s = qwasar_session_new(sv->e, err, cap);
         if (!sv->s) return NULL;
         return qwasar_session_eval_images(sv->s, tokens, n, images, n_images, err, cap);
@@ -299,7 +347,7 @@ static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
     int32_t live = sv->s ? qwasar_session_common_prefix(sv->s, tokens, n) : 0;
     if (live > 0 && live < n) {
         *reused = live;
-        return qwasar_session_eval(sv->s, tokens + live, n - live, err, cap);
+        return srv_eval_from(sv, tokens, live, n, mk, err, cap);
     }
     if (live == n && n > 0) {
         /* The session is already sitting at the end of this prompt, so its last
@@ -319,7 +367,21 @@ static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
      * evaluate to produce them. */
     int32_t covered = sv->no_cache ? 0 : qwasar_session_restore(sv->s, sv->e, tokens, n - 1);
     *reused = covered;
-    return qwasar_session_eval(sv->s, tokens + covered, n - covered, err, cap);
+    sv->ckpt_n = covered;
+    return srv_eval_from(sv, tokens, covered, n, mk, err, cap);
+}
+
+/* How many leading tokens of `prompt` the first `n_msgs` messages render to
+ * under `opts` -- 0 unless that rendering is a proper prefix of it. */
+static int32_t srv_prefix_len(server *sv, const qwasar_message *msgs, int32_t n_msgs,
+                              const qwasar_chat_options *opts, const int32_t *prompt, int32_t n) {
+    char err[256];
+    int32_t m = 0;
+    int32_t *p = qwasar_apply_chat_template(sv->tok, msgs, n_msgs, opts, &m, err, sizeof err);
+    if (!p) return 0;
+    const bool ok = m > 0 && m < n && !memcmp(p, prompt, (size_t)m * sizeof *p);
+    free(p);
+    return ok ? m : 0;
 }
 
 typedef void (*delta_fn)(void *ud, bool reasoning, const char *s, size_t n);
@@ -1391,13 +1453,28 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
         return;
     }
 
+    /* Checkpoint boundaries: the prompt rendered only as far as the system
+     * messages (with the tools, which the template puts there), and as far as
+     * the last complete turn.  Used only where the rendering really is a
+     * prefix of the prompt. */
+    ckpt_marks marks = { 0, 0 };
+    if (!sv->no_cache && req.n_images == 0) {
+        qwasar_chat_options upto = chat;
+        upto.add_generation_prompt = false;
+        upto.continue_final_message = false;
+        int32_t n_sys = 0;
+        while (n_sys < req.n && req.msgs[n_sys].role && !strcmp(req.msgs[n_sys].role, "system")) n_sys++;
+        if (n_sys > 0) marks.sys_n = srv_prefix_len(sv, req.msgs, n_sys, &upto, prompt, n_prompt);
+        if (!prefill) marks.hist_n = srv_prefix_len(sv, req.msgs, req.n, &upto, prompt, n_prompt);
+    }
+
     int32_t reused = 0;
     /* The request outlives the prompt now: rendering turns its text into
      * tokens, but its image rows are what the prefill scatters in, so freeing
      * it here -- which is where it used to happen -- released them one call
      * before they were read. */
     const float *logits = srv_prefill(sv, prompt, n_prompt, req.images, req.n_images,
-                                      &reused, err, sizeof err);
+                                      &marks, &reused, err, sizeof err);
     req_free(&req);
     free(prompt);
     if (!logits) { http_error(c, 500, "Internal Server Error", err); return; }

@@ -20,6 +20,12 @@
  *     checkpoint is usable exactly when its tokens are a prefix of the incoming
  *     prompt.
  *
+ * Flash-Next (qwen4_exp) adds three things to the payload: the QSA indexer's
+ * key cache, per position like the KV cache; the engram's dilated-conv window;
+ * and its n-gram context (qw_flash_pack).  Its model id mixes in the MoE,
+ * indexer and engram shapes, for that family only, so the dense model's
+ * existing checkpoints keep theirs.
+ *
  * Files are keyed by a hash of their token sequence, but the stored tokens are
  * always compared before use, so a hash collision costs a miss rather than
  * corruption. */
@@ -73,7 +79,19 @@ static uint64_t qw_model_id(const qw_config *c) {
         (uint32_t)c->linear_num_value_heads, (uint32_t)c->linear_key_head_dim,
         (uint32_t)c->quant_bits, (uint32_t)c->quant_group_size,
     };
-    return qw_fnv64(f, sizeof f, 1469598103934665603ull);
+    uint64_t h = qw_fnv64(f, sizeof f, 1469598103934665603ull);
+    /* Flash-Next's own shape, mixed in for that family only so the dense
+     * model's existing checkpoints keep their ids. */
+    if (c->family == QW_FAMILY_QWEN4_EXP) {
+        uint32_t x[10] = {
+            (uint32_t)c->family, (uint32_t)c->num_experts, (uint32_t)c->num_experts_per_tok,
+            (uint32_t)c->moe_intermediate_size, (uint32_t)c->hc_count,
+            (uint32_t)c->indexer_n_heads, (uint32_t)c->indexer_head_dim,
+            (uint32_t)c->ple_layer, (uint32_t)c->ple_embed_dim, (uint32_t)c->ngram_size,
+        };
+        h = qw_fnv64(x, sizeof x, h);
+    }
+    return h;
 }
 
 static void qw_fill_dims(const qw_config *c, const qw_shape *sh, uint32_t d[8]) {
@@ -173,11 +191,6 @@ static void qw_kv_evict(const char *dir, uint64_t budget) {
 
 bool qwasar_session_save(qwasar_session *s, const qwasar_engine *e,
                          char *err, size_t errcap) {
-    if (qwasar_session_is_flash(s)) {
-        snprintf(err, errcap, "checkpoints are not implemented for qwen4_exp yet "
-                              "(the indexer and engram state have no format)");
-        return false;
-    }
     int32_t n = 0;
     const int32_t *tokens = qw_session_history(s, &n);
     if (!tokens || n < QW_KV_MIN_TOKENS) {
@@ -330,7 +343,6 @@ int32_t qwasar_kv_probe(const qwasar_engine *e, const int32_t *tokens, int32_t n
 int32_t qwasar_session_restore(qwasar_session *s, const qwasar_engine *e,
                                const int32_t *tokens, int32_t n) {
     if (!tokens || n <= 0 || qwasar_session_n_past(s) != 0) return 0;
-    if (qwasar_session_is_flash(s)) return 0;
 
     char dir[1024];
     if (!qw_kv_dir(dir, sizeof dir)) return 0;
