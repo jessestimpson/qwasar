@@ -25,6 +25,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -276,6 +277,11 @@ typedef struct {
     pthread_mutex_t   conns_lock;
 } server;
 
+/* Graceful shutdown (srv_shutdown). */
+static server     *g_srv;
+static atomic_bool g_ready;      /* the model is loaded */
+static atomic_bool g_stopping;   /* shutting down: replies end at the next token */
+
 /* Where the prompt is worth a disk checkpoint (srv_eval_from). */
 typedef struct {
     int32_t sys_n;    /* end of the system prompt and tools: every conversation shares it */
@@ -316,6 +322,15 @@ static const float *srv_eval_from(server *sv, const int32_t *tokens, int32_t fro
             else fprintf(stderr, "  no checkpoint at %d tokens: %s\n", from, serr);
         }
     }
+    /* A rewind point one token short of the end: the next request in this
+     * conversation always repeats this prompt, whatever becomes of the reply
+     * -- and a retry repeats all of it, which still leaves the one token that
+     * produces the logits. */
+    if (n - from > 1) {
+        if (!qwasar_session_eval(sv->s, tokens + from, n - 1 - from, err, cap)) return NULL;
+        from = n - 1;
+    }
+    qwasar_session_mark(sv->s);
     return qwasar_session_eval(sv->s, tokens + from, n - from, err, cap);
 }
 
@@ -360,6 +375,17 @@ static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
         *reused = n;
         const float *l = qwasar_session_logits(sv->s);
         if (l) return l;
+    }
+
+    /* The live session has moved past this prompt's shared part -- most often
+     * the reply it generated is not what came back (reasoning a client drops,
+     * a stop sequence, a retry).  Back to where the last prompt ended, if this
+     * one keeps that, rather than to disk. */
+    const int32_t back = sv->s ? qwasar_session_rewind(sv->s, tokens, n) : 0;
+    if (back > 0) {
+        *reused = back;
+        if (sv->verbose) fprintf(stderr, "  rewound to the last prompt (%d tokens)\n", back);
+        return srv_eval_from(sv, tokens, back, n, mk, err, cap);
     }
 
     if (sv->s) qwasar_session_free(sv->s);
@@ -591,6 +617,9 @@ static bool srv_generate(server *sv, const float *logits, const qwasar_sampling 
             }
             lp = masked;
         }
+        /* Shutting down (srv_shutdown): the reply ends here, as if cut by
+         * its budget, so the engine is free for the checkpoint. */
+        if (atomic_load(&g_stopping)) break;
         int32_t next = qwasar_sample(lp, vocab, sp, &sv->rng);
         if (qwasar_is_eos(sv->e, next)) { out->hit_eos = true; break; }
         out->n_gen++;
@@ -2022,6 +2051,40 @@ static void *conn_main(void *arg) {
     return NULL;
 }
 
+/* A graceful stop -- SIGTERM, SIGINT, or the supervisor closing stdin --
+ * writes the live conversation to disk before exiting, so the next run
+ * picks it up where it was: the reply in progress ends at its next token,
+ * the session goes back to its rewind point (the end of the last prompt,
+ * which the conversation's next request repeats whatever became of the
+ * reply), and a checkpoint is written there.  Once only; whichever cause
+ * comes first does it. */
+static void srv_shutdown(const char *why) {
+    static atomic_flag once = ATOMIC_FLAG_INIT;
+    if (atomic_flag_test_and_set(&once)) {
+        for (;;) pause();                  /* the first caller exits for us all */
+    }
+    atomic_store(&g_stopping, true);
+    fprintf(stderr, "qwasar-server: %s; exiting\n", why);
+    server *sv = g_srv;
+    if (!atomic_load(&g_ready) || !sv || sv->no_cache) _exit(0);
+
+    pthread_mutex_lock(&sv->lock);         /* no request in flight past here */
+    if (sv->s && qwasar_session_rewind_to_mark(sv->s) > 0) {
+        char err[256];
+        struct timeval t0, t1;
+        gettimeofday(&t0, NULL);
+        if (qwasar_session_save(sv->s, sv->e, err, sizeof err)) {
+            gettimeofday(&t1, NULL);
+            fprintf(stderr, "qwasar-server: saved the conversation (%d tokens) in %.2fs\n",
+                    qwasar_session_n_past(sv->s),
+                    (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) * 1e-6);
+        } else {
+            fprintf(stderr, "qwasar-server: conversation not saved: %s\n", err);
+        }
+    }
+    _exit(0);
+}
+
 static void *stdin_watch(void *arg) {
     (void)arg;
     char buf[256];
@@ -2029,8 +2092,34 @@ static void *stdin_watch(void *arg) {
         const ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
         if (n == 0 || (n < 0 && errno != EINTR)) break;
     }
-    fprintf(stderr, "qwasar-server: standard input closed; exiting\n");
-    _exit(0);
+    srv_shutdown("standard input closed");
+    return NULL;
+}
+
+static void *shutdown_run(void *arg) {
+    srv_shutdown(arg);
+    return NULL;
+}
+
+/* SIGTERM and SIGINT, taken synchronously on a thread of their own (they are
+ * blocked everywhere else).  The first starts the shutdown; a second, while
+ * a large checkpoint is still being written, exits at once. */
+static void *signal_watch(void *arg) {
+    sigset_t *set = arg;
+    bool first = true;
+    for (;;) {
+        int sig = 0;
+        if (sigwait(set, &sig) != 0) continue;
+        if (!first) _exit(128 + sig);
+        first = false;
+        pthread_t t;
+        if (pthread_create(&t, NULL, shutdown_run,
+                           (void *)(sig == SIGINT ? "interrupted" : "terminated")) == 0)
+            pthread_detach(t);
+        else
+            _exit(0);
+    }
+    return NULL;
 }
 
 static void usage(FILE *out) {
@@ -2085,6 +2174,19 @@ int main(int argc, char **argv) {
     qwasar_options opts = { 0 };
     server sv = { 0 };
     sv.max_tokens = 2048;
+
+    /* Stops are taken by a thread of their own from the first moment, so one
+     * that arrives during the model load exits the same way as any other. */
+    g_srv = &sv;
+    static sigset_t stop_signals;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGTERM);
+    sigaddset(&stop_signals, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &stop_signals, NULL);   /* before any thread starts */
+    {
+        pthread_t t;
+        if (pthread_create(&t, NULL, signal_watch, &stop_signals) == 0) pthread_detach(t);
+    }
     const char *host = "127.0.0.1";
     int port = 8080;
     bool cors = false;
@@ -2151,6 +2253,7 @@ int main(int argc, char **argv) {
 
     pthread_mutex_init(&sv.lock, NULL);
     pthread_mutex_init(&sv.conns_lock, NULL);
+    atomic_store(&g_ready, true);
     pthread_attr_t detached;
     pthread_attr_init(&detached);
     pthread_attr_setdetachstate(&detached, PTHREAD_CREATE_DETACHED);

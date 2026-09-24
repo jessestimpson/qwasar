@@ -177,19 +177,14 @@ static size_t flash_ple_bytes(const qwasar_session *s) {
     return s->cfg->ple_layer >= 0 ? (size_t)s->flash->ple_state_len * s->shape->hc_hidden * 4 : 0;
 }
 
-size_t qw_flash_state_bytes(const qwasar_session *s, int32_t n) {
-    return flash_ikeys_bytes(s, n) + flash_ple_bytes(s) + 9 * sizeof(int32_t);
+/* The part that is not per position -- the engram window and n-gram context
+ * -- which a rewind point keeps too (qwasar_session_mark). */
+size_t qw_flash_tail_bytes(const qwasar_session *s) {
+    return flash_ple_bytes(s) + 9 * sizeof(int32_t);
 }
 
-char *qw_flash_pack(const qwasar_session *s, char *out) {
+char *qw_flash_tail_save(const qwasar_session *s, char *out) {
     const struct qw_flash_state *f = s->flash;
-    const int32_t n = s->n_past, d = s->cfg->indexer_head_dim;
-    const size_t used = (size_t)n * d * 4, stride = (size_t)s->max_ctx * d * 4;
-    const char *ik = qw_buf_contents(f->ikeys);
-    for (int32_t l = 0; l < s->shape->n_full_attn_layers; l++) {
-        memcpy(out, ik + (size_t)l * stride, used);
-        out += used;
-    }
     const size_t ple = flash_ple_bytes(s);
     if (ple) { memcpy(out, qw_buf_contents(f->ple_state), ple); out += ple; }
     memcpy(out, f->hist, 8 * sizeof(int32_t)); out += 8 * sizeof(int32_t);
@@ -197,20 +192,39 @@ char *qw_flash_pack(const qwasar_session *s, char *out) {
     return out;
 }
 
-const char *qw_flash_unpack(qwasar_session *s, const char *in, int32_t n) {
+const char *qw_flash_tail_load(qwasar_session *s, const char *in) {
     struct qw_flash_state *f = s->flash;
-    const int32_t d = s->cfg->indexer_head_dim;
-    const size_t used = (size_t)n * d * 4, stride = (size_t)s->max_ctx * d * 4;
-    char *ik = qw_buf_contents(f->ikeys);
-    for (int32_t l = 0; l < s->shape->n_full_attn_layers; l++) {
-        memcpy(ik + (size_t)l * stride, in, used);
-        in += used;
-    }
     const size_t ple = flash_ple_bytes(s);
     if (ple) { memcpy(qw_buf_contents(f->ple_state), in, ple); in += ple; }
     memcpy(f->hist, in, 8 * sizeof(int32_t)); in += 8 * sizeof(int32_t);
     memcpy(&f->last_eos, in, sizeof(int32_t)); in += sizeof(int32_t);
     return in;
+}
+
+size_t qw_flash_state_bytes(const qwasar_session *s, int32_t n) {
+    return flash_ikeys_bytes(s, n) + qw_flash_tail_bytes(s);
+}
+
+char *qw_flash_pack(const qwasar_session *s, char *out) {
+    const int32_t n = s->n_past, d = s->cfg->indexer_head_dim;
+    const size_t used = (size_t)n * d * 4, stride = (size_t)s->max_ctx * d * 4;
+    const char *ik = qw_buf_contents(s->flash->ikeys);
+    for (int32_t l = 0; l < s->shape->n_full_attn_layers; l++) {
+        memcpy(out, ik + (size_t)l * stride, used);
+        out += used;
+    }
+    return qw_flash_tail_save(s, out);
+}
+
+const char *qw_flash_unpack(qwasar_session *s, const char *in, int32_t n) {
+    const int32_t d = s->cfg->indexer_head_dim;
+    const size_t used = (size_t)n * d * 4, stride = (size_t)s->max_ctx * d * 4;
+    char *ik = qw_buf_contents(s->flash->ikeys);
+    for (int32_t l = 0; l < s->shape->n_full_attn_layers; l++) {
+        memcpy(ik + (size_t)l * stride, in, used);
+        in += used;
+    }
+    return qw_flash_tail_load(s, in);
 }
 
 /* ---- the engram, host side ---------------------------------------------------

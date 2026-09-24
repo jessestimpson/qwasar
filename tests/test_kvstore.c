@@ -48,6 +48,70 @@ static void rm_cache(const char *home) {
     if (system(cmd) != 0) { /* best effort */ }
 }
 
+/* The in-memory rewind point (qwasar_session_mark / _rewind), as the server
+ * uses it: a prompt, a rewind point one token short of its end, a reply;
+ * then a next prompt that keeps the first but not the reply.  Rewinding and
+ * evaluating the rest must be exactly a fresh session evaluating the same
+ * tokens in the same chunks -- and so must a checkpoint written at the
+ * rewind point on the way out (qwasar_session_rewind_to_mark), restored. */
+static void check_rewind(qwasar_engine *e, int32_t vocab) {
+    char err[512];
+    const int32_t np = 300, ng = 20, nx = 30, nq = np + nx;
+    int32_t *q = malloc((size_t)nq * sizeof *q), *gen = malloc((size_t)ng * sizeof *gen);
+    for (int32_t i = 0; i < nq; i++) q[i] = (int32_t)((3000 + (i * 7907) % 50000) % vocab);
+    for (int32_t i = 0; i < ng; i++) gen[i] = (int32_t)((500 + 37 * i) % vocab);
+    float *ref = malloc((size_t)vocab * sizeof *ref);
+
+    /* The reference: the next prompt from scratch, chunked as after a rewind. */
+    qwasar_session *b = qwasar_session_new(e, err, sizeof err);
+    const float *lb = b ? qwasar_session_eval(b, q, np - 1, err, sizeof err) : NULL;
+    if (lb) lb = qwasar_session_eval(b, q + np - 1, nq - (np - 1), err, sizeof err);
+    CHECK(lb != NULL, "reference eval: %s", err);
+    if (lb) memcpy(ref, lb, (size_t)vocab * sizeof *ref);
+
+    qwasar_session *a = qwasar_session_new(e, err, sizeof err);
+    bool ok = a && qwasar_session_eval(a, q, np - 1, err, sizeof err);
+    CHECK(ok && qwasar_session_mark(a), "mark: %s", err);
+    ok = ok && qwasar_session_eval(a, q + np - 1, 1, err, sizeof err);
+    for (int32_t i = 0; ok && i < ng; i++) ok = qwasar_session_eval(a, gen + i, 1, err, sizeof err);
+    CHECK(ok, "prompt and reply: %s", err);
+
+    /* Refused: a prompt differing inside the marked part, or not past it. */
+    int32_t *bad = malloc((size_t)nq * sizeof *bad);
+    memcpy(bad, q, (size_t)nq * sizeof *bad);
+    bad[np / 2] = (bad[np / 2] + 1) % vocab;
+    CHECK(qwasar_session_rewind(a, bad, nq) == 0, "rewound for a prompt that differs before the mark");
+    CHECK(qwasar_session_rewind(a, q, np - 1) == 0, "rewound for a prompt no longer than the mark");
+    CHECK(qwasar_session_n_past(a) == np + ng, "a refused rewind changed the session");
+
+    CHECK(qwasar_session_rewind(a, q, nq) == np - 1, "rewind did not return to the mark");
+    const float *la = qwasar_session_eval(a, q + np - 1, nq - (np - 1), err, sizeof err);
+    CHECK(la != NULL, "eval after rewind: %s", err);
+    if (la && lb) {
+        const double d = rel_l2(la, ref, (size_t)vocab);
+        CHECK(d == 0.0, "after a rewind the logits differ: rel l2 %.3g", d);
+        printf("  after a rewind past a 20-token reply: rel l2 %.1e\n", d);
+    }
+
+    /* On the way out: back to the mark, saved, restored by a new session. */
+    for (int32_t i = 0; ok && i < ng; i++) ok = qwasar_session_eval(a, gen + i, 1, err, sizeof err);
+    CHECK(qwasar_session_rewind_to_mark(a) == np - 1, "rewind_to_mark");
+    CHECK(qwasar_session_save(a, e, err, sizeof err), "save at the mark: %s", err);
+    qwasar_session *c = qwasar_session_new(e, err, sizeof err);
+    CHECK(c && qwasar_session_restore(c, e, q, nq) == np - 1, "the saved rewind point did not restore");
+    const float *lc = c ? qwasar_session_eval(c, q + np - 1, nq - (np - 1), err, sizeof err) : NULL;
+    if (lc && lb) {
+        const double d = rel_l2(lc, ref, (size_t)vocab);
+        CHECK(d == 0.0, "restored from the rewind point, the logits differ: rel l2 %.3g", d);
+        printf("  saved at the rewind point and restored: rel l2 %.1e\n", d);
+    }
+
+    if (a) qwasar_session_free(a);
+    if (b) qwasar_session_free(b);
+    if (c) qwasar_session_free(c);
+    free(q); free(gen); free(bad); free(ref);
+}
+
 /* The whole round trip against one model, in a private HOME. */
 static int check_model(const char *model) {
     printf("== %s\n", model);
@@ -167,6 +231,8 @@ static int check_model(const char *model) {
             printf("  truncated checkpoint rejected\n");
         }
     }
+
+    check_rewind(e, vocab);
 
     free(prompt); free(longer); free(altered); free(ref);
     qwasar_session_free(a);

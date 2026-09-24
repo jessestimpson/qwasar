@@ -152,7 +152,10 @@ final class ServerController {
     }
 
     /// Asks the server to exit, and makes sure it does.  `then` runs once it
-    /// has gone -- straight away if it was not running.
+    /// has gone -- straight away if it was not running.  On the way out the
+    /// server writes the live conversation to disk (a checkpoint the next run
+    /// resumes from), which for a long conversation at a large context is
+    /// gigabytes, hence the minute before it is killed.
     func stop(then: (() -> Void)? = nil) {
         guard let p = process else { then?(); return }
         if let then { afterExit.append(then) }
@@ -162,7 +165,7 @@ final class ServerController {
         try? lifeline?.fileHandleForWriting.close()     // and EOF, belt and braces
         let pid = p.processIdentifier
         Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(5))
+            try? await Task.sleep(for: .seconds(60))
             if let self, self.process === p { kill(pid, SIGKILL) }
         }
     }

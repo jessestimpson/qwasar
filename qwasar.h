@@ -335,6 +335,21 @@ float   qwasar_rng_uniform(uint64_t *state);
 int32_t qwasar_session_common_prefix(const qwasar_session *s,
                                      const int32_t *tokens, int32_t n);
 
+/* A rewind point, for when the next prompt keeps this one but not what was
+ * generated after it -- a client that drops the reasoning it was sent, a
+ * reply cut at a stop sequence, a retry of the same request.
+ * qwasar_session_mark records the session as it stands (one copy of its
+ * recurrent state, ~115 MB for Flash-Next; false where the session has an
+ * MTP head or images, which it does not cover).  qwasar_session_rewind goes
+ * back to it if the marked tokens are a proper prefix of `tokens`, returning
+ * how many they are, else 0 and nothing changes. */
+bool    qwasar_session_mark(qwasar_session *s);
+int32_t qwasar_session_rewind(qwasar_session *s, const int32_t *tokens, int32_t n);
+/* Back to the rewind point unconditionally: what a checkpoint written on the
+ * way out should hold, since the next request in the conversation repeats the
+ * last prompt but not necessarily the reply.  Returns its length, or 0. */
+int32_t qwasar_session_rewind_to_mark(qwasar_session *s);
+
 /* ---- disk checkpoints -------------------------------------------------------
  *
  * Saves the session so a later run can skip prefilling whatever prefix it

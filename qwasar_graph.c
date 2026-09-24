@@ -193,6 +193,7 @@ void qwasar_session_free(qwasar_session *s) {
     qw_buf_free(s->capture);
     free(s->capture_layers);
     free(s->history);
+    free(s->mark);
     free(s->mrope);
     free(s->kind_index);
     free(s);
@@ -348,6 +349,64 @@ int32_t qwasar_session_common_prefix(const qwasar_session *s,
      * reflects every token evaluated, so a partial match cannot be truncated
      * back to the agreeing prefix. */
     return i == s->n_history ? i : 0;
+}
+
+/* ---- rewind point ------------------------------------------------------------ */
+
+/* What a rewind point copies: the delta layers' recurrent and conv states,
+ * and Flash-Next's engram window and n-gram context -- everything that is
+ * not a row per position. */
+static size_t qw_mark_bytes(const qwasar_session *s) {
+    const qw_config *c = s->cfg;
+    const qw_shape  *sh = s->shape;
+    const size_t ssm = (size_t)sh->n_linear_attn_layers * c->linear_num_value_heads
+                     * c->linear_value_head_dim * c->linear_key_head_dim * sizeof(float);
+    const size_t conv = (size_t)sh->n_linear_attn_layers
+                      * (size_t)(c->linear_conv_kernel_dim - 1) * sh->conv_dim * sizeof(float);
+    return ssm + conv + (s->flash ? qw_flash_tail_bytes(s) : 0);
+}
+
+bool qwasar_session_mark(qwasar_session *s) {
+    if (!s || s->n_past <= 0 || s->mtp_on || s->mrope_active) return false;
+    const size_t need = qw_mark_bytes(s);
+    if (!s->mark) {
+        s->mark = malloc(need);
+        if (!s->mark) return false;
+        s->mark_bytes = need;
+    }
+    const qw_config *c = s->cfg;
+    const qw_shape  *sh = s->shape;
+    const size_t ssm = (size_t)sh->n_linear_attn_layers * c->linear_num_value_heads
+                     * c->linear_value_head_dim * c->linear_key_head_dim * sizeof(float);
+    const size_t conv = need - ssm - (s->flash ? qw_flash_tail_bytes(s) : 0);
+    char *out = s->mark;
+    memcpy(out, qw_buf_contents(s->ssm_state), ssm);   out += ssm;
+    memcpy(out, qw_buf_contents(s->conv_state), conv); out += conv;
+    if (s->flash) qw_flash_tail_save(s, out);
+    s->mark_n = s->n_past;
+    return true;
+}
+
+int32_t qwasar_session_rewind(qwasar_session *s, const int32_t *tokens, int32_t n) {
+    if (!s || !tokens || s->mark_n <= 0 || s->mark_n >= n || s->n_history < s->mark_n
+        || memcmp(s->history, tokens, (size_t)s->mark_n * sizeof *tokens) != 0)
+        return 0;
+    return qwasar_session_rewind_to_mark(s);
+}
+
+int32_t qwasar_session_rewind_to_mark(qwasar_session *s) {
+    if (!s || s->mark_n <= 0 || s->n_history < s->mark_n) return 0;
+    const qw_config *c = s->cfg;
+    const qw_shape  *sh = s->shape;
+    const size_t ssm = (size_t)sh->n_linear_attn_layers * c->linear_num_value_heads
+                     * c->linear_value_head_dim * c->linear_key_head_dim * sizeof(float);
+    const size_t conv = s->mark_bytes - ssm - (s->flash ? qw_flash_tail_bytes(s) : 0);
+    const char *in = s->mark;
+    memcpy(qw_buf_contents(s->ssm_state), in, ssm);   in += ssm;
+    memcpy(qw_buf_contents(s->conv_state), in, conv); in += conv;
+    if (s->flash) qw_flash_tail_load(s, in);
+    s->n_past = s->n_history = s->mark_n;
+    return s->mark_n;
 }
 
 const int32_t *qw_session_history(const qwasar_session *s, int32_t *n) {

@@ -130,6 +130,13 @@ struct qwasar_session {
     int32_t *history;
     int32_t  n_history;
 
+    /* A rewind point (qwasar_session_mark): the state that is not indexed by
+     * position, as it stood after `mark_n` tokens.  Rows past it in the KV and
+     * indexer caches are simply overwritten when evaluation resumes there. */
+    void    *mark;            /* host copy, mark_bytes long; NULL until first used */
+    size_t   mark_bytes;
+    int32_t  mark_n;          /* 0: no rewind point */
+
     /* diagnostic capture (see qwasar_session_set_capture) */
     int32_t *capture_layers;
     int32_t  n_capture;
@@ -166,5 +173,8 @@ void qw_flash_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wan
 size_t      qw_flash_state_bytes(const qwasar_session *s, int32_t n_tokens);
 char       *qw_flash_pack(const qwasar_session *s, char *out);
 const char *qw_flash_unpack(qwasar_session *s, const char *in, int32_t n_tokens);
+size_t      qw_flash_tail_bytes(const qwasar_session *s);
+char       *qw_flash_tail_save(const qwasar_session *s, char *out);
+const char *qw_flash_tail_load(qwasar_session *s, const char *in);
 
 #endif /* QWASAR_SESSION_H */
