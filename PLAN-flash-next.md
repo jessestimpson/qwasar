@@ -442,20 +442,33 @@ overrides).  One large model process at a time.
 target band is 30--60 t/s; the two kernels named under "Speed" above are the
 reason, and nothing about them has changed yet.
 
-**Where speed stands** (same machine, 2026-09-24): decode **~57 t/s**, prefill
-~400 t/s at 4K tokens, load ~15 s.  In decode, what got it here:
-a parallel router; split-K matvecs, where a threadgroup's simdgroups divide
-one row's input (one token's matvecs with few outputs, and the expert banks);
-same-input projections in a single dispatch (a delta layer's four
-in-projections, q/k/v with the indexer, shared gate/up, the split gate/up
-banks) -- separate dispatches on a serial encoder each drain before the next;
-and taking the engram gather off the critical path.  That gather is 16 random
-reads of a 30 GB table on disk.  One after another they were 3.6 ms of every
-token with the GPU idle.  Now they run in parallel, beside the encoding and
-the first layers, and the forward is committed every four layers.  What remains
-is mostly the routed experts, ~120 GB/s on 512 scattered banks where a
-16-expert bank reaches ~345 GB/s.  That is memory locality, not kernel
-structure.
+**Where speed stands** (same machine, 2026-09-24): decode **~64 t/s** (~59 past
+the QSA budget at 4K tokens), prefill ~465 t/s at 4K tokens, load ~15 s.  In
+decode, what got it here:
+- a parallel router;
+- split-K matvecs, where a threadgroup's simdgroups divide one row's input
+  (one token's matvecs with few outputs, and the expert banks);
+- same-input projections in a single dispatch: a delta layer's four
+  in-projections, q/k/v with the indexer, shared gate/up, and the split
+  gate/up banks;
+- the engram gather taken off the critical path.  It is 16 random reads of a
+  30 GB table on disk.  One after another they were 3.6 ms of every token with
+  the GPU idle.  Now they run in parallel, beside the encoding and the first
+  layers, and the forward is committed every four layers;
+- independent dispatches overlapped.  A serial encoder drains the GPU between
+  every two dispatches, and most dispatches in a token are small.  Where
+  chains are independent (the shared expert beside the router and the routed
+  experts; the injection logits beside the mix; the query, key and indexer
+  chains in QSA; the delta layer's slices and gates), they share a concurrent
+  encoder (`qw_cmd_parallel`).  Concurrent encoders throughout, with a barrier
+  after every dependent dispatch, measured 4% slower than serial ones, so the
+  regions are opt-in.
+
+**Not memory locality.** The routed experts read at ~350 GB/s, against ~490 GB/s
+for a large streaming matvec.  Random and consecutive expert ids measure the
+same, and an early 16-expert comparison was only the system cache.  The gap is
+per-dispatch ramp and drain on 10--20 MB reads, which is what the overlap
+addresses.
 
 ## 4. Risks, named
 

@@ -417,13 +417,21 @@ void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
                              qw_off(s->conv_snap, conv_stride * li),
                              s->n_snap, (int32_t)(conv_stride * sh->n_linear_attn_layers));
 
-    /* q | k | v are concatenated along the channel axis; de-stride them. */
+    /* q | k | v are concatenated along the channel axis; de-stride them.
+     * The slices and the gates (from a and b alone) are independent of one
+     * another, as are the two norms after: each group runs side by side
+     * (qw_cmd_parallel). */
+    qw_cmd_parallel(c, true);
+    qw_op_gdn_gates(c, qw_ref_at(s->g, 0), qw_ref_at(s->beta, 0),
+                    qw_ref_at(s->a_proj, 0), qw_ref_at(s->b_proj, 0),
+                    qw_tensor_ref(L->A_log), qw_tensor_ref(L->dt_bias), hv, rows);
     qw_op_slice_rows(c, qw_ref_at(s->gq, 0), qw_ref_at(s->qkv, 0), rows, sh->conv_dim,
                      0, sh->key_dim);
     qw_op_slice_rows(c, qw_ref_at(s->gk, 0), qw_ref_at(s->qkv, 0), rows, sh->conv_dim,
                      sh->key_dim, sh->key_dim);
     qw_op_slice_rows(c, qw_ref_at(s->gv, 0), qw_ref_at(s->qkv, 0), rows, sh->conv_dim,
                      2 * sh->key_dim, sh->value_dim);
+    qw_cmd_parallel(c, false);
 
     /* k = l2norm(k);  q = l2norm(q)/sqrt(dk).  Expressed as an unweighted RMS
      * norm with a trailing scale -- see metal/norm.metal.
@@ -437,14 +445,12 @@ void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
      * by more than the tolerance (measured at 0.7% on the toy). */
     const qw_ref no_weight = qw_ref_at(NULL, 0);
     const float l2eps = cfg->family == QW_FAMILY_QWEN4_EXP ? 1e-6f / (float)dk : 1e-6f;
+    qw_cmd_parallel(c, true);
     qw_op_rms_norm(c, qw_ref_at(s->gq, 0), qw_ref_at(s->gq, 0), no_weight,
                    dk, rows * hk, l2eps, 1.0f / (float)dk);
     qw_op_rms_norm(c, qw_ref_at(s->gk, 0), qw_ref_at(s->gk, 0), no_weight,
                    dk, rows * hk, l2eps, 1.0f / sqrtf((float)dk));
-
-    qw_op_gdn_gates(c, qw_ref_at(s->g, 0), qw_ref_at(s->beta, 0),
-                    qw_ref_at(s->a_proj, 0), qw_ref_at(s->b_proj, 0),
-                    qw_tensor_ref(L->A_log), qw_tensor_ref(L->dt_bias), hv, rows);
+    qw_cmd_parallel(c, false);
     qw_cmd_mark(c, "delta: conv, norms, gates");
 
     qw_op_gated_delta(c, qw_ref_at(s->gdn_y, 0), qw_ref_at(s->gq, 0), qw_ref_at(s->gk, 0),

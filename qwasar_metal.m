@@ -239,8 +239,38 @@ struct qw_cmd_s {
     void *enc;  /* id<MTLComputeCommandEncoder>, +1 retained */
     void *flushed[QW_CMD_FLUSHED];   /* committed by qw_cmd_flush, +1 retained */
     int   n_flushed;
+    int   parallel;   /* qw_cmd_parallel depth: >0, a concurrent encoder */
     char  err[256];
 };
+
+/* Encoders are serial: each dispatch sees everything before it.  Inside
+ * qw_cmd_parallel the command switches to a concurrent encoder, whose
+ * dispatches Metal may overlap, and back to a serial one after.  Concurrent
+ * encoders throughout, with a barrier after every dependent dispatch,
+ * measured 4% slower on a Flash-Next token than serial ones. */
+static id<MTLComputeCommandEncoder> qw_new_encoder(id<MTLCommandBuffer> cb, bool concurrent) {
+    return concurrent ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+                      : [cb computeCommandEncoder];
+}
+
+static void qw_cmd_end_encoding(qw_cmd c);
+
+/* QWASAR_NO_PARALLEL=1: regions stay serial -- the same results, for telling
+ * a race from anything else. */
+static int g_no_parallel = -1;
+
+void qw_cmd_parallel(qw_cmd c, bool on) {
+    if (g_no_parallel < 0) {
+        const char *v = getenv("QWASAR_NO_PARALLEL");
+        g_no_parallel = v && *v && strcmp(v, "0");
+    }
+    if (!c || !c->enc || g_no_parallel) return;
+    if (on ? c->parallel++ > 0 : (c->parallel == 0 || --c->parallel > 0)) return;
+    qw_cmd_end_encoding(c);
+    @autoreleasepool {
+        c->enc = (void *)CFBridgingRetain(qw_new_encoder((__bridge id<MTLCommandBuffer>)c->cb, on));
+    }
+}
 
 qw_cmd qw_cmd_begin(void) {
     if (!g_queue) return NULL;
@@ -248,7 +278,7 @@ qw_cmd qw_cmd_begin(void) {
     if (!c) return NULL;
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = qw_new_encoder(cb, false);
         c->cb  = (void *)CFBridgingRetain(cb);
         c->enc = (void *)CFBridgingRetain(enc);
     }
@@ -276,7 +306,7 @@ void qw_cmd_flush(qw_cmd c) {
         c->flushed[c->n_flushed++] = c->cb;
         id<MTLCommandBuffer> nb = [g_queue commandBuffer];
         c->cb  = (void *)CFBridgingRetain(nb);
-        c->enc = (void *)CFBridgingRetain([nb computeCommandEncoder]);
+        c->enc = (void *)CFBridgingRetain(qw_new_encoder(nb, c->parallel > 0));
     }
 }
 
@@ -381,7 +411,7 @@ void qw_cmd_mark(qw_cmd c, const char *label) {
         CFBridgingRelease((CFTypeRef)c->cb);
         id<MTLCommandBuffer> nb = [g_queue commandBuffer];
         c->cb  = (void *)CFBridgingRetain(nb);
-        c->enc = (void *)CFBridgingRetain([nb computeCommandEncoder]);
+        c->enc = (void *)CFBridgingRetain(qw_new_encoder(nb, c->parallel > 0));
     }
     int i = 0;
     while (i < g_prof_n && strcmp(g_prof[i].label, label)) i++;

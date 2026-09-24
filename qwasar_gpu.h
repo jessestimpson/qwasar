@@ -60,6 +60,10 @@ void   qw_cmd_wait(qw_cmd c);     /* submit and block until done */
  * starts on it while the CPU encodes the rest.  qw_cmd_wait waits for all of
  * it and reports the first error of any. */
 void   qw_cmd_flush(qw_cmd c);
+/* Between qw_cmd_parallel(c, true) and (c, false) the dispatches encoded may
+ * run at the same time: the caller vouches that none reads what another
+ * writes.  Outside, each dispatch sees everything before it.  Nests. */
+void   qw_cmd_parallel(qw_cmd c, bool on);
 void   qw_cmd_free(qw_cmd c);
 /* Error string from the last completed command buffer, or NULL. */
 const char *qw_cmd_error(qw_cmd c);
