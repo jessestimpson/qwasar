@@ -185,6 +185,228 @@ kernel void qw_moe_route(
     }
 }
 
+/* ---- grouped experts, for prefill ------------------------------------------
+ *
+ * A chunk of prefill routes rows*K (token, expert) pairs.  One matvec per pair
+ * re-reads each expert's weights for every token routed to it -- half of a
+ * prompt's GPU time.  Grouped, each expert's weights are read once per tile
+ * of up to BM of its pairs, by the tiled matmul below.
+ *
+ * qw_moe_group sorts the pairs by expert (stably, so the order and the result
+ * are deterministic) and cuts each expert's run into tiles.  It is one thread:
+ * a few thousand pairs, once per layer per chunk, is tens of microseconds. */
+struct qw_group_args { uint pairs, E, BM, max_tiles; };
+#define QW_GROUP_THREADS 1024
+#define QW_GROUP_MAX_E   1024
+
+kernel void qw_moe_group(
+    device const int *idx    [[buffer(0)]],   /* [pairs] expert of each pair */
+    device       int *perm   [[buffer(1)]],   /* [pairs] out: pairs by expert */
+    device       int *tiles  [[buffer(2)]],   /* out: [0] count, then (expert, start, len) */
+    device       int *unused [[buffer(3)]],
+    constant qw_group_args &a [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]])
+{
+    /* Counted and scattered with threadgroup atomics.  The order of pairs
+     * within one expert's run varies from run to run, and nothing depends on
+     * it: every output row of a tile is its own dot product. */
+    threadgroup atomic_int cnt[QW_GROUP_MAX_E];
+    threadgroup int start[QW_GROUP_MAX_E];
+    for (uint e = tid; e < a.E; e += ntg) atomic_store_explicit(&cnt[e], 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint p = tid; p < a.pairs; p += ntg)
+        atomic_fetch_add_explicit(&cnt[idx[p]], 1, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        int running = 0, nt = 0;
+        for (uint e = 0; e < a.E; ++e) {
+            const int c = atomic_load_explicit(&cnt[e], memory_order_relaxed);
+            for (int s = 0; s < c && nt < (int)a.max_tiles; s += (int)a.BM) {
+                tiles[1 + nt * 3 + 0] = (int)e;
+                tiles[1 + nt * 3 + 1] = running + s;
+                tiles[1 + nt * 3 + 2] = min((int)a.BM, c - s);
+                nt++;
+            }
+            start[e] = running;
+            atomic_store_explicit(&cnt[e], running, memory_order_relaxed);
+            running += c;
+        }
+        tiles[0] = nt;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint p = tid; p < a.pairs; p += ntg)
+        perm[atomic_fetch_add_explicit(&cnt[idx[p]], 1, memory_order_relaxed)] = (int)p;
+}
+
+/* Tiling for the grouped matmul, injected from qwasar_gpu.h like the dense
+ * one's.  Smaller in M than qmm's: a 256-token chunk spreads 2560 pairs over
+ * 512 experts, ~5 each, and a 64-row tile would spend 90% of its matrix-unit
+ * work on empty rows -- measured, it undid everything reading the weights
+ * once had saved. */
+#ifndef QW_GMM_BM
+#define QW_GMM_BM   16
+#define QW_GMM_BN   64
+#define QW_GMM_BK   32
+#define QW_GMM_SG_M 1
+#define QW_GMM_SG_N 4
+#endif
+#define QW_GMM_THREADS (QW_GMM_SG_M * QW_GMM_SG_N * 32)
+#define QW_GMM_FRAG_M  ((QW_GMM_BM / QW_GMM_SG_M) / QW_SG_TILE)
+#define QW_GMM_FRAG_N  ((QW_GMM_BN / QW_GMM_SG_N) / QW_SG_TILE)
+#define QW_GMM_POOL_HALF (QW_GMM_BK * (QW_GMM_BM + QW_GMM_BN))
+#define QW_GMM_POOL_F    (QW_GMM_POOL_HALF / 2 > QW_GMM_BM * QW_GMM_BN \
+                          ? QW_GMM_POOL_HALF / 2 : QW_GMM_BM * QW_GMM_BN)
+
+/* The tiled matmul of metal/qmm.metal, over one expert's slice of a bank per
+ * tile: rows gathered through `perm`, results scattered back to their pairs.
+ * Everything between is qw_qmm_q4_g64's inner loop, unchanged. */
+struct qw_gmm_args { uint k, n, K, x_by_pair; };
+
+kernel void qw_qmm_q4_gather(
+    device const uint    *wb      [[buffer(0)]],   /* bank [E, n, k/8] */
+    device const ushort  *sb      [[buffer(1)]],   /* bank [E, n, k/G] bf16 */
+    device const ushort  *bb      [[buffer(2)]],
+    device const float   *x       [[buffer(3)]],   /* [rows or pairs, k] */
+    device       float   *y       [[buffer(4)]],   /* [pairs, n] */
+    constant qw_gmm_args &a       [[buffer(5)]],
+    device const int     *perm    [[buffer(6)]],   /* [pairs], sorted by expert */
+    device const int     *tiles   [[buffer(7)]],   /* [0] = count; then (expert, start, len) */
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  sgid [[simdgroup_index_in_threadgroup]])
+{
+    /* One pool, used as the two operand tiles during the K loop and then as the
+     * output tile once the loop is done.
+     *
+     * Operands are half, accumulators stay float.  Dequantised 4-bit weights
+     * and post-norm activations both sit far inside half's range, and halving
+     * the tiles halves the threadgroup traffic in the inner loop, which is
+     * where this kernel spends its time.  The matrix units themselves are not
+     * meaningfully faster for half on this hardware -- measured 16.5 against
+     * 15.6 -- so the win is bandwidth, not arithmetic. */
+    threadgroup float pool[QW_GMM_POOL_F];
+    threadgroup half *As = (threadgroup half *)pool;                     /* [BM][BK] */
+    threadgroup half *Bs = (threadgroup half *)pool + QW_GMM_BK * QW_GMM_BM;
+
+    const uint words  = a.k / QW_QPER_WORD;
+    const uint groups = a.k / QW_QGROUP;
+
+    /* This threadgroup's tile: up to BM pairs routed to one expert. */
+    if ((int)tgid.y >= tiles[0]) return;
+    device const int *tl = tiles + 1 + tgid.y * 3;
+    const uint expert = (uint)tl[0], first = (uint)tl[1], len = (uint)tl[2];
+    device const uint   *w      = wb + (ulong)expert * a.n * words;
+    device const ushort *scales = sb + (ulong)expert * a.n * groups;
+    device const ushort *biases = bb + (ulong)expert * a.n * groups;
+    const uint col0 = tgid.x * QW_GMM_BN;   /* first weight row in this block */
+
+    /* This simdgroup's corner of the output tile. */
+    const uint sg_m = sgid / QW_GMM_SG_N;
+    const uint sg_n = sgid % QW_GMM_SG_N;
+    const uint m_base = sg_m * (QW_GMM_BM / QW_GMM_SG_M);
+    const uint n_base = sg_n * (QW_GMM_BN / QW_GMM_SG_N);
+
+    simdgroup_float8x8 acc[QW_GMM_FRAG_M][QW_GMM_FRAG_N];
+#pragma unroll
+    for (uint i = 0; i < QW_GMM_FRAG_M; ++i)
+#pragma unroll
+        for (uint j = 0; j < QW_GMM_FRAG_N; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k0 = 0; k0 < a.k; k0 += QW_GMM_BK) {
+
+        /* Activations.  Consecutive threads take consecutive k for one token,
+         * so each group of 32 reads one contiguous 128-byte span of x. */
+        for (uint idx = tid; idx < QW_GMM_BM * QW_GMM_BK; idx += QW_GMM_THREADS) {
+            const uint kk = idx % QW_GMM_BK;
+            const uint mm = idx / QW_GMM_BK;
+            /* The pair's activation row: its own (after the expert's first
+             * matmul) or its token's (x_by_pair off: row = pair / K). */
+            half v = half(0);
+            if (mm < len) {
+                const uint p = (uint)perm[first + mm];
+                const uint xr = a.x_by_pair ? p : p / a.K;
+                v = half(x[(ulong)xr * a.k + k0 + kk]);
+            }
+            As[mm * QW_GMM_BK + kk] = v;
+        }
+
+        /* Weights, one packed word (8 values) per thread.  A word never spans
+         * two quantisation groups because 8 divides 64, so one scale and one
+         * bias cover the whole word. */
+        for (uint idx = tid; idx < QW_GMM_BN * (QW_GMM_BK / QW_QPER_WORD);
+             idx += QW_GMM_THREADS) {
+            const uint nn = idx / (QW_GMM_BK / QW_QPER_WORD);
+            const uint wk = idx % (QW_GMM_BK / QW_QPER_WORD);
+            const uint gn = col0 + nn;
+            const uint gk = k0 + wk * QW_QPER_WORD;
+
+            uint  ww = 0;
+            float sc = 0.0f, bi = 0.0f;
+            if (gn < a.n) {
+                ww = w[(ulong)gn * words + gk / QW_QPER_WORD];
+                const uint g = gk / QW_QGROUP;
+                sc = qw_bf16_to_f32(scales[(ulong)gn * groups + g]);
+                bi = qw_bf16_to_f32(biases[(ulong)gn * groups + g]);
+            }
+#pragma unroll
+            for (uint j = 0; j < QW_QPER_WORD; ++j)
+                Bs[(wk * QW_QPER_WORD + j) * QW_GMM_BN + nn] =
+                    half(fma(sc, float((ww >> (4 * j)) & 0xF), bi));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint ks = 0; ks < QW_GMM_BK; ks += QW_SG_TILE) {
+            simdgroup_half8x8 af[QW_GMM_FRAG_M], bf[QW_GMM_FRAG_N];
+
+#pragma unroll
+            for (uint i = 0; i < QW_GMM_FRAG_M; ++i)
+                simdgroup_load(af[i],
+                               As + (m_base + i * QW_SG_TILE) * QW_GMM_BK + ks,
+                               QW_GMM_BK, 0, /*transpose=*/false);
+#pragma unroll
+            for (uint j = 0; j < QW_GMM_FRAG_N; ++j)
+                simdgroup_load(bf[j], Bs + ks * QW_GMM_BN + n_base + j * QW_SG_TILE,
+                               QW_GMM_BN, 0, /*transpose=*/false);
+
+#pragma unroll
+            for (uint i = 0; i < QW_GMM_FRAG_M; ++i)
+#pragma unroll
+                for (uint j = 0; j < QW_GMM_FRAG_N; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* Reuse the operand pool as the output tile.  Every simdgroup has finished
+     * reading it above, and the barrier ending the last K step is what makes
+     * that safe. */
+    threadgroup float *Cs = pool;    /* [BM][BN] */
+
+#pragma unroll
+    for (uint i = 0; i < QW_GMM_FRAG_M; ++i)
+#pragma unroll
+        for (uint j = 0; j < QW_GMM_FRAG_N; ++j)
+            simdgroup_store(acc[i][j],
+                            Cs + (m_base + i * QW_SG_TILE) * QW_GMM_BN
+                               + n_base + j * QW_SG_TILE,
+                            QW_GMM_BN, 0, /*transpose=*/false);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Ragged tiles are handled here rather than by the fragment stores, which
+     * always write a full 8x8. */
+    for (uint idx = tid; idx < QW_GMM_BM * QW_GMM_BN; idx += QW_GMM_THREADS) {
+        const uint mm = idx / QW_GMM_BN;
+        const uint nn = idx % QW_GMM_BN;
+        const uint gn = col0 + nn;
+        if (mm < len && gn < a.n) y[(ulong)perm[first + mm] * a.n + gn] = Cs[idx];
+    }
+}
+
 /* Matvec against an expert bank: pair p reads matrix idx[p] of the bank and
  * activation row p (x_by_pair) or p / K.  Otherwise qw_qmv_q4_g64 exactly:
  * one simdgroup per QW_QMV_ROWS output rows, lanes walking words. */

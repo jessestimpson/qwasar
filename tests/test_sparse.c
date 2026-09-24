@@ -567,6 +567,60 @@ static void test_select_scale(void) {
     }
 }
 
+/* Grouped experts (prefill) against the per-pair matvec (decode) on the same
+ * bank: every output of every pair.  A skewed routing -- one expert takes
+ * over a thousand pairs, many get a few, some none -- so tiles are full,
+ * partial and absent. */
+static void test_grouped_experts(void) {
+    const int32_t E = 64, k = 2560, n = 640, rows = 256, K = 10, pairs = rows * K;
+    for (int gi = 0; gi < 2; gi++) {
+        const int32_t G = gi ? 32 : 64, words = k / 8, groups = k / G;
+        qw_buf wb = mkbuf((size_t)E * n * words * 4), sb = mkbuf((size_t)E * n * groups * 2),
+               bb = mkbuf((size_t)E * n * groups * 2);
+        uint32_t *wp = qw_buf_contents(wb);
+        uint16_t *sp = qw_buf_contents(sb), *bp = qw_buf_contents(bb);
+        uint32_t st = 99u + (uint32_t)gi;
+        for (size_t i = 0; i < (size_t)E * n * words; i++) { st = st * 1664525u + 1013904223u; wp[i] = st; }
+        for (size_t i = 0; i < (size_t)E * n * groups; i++) {
+            st = st * 1664525u + 1013904223u;
+            sp[i] = f2bf(0.01f + (float)(st >> 24) * 1e-4f);
+            bp[i] = f2bf(-0.05f + (float)((st >> 8) & 255) * 4e-4f);
+        }
+        qw_buf xb = mkbuf((size_t)pairs * k * 4), ib = mkbuf((size_t)pairs * 4);
+        float *xp = qw_buf_contents(xb);
+        int32_t *ip = qw_buf_contents(ib);
+        fill_random(xp, (size_t)pairs * k, 5 + (uint32_t)gi);
+        for (int32_t p = 0; p < pairs; p++) {
+            st = st * 1664525u + 1013904223u;
+            ip[p] = (st >> 16) % 5 < 2 ? 0 : (int32_t)((st >> 8) % (uint32_t)(E - 16));
+        }
+        qw_buf perm = mkbuf((size_t)pairs * 4), tiles = mkbuf((size_t)(1 + 3 * qw_moe_max_tiles(pairs, E)) * 4),
+               cur = mkbuf((size_t)E * 4), yg = mkbuf((size_t)pairs * n * 4), yr = mkbuf((size_t)pairs * n * 4);
+        for (int by_pair = 0; by_pair < 2; by_pair++) {
+            qw_cmd c = qw_cmd_begin();
+            qw_op_moe_group(c, qw_ref_at(perm, 0), qw_ref_at(tiles, 0), qw_ref_at(cur, 0),
+                            qw_ref_at(ib, 0), pairs, E);
+            qw_op_qmm_q4_gather(c, qw_ref_at(yg, 0), qw_ref_at(xb, 0), qw_ref_at(perm, 0),
+                                qw_ref_at(tiles, 0), qw_ref_at(wb, 0), qw_ref_at(sb, 0), qw_ref_at(bb, 0),
+                                k, n, pairs, E, K, by_pair != 0, G);
+            qw_op_qmv_q4_bank(c, qw_ref_at(yr, 0), qw_ref_at(xb, 0), qw_ref_at(ib, 0),
+                              qw_ref_at(wb, 0), qw_ref_at(sb, 0), qw_ref_at(bb, 0),
+                              k, n, pairs, K, by_pair != 0, G);
+            run(c, "grouped experts");
+            char label[64];
+            snprintf(label, sizeof label, "grouped vs per-pair g%d %s", G, by_pair ? "by pair" : "by token");
+            /* fp16 operand tiles in the grouped matmul, as in qmm: ~2e-4 */
+            report(label, qw_buf_contents(yg), qw_buf_contents(yr), (size_t)pairs * n, 1e-3);
+        }
+        const int32_t *tp = qw_buf_contents(tiles);
+        int32_t big = 0;
+        for (int32_t t = 0; t < tp[0]; t++) if (tp[1 + 3 * t] == 0) big++;
+        CHECK(big > 10, "expert 0 should span many tiles, got %d", big);
+        qw_buf_free(wb); qw_buf_free(sb); qw_buf_free(bb); qw_buf_free(xb); qw_buf_free(ib);
+        qw_buf_free(perm); qw_buf_free(tiles); qw_buf_free(cur); qw_buf_free(yg); qw_buf_free(yr);
+    }
+}
+
 /* MLX's layout: split gate and up banks and a group-32 embedding, each
  * against scalar code over the same bound tensors. */
 static void test_mlx_layout(qwasar_engine *e) {
@@ -631,6 +685,7 @@ int main(void) {
     printf("== norm, conv\n");        test_gated_and_conv();
     printf("== qsa\n");               test_qsa(e);
     printf("== qsa selection at scale\n"); test_select_scale();
+    printf("== grouped experts\n");  test_grouped_experts();
     printf("== reused ops\n");        test_reused(e);
 
     qwasar_engine_free(e);

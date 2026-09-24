@@ -23,11 +23,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Rows at or above which the experts run grouped (prefill); below, a matvec
+ * per (token, expert) pair (decode, and the short chunks a verify makes). */
+#define QW_MOE_GROUP_ROWS 8
+
 struct qw_flash_state {
     /* streams and mixers */
     qw_buf h4, n4, mixd, mixu, inj;
     /* MoE */
     qw_buf route_logits, route_idx, route_w, exp_gu, exp_act, exp_y;
+    qw_buf grp_perm, grp_tiles, grp_cursor;     /* prefill's expert grouping */
     qw_buf sh_g, sh_u, sh_out, sh_gs;
     /* QSA */
     qw_buf iqk, iq, iscores, mask, ikeys;   /* ikeys: [n_full, max_ctx, d] fp32 */
@@ -78,6 +83,9 @@ struct qw_flash_state *qw_flash_state_new(qwasar_session *s, char *err, size_t e
         { &f->exp_gu,  (size_t)R * K * 2 * I * 4, "expert gate|up" },
         { &f->exp_act, (size_t)R * K * I * 4, "expert act" },
         { &f->exp_y,   (size_t)R * K * H * 4, "expert out" },
+        { &f->grp_perm,   (size_t)R * K * 4, "expert order" },
+        { &f->grp_tiles,  (size_t)(1 + 3 * qw_moe_max_tiles(R * K, E)) * 4, "expert tiles" },
+        { &f->grp_cursor, (size_t)E * 4, "expert cursor" },
         { &f->sh_g,   (size_t)R * SI * 4, "shared gate" },
         { &f->sh_u,   (size_t)R * SI * 4, "shared up" },
         { &f->sh_out, (size_t)R * H * 4, "shared out" },
@@ -123,6 +131,7 @@ void qw_flash_state_free(struct qw_flash_state *f) {
     qw_buf *all[] = {
         &f->h4, &f->n4, &f->mixd, &f->mixu, &f->inj,
         &f->route_logits, &f->route_idx, &f->route_w, &f->exp_gu, &f->exp_act, &f->exp_y,
+        &f->grp_perm, &f->grp_tiles, &f->grp_cursor,
         &f->sh_g, &f->sh_u, &f->sh_out, &f->sh_gs,
         &f->iqk, &f->iq, &f->iscores, &f->mask, &f->ikeys,
         &f->ple_emb, &f->ple_key, &f->ple_keyn, &f->ple_val, &f->ple_qn, &f->ple_gv,
@@ -333,7 +342,39 @@ static void encode_moe(qwasar_session *s, qw_cmd c, const qw_moe *M, int32_t row
     qw_op_moe_route(c, qw_ref_at(f->route_idx, 0), qw_ref_at(f->route_w, 0),
                     qw_ref_at(f->route_logits, 0), rows, M->n_experts, K, cfg->norm_topk_prob);
     qw_cmd_mark(c, "moe router");
-    if (M->split) {
+
+    /* Many rows: group the pairs by expert and read each expert's weights once
+     * per tile of its tokens.  Few (decode): a matvec per pair is the whole
+     * cost of a bank anyway. */
+    if (rows >= QW_MOE_GROUP_ROWS) {
+        const int32_t E = M->n_experts;
+        const qw_ref perm = qw_ref_at(f->grp_perm, 0), tiles = qw_ref_at(f->grp_tiles, 0);
+        qw_op_moe_group(c, perm, tiles, qw_ref_at(f->grp_cursor, 0), qw_ref_at(f->route_idx, 0),
+                        pairs, E);
+        if (M->split) {
+            const qw_ref g = qw_ref_at(f->exp_gu, 0);
+            const qw_ref u = qw_ref_at(f->exp_gu, (size_t)pairs * I * sizeof(float));
+            qw_op_qmm_q4_gather(c, g, qw_ref_at(s->hn, 0), perm, tiles,
+                                qw_tensor_ref(M->gate.weight), qw_tensor_ref(M->gate.scales),
+                                qw_tensor_ref(M->gate.biases), H, I, pairs, E, K, false,
+                                M->gate.group_size);
+            qw_op_qmm_q4_gather(c, u, qw_ref_at(s->hn, 0), perm, tiles,
+                                qw_tensor_ref(M->up.weight), qw_tensor_ref(M->up.scales),
+                                qw_tensor_ref(M->up.biases), H, I, pairs, E, K, false,
+                                M->up.group_size);
+            qw_op_swiglu(c, qw_ref_at(f->exp_act, 0), g, u, pairs * I);
+        } else {
+            qw_op_qmm_q4_gather(c, qw_ref_at(f->exp_gu, 0), qw_ref_at(s->hn, 0), perm, tiles,
+                                qw_tensor_ref(M->gate_up.weight), qw_tensor_ref(M->gate_up.scales),
+                                qw_tensor_ref(M->gate_up.biases), H, 2 * I, pairs, E, K, false,
+                                M->gate_up.group_size);
+            qw_op_swiglu_split(c, qw_ref_at(f->exp_act, 0), qw_ref_at(f->exp_gu, 0), pairs, I);
+        }
+        qw_op_qmm_q4_gather(c, qw_ref_at(f->exp_y, 0), qw_ref_at(f->exp_act, 0), perm, tiles,
+                            qw_tensor_ref(M->down.weight), qw_tensor_ref(M->down.scales),
+                            qw_tensor_ref(M->down.biases), I, H, pairs, E, K, true,
+                            M->down.group_size);
+    } else if (M->split) {
         /* Gate and up as two banks (MLX's layout), into the two halves of the
          * scratch the fused bank fills: [pairs, I] of gate, then of up. */
         const qw_ref g = qw_ref_at(f->exp_gu, 0);
@@ -352,9 +393,10 @@ static void encode_moe(qwasar_session *s, qw_cmd c, const qw_moe *M, int32_t row
                           M->gate_up.group_size);
         qw_op_swiglu_split(c, qw_ref_at(f->exp_act, 0), qw_ref_at(f->exp_gu, 0), pairs, I);
     }
-    qw_op_qmv_q4_bank(c, qw_ref_at(f->exp_y, 0), qw_ref_at(f->exp_act, 0), qw_ref_at(f->route_idx, 0),
-                      qw_tensor_ref(M->down.weight), qw_tensor_ref(M->down.scales),
-                      qw_tensor_ref(M->down.biases), I, H, pairs, K, true, M->down.group_size);
+    if (rows < QW_MOE_GROUP_ROWS)
+        qw_op_qmv_q4_bank(c, qw_ref_at(f->exp_y, 0), qw_ref_at(f->exp_act, 0), qw_ref_at(f->route_idx, 0),
+                          qw_tensor_ref(M->down.weight), qw_tensor_ref(M->down.scales),
+                          qw_tensor_ref(M->down.biases), I, H, pairs, K, true, M->down.group_size);
     qw_op_moe_combine(c, qw_ref_at(s->hn2, 0), qw_ref_at(f->exp_y, 0), qw_ref_at(f->route_w, 0),
                       rows, K, H);
     qw_cmd_mark(c, "moe routed experts");

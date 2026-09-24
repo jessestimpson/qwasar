@@ -86,6 +86,11 @@ bool qw_gpu_init(char *err, size_t errcap) {
             @"QW_QMM_SG_N" : @(QW_QMM_SG_N),
             @"QW_QMVB_B" : @(QW_QMVB_B),
             @"QW_QMVB_ROWS" : @(QW_QMVB_ROWS),
+            @"QW_GMM_BM" : @(QW_GMM_BM),
+            @"QW_GMM_BN" : @(QW_GMM_BN),
+            @"QW_GMM_BK" : @(QW_GMM_BK),
+            @"QW_GMM_SG_M" : @(QW_GMM_SG_M),
+            @"QW_GMM_SG_N" : @(QW_GMM_SG_N),
         };
         g_library = [g_device newLibraryWithSource:source options:opts error:&nserr];
         if (!g_library) {
@@ -1154,6 +1159,49 @@ void qw_op_qmv_q4_bank(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
     const NSUInteger kRows = 4, nsg = 8, per_tg = nsg * kRows;
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + per_tg - 1) / per_tg, (NSUInteger)pairs, 1)
         threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+}
+
+typedef struct { uint32_t pairs, E, BM, max_tiles; } qw_group_args;
+typedef struct { uint32_t k, n, K, x_by_pair; } qw_gmm_args;
+
+int32_t qw_moe_max_tiles(int32_t pairs, int32_t E) {
+    return (pairs < E ? pairs : E) + (pairs + QW_GMM_BM - 1) / QW_GMM_BM;
+}
+
+void qw_op_moe_group(qw_cmd c, qw_ref perm, qw_ref tiles, qw_ref cursor, qw_ref idx,
+                     int32_t pairs, int32_t E) {
+    QW_BEGIN("qw_moe_group")
+    qw_set(enc, idx, 0); qw_set(enc, perm, 1); qw_set(enc, tiles, 2); qw_set(enc, cursor, 3);
+    qw_group_args args = { (uint32_t)pairs, (uint32_t)E, (uint32_t)QW_GMM_BM,
+                           (uint32_t)qw_moe_max_tiles(pairs, E) };
+    [enc setBytes:&args length:sizeof args atIndex:4];
+    /* One threadgroup of QW_GROUP_THREADS (metal/sparse.metal). */
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+}
+
+void qw_op_qmm_q4_gather(qw_cmd c, qw_ref y, qw_ref x, qw_ref perm, qw_ref tiles,
+                         qw_ref w, qw_ref scales, qw_ref biases,
+                         int32_t k, int32_t n, int32_t pairs, int32_t E, int32_t K,
+                         bool x_by_pair, int32_t group) {
+    if (!c || !c->enc) return;
+    if (k % QW_GMM_BK != 0) {
+        fprintf(stderr, "qwasar: grouped qmm needs k divisible by %d, got %d\n", QW_GMM_BK, k);
+        return;
+    }
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmm_q4_gather", group);
+    if (!ps) return;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, w, 0); qw_set(enc, scales, 1); qw_set(enc, biases, 2);
+    qw_set(enc, x, 3); qw_set(enc, y, 4);
+    qw_gmm_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)K, x_by_pair ? 1u : 0u };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+    qw_set(enc, perm, 6); qw_set(enc, tiles, 7);
+    /* The tile count is the GPU's; launch the bound, and tiles past the
+     * count return at once. */
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + QW_GMM_BN - 1) / QW_GMM_BN,
+                                          (NSUInteger)qw_moe_max_tiles(pairs, E), 1)
+        threadsPerThreadgroup:MTLSizeMake(QW_GMM_THREADS, 1, 1)];
 }
 
 void qw_op_swiglu_split(qw_cmd c, qw_ref act, qw_ref gu, int32_t pairs, int32_t I) {

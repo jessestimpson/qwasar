@@ -177,6 +177,14 @@ void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
  *
  * BK must be a multiple of 8 and divide 64, so a fragment step stays inside one
  * quantisation group and a packed word never spans two. */
+/* The grouped (per-expert) matmul's tiles: metal/sparse.metal. */
+#define QW_GMM_BM   16
+#define QW_GMM_BN   64
+#define QW_GMM_BK   32
+#define QW_GMM_SG_M 1
+#define QW_GMM_SG_N 4
+#define QW_GMM_THREADS (QW_GMM_SG_M * QW_GMM_SG_N * 32)
+
 #define QW_QMM_BM 64
 #define QW_QMM_BN 64
 #define QW_QMM_BK 32
@@ -376,6 +384,17 @@ void qw_op_qmv_q4_bank(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
                        int32_t k, int32_t n, int32_t pairs, int32_t K, bool x_by_pair,
                        int32_t group);
 /* act[p, i] = silu(gu[p, i]) * gu[p, I+i]. */
+/* Prefill's experts, grouped: pairs sorted by expert into up-to-QW_GMM_BM
+ * tiles (qw_op_moe_group), then one tiled matmul per tile against its
+ * expert's slice of the bank (qw_op_qmm_q4_gather).  perm is [pairs] ints,
+ * tiles [1 + 3 * qw_moe_max_tiles] ints, cursor [E] ints of scratch. */
+int32_t qw_moe_max_tiles(int32_t pairs, int32_t E);
+void qw_op_moe_group(qw_cmd c, qw_ref perm, qw_ref tiles, qw_ref cursor, qw_ref idx,
+                     int32_t pairs, int32_t E);
+void qw_op_qmm_q4_gather(qw_cmd c, qw_ref y, qw_ref x, qw_ref perm, qw_ref tiles,
+                         qw_ref w, qw_ref scales, qw_ref biases,
+                         int32_t k, int32_t n, int32_t pairs, int32_t E, int32_t K,
+                         bool x_by_pair, int32_t group);
 void qw_op_swiglu_split(qw_cmd c, qw_ref act, qw_ref gu, int32_t pairs, int32_t I);
 /* out[r] = sum_k w[r, k] * y[r*K + k]. */
 void qw_op_moe_combine(qw_cmd c, qw_ref out, qw_ref y, qw_ref w, int32_t rows, int32_t K, int32_t H);

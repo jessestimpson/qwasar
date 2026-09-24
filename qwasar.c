@@ -1955,7 +1955,13 @@ qwasar_engine *qwasar_engine_load(const qwasar_options *opts, char *err, size_t 
     e->context_size = opts->context_size > 0 ? opts->context_size : 32768;
     if (e->context_size > e->config.max_position_embeddings)
         e->context_size = e->config.max_position_embeddings;
-    e->prefill_chunk = opts->prefill_chunk > 0 ? opts->prefill_chunk : 256;
+    /* Flash-Next prefers long chunks: a chunk reads close to every expert's
+     * weights once per layer whatever its length, so more tokens per chunk is
+     * fewer reads per token -- measured on the M5 Max at 1.6K tokens, 325 t/s
+     * at 256, 379 at 512, 427 at 1024.  Scratch grows with it, a few hundred
+     * MB at 1024.  The 27B's dense prefill has no such term. */
+    e->prefill_chunk = opts->prefill_chunk > 0 ? opts->prefill_chunk
+                     : e->config.family == QW_FAMILY_QWEN4_EXP ? 1024 : 256;
 
     if (!qw_load_shards(e, err, errcap))   goto fail;
     if (!qw_table_index(&e->tensors))      { qw_errf(err, errcap, "out of memory"); goto fail; }
