@@ -927,12 +927,13 @@ void qw_op_gdn_gates(qw_cmd c, qw_ref g, qw_ref beta, qw_ref a, qw_ref b,
    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
 }
 
-typedef struct { uint32_t rows, hk, hv, gqa, n_snap, snap_stride; } qw_gdn_args;
+typedef struct { uint32_t rows, hk, hv, gqa, n_snap, snap_stride, prep; float l2eps, q_scale, k_scale; } qw_gdn_args;
 
-void qw_op_gated_delta(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
-                       qw_ref g, qw_ref beta, qw_ref state,
-                       int32_t hk, int32_t hv, int32_t dk, int32_t dv, int32_t rows,
-                       qw_ref snap, int32_t n_snap, int32_t snap_stride) {
+static void qw_gated_delta_encode(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
+                                  qw_ref g, qw_ref beta, qw_ref state,
+                                  int32_t hk, int32_t hv, int32_t dk, int32_t dv, int32_t rows,
+                                  qw_ref snap, int32_t n_snap, int32_t snap_stride,
+                                  const qw_gdn_prep *prep) {
     if (!c || !c->enc) return;
     /* The per-lane state array is sized at compile time; see the comment at the
      * top of metal/gated_delta.metal. */
@@ -955,9 +956,16 @@ void qw_op_gated_delta(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
     qw_set(enc, y, 6);
     qw_gdn_args args = { (uint32_t)rows, (uint32_t)hk, (uint32_t)hv,
                          (uint32_t)(hv / hk), (uint32_t)n_snap,
-                         (uint32_t)snap_stride };
+                         (uint32_t)snap_stride, prep ? 1u : 0u,
+                         prep ? prep->l2eps : 0.0f, prep ? prep->q_scale : 0.0f,
+                         prep ? prep->k_scale : 0.0f };
     [enc setBytes:&args length:sizeof args atIndex:7];
     qw_set(enc, n_snap > 0 ? snap : state, 8);
+    /* Unused without prep, but every declared buffer needs a binding. */
+    qw_set(enc, prep ? prep->a : state, 9);
+    qw_set(enc, prep ? prep->b : state, 10);
+    qw_set(enc, prep ? prep->A_log : state, 11);
+    qw_set(enc, prep ? prep->dt_bias : state, 12);
 
     /* One simdgroup per (head, value row): x spans the key dim, y the value
      * rows, z the heads.  A (32,4,1) threadgroup keeps each simdgroup's 32
@@ -965,6 +973,22 @@ void qw_op_gated_delta(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
      * dimension. */
     [enc dispatchThreads:MTLSizeMake(32, (NSUInteger)dv, (NSUInteger)hv)
    threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+}
+
+void qw_op_gated_delta(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
+                       qw_ref g, qw_ref beta, qw_ref state,
+                       int32_t hk, int32_t hv, int32_t dk, int32_t dv, int32_t rows,
+                       qw_ref snap, int32_t n_snap, int32_t snap_stride) {
+    qw_gated_delta_encode(c, y, q, k, v, g, beta, state, hk, hv, dk, dv, rows,
+                          snap, n_snap, snap_stride, NULL);
+}
+
+void qw_op_gated_delta_prep(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
+                            const qw_gdn_prep *prep, qw_ref state,
+                            int32_t hk, int32_t hv, int32_t dk, int32_t dv, int32_t rows,
+                            qw_ref snap, int32_t n_snap, int32_t snap_stride) {
+    qw_gated_delta_encode(c, y, q, k, v, state, state, state, hk, hv, dk, dv, rows,
+                          snap, n_snap, snap_stride, prep);
 }
 
 typedef struct { uint32_t hidden, n_tokens; } qw_embed_args;
@@ -1311,6 +1335,26 @@ bool qw_op_qmv_q4_bank2(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
     return true;
 }
 
+typedef struct { uint32_t k, n, stride, bank; } qw_swiglu_mv_args;
+
+void qw_op_qmv_q4_swiglu(qw_cmd c, qw_ref y, qw_ref gate, qw_ref up, int32_t stride, qw_ref idx,
+                         qw_ref w, qw_ref scales, qw_ref biases,
+                         int32_t k, int32_t n, int32_t rows, int32_t group) {
+    if (!c || !c->enc) return;
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmv_q4_swiglu", group);
+    if (!ps) return;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    const bool bank = idx.buf != NULL;
+    qw_set(enc, w, 0); qw_set(enc, scales, 1); qw_set(enc, biases, 2);
+    qw_set(enc, gate, 3); qw_set(enc, bank ? idx : gate, 4); qw_set(enc, y, 5); qw_set(enc, up, 7);
+    qw_swiglu_mv_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)stride, bank ? 1u : 0u };
+    [enc setBytes:&args length:sizeof args atIndex:6];
+    const NSUInteger kRows = 4, nsg = 8, per_tg = nsg * kRows;
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + per_tg - 1) / per_tg, (NSUInteger)rows, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+}
+
 typedef struct { uint32_t pairs, E, BM, max_tiles; } qw_group_args;
 typedef struct { uint32_t k, n, K, x_by_pair; } qw_gmm_args;
 
@@ -1365,6 +1409,46 @@ void qw_op_swiglu_split(qw_cmd c, qw_ref act, qw_ref gu, int32_t pairs, int32_t 
 void qw_op_moe_combine(qw_cmd c, qw_ref out, qw_ref y, qw_ref w, int32_t rows, int32_t K, int32_t H) {
     QW_BEGIN("qw_moe_combine")
     qw_set(enc, y, 0); qw_set(enc, w, 1); qw_set(enc, out, 2);
+    qw_combine_args args = { (uint32_t)rows, (uint32_t)K, (uint32_t)H };
+    [enc setBytes:&args length:sizeof args atIndex:3];
+    qw_dispatch_threads(enc, (NSUInteger)rows * H);
+}
+
+typedef struct { uint32_t rows, H, S; float eps; } qw_hc_inorm_args;
+typedef struct { uint32_t k, H, S; float scale; } qw_hc_mixup_args;
+
+void qw_op_hc_inject_norm(qw_cmd c, qw_ref h4, qw_ref out, qw_ref inj, qw_ref w, qw_ref n4,
+                          int32_t rows, int32_t H, int32_t S, float eps) {
+    QW_BEGIN("qw_hc_inject_norm")
+    qw_set(enc, h4, 0); qw_set(enc, out, 1); qw_set(enc, inj, 2); qw_set(enc, w, 3); qw_set(enc, n4, 4);
+    qw_hc_inorm_args args = { (uint32_t)rows, (uint32_t)H, (uint32_t)S, eps };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows * S, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+}
+
+bool qw_op_hc_mix_up(qw_cmd c, qw_ref x, qw_ref d, qw_ref n4, qw_ref w, qw_ref scales, qw_ref biases,
+                     int32_t k, int32_t H, int32_t S, int32_t rows, float scale, int32_t group) {
+    if (S > 4 || k % 8) return false;
+    if (!c || !c->enc) return true;
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_hc_mix_up", group);
+    if (!ps) return true;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, w, 0); qw_set(enc, scales, 1); qw_set(enc, biases, 2);
+    qw_set(enc, d, 3); qw_set(enc, n4, 4); qw_set(enc, x, 5);
+    qw_hc_mixup_args args = { (uint32_t)k, (uint32_t)H, (uint32_t)S, scale };
+    [enc setBytes:&args length:sizeof args atIndex:6];
+    const NSUInteger nsg = 8;
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)H + nsg - 1) / nsg, (NSUInteger)rows, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+    return true;
+}
+
+void qw_op_moe_combine_shared(qw_cmd c, qw_ref out, qw_ref y, qw_ref w, qw_ref sh, qw_ref g,
+                              int32_t rows, int32_t K, int32_t H) {
+    QW_BEGIN("qw_moe_combine_shared")
+    qw_set(enc, y, 0); qw_set(enc, w, 1); qw_set(enc, out, 2); qw_set(enc, sh, 4); qw_set(enc, g, 5);
     qw_combine_args args = { (uint32_t)rows, (uint32_t)K, (uint32_t)H };
     [enc setBytes:&args length:sizeof args atIndex:3];
     qw_dispatch_threads(enc, (NSUInteger)rows * H);

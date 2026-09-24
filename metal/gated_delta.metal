@@ -40,6 +40,14 @@ struct qw_gdn_args {
      * call, so this is a store of what is already there. */
     uint n_snap;
     uint snap_stride;   /* floats between one timestep's snapshot and the next */
+    /* prep: q and k arrive raw and are l2-normed here -- x * rsqrt(mean x^2 +
+     * l2eps) * {q,k}_scale, qw_rms_norm's arithmetic -- and the decay and
+     * write strength are computed here from a, b, A_log and dt_bias
+     * (qw_gdn_gates' arithmetic).  Each simdgroup already reads all of its
+     * head's q and k, so the norms are two more simd_sums, not two
+     * dispatches; the gates are a scalar per head. */
+    uint prep;
+    float l2eps, q_scale, k_scale;
 };
 
 kernel void qw_gated_delta(
@@ -52,6 +60,10 @@ kernel void qw_gated_delta(
     device       float   *y     [[buffer(6)]],   /* [rows, hv, DV] */
     constant qw_gdn_args &a     [[buffer(7)]],
     device       float   *snap  [[buffer(8)]],   /* [n_snap, hv, DV, DK] fp32 */
+    device const float   *a_in  [[buffer(9)]],   /* prep: [rows, hv] */
+    device const float   *b_in  [[buffer(10)]],  /* prep: [rows, hv] */
+    device const ushort  *A_log [[buffer(11)]],  /* prep: [hv] bf16 */
+    device const ushort  *dt_b  [[buffer(12)]],  /* prep: [hv] bf16 */
     uint3 gid  [[thread_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]])
 {
@@ -81,15 +93,35 @@ kernel void qw_gated_delta(
 
     const uint col = QW_GDN_PER_LANE * lane;
 
+    const float A  = a.prep ? exp(qw_bf16_to_f32(A_log[hv_idx])) : 0.0f;
+    const float dt = a.prep ? qw_bf16_to_f32(dt_b[hv_idx]) : 0.0f;
+
     for (uint t = 0; t < a.rows; ++t) {
-        const float gt = gp[0];
-        const float bt = bp[0];
+        float qs[QW_GDN_PER_LANE], ks[QW_GDN_PER_LANE];
+#pragma unroll
+        for (uint i = 0; i < QW_GDN_PER_LANE; ++i) { qs[i] = qp[col + i]; ks[i] = kp[col + i]; }
+        float gt, bt;
+        if (a.prep) {
+            float sq = 0.0f, sk = 0.0f;
+#pragma unroll
+            for (uint i = 0; i < QW_GDN_PER_LANE; ++i) { sq = fma(qs[i], qs[i], sq); sk = fma(ks[i], ks[i], sk); }
+            const float iq = rsqrt(simd_sum(sq) / float(QW_GDN_DK) + a.l2eps) * a.q_scale;
+            const float ik = rsqrt(simd_sum(sk) / float(QW_GDN_DK) + a.l2eps) * a.k_scale;
+#pragma unroll
+            for (uint i = 0; i < QW_GDN_PER_LANE; ++i) { qs[i] *= iq; ks[i] *= ik; }
+            const uint j = t * a.hv + hv_idx;
+            gt = exp(-A * qw_softplus(a_in[j] + dt));
+            bt = qw_sigmoid(b_in[j]);
+        } else {
+            gt = gp[0];
+            bt = bp[0];
+        }
 
         float kv = 0.0f;
 #pragma unroll
         for (uint i = 0; i < QW_GDN_PER_LANE; ++i) {
             st[i] *= gt;
-            kv = fma(st[i], kp[col + i], kv);
+            kv = fma(st[i], ks[i], kv);
         }
         kv = simd_sum(kv);
 
@@ -100,8 +132,8 @@ kernel void qw_gated_delta(
         float out = 0.0f;
 #pragma unroll
         for (uint i = 0; i < QW_GDN_PER_LANE; ++i) {
-            st[i] = fma(kp[col + i], delta, st[i]);
-            out = fma(st[i], qp[col + i], out);
+            st[i] = fma(ks[i], delta, st[i]);
+            out = fma(st[i], qs[i], out);
         }
         out = simd_sum(out);
         if (lane == 0) yp[0] = out;

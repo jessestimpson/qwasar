@@ -98,6 +98,96 @@ kernel void qw_hc_inject(
     h4[gid] += out[r * a.H + i] * w;
 }
 
+/* A block's output into the streams, then the streams normed for the next
+ * mixer: qw_hc_inject and qw_rms_norm_grouped in one pass.  A threadgroup per
+ * (row, stream); each thread reads back only what it wrote. */
+struct qw_hc_inorm_args { uint rows, H, S; float eps; };
+
+kernel void qw_hc_inject_norm(
+    device       float  *h4  [[buffer(0)]],   /* [rows, S*H], updated */
+    device const float  *out [[buffer(1)]],   /* [rows, H] */
+    device const float  *inj [[buffer(2)]],   /* [rows, S] raw block-inject logits */
+    device const ushort *w   [[buffer(3)]],   /* [S*H] bf16 norm gains */
+    device       float  *n4  [[buffer(4)]],   /* [rows, S*H] */
+    constant qw_hc_inorm_args &a [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint ntg  [[threads_per_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint nsg  [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float partial[32];
+    const uint r = tgid / a.S, st = tgid % a.S;
+    device       float *hr = h4 + (ulong)tgid * a.H;
+    device const float *orow = out + (ulong)r * a.H;
+    const float wgt = 2.0f * qw_sigmoid(inj[r * a.S + st] / float(a.S));
+    for (uint i = tid; i < a.H; i += ntg) hr[i] += orow[i] * wgt;
+    const float sumsq = qw_row_sumsq(hr, a.H, tid, ntg, sgid, nsg, lane, partial);
+    const float inv = rsqrt(sumsq / float(a.H) + a.eps);
+    device float *yr = n4 + (ulong)tgid * a.H;
+    device const ushort *wr = w + (ulong)st * a.H;
+    for (uint i = tid; i < a.H; i += ntg) yr[i] = hr[i] * inv * qw_bf16_to_f32(wr[i]);
+}
+
+/* The mixer's second half for few rows: up-projection, the silu before it
+ * and the stream mix after, in one pass.  A simdgroup owns element i of the
+ * mixed output and computes the S up-projection rows that feed it (rows
+ * s*H + i), its input silu(scale * down) as it loads; then
+ * x[i] = mean_s sigmoid(m_s) * n4[s*H + i].  S <= 4. */
+struct qw_hc_mixup_args { uint k, H, S; float scale; };
+
+kernel void qw_hc_mix_up(
+    device const uint    *w       [[buffer(0)]],   /* [S*H, k/8] */
+    device const ushort  *scales  [[buffer(1)]],
+    device const ushort  *biases  [[buffer(2)]],
+    device const float   *d       [[buffer(3)]],   /* [rows, k] mix-down, pre-silu */
+    device const float   *n4      [[buffer(4)]],   /* [rows, S*H] */
+    device       float   *x       [[buffer(5)]],   /* [rows, H] */
+    constant qw_hc_mixup_args &a  [[buffer(6)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint  sgid  [[simdgroup_index_in_threadgroup]],
+    uint  nsg   [[simdgroups_per_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]])
+{
+    const uint words  = a.k / QW_QPER_WORD;
+    const uint groups = a.k / QW_QGROUP;
+    const uint i = tgid.x * nsg + sgid;
+    if (i >= a.H) return;
+    const uint r = tgid.y;
+    device const float *dv = d + (ulong)r * a.k;
+
+    float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (uint wi = lane; wi < words; wi += 32) {
+        const uint g = wi / QW_WORDS_PER_GROUP;
+        float xs[QW_QPER_WORD];
+#pragma unroll
+        for (int j = 0; j < QW_QPER_WORD; ++j) xs[j] = qw_silu(dv[wi * QW_QPER_WORD + j] * a.scale);
+#pragma unroll
+        for (uint st = 0; st < 4; ++st) {
+            if (st >= a.S) break;
+            const ulong n = (ulong)st * a.H + i;
+            const uint  ww = w[n * words + wi];
+            const float sc = qw_bf16_to_f32(scales[n * groups + g]);
+            const float bi = qw_bf16_to_f32(biases[n * groups + g]);
+            float4 ev, od;
+            qw_unpack8_affine(ww, sc * 255.0f, bi, &ev, &od);
+#pragma unroll
+            for (uint k = 0; k < 4; ++k) {
+                acc[st] = fma(ev[k], xs[2 * k],     acc[st]);
+                acc[st] = fma(od[k], xs[2 * k + 1], acc[st]);
+            }
+        }
+    }
+    float mix = 0.0f;
+#pragma unroll
+    for (uint st = 0; st < 4; ++st) {
+        const float m = simd_sum(acc[st]);
+        if (st < a.S) mix += qw_sigmoid(m) * n4[(ulong)r * a.S * a.H + (ulong)st * a.H + i];
+    }
+    if (lane == 0) x[(ulong)r * a.H + i] = mix / float(a.S);
+}
+
 /* ---- mixture of experts --------------------------------------------------- */
 
 /* Softmax in fp32 over every expert, top-k, renormalised.  One threadgroup
@@ -529,6 +619,73 @@ kernel void qw_qmv_q4_bank(
     }
 }
 
+/* A down projection whose input is swiglu(gate, up), computed as it is
+ * loaded: y[p] = W_e . (silu(g[p]) * u[p]), W_e the bank's expert idx[p]
+ * (`bank`) or the one matrix.  qw_qmv_q4_bank's plan otherwise.  Saves the
+ * activation's own dispatch and its round trip through memory, for the
+ * routed experts' down bank and the shared expert's down at decode. */
+struct qw_swiglu_mv_args { uint k, n, stride, bank; };
+
+kernel void qw_qmv_q4_swiglu(
+    device const uint    *w       [[buffer(0)]],   /* [E or 1, n, k/8] */
+    device const ushort  *scales  [[buffer(1)]],
+    device const ushort  *biases  [[buffer(2)]],
+    device const float   *gate    [[buffer(3)]],   /* row p at p * stride */
+    device const int     *idx     [[buffer(4)]],   /* [pairs], when bank */
+    device       float   *y       [[buffer(5)]],   /* [pairs, n] */
+    constant qw_swiglu_mv_args &a [[buffer(6)]],
+    device const float   *up      [[buffer(7)]],   /* row p at p * stride */
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint  sgid  [[simdgroup_index_in_threadgroup]],
+    uint  nsg   [[simdgroups_per_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]])
+{
+    const uint words  = a.k / QW_QPER_WORD;
+    const uint groups = a.k / QW_QGROUP;
+    const uint row0 = (tgid.x * nsg + sgid) * QW_QMV_ROWS;
+    if (row0 >= a.n) return;
+
+    const uint p = tgid.y;
+    const ulong e = a.bank ? (ulong)idx[p] : 0;
+    device const float  *gv = gate + (ulong)p * a.stride;
+    device const float  *uv = up   + (ulong)p * a.stride;
+    device const uint   *we = w      + e * a.n * words;
+    device const ushort *se = scales + e * a.n * groups;
+    device const ushort *be = biases + e * a.n * groups;
+
+    float acc[QW_QMV_ROWS] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (uint wi = lane; wi < words; wi += 32) {
+        const uint g = wi / QW_WORDS_PER_GROUP;
+        float xs[QW_QPER_WORD];
+#pragma unroll
+        for (int j = 0; j < QW_QPER_WORD; ++j) {
+            const uint i = wi * QW_QPER_WORD + j;
+            xs[j] = qw_silu(gv[i]) * uv[i];
+        }
+#pragma unroll
+        for (uint r = 0; r < QW_QMV_ROWS; ++r) {
+            const uint n = row0 + r;
+            if (n >= a.n) break;
+            const uint  ww = we[(ulong)n * words + wi];
+            const float sc = qw_bf16_to_f32(se[(ulong)n * groups + g]);
+            const float bi = qw_bf16_to_f32(be[(ulong)n * groups + g]);
+            float4 ev, od;
+            qw_unpack8_affine(ww, sc * 255.0f, bi, &ev, &od);
+#pragma unroll
+            for (uint k = 0; k < 4; ++k) {
+                acc[r] = fma(ev[k], xs[2 * k],     acc[r]);
+                acc[r] = fma(od[k], xs[2 * k + 1], acc[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (uint r = 0; r < QW_QMV_ROWS; ++r) {
+        const float v = simd_sum(acc[r]);
+        const uint  n = row0 + r;
+        if (lane == 0 && n < a.n) y[(ulong)p * a.n + n] = v;
+    }
+}
+
 /* act[p, i] = silu(gu[p, i]) * gu[p, I + i]: the fused expert's two halves. */
 struct qw_swiglu_split_args { uint pairs, I; };
 
@@ -557,6 +714,26 @@ kernel void qw_moe_combine(
     if (gid >= a.rows * a.H) return;
     const uint r = gid / a.H, i = gid % a.H;
     float acc = 0.0f;
+    for (uint k = 0; k < a.K; ++k)
+        acc = fma(w[r * a.K + k], y[((ulong)r * a.K + k) * a.H + i], acc);
+    out[gid] = acc;
+}
+
+/* The block's whole output in one pass: the routed experts' weighted sum
+ * plus the shared expert under its scalar sigmoid gate -- what
+ * qw_moe_combine, qw_scale_rows_sigmoid and an add did in three. */
+kernel void qw_moe_combine_shared(
+    device const float *y   [[buffer(0)]],   /* [rows*K, H] */
+    device const float *w   [[buffer(1)]],   /* [rows, K] */
+    device       float *out [[buffer(2)]],   /* [rows, H] */
+    constant qw_combine_args &a [[buffer(3)]],
+    device const float *sh  [[buffer(4)]],   /* [rows, H] shared expert */
+    device const float *g   [[buffer(5)]],   /* [rows] its gate logit */
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= a.rows * a.H) return;
+    const uint r = gid / a.H, i = gid % a.H;
+    float acc = sh[gid] * qw_sigmoid(g[r]);
     for (uint k = 0; k < a.K; ++k)
         acc = fma(w[r * a.K + k], y[((ulong)r * a.K + k) * a.H + i], acc);
     out[gid] = acc;

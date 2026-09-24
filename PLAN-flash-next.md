@@ -442,7 +442,7 @@ overrides).  One large model process at a time.
 target band is 30--60 t/s; the two kernels named under "Speed" above are the
 reason, and nothing about them has changed yet.
 
-**Where speed stands** (same machine, 2026-09-24): decode **~64 t/s** (~59 past
+**Where speed stands** (same machine, 2026-09-24): decode **~68 t/s** (~59 past
 the QSA budget at 4K tokens), prefill ~465 t/s at 4K tokens, load ~15 s.  In
 decode, what got it here:
 - a parallel router;
@@ -463,6 +463,13 @@ decode, what got it here:
   encoder (`qw_cmd_parallel`).  Concurrent encoders throughout, with a barrier
   after every dependent dispatch, measured 4% slower than serial ones, so the
   regions are opt-in.
+- elementwise work folded into its neighbours: the delta layer's q/k l2 norms
+  and gates into the recurrence, and its one-token q/k/v slices replaced by
+  offsets; the MoE activation into both down projections, with the combine,
+  the shared expert's gate and the residual add in one pass; the mixer's
+  up-projection, silu and stream mix in one kernel, and each block's
+  injection into the next mixer's norm.  That took ~1,800 dispatches a token
+  down to ~1,100, and decode to ~68 t/s on a quiet machine.
 
 **Not memory locality.** The routed experts read at ~350 GB/s, against ~490 GB/s
 for a large streaming matvec.  Random and consecutive expert ids measure the

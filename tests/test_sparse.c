@@ -651,6 +651,183 @@ static void test_multi(void) {
         }
 }
 
+/* ---- fused decode kernels, against the ops they replace ------------------- */
+
+/* Random 4-bit weights, n rows of k, as the generators above. */
+static void mkq4(int32_t n, int32_t k, int32_t G, uint32_t st, qw_buf *w, qw_buf *sc, qw_buf *bi) {
+    const size_t groups = (size_t)k / G;
+    *w = mkbuf((size_t)n * k / 2); *sc = mkbuf((size_t)n * groups * 2); *bi = mkbuf((size_t)n * groups * 2);
+    uint32_t *wp = qw_buf_contents(*w);
+    uint16_t *sp = qw_buf_contents(*sc), *bp = qw_buf_contents(*bi);
+    for (size_t j = 0; j < (size_t)n * k / 8; j++) { st = st * 1664525u + 1013904223u; wp[j] = st; }
+    for (size_t j = 0; j < (size_t)n * groups; j++) {
+        st = st * 1664525u + 1013904223u;
+        sp[j] = f2bf(0.01f + (float)(st >> 24) * 1e-4f);
+        bp[j] = f2bf(-0.05f + (float)((st >> 8) & 255) * 4e-4f);
+    }
+}
+
+static qw_ref qw_off(qw_buf b, size_t elems) { return qw_ref_at(b, elems * 4); }
+
+static qw_buf copybuf(qw_buf b, size_t bytes) {
+    qw_buf c = mkbuf(bytes);
+    memcpy(qw_buf_contents(c), qw_buf_contents(b), bytes);
+    return c;
+}
+
+static void test_fused(void) {
+    const int32_t G = 32;
+    char label[64];
+
+    /* down projection of swiglu(gate, up): one matrix, and a bank in both
+     * gate/up layouts (split halves; interleaved per pair) */
+    {
+        const int32_t k = 640, n = 2560, rows = 3, E = 16, K = 10, pairs = 10;
+        qw_buf w, sc, bi, wb, sb, bb;
+        mkq4(n, k, G, 11, &w, &sc, &bi);
+        mkq4(E * n, k, G, 12, &wb, &sb, &bb);
+        qw_buf gu = mkbuf((size_t)2 * pairs * k * 4), act = mkbuf((size_t)pairs * k * 4);
+        qw_buf y1 = mkbuf((size_t)pairs * n * 4), y2 = mkbuf((size_t)pairs * n * 4);
+        qw_buf idx = mkbuf((size_t)pairs * 4);
+        fill_random(qw_buf_contents(gu), (size_t)2 * pairs * k, 13);
+        int32_t *ip = qw_buf_contents(idx);
+        for (int32_t p = 0; p < pairs; p++) ip[p] = (p * 5 + 2) % E;
+        const qw_ref g = qw_ref_at(gu, 0);
+
+        qw_cmd c = qw_cmd_begin();
+        qw_op_swiglu(c, qw_ref_at(act, 0), g, qw_off(gu, (size_t)rows * k), rows * k);
+        qw_op_qmat_q4(c, qw_ref_at(y1, 0), qw_ref_at(act, 0), qw_ref_at(w, 0), qw_ref_at(sc, 0),
+                      qw_ref_at(bi, 0), k, n, rows, G);
+        qw_op_qmv_q4_swiglu(c, qw_ref_at(y2, 0), g, qw_off(gu, (size_t)rows * k), k, qw_ref_at(NULL, 0),
+                            qw_ref_at(w, 0), qw_ref_at(sc, 0), qw_ref_at(bi, 0), k, n, rows, G);
+        run(c, "swiglu matvec");
+        report("swiglu . matvec", qw_buf_contents(y2), qw_buf_contents(y1), (size_t)rows * n, 1e-5);
+
+        for (int layout = 0; layout < 2; layout++) {
+            c = qw_cmd_begin();
+            const qw_ref u = layout ? qw_off(gu, (size_t)k) : qw_off(gu, (size_t)pairs * k);
+            const int32_t stride = layout ? 2 * k : k;
+            if (layout) qw_op_swiglu_split(c, qw_ref_at(act, 0), g, pairs, k);
+            else qw_op_swiglu(c, qw_ref_at(act, 0), g, u, pairs * k);
+            qw_op_qmv_q4_bank(c, qw_ref_at(y1, 0), qw_ref_at(act, 0), qw_ref_at(idx, 0), qw_ref_at(wb, 0),
+                              qw_ref_at(sb, 0), qw_ref_at(bb, 0), k, n, pairs, K, true, G);
+            qw_op_qmv_q4_swiglu(c, qw_ref_at(y2, 0), g, u, stride, qw_ref_at(idx, 0), qw_ref_at(wb, 0),
+                                qw_ref_at(sb, 0), qw_ref_at(bb, 0), k, n, pairs, G);
+            run(c, "swiglu bank");
+            snprintf(label, sizeof label, "swiglu . bank (%s)", layout ? "interleaved" : "split");
+            report(label, qw_buf_contents(y2), qw_buf_contents(y1), (size_t)pairs * n, 1e-5);
+        }
+        qw_buf_free(w); qw_buf_free(sc); qw_buf_free(bi); qw_buf_free(wb); qw_buf_free(sb); qw_buf_free(bb);
+        qw_buf_free(gu); qw_buf_free(act); qw_buf_free(y1); qw_buf_free(y2); qw_buf_free(idx);
+    }
+
+    /* combine + the shared expert's sigmoid gate + the add */
+    {
+        const int32_t rows = 3, K = 10, H = 2560;
+        qw_buf y = mkbuf((size_t)rows * K * H * 4), w = mkbuf((size_t)rows * K * 4);
+        qw_buf sh = mkbuf((size_t)rows * H * 4), g = mkbuf((size_t)rows * 4);
+        qw_buf o1 = mkbuf((size_t)rows * H * 4), o2 = mkbuf((size_t)rows * H * 4);
+        fill_random(qw_buf_contents(y), (size_t)rows * K * H, 21);
+        fill_random(qw_buf_contents(w), (size_t)rows * K, 22);
+        fill_random(qw_buf_contents(sh), (size_t)rows * H, 23);
+        fill_random(qw_buf_contents(g), (size_t)rows, 24);
+        qw_buf sh1 = copybuf(sh, (size_t)rows * H * 4);
+        qw_cmd c = qw_cmd_begin();
+        qw_op_moe_combine_shared(c, qw_ref_at(o2, 0), qw_ref_at(y, 0), qw_ref_at(w, 0), qw_ref_at(sh, 0),
+                                 qw_ref_at(g, 0), rows, K, H);
+        qw_op_moe_combine(c, qw_ref_at(o1, 0), qw_ref_at(y, 0), qw_ref_at(w, 0), rows, K, H);
+        qw_op_scale_rows_sigmoid(c, qw_ref_at(sh1, 0), qw_ref_at(g, 0), rows, H);
+        qw_op_add_inplace(c, qw_ref_at(o1, 0), qw_ref_at(sh1, 0), rows * H);
+        run(c, "combine shared");
+        report("combine + shared gate", qw_buf_contents(o2), qw_buf_contents(o1), (size_t)rows * H, 1e-6);
+        qw_buf_free(y); qw_buf_free(w); qw_buf_free(sh); qw_buf_free(g); qw_buf_free(o1);
+        qw_buf_free(o2); qw_buf_free(sh1);
+    }
+
+    /* hyper-connections: inject then norm; up-projection, silu and mix */
+    {
+        const int32_t rows = 3, H = 2560, S = 4, HH = S * H, R = 320;
+        qw_buf h4 = mkbuf((size_t)rows * HH * 4), out = mkbuf((size_t)rows * H * 4);
+        qw_buf inj = mkbuf((size_t)rows * S * 4), nw = mkbuf((size_t)HH * 2);
+        fill_random(qw_buf_contents(h4), (size_t)rows * HH, 31);
+        fill_random(qw_buf_contents(out), (size_t)rows * H, 32);
+        fill_random(qw_buf_contents(inj), (size_t)rows * S, 33);
+        uint16_t *nwp = qw_buf_contents(nw);
+        for (int32_t i = 0; i < HH; i++) { float t; fill_random(&t, 1, 300 + i); nwp[i] = f2bf(1.0f + 0.1f * t); }
+        qw_buf h4b = copybuf(h4, (size_t)rows * HH * 4);
+        qw_buf n1 = mkbuf((size_t)rows * HH * 4), n2 = mkbuf((size_t)rows * HH * 4);
+        qw_cmd c = qw_cmd_begin();
+        qw_op_hc_inject(c, qw_ref_at(h4, 0), qw_ref_at(out, 0), qw_ref_at(inj, 0), rows, H, S);
+        qw_op_rms_norm_grouped(c, qw_ref_at(n1, 0), qw_ref_at(h4, 0), qw_ref_at(nw, 0), H, S, rows, 1e-6f);
+        qw_op_hc_inject_norm(c, qw_ref_at(h4b, 0), qw_ref_at(out, 0), qw_ref_at(inj, 0), qw_ref_at(nw, 0),
+                             qw_ref_at(n2, 0), rows, H, S, 1e-6f);
+        run(c, "inject norm");
+        report("hc inject + norm: streams", qw_buf_contents(h4b), qw_buf_contents(h4), (size_t)rows * HH, 1e-6);
+        report("hc inject + norm: normed", qw_buf_contents(n2), qw_buf_contents(n1), (size_t)rows * HH, 1e-5);
+
+        qw_buf w, sc, bi;
+        mkq4(HH, R, G, 34, &w, &sc, &bi);
+        qw_buf d = mkbuf((size_t)rows * R * 4), m = mkbuf((size_t)rows * HH * 4);
+        qw_buf x1 = mkbuf((size_t)rows * H * 4), x2 = mkbuf((size_t)rows * H * 4);
+        fill_random(qw_buf_contents(d), (size_t)rows * R, 35);
+        qw_buf d1 = copybuf(d, (size_t)rows * R * 4);
+        for (int32_t r = 1; r <= rows; r += rows - 1) {
+            c = qw_cmd_begin();
+            memcpy(qw_buf_contents(d1), qw_buf_contents(d), (size_t)rows * R * 4);
+            qw_op_silu_scale(c, qw_ref_at(d1, 0), r * R, 0.25f);
+            qw_op_qmat_q4(c, qw_ref_at(m, 0), qw_ref_at(d1, 0), qw_ref_at(w, 0), qw_ref_at(sc, 0),
+                          qw_ref_at(bi, 0), R, HH, r, G);
+            qw_op_hc_mix(c, qw_ref_at(x1, 0), qw_ref_at(n1, 0), qw_ref_at(m, 0), r, H, S);
+            CHECK(qw_op_hc_mix_up(c, qw_ref_at(x2, 0), qw_ref_at(d, 0), qw_ref_at(n1, 0), qw_ref_at(w, 0),
+                                  qw_ref_at(sc, 0), qw_ref_at(bi, 0), R, H, S, r, 0.25f, G),
+                  "hc mix up not encoded");
+            run(c, "mix up");
+            snprintf(label, sizeof label, "hc up . silu . mix, %d row%s", r, r > 1 ? "s" : "");
+            report(label, qw_buf_contents(x2), qw_buf_contents(x1), (size_t)r * H, 1e-5);
+        }
+        qw_buf_free(h4); qw_buf_free(out); qw_buf_free(inj); qw_buf_free(nw); qw_buf_free(h4b);
+        qw_buf_free(n1); qw_buf_free(n2); qw_buf_free(w); qw_buf_free(sc); qw_buf_free(bi);
+        qw_buf_free(d); qw_buf_free(m); qw_buf_free(x1); qw_buf_free(x2); qw_buf_free(d1);
+    }
+
+    /* the delta recurrence normalising q, k and computing its gates itself */
+    {
+        const int32_t hk = 2, hv = 4, dk = 128, dv = 128, rows = 3;
+        const size_t qn = (size_t)rows * hk * dk, vn = (size_t)rows * hv * dv, sn = (size_t)hv * dv * dk;
+        qw_buf q = mkbuf(qn * 4), k = mkbuf(qn * 4), v = mkbuf(vn * 4);
+        qw_buf a = mkbuf((size_t)rows * hv * 4), b = mkbuf((size_t)rows * hv * 4);
+        qw_buf Al = mkbuf((size_t)hv * 2), dt = mkbuf((size_t)hv * 2);
+        qw_buf st1 = mkbuf(sn * 4), g = mkbuf((size_t)rows * hv * 4), beta = mkbuf((size_t)rows * hv * 4);
+        qw_buf y1 = mkbuf(vn * 4), y2 = mkbuf(vn * 4);
+        fill_random(qw_buf_contents(q), qn, 41); fill_random(qw_buf_contents(k), qn, 42);
+        fill_random(qw_buf_contents(v), vn, 43); fill_random(qw_buf_contents(a), (size_t)rows * hv, 44);
+        fill_random(qw_buf_contents(b), (size_t)rows * hv, 45);
+        fill_random(qw_buf_contents(st1), sn, 46);
+        uint16_t *alp = qw_buf_contents(Al), *dtp = qw_buf_contents(dt);
+        for (int32_t h = 0; h < hv; h++) { alp[h] = f2bf(-0.5f + 0.3f * h); dtp[h] = f2bf(0.1f * h - 0.2f); }
+        qw_buf st2 = copybuf(st1, sn * 4), q1 = copybuf(q, qn * 4), k1 = copybuf(k, qn * 4);
+        const float eps = 1e-6f / dk;
+        qw_cmd c = qw_cmd_begin();
+        qw_op_rms_norm(c, qw_ref_at(q1, 0), qw_ref_at(q1, 0), qw_ref_at(NULL, 0), dk, rows * hk, eps, 1.0f / dk);
+        qw_op_rms_norm(c, qw_ref_at(k1, 0), qw_ref_at(k1, 0), qw_ref_at(NULL, 0), dk, rows * hk, eps,
+                       1.0f / sqrtf((float)dk));
+        qw_op_gdn_gates(c, qw_ref_at(g, 0), qw_ref_at(beta, 0), qw_ref_at(a, 0), qw_ref_at(b, 0),
+                        qw_ref_at(Al, 0), qw_ref_at(dt, 0), hv, rows);
+        qw_op_gated_delta(c, qw_ref_at(y1, 0), qw_ref_at(q1, 0), qw_ref_at(k1, 0), qw_ref_at(v, 0),
+                          qw_ref_at(g, 0), qw_ref_at(beta, 0), qw_ref_at(st1, 0), hk, hv, dk, dv, rows,
+                          qw_ref_at(NULL, 0), 0, 0);
+        const qw_gdn_prep prep = { qw_ref_at(a, 0), qw_ref_at(b, 0), qw_ref_at(Al, 0), qw_ref_at(dt, 0),
+                                   eps, 1.0f / dk, 1.0f / sqrtf((float)dk) };
+        qw_op_gated_delta_prep(c, qw_ref_at(y2, 0), qw_ref_at(q, 0), qw_ref_at(k, 0), qw_ref_at(v, 0), &prep,
+                               qw_ref_at(st2, 0), hk, hv, dk, dv, rows, qw_ref_at(NULL, 0), 0, 0);
+        run(c, "gated delta prep");
+        report("delta, norms and gates inside: y", qw_buf_contents(y2), qw_buf_contents(y1), vn, 1e-5);
+        report("delta, norms and gates inside: state", qw_buf_contents(st2), qw_buf_contents(st1), sn, 1e-5);
+        qw_buf bufs[] = { q, k, v, a, b, Al, dt, st1, g, beta, y1, y2, st2, q1, k1 };
+        for (size_t i = 0; i < sizeof bufs / sizeof *bufs; i++) qw_buf_free(bufs[i]);
+    }
+}
+
 /* The decode banks with the input split across a threadgroup (k >= 2048),
  * one bank and two at once (gate and up), against the cpu matvec on each
  * pair's expert.  Two tokens, so p / K picks the input. */
@@ -830,6 +1007,7 @@ int main(void) {
     printf("== one-token matvec, few outputs\n"); test_splitk();
     printf("== decode banks, split\n"); test_bank_splitk();
     printf("== same-input matvecs, fused\n"); test_multi();
+    printf("== fused decode kernels\n"); test_fused();
     printf("== reused ops\n");        test_reused(e);
 
     qwasar_engine_free(e);

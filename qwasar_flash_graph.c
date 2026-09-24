@@ -236,13 +236,22 @@ void qw_flash_prepare_chunk(qwasar_session *s, const int32_t *tokens, int32_t ro
 
 /* GatedResidual: streams -> normalised streams (n4), one mixed input (s->hn),
  * and the per-stream injection logits (inj) when the block has them. */
-static void encode_hc(qwasar_session *s, qw_cmd c, const qw_hc *hc, int32_t rows) {
+/* GatedResidual: streams -> normalised streams (n4), one mixed input (s->hn),
+ * and the per-stream injection logits (inj) when the block has them.
+ * `inject`: the previous block's output (hn2, under the previous mixer's inj)
+ * is still to be added to the streams, and goes in with the norm. */
+static void encode_hc(qwasar_session *s, qw_cmd c, const qw_hc *hc, int32_t rows, bool inject) {
     struct qw_flash_state *f = s->flash;
     const qw_config *cfg = s->cfg;
     const int32_t H = cfg->hidden_size, S = cfg->hc_count, HH = s->shape->hc_hidden;
 
-    qw_op_rms_norm_grouped(c, qw_ref_at(f->n4, 0), qw_ref_at(f->h4, 0), qw_tensor_ref(hc->hc_norm),
-                           H, S, rows, cfg->rms_norm_eps);
+    if (inject)
+        qw_op_hc_inject_norm(c, qw_ref_at(f->h4, 0), qw_ref_at(s->hn2, 0), qw_ref_at(f->inj, 0),
+                             qw_tensor_ref(hc->hc_norm), qw_ref_at(f->n4, 0), rows, H, S,
+                             cfg->rms_norm_eps);
+    else
+        qw_op_rms_norm_grouped(c, qw_ref_at(f->n4, 0), qw_ref_at(f->h4, 0), qw_tensor_ref(hc->hc_norm),
+                               H, S, rows, cfg->rms_norm_eps);
     qw_cmd_mark(c, "hc: norm");
     /* The injection logits read only the normed streams, as the mix does:
      * the two run side by side (qw_cmd_parallel). */
@@ -252,13 +261,23 @@ static void encode_hc(qwasar_session *s, qw_cmd c, const qw_hc *hc, int32_t rows
         qw_op_dmat_bf16(c, qw_ref_at(f->inj, 0), qw_ref_at(f->n4, 0),
                         qw_tensor_ref(hc->block_inject), HH, S, rows);
     qw_cmd_parallel(c, false);
-    qw_op_silu_scale(c, qw_ref_at(f->mixd, 0), rows * cfg->hc_lowrank, 1.0f / (float)S);
     qw_cmd_mark(c, "hc: mix down, inject weights");
-    qw_encode_qlinear(c, &hc->mix_up, qw_ref_at(f->mixu, 0), qw_ref_at(f->mixd, 0), rows);
-    qw_op_hc_mix(c, qw_ref_at(s->hn, 0), qw_ref_at(f->n4, 0), qw_ref_at(f->mixu, 0), rows, H, S);
+    /* Few rows: the up-projection, its silu and the mix in one pass. */
+    const float scale = 1.0f / (float)S;
+    if (rows >= QW_QMM_MIN_ROWS ||
+        !qw_op_hc_mix_up(c, qw_ref_at(s->hn, 0), qw_ref_at(f->mixd, 0), qw_ref_at(f->n4, 0),
+                         qw_tensor_ref(hc->mix_up.weight), qw_tensor_ref(hc->mix_up.scales),
+                         qw_tensor_ref(hc->mix_up.biases), cfg->hc_lowrank, H, S, rows, scale,
+                         hc->mix_up.group_size)) {
+        qw_op_silu_scale(c, qw_ref_at(f->mixd, 0), rows * cfg->hc_lowrank, scale);
+        qw_encode_qlinear(c, &hc->mix_up, qw_ref_at(f->mixu, 0), qw_ref_at(f->mixd, 0), rows);
+        qw_op_hc_mix(c, qw_ref_at(s->hn, 0), qw_ref_at(f->n4, 0), qw_ref_at(f->mixu, 0), rows, H, S);
+    }
     qw_cmd_mark(c, "hc: mix up");
 }
 
+/* The block output into the streams on its own, where no mixer follows
+ * directly to take it (qw_op_hc_inject_norm). */
 static void encode_inject(qwasar_session *s, qw_cmd c, int32_t rows) {
     struct qw_flash_state *f = s->flash;
     qw_op_hc_inject(c, qw_ref_at(f->h4, 0), qw_ref_at(s->hn2, 0), qw_ref_at(f->inj, 0),
@@ -325,8 +344,10 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
      * selection past the budget needs every one of them. */
     qw_op_slice_rows(c, qw_ref_offset(ikeys, (size_t)s->n_past * d * 4), qw_ref_at(f->iqk, 0),
                      rows, (nq + 1) * d, nq * d, d);
-    if (!dense)
-        qw_op_slice_rows(c, qw_ref_at(f->iq, 0), qw_ref_at(f->iqk, 0), rows, (nq + 1) * d, 0, nq * d);
+    /* One row's query heads are already contiguous at the front of iqk. */
+    const qw_ref iq = rows == 1 ? qw_ref_at(f->iqk, 0) : qw_ref_at(f->iq, 0);
+    if (!dense && rows > 1)
+        qw_op_slice_rows(c, iq, qw_ref_at(f->iqk, 0), rows, (nq + 1) * d, 0, nq * d);
     qw_cmd_parallel(c, false);
 
     qw_cmd_parallel(c, true);
@@ -338,7 +359,7 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
     /* Past the budget: the indexer's query heads normed and rotated at their
      * own positions, to score blocks against the cached keys. */
     if (!dense)
-        qw_op_rms_norm(c, qw_ref_at(f->iq, 0), qw_ref_at(f->iq, 0), qw_tensor_ref(L->indexer.q_norm),
+        qw_op_rms_norm(c, iq, iq, qw_tensor_ref(L->indexer.q_norm),
                        d, rows * nq, cfg->rms_norm_eps, 1.0f);
     qw_cmd_parallel(c, false);
 
@@ -351,7 +372,7 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
                    qw_ref_at(s->k, 0), qw_ref_at(s->v, 0),
                    rows, cfg->num_key_value_heads, hd, s->max_ctx, s->n_past);
     if (!dense)
-        qw_op_rope_partial(c, qw_ref_at(f->iq, 0), qw_ref_at(s->positions, 0),
+        qw_op_rope_partial(c, iq, qw_ref_at(s->positions, 0),
                            qw_ref_at(s->rope_axis, 0), qw_ref_at(s->rope_inv_freq, 0),
                            rows, nq, d, cfg->rotary_dim);
     qw_cmd_parallel(c, false);
@@ -367,7 +388,7 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
         return;
     }
 
-    qw_op_qsa_scores(c, qw_ref_at(f->iscores, 0), qw_ref_at(f->iq, 0), ikeys,
+    qw_op_qsa_scores(c, qw_ref_at(f->iscores, 0), iq, ikeys,
                      qw_tensor_ref(L->indexer.k_norm), qw_ref_at(s->rope_inv_freq, 0),
                      rows, nq, d, cfg->indexer_compress_ratio, s->n_past, cfg->rotary_dim,
                      f->max_blocks, cfg->rms_norm_eps);
@@ -385,23 +406,22 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
     qw_encode_qlinear(c, &L->o_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->attn_out, 0), rows);
 }
 
-/* The shared expert after its projections (encoded with the router):
- * step 0 swiglu, 1 down, 2 the sigmoid gate.  Each depends only on the one
- * before, so encode_moe pairs them with the routed chain's steps. */
-static void encode_shared_step(qwasar_session *s, qw_cmd c, const qw_moe *M, int32_t rows, int step) {
+/* The shared expert after its projections (encoded with the router): its
+ * down projection of swiglu(gate, up) -- one dispatch for a token, the
+ * activation computed as the input loads.  Its sigmoid gate is applied in
+ * the combine. */
+static void encode_shared_down(qwasar_session *s, qw_cmd c, const qw_moe *M, int32_t rows) {
     struct qw_flash_state *f = s->flash;
-    const int32_t H = s->cfg->hidden_size, SI = s->cfg->shared_expert_intermediate_size;
-    switch (step) {
-    case 0:
-        qw_op_swiglu(c, qw_ref_at(f->sh_g, 0), qw_ref_at(f->sh_g, 0), qw_ref_at(f->sh_u, 0), rows * SI);
-        break;
-    case 1:
-        qw_encode_qlinear(c, &M->sh_down, qw_ref_at(f->sh_out, 0), qw_ref_at(f->sh_g, 0), rows);
-        break;
-    default:
-        qw_op_scale_rows_sigmoid(c, qw_ref_at(f->sh_out, 0), qw_ref_at(f->sh_gs, 0), rows, H);
-        break;
+    const int32_t SI = s->cfg->shared_expert_intermediate_size;
+    if (rows == 1) {
+        qw_op_qmv_q4_swiglu(c, qw_ref_at(f->sh_out, 0), qw_ref_at(f->sh_g, 0), qw_ref_at(f->sh_u, 0),
+                            SI, qw_ref_at(NULL, 0), qw_tensor_ref(M->sh_down.weight),
+                            qw_tensor_ref(M->sh_down.scales), qw_tensor_ref(M->sh_down.biases),
+                            SI, M->sh_down.out_features, 1, M->sh_down.group_size);
+        return;
     }
+    qw_op_swiglu(c, qw_ref_at(f->sh_g, 0), qw_ref_at(f->sh_g, 0), qw_ref_at(f->sh_u, 0), rows * SI);
+    qw_encode_qlinear(c, &M->sh_down, qw_ref_at(f->sh_out, 0), qw_ref_at(f->sh_g, 0), rows);
 }
 
 /* The MoE block: router, routed experts, the gated shared expert; into hn2. */
@@ -460,60 +480,51 @@ static void encode_moe(qwasar_session *s, qw_cmd c, const qw_moe *M, int32_t row
                             qw_tensor_ref(M->down.weight), qw_tensor_ref(M->down.scales),
                             qw_tensor_ref(M->down.biases), I, H, pairs, E, K, true,
                             M->down.group_size);
-    } else if (M->split) {
-        /* Gate and up as two banks (MLX's layout), into the two halves of the
-         * scratch the fused bank fills: [pairs, I] of gate, then of up. */
+    } else {
+        /* Decode: gate and up beside the shared expert's down, then the down
+         * bank with the activation computed as it loads (qw_op_qmv_q4_swiglu).
+         * MLX's split banks fill the two halves of the scratch -- [pairs, I]
+         * of gate, then of up -- where a fused bank interleaves them per pair. */
         qw_cmd_parallel(c, true);
-        encode_shared_step(s, c, M, rows, 0);
-        const qw_ref g = qw_ref_at(f->exp_gu, 0);
-        const qw_ref u = qw_ref_at(f->exp_gu, (size_t)pairs * I * sizeof(float));
-        if (M->gate.group_size != M->up.group_size ||
-            !qw_op_qmv_q4_bank2(c, g, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
-                                qw_tensor_ref(M->gate.weight), qw_tensor_ref(M->gate.scales),
-                                qw_tensor_ref(M->gate.biases), qw_tensor_ref(M->up.weight),
-                                qw_tensor_ref(M->up.scales), qw_tensor_ref(M->up.biases),
-                                H, I, pairs, K, M->gate.group_size)) {
+        encode_shared_down(s, c, M, rows);
+        qw_ref g = qw_ref_at(f->exp_gu, 0), u;
+        int32_t stride;
+        if (M->split) {
+            u = qw_ref_at(f->exp_gu, (size_t)pairs * I * sizeof(float));
+            stride = I;
+            if (M->gate.group_size != M->up.group_size ||
+                !qw_op_qmv_q4_bank2(c, g, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
+                                    qw_tensor_ref(M->gate.weight), qw_tensor_ref(M->gate.scales),
+                                    qw_tensor_ref(M->gate.biases), qw_tensor_ref(M->up.weight),
+                                    qw_tensor_ref(M->up.scales), qw_tensor_ref(M->up.biases),
+                                    H, I, pairs, K, M->gate.group_size)) {
+                qw_op_qmv_q4_bank(c, g, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
+                                  qw_tensor_ref(M->gate.weight), qw_tensor_ref(M->gate.scales),
+                                  qw_tensor_ref(M->gate.biases), H, I, pairs, K, false, M->gate.group_size);
+                qw_op_qmv_q4_bank(c, u, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
+                                  qw_tensor_ref(M->up.weight), qw_tensor_ref(M->up.scales),
+                                  qw_tensor_ref(M->up.biases), H, I, pairs, K, false, M->up.group_size);
+            }
+        } else {
+            u = qw_ref_at(f->exp_gu, (size_t)I * sizeof(float));
+            stride = 2 * I;
             qw_op_qmv_q4_bank(c, g, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
-                              qw_tensor_ref(M->gate.weight), qw_tensor_ref(M->gate.scales),
-                              qw_tensor_ref(M->gate.biases), H, I, pairs, K, false, M->gate.group_size);
-            qw_op_qmv_q4_bank(c, u, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
-                              qw_tensor_ref(M->up.weight), qw_tensor_ref(M->up.scales),
-                              qw_tensor_ref(M->up.biases), H, I, pairs, K, false, M->up.group_size);
+                              qw_tensor_ref(M->gate_up.weight), qw_tensor_ref(M->gate_up.scales),
+                              qw_tensor_ref(M->gate_up.biases), H, 2 * I, pairs, K, false,
+                              M->gate_up.group_size);
         }
         qw_cmd_parallel(c, false);
-        qw_cmd_parallel(c, true);
-        encode_shared_step(s, c, M, rows, 1);
-        qw_op_swiglu(c, qw_ref_at(f->exp_act, 0), g, u, pairs * I);
-        qw_cmd_parallel(c, false);
-    } else {
-        qw_cmd_parallel(c, true);
-        encode_shared_step(s, c, M, rows, 0);
-        qw_op_qmv_q4_bank(c, qw_ref_at(f->exp_gu, 0), qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
-                          qw_tensor_ref(M->gate_up.weight), qw_tensor_ref(M->gate_up.scales),
-                          qw_tensor_ref(M->gate_up.biases), H, 2 * I, pairs, K, false,
-                          M->gate_up.group_size);
-        qw_cmd_parallel(c, false);
-        qw_cmd_parallel(c, true);
-        encode_shared_step(s, c, M, rows, 1);
-        qw_op_swiglu_split(c, qw_ref_at(f->exp_act, 0), qw_ref_at(f->exp_gu, 0), pairs, I);
-        qw_cmd_parallel(c, false);
+        qw_op_qmv_q4_swiglu(c, qw_ref_at(f->exp_y, 0), g, u, stride, qw_ref_at(f->route_idx, 0),
+                            qw_tensor_ref(M->down.weight), qw_tensor_ref(M->down.scales),
+                            qw_tensor_ref(M->down.biases), I, H, pairs, M->down.group_size);
     }
-    if (rows < QW_MOE_GROUP_ROWS) {
-        qw_cmd_parallel(c, true);
-        encode_shared_step(s, c, M, rows, 2);
-        qw_op_qmv_q4_bank(c, qw_ref_at(f->exp_y, 0), qw_ref_at(f->exp_act, 0), qw_ref_at(f->route_idx, 0),
-                          qw_tensor_ref(M->down.weight), qw_tensor_ref(M->down.scales),
-                          qw_tensor_ref(M->down.biases), I, H, pairs, K, true, M->down.group_size);
-        qw_cmd_parallel(c, false);
-    } else {
-        /* Prefill's routed chain is long matmuls; the shared steps follow it. */
-        for (int step = 0; step < 3; step++) encode_shared_step(s, c, M, rows, step);
-    }
-    qw_op_moe_combine(c, qw_ref_at(s->hn2, 0), qw_ref_at(f->exp_y, 0), qw_ref_at(f->route_w, 0),
-                      rows, K, H);
+    /* Prefill's routed chain is long matmuls; the shared expert follows it. */
+    if (rows >= QW_MOE_GROUP_ROWS) encode_shared_down(s, c, M, rows);
     qw_cmd_mark(c, "moe routed experts");
 
-    qw_op_add_inplace(c, qw_ref_at(s->hn2, 0), qw_ref_at(f->sh_out, 0), rows * H);
+    /* Routed sum, gated shared expert, into hn2: one pass. */
+    qw_op_moe_combine_shared(c, qw_ref_at(s->hn2, 0), qw_ref_at(f->exp_y, 0), qw_ref_at(f->route_w, 0),
+                             qw_ref_at(f->sh_out, 0), qw_ref_at(f->sh_gs, 0), rows, K, H);
 }
 
 /* ---- the forward --------------------------------------------------------------- */
@@ -532,6 +543,9 @@ void qw_flash_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wan
     qw_op_repeat_cols(c, qw_ref_at(f->h4, 0), qw_ref_at(s->h, 0), rows, H, S);
     qw_cmd_mark(c, "embed");
 
+    /* A block's output joins the streams with the next mixer's norm
+     * (encode_hc); `pending` until then. */
+    bool pending = false;
     for (int32_t i = 0; i < cfg->num_hidden_layers; i++) {
         const qw_layer *L = qwasar_engine_layer(e, i);
         /* Commit every few layers: the GPU runs them while the rest encode
@@ -542,11 +556,13 @@ void qw_flash_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wan
              * be in place before anything that reads them is submitted. */
             qw_cmd_flush(c);
             gather_join(f);
+            if (pending) encode_inject(s, c, rows);
+            pending = false;
             encode_ple(s, c, L->ple, rows);
             qw_cmd_mark(c, "engram");
         }
 
-        encode_hc(s, c, &L->attn_hc, rows);
+        encode_hc(s, c, &L->attn_hc, rows, pending);
         qw_cmd_mark(c, "hyper-connections");
         if (L->is_linear_attn) {
             qw_encode_gated_delta_layer(s, c, L, s->kind_index[i], rows);
@@ -555,22 +571,24 @@ void qw_flash_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wan
             encode_qsa_layer(s, c, L, s->kind_index[i], rows);
             qw_cmd_mark(c, "sparse attention");
         }
-        encode_inject(s, c, rows);
 
-        encode_hc(s, c, &L->mlp_hc, rows);
+        encode_hc(s, c, &L->mlp_hc, rows, true);
         qw_cmd_mark(c, "hyper-connections");
         encode_moe(s, c, &L->moe, rows);
-        encode_inject(s, c, rows);
+        pending = true;
         qw_cmd_mark(c, "moe shared expert");
 
         if (f->dbg_stop_layer == i) break;
     }
     gather_join(f);
-    if (f->dbg_stop_layer >= 0 && f->dbg_stop_layer < cfg->num_hidden_layers) return;
-
-    if (!want_logits) return;
+    const bool stopped = f->dbg_stop_layer >= 0 && f->dbg_stop_layer < cfg->num_hidden_layers;
+    if (stopped || !want_logits) {
+        /* The streams complete, for anyone reading them (qw_flash_debug_h4). */
+        if (pending) encode_inject(s, c, rows);
+        return;
+    }
     /* The final mixer feeds lm_head directly: there is no norm between. */
-    encode_hc(s, c, qwasar_engine_final_hc(e), rows);
+    encode_hc(s, c, qwasar_engine_final_hc(e), rows, pending);
     qw_encode_qlinear(c, qwasar_engine_head(e), qw_ref_at(s->logits, 0),
                       qw_off(s->hn, (size_t)(rows - 1) * H), 1);
     qw_cmd_mark(c, "final mixer + lm_head");

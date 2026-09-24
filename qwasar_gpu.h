@@ -285,6 +285,18 @@ void qw_op_gated_delta(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
                        qw_ref g, qw_ref beta, qw_ref state,
                        int32_t hk, int32_t hv, int32_t dk, int32_t dv, int32_t rows,
                        qw_ref snap, int32_t n_snap, int32_t snap_stride);
+/* The same recurrence with its inputs' preparation folded in: q and k raw,
+ * l2-normed in the kernel -- x * rsqrt(mean x^2 + l2eps) * q_scale or k_scale,
+ * as qw_op_rms_norm -- and the decay and write strength computed from a, b,
+ * A_log and dt_bias, as qw_op_gdn_gates. */
+typedef struct {
+    qw_ref a, b, A_log, dt_bias;
+    float l2eps, q_scale, k_scale;
+} qw_gdn_prep;
+void qw_op_gated_delta_prep(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
+                            const qw_gdn_prep *prep, qw_ref state,
+                            int32_t hk, int32_t hv, int32_t dk, int32_t dv, int32_t rows,
+                            qw_ref snap, int32_t n_snap, int32_t snap_stride);
 
 /* ---- rope, embedding, plumbing -------------------------------------------- */
 
@@ -372,11 +384,24 @@ typedef struct { float best, second; uint32_t index, pad; } qw_cand;
 void qw_op_argmax_top2(qw_cmd c, qw_ref out, qw_ref scratch, qw_ref logits,
                        int32_t n, int32_t rows, qw_ref token_out,
                        int32_t prefix, int32_t tail_base);
+/* h4 += out (x) 2*sigmoid(inj / S) per stream, then n4 = the streams normed
+ * with gains w (qw_op_hc_inject, qw_op_rms_norm_grouped): one pass. */
+void qw_op_hc_inject_norm(qw_cmd c, qw_ref h4, qw_ref out, qw_ref inj, qw_ref w, qw_ref n4,
+                          int32_t rows, int32_t H, int32_t S, float eps);
+/* x = mean_s sigmoid(W_s . silu(scale * d)) * n4_s, W_s the up-projection's
+ * rows s*H.. -- the mixer's up-projection, its silu and qw_op_hc_mix in one
+ * pass, a row at a time (for few rows).  False, nothing encoded, if S > 4. */
+bool qw_op_hc_mix_up(qw_cmd c, qw_ref x, qw_ref d, qw_ref n4, qw_ref w, qw_ref scales, qw_ref biases,
+                     int32_t k, int32_t H, int32_t S, int32_t rows, float scale, int32_t group);
 
 /* ---- Flash-Next (qwen4_exp) -- metal/sparse.metal ---------------------------
  *
  * The family's own kernels; each is a transcription of qwasar_flash_cpu.c and
  * is held to it by tests/test_flashnext.  Shapes follow PLAN-flash-next.md. */
+/* out[r] = sum_k w[r,k] y[r*K+k] + sigmoid(g[r]) sh[r]: the MoE block's
+ * output, routed and shared, in one pass. */
+void qw_op_moe_combine_shared(qw_cmd c, qw_ref out, qw_ref y, qw_ref w, qw_ref sh, qw_ref g,
+                              int32_t rows, int32_t K, int32_t H);
 
 /* h4[r, s*H+i] = x[r, i]: the embedding repeated into every stream. */
 void qw_op_repeat_cols(qw_cmd c, qw_ref h4, qw_ref x, int32_t rows, int32_t H, int32_t S);
@@ -404,6 +429,12 @@ bool qw_op_qmv_q4_bank2(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
                         qw_ref w, qw_ref scales, qw_ref biases,
                         qw_ref w2, qw_ref scales2, qw_ref biases2,
                         int32_t k, int32_t n, int32_t pairs, int32_t K, int32_t group);
+/* y[p] = W . (silu(gate[p]) * up[p]), rows p at p * stride in gate and up:
+ * the activation computed as the input loads.  W is expert idx[p] of a bank
+ * when idx is given (qw_ref_at(NULL, 0) for one matrix). */
+void qw_op_qmv_q4_swiglu(qw_cmd c, qw_ref y, qw_ref gate, qw_ref up, int32_t stride, qw_ref idx,
+                         qw_ref w, qw_ref scales, qw_ref biases,
+                         int32_t k, int32_t n, int32_t rows, int32_t group);
 /* act[p, i] = silu(gu[p, i]) * gu[p, I+i]. */
 /* Prefill's experts, grouped: pairs sorted by expert into up-to-QW_GMM_BM
  * tiles (qw_op_moe_group), then one tiled matmul per tile against its
