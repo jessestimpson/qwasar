@@ -9,6 +9,8 @@ tools/bin2c
 
 # compiled test binaries, but keep their sources
 tests/test_*
+!tests/test_*.py
+__pycache__/
 !tests/test_*.c
 
 # generated: embedded Metal sources (see Makefile / tools/bin2c.c)

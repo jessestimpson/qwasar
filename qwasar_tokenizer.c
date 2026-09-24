@@ -903,6 +903,8 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
                 if (len) qw_put_str(&c, "\n\n");
                 qw_put_template(&c, m->tool_calls);
             }
+            /* A prefilled final turn stays open for the model to continue. */
+            if (opts->continue_final_message && i + 1 == n_msgs) break;
             qw_put_id(&c, c.im_end);
             qw_put_str(&c, "\n");
         } else if (!strcmp(m->role, "tool")) {
@@ -924,7 +926,9 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
         }
     }
 
-    if (opts->add_generation_prompt) qw_put_generation_prompt(&c, opts);
+    const bool continuing = opts->continue_final_message
+                          && !strcmp(msgs[n_msgs - 1].role, "assistant");
+    if (opts->add_generation_prompt && !continuing) qw_put_generation_prompt(&c, opts);
 
     if (!c.ok) {
         snprintf(err, errcap, "out of memory encoding the prompt");

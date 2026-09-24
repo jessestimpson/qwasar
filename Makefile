@@ -25,7 +25,7 @@ CORE_OBJS  := qwasar.o qwasar_graph.o qwasar_kvstore.o qwasar_tokenizer.o \
               qwasar_toolcall.o qwasar_sample.o qwasar_json.o qwasar_cpu.o \
               qwasar_image.o qwasar_video.o qwasar_vision.o qwasar_metal.o
 
-.PHONY: all clean test help check-metal
+.PHONY: all clean test test-api help check-metal
 
 all: qwasar qwasar-agent qwasar-server
 
@@ -34,6 +34,7 @@ help:
 	@echo "  make          build ./qwasar, ./qwasar-agent and ./qwasar-server"
 	@echo "  make libqwasar.a  static library for embedders (crucible/)"
 	@echo "  make test     build and run tests"
+	@echo "  make test-api  start ./qwasar-server and check its API against the OpenAI and Anthropic specs"
 	@echo "  make clean    remove build outputs"
 	@echo "  make check-metal  offline kernel syntax check (needs the Metal Toolchain)"
 
@@ -148,6 +149,14 @@ test: $(TESTS)
 	@for t in $(TESTS); do echo "== $$t"; \
 		QWASAR_TEST_MODEL="$(QWASAR_TEST_MODEL)" \
 		QWASAR_TEST_MTP="$(QWASAR_TEST_MTP)" ./$$t || exit 1; done
+
+# Integration tests for the HTTP API: starts ./qwasar-server on a free port
+# and checks it against the OpenAI and Anthropic specs, one server for both.
+# Python standard library only.  Set QWASAR_SERVER_URL to test a server that
+# is already running instead.
+test-api: qwasar-server
+	QWASAR_TEST_MODEL="$(if $(wildcard $(QWASAR_TEST_MODEL)),$(QWASAR_TEST_MODEL))" \
+		PYTHONPATH=tests python3 -m unittest -v test_openai_api test_anthropic_api
 
 # Optional offline syntax check for the kernels.
 #

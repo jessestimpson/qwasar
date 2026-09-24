@@ -106,6 +106,11 @@ typedef struct {
      * prompt the model was trained against. */
     const char *const *tools;
     int32_t            n_tools;
+    /* When the last message is an assistant turn, leave it open -- no
+     * <|im_end|> and no new generation prompt -- so the model continues it.
+     * This is Anthropic's "prefill".  The turn's reasoning block is written
+     * closed, so generation starts in the answer rather than in reasoning. */
+    bool               continue_final_message;
 } qwasar_chat_options;
 
 /* Renders the conversation as ChatML and encodes it.  Caller frees the result. */

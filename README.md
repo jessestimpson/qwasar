@@ -148,15 +148,24 @@ GET  /v1/models
 GET  /v1/models/{id}
 POST /v1/chat/completions   OpenAI, streaming and not, with tools
 POST /v1/messages           Anthropic, streaming and not, with tools
+POST /v1/messages/count_tokens
 ```
 
 Both completion endpoints take `temperature`, `top_p`, `top_k`, `min_p`,
-`seed`, `max_tokens`, `stream`, and `tools`. Reasoning comes back as
+`seed`, `max_tokens`, `stream`, and `tools`. The OpenAI one also honours `stop`,
+`tool_choice` (`none`, `auto`, `required`, or a named function), and
+`stream_options.include_usage`; `n` other than 1 is refused with a 400. The
+Anthropic one honours `stop_sequences`, `tool_choice` (`auto`, `any`, `tool`,
+`none`), and prefill — a conversation ending in an assistant turn is
+continued. `/v1/models` answers in Anthropic's shape to clients that send
+`anthropic-version`, and errors on the Messages API use Anthropic's envelope. Reasoning comes back as
 `reasoning_content` (OpenAI) or `thinking` blocks (Anthropic). `--cors` for
 browser clients; `--host 0.0.0.0` for remote machines.
 
-**One request at a time** — 48 of the 64 layers are recurrent and their state
-cannot be forked the way a KV cache can. What does work is **prefix reuse**: a
+**One completion at a time** — 48 of the 64 layers are recurrent and their
+state cannot be forked the way a KV cache can. Connections are served
+concurrently, so an idle keep-alive client does not lock others out; their
+completions queue. What does work is **prefix reuse**: a
 stateless client resending a growing conversation continues from wherever the
 live session already is — *provided it sends the assistant's reasoning back*
 (as `reasoning_content` or a `thinking` block). Without that, every request
@@ -170,6 +179,11 @@ session rather than risking a stale prefix match (two different pictures render
 to identical placeholder tokens).
 
 `/v1/responses` and `/v1/completions` return 501.
+
+`make test-api` starts the server and checks it against the OpenAI and
+Anthropic specs (Python standard library only; `QWASAR_SERVER_URL` targets a
+running one). With the `openai` or `anthropic` package installed, the official
+clients are exercised too.
 
 ## Images and video
 
