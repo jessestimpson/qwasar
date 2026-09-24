@@ -282,6 +282,32 @@ static server     *g_srv;
 static atomic_bool g_ready;      /* the model is loaded */
 static atomic_bool g_stopping;   /* shutting down: replies end at the next token */
 
+/* The log: one timestamped line per event, on stderr -- which is the file
+ * the menu bar's Open Log shows.  Request detail is behind -v. */
+static double srv_now(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + tv.tv_usec * 1e-6;
+}
+
+static void srv_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void srv_log(const char *fmt, ...) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm tm;
+    localtime_r(&tv.tv_sec, &tm);
+    char when[32], line[1024];
+    strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tm);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "[%s.%03d] %s\n", when, (int)(tv.tv_usec / 1000), line);
+}
+
+/* Tokens per second, 0 for no time. */
+static double srv_rate(int32_t n, double secs) { return secs > 0 ? n / secs : 0.0; }
+
 /* Where the prompt is worth a disk checkpoint (srv_eval_from). */
 typedef struct {
     int32_t sys_n;    /* end of the system prompt and tools: every conversation shares it */
@@ -318,8 +344,8 @@ static const float *srv_eval_from(server *sv, const int32_t *tokens, int32_t fro
         if (saved) sv->ckpt_n = from;
         if (sv->verbose) {
             const double dt = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) * 1e-6;
-            if (saved) fprintf(stderr, "  checkpoint at %d tokens (%.2fs)\n", from, dt);
-            else fprintf(stderr, "  no checkpoint at %d tokens: %s\n", from, serr);
+            if (saved) srv_log("  checkpoint written at %d tokens in %.2fs", from, dt);
+            else srv_log("  no checkpoint at %d tokens: %s", from, serr);
         }
     }
     /* A rewind point one token short of the end: the next request in this
@@ -342,8 +368,10 @@ static const float *srv_eval_from(server *sv, const int32_t *tokens, int32_t fro
  * and has to be replaced. */
 static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
                                 const qwasar_image_input *images, int32_t n_images,
-                                const ckpt_marks *mk, int32_t *reused, char *err, size_t cap) {
+                                const ckpt_marks *mk, int32_t *reused, const char **how,
+                                char *err, size_t cap) {
     *reused = 0;
+    *how = "a new session";
 
     /* Images defeat prefix reuse, and silently.  Two different pictures render
      * to the same run of <|image_pad|> tokens, so a token-sequence match can
@@ -358,6 +386,7 @@ static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
     if (n_images > 0) {
         if (sv->s) qwasar_session_free(sv->s);
         sv->ckpt_n = 0;
+        *how = "a new session (images)";
         sv->s = qwasar_session_new(sv->e, err, cap);
         if (!sv->s) return NULL;
         return qwasar_session_eval_images(sv->s, tokens, n, images, n_images, err, cap);
@@ -366,6 +395,7 @@ static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
     int32_t live = sv->s ? qwasar_session_common_prefix(sv->s, tokens, n) : 0;
     if (live > 0 && live < n) {
         *reused = live;
+        *how = "the live session";
         return srv_eval_from(sv, tokens, live, n, mk, err, cap);
     }
     if (live == n && n > 0) {
@@ -373,6 +403,7 @@ static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
          * logits are the ones we want.  Re-evaluating the final token would
          * append a duplicate instead of reproducing the step. */
         *reused = n;
+        *how = "the live session, already at its end";
         const float *l = qwasar_session_logits(sv->s);
         if (l) return l;
     }
@@ -384,7 +415,7 @@ static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
     const int32_t back = sv->s ? qwasar_session_rewind(sv->s, tokens, n) : 0;
     if (back > 0) {
         *reused = back;
-        if (sv->verbose) fprintf(stderr, "  rewound to the last prompt (%d tokens)\n", back);
+        *how = "the live session, rewound to the last prompt";
         return srv_eval_from(sv, tokens, back, n, mk, err, cap);
     }
 
@@ -395,9 +426,15 @@ static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
     /* A checkpoint is asked to cover at most n-1 tokens.  Restoring the whole
      * prompt would leave the session with no logits and nothing left to
      * evaluate to produce them. */
+    const double t0 = srv_now();
     int32_t covered = sv->no_cache ? 0 : qwasar_session_restore(sv->s, sv->e, tokens, n - 1);
     *reused = covered;
     sv->ckpt_n = covered;
+    if (covered > 0) {
+        *how = "a disk checkpoint";
+        if (sv->verbose)
+            srv_log("  restored %d tokens from a disk checkpoint in %.2fs", covered, srv_now() - t0);
+    }
     return srv_eval_from(sv, tokens, covered, n, mk, err, cap);
 }
 
@@ -1402,6 +1439,7 @@ static void on_delta(void *ud, bool reasoning, const char *s, size_t n) {
 static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthropic,
                               bool count_only) {
     const qj_node *root = qj_root(d);
+    const double t_start = srv_now();
 
     request req;
     memset(&req, 0, sizeof req);
@@ -1507,18 +1545,41 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
         if (!prefill) marks.hist_n = srv_prefix_len(sv, req.msgs, req.n, &upto, prompt, n_prompt);
     }
 
+    if (sv->verbose)
+        srv_log("  %s request: %d message%s, %d tool%s, thinking %s, %s",
+                anthropic ? "Anthropic" : "OpenAI", req.n, req.n == 1 ? "" : "s",
+                req.n_tools, req.n_tools == 1 ? "" : "s", thinking ? "on" : "off",
+                stream ? "streaming" : "not streaming");
+
     int32_t reused = 0;
+    const char *how = "";
     /* The request outlives the prompt now: rendering turns its text into
      * tokens, but its image rows are what the prefill scatters in, so freeing
      * it here -- which is where it used to happen -- released them one call
      * before they were read. */
+    const double t_prefill = srv_now();
     const float *logits = srv_prefill(sv, prompt, n_prompt, req.images, req.n_images,
-                                      &marks, &reused, err, sizeof err);
+                                      &marks, &reused, &how, err, sizeof err);
     req_free(&req);
     free(prompt);
-    if (!logits) { http_error(c, 500, "Internal Server Error", err); return; }
-    if (sv->verbose)
-        fprintf(stderr, "  prompt %d tokens (%d reused)\n", n_prompt, reused);
+    const double prefill_s = srv_now() - t_prefill;
+    if (!logits) {
+        srv_log("  prefill failed: %s", err);
+        http_error(c, 500, "Internal Server Error", err);
+        return;
+    }
+    if (sv->verbose) {
+        /* A rate over a handful of tokens is mostly fixed cost; not shown. */
+        const int32_t fresh = n_prompt - reused;
+        char rate[32] = "";
+        if (fresh >= 16) snprintf(rate, sizeof rate, " (%.0f tok/s)", srv_rate(fresh, prefill_s));
+        if (reused > 0)
+            srv_log("  prompt %d tokens: %d reused from %s, %d prefilled in %.2fs%s",
+                    n_prompt, reused, how, fresh, prefill_s, rate);
+        else
+            srv_log("  prompt %d tokens: prefilled in %.2fs%s, from %s",
+                    n_prompt, prefill_s, rate, how);
+    }
 
     char id[64];
     gen_id(id, sizeof id, anthropic ? "msg_" : "chatcmpl-");
@@ -1551,8 +1612,19 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
     genres g;
     /* A prefilled turn already has its reasoning block closed, so the
      * continuation starts in the answer. */
+    const double t_decode = srv_now();
     bool ok = srv_generate(sv, logits, &sp, max_tokens, thinking && !prefill, &oo.go,
                            stream ? on_delta : NULL, &st, &g, err, sizeof err);
+    const double decode_s = srv_now() - t_decode;
+    if (sv->verbose || !ok) {
+        const char *why = !ok ? "failed" : g.has_call ? "a tool call"
+                        : g.hit_stop ? "a stop sequence" : g.hit_eos ? "end of turn"
+                        : atomic_load(&g_stopping) ? "shutdown" : "the output limit";
+        srv_log("  reply %d tokens in %.2fs (%.1f tok/s), ended by %s%s%s; "
+                "first token after %.2fs, request %.2fs",
+                g.n_gen, decode_s, srv_rate(g.n_gen, decode_s), why,
+                ok ? "" : ": ", ok ? "" : err, t_decode - t_start, srv_now() - t_start);
+    }
     if (!ok) {
         if (!stream) {
             http_error(c, 500, "Internal Server Error", err);
@@ -1975,7 +2047,7 @@ static void serve(server *sv, conn *c) {
         str body = { 0 };
         if (!read_request(c, &carry, &r, &body)) { str_free(&body); break; }
 
-        if (sv->verbose) fprintf(stderr, "%s %s\n", r.method, r.path);
+        if (sv->verbose && strcmp(r.path, "/health")) srv_log("%s %s", r.method, r.path);
         /* Errors take the shape of the API being spoken: the Messages API's
          * paths are Anthropic's, and elsewhere an anthropic-version header
          * says so -- except on OpenAI's own completions path. */
@@ -2064,7 +2136,7 @@ static void srv_shutdown(const char *why) {
         for (;;) pause();                  /* the first caller exits for us all */
     }
     atomic_store(&g_stopping, true);
-    fprintf(stderr, "qwasar-server: %s; exiting\n", why);
+    srv_log("%s; exiting", why);
     server *sv = g_srv;
     if (!atomic_load(&g_ready) || !sv || sv->no_cache) _exit(0);
 
@@ -2075,11 +2147,11 @@ static void srv_shutdown(const char *why) {
         gettimeofday(&t0, NULL);
         if (qwasar_session_save(sv->s, sv->e, err, sizeof err)) {
             gettimeofday(&t1, NULL);
-            fprintf(stderr, "qwasar-server: saved the conversation (%d tokens) in %.2fs\n",
+            srv_log("saved the conversation (%d tokens) in %.2fs",
                     qwasar_session_n_past(sv->s),
                     (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) * 1e-6);
         } else {
-            fprintf(stderr, "qwasar-server: conversation not saved: %s\n", err);
+            srv_log("conversation not saved: %s", err);
         }
     }
     _exit(0);
@@ -2223,6 +2295,8 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     char err[512] = "";
+    srv_log("loading %s", opts.model_path);
+    const double t_load = srv_now();
     sv.e = qwasar_engine_load(&opts, err, sizeof err);
     if (!sv.e) { fprintf(stderr, "qwasar-server: %s\n", err); return 1; }
     sv.tok = qwasar_tokenizer_load(opts.model_path, err, sizeof err);
@@ -2248,8 +2322,12 @@ int main(int argc, char **argv) {
     if (bind(ls, (struct sockaddr *)&addr, sizeof addr) != 0) { perror("bind"); return 1; }
     if (listen(ls, 16) != 0) { perror("listen"); return 1; }
 
-    fprintf(stderr, "qwasar-server on http://%s:%d  (model %s, ctx %d)\n",
-            host, port, model_id, sv.ctx);
+    char limit[64];
+    if (sv.max_tokens > 0) snprintf(limit, sizeof limit, "%d tokens unless a request sets one", sv.max_tokens);
+    else snprintf(limit, sizeof limit, "whatever the context has room for");
+    srv_log("%s loaded in %.1fs; context %d tokens, output limit %s, checkpoints %s",
+            model_name, srv_now() - t_load, sv.ctx, limit, sv.no_cache ? "off" : "on");
+    srv_log("listening on http://%s:%d  (model %s)", host, port, model_id);
 
     pthread_mutex_init(&sv.lock, NULL);
     pthread_mutex_init(&sv.conns_lock, NULL);

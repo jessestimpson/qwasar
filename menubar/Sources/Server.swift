@@ -127,7 +127,9 @@ final class ServerController {
         // tokens for a request that names no limit) suit a terminal, not an
         // agent working through a codebase.  The KV cache is sized to the
         // context up front: at 262K about 8 GB for Flash-Next, 17 GB for the 27B.
-        var args = ["-m", model, "--port", String(port), "--exit-on-eof", "--max-tokens", "0"]
+        // -v: each request's prompt, reuse, prefill and decode speed, and
+        // checkpoints go to the log that Open Log shows.
+        var args = ["-m", model, "--port", String(port), "--exit-on-eof", "--max-tokens", "0", "-v"]
         if let ctx = ModelCatalog.maxContext(of: model) { args += ["--ctx", String(ctx)] }
         p.arguments = args
         let pipe = Pipe()
@@ -208,7 +210,14 @@ final class ServerController {
         return text.split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .last(where: { !$0.isEmpty })
-            .map { $0.replacingOccurrences(of: "qwasar-server: ", with: "") }
+            .map { line -> String in
+                // Log lines carry a "[date time] " stamp; the reason is what follows.
+                var text = line
+                if text.hasPrefix("["), let close = text.firstIndex(of: "]") {
+                    text = String(text[text.index(after: close)...]).trimmingCharacters(in: .whitespaces)
+                }
+                return text.replacingOccurrences(of: "qwasar-server: ", with: "")
+            }
     }
 
     // MARK: the probe
