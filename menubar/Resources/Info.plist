@@ -15,5 +15,7 @@
     <key>LSApplicationCategoryType</key>     <string>public.app-category.developer-tools</string>
     <!-- Filled in by the Makefile from the checkout's qwasar-model link. -->
     <key>QWDefaultModel</key>                <string></string>
+    <!-- The checkout's models/ directory, where the menu looks for models. -->
+    <key>QWModelsDir</key>                   <string></string>
 </dict>
 </plist>

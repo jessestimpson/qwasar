@@ -27,6 +27,10 @@ SRCS      := $(wildcard Sources/*.swift)
 # not be sitting beside it.
 MODEL     ?= $(shell [ -e $(ROOT)/qwasar-model ] && cd $(ROOT)/qwasar-model && pwd -P)
 
+# Where the Model menu looks first for the models it offers, resolved now for
+# the same reason.
+MODELS_DIR ?= $(shell [ -d $(ROOT)/models ] && cd $(ROOT)/models && pwd -P)
+
 .PHONY: all run install clean server
 
 all: $(APP)
@@ -42,6 +46,7 @@ $(BIN): $(SRCS)
 $(APP): $(BIN) server Resources/Info.plist
 	@cp Resources/Info.plist $(APP)/Contents/Info.plist
 	@plutil -replace QWDefaultModel -string "$(MODEL)" $(APP)/Contents/Info.plist
+	@plutil -replace QWModelsDir -string "$(MODELS_DIR)" $(APP)/Contents/Info.plist
 	@cp $(ROOT)/qwasar-server $(HELPER)
 	@# Ad-hoc signing, helper first: signing the bundle seals what is inside it.
 	@codesign --force --sign - --options runtime --timestamp=none $(HELPER)

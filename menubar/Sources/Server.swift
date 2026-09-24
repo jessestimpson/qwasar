@@ -122,7 +122,14 @@ final class ServerController {
 
         let p = Process()
         p.executableURL = binary
-        p.arguments = ["-m", model, "--port", String(port), "--exit-on-eof"]
+        // The whole context the model was trained for, and output limited only
+        // by what that context has left -- the server's defaults (32K, and 2048
+        // tokens for a request that names no limit) suit a terminal, not an
+        // agent working through a codebase.  The KV cache is sized to the
+        // context up front: at 262K about 8 GB for Flash-Next, 17 GB for the 27B.
+        var args = ["-m", model, "--port", String(port), "--exit-on-eof", "--max-tokens", "0"]
+        if let ctx = ModelCatalog.maxContext(of: model) { args += ["--ctx", String(ctx)] }
+        p.arguments = args
         let pipe = Pipe()
         p.standardInput = pipe
         p.standardOutput = log

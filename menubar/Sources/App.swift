@@ -28,7 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let copyItem = NSMenuItem(title: "Copy API URL", action: #selector(copyURL), keyEquivalent: "c")
     private let toggleItem = NSMenuItem(title: "", action: #selector(toggle), keyEquivalent: "s")
     private let portItem = NSMenuItem(title: "", action: #selector(choosePort), keyEquivalent: "")
-    private let modelItem = NSMenuItem(title: "", action: #selector(chooseModel), keyEquivalent: "")
+    private let modelItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let modelMenu = NSMenu()
+    /// Loadable model folders found on disk, rescanned each time the menu opens.
+    private var models: [FoundModel] = []
     private let loginItem = NSMenuItem(title: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -45,7 +48,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         statusLine.isEnabled = false
-        for i in [copyItem, toggleItem, portItem, modelItem, loginItem] { i.target = self }
+        for i in [copyItem, toggleItem, portItem, loginItem] { i.target = self }
+        modelMenu.autoenablesItems = false
+        modelItem.submenu = modelMenu
+        models = ModelCatalog.scan(extra: server.modelPath.map { [$0] } ?? [])
         menu.addItem(statusLine)
         menu.addItem(copyItem)
         menu.addItem(.separator())
@@ -73,6 +79,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === item.menu else { return }
+        models = ModelCatalog.scan(extra: server.modelPath.map { [$0] } ?? [])
         server.refresh()
         render()
     }
@@ -123,10 +131,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleItem.title = running ? "Stop Server" : "Start Server"
         toggleItem.isEnabled = server.state != .stopping
         portItem.title = "Port: \(port)…"
-        let model = server.modelPath.map { ($0 as NSString).lastPathComponent } ?? "none"
-        modelItem.title = "Model: \(model)…"
-        modelItem.toolTip = server.modelPath
+        renderModels()
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    /// "Model: …" and its submenu: one entry per supported model, each the
+    /// folder that would be used for it -- the current one if it is that
+    /// model, else the first found -- then any other folder by hand.
+    private func renderModels() {
+        let current = server.modelPath
+        let currentFamily = current.flatMap(ModelCatalog.family(of:))
+        modelItem.title = "Model: " + (currentFamily?.title
+            ?? current.map { ($0 as NSString).lastPathComponent } ?? "none")
+        modelItem.toolTip = current
+
+        modelMenu.removeAllItems()
+        for family in ModelFamily.allCases {
+            let folder = family == currentFamily ? current
+                : models.first(where: { $0.family == family })?.path
+            let entry = NSMenuItem(title: family.title, action: #selector(selectModel(_:)),
+                                   keyEquivalent: "")
+            entry.target = self
+            if let folder {
+                entry.representedObject = folder
+                entry.state = family == currentFamily ? .on : .off
+                entry.toolTip = "\(folder)\n\(family.note)"
+            } else {
+                entry.title = "\(family.title) — not found"
+                entry.isEnabled = false
+                entry.toolTip = "No \(family.title) folder in the checkout's models/, LM Studio's "
+                              + "models or the Hugging Face cache.  Other Folder… can point at one."
+            }
+            modelMenu.addItem(entry)
+        }
+        modelMenu.addItem(.separator())
+        let other = NSMenuItem(title: "Other Folder…", action: #selector(chooseModel), keyEquivalent: "")
+        other.target = self
+        // A folder chosen by hand that is neither model's, e.g. an unsupported one.
+        other.state = current != nil && currentFamily == nil ? .on : .off
+        modelMenu.addItem(other)
     }
 
     /// Puts the dot where the Q's cut-out is.  The button draws its image
@@ -195,6 +238,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let wasRunning = server.isRunning
         server.port = p
         if wasRunning { server.restart() } else { server.refresh() }
+        render()
+    }
+
+    @objc private func selectModel(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String, path != server.modelPath else { return }
+        server.setModelPath(path)
+        if server.isRunning { server.restart() }
         render()
     }
 
