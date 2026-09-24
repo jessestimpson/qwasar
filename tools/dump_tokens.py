@@ -115,6 +115,27 @@ CHATS = [
         ],
         "kwargs": {"add_generation_prompt": True},
     },
+    # A replayed turn with no reasoning -- a client that drops it, or thinking
+    # off -- renders an empty <think> block, which has to be the same "\n\n"
+    # token the generation prompt writes or the replay never matches.
+    {
+        "name": "multi_turn_no_reasoning",
+        "messages": [
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer."},
+            {"role": "user", "content": "Second question"},
+        ],
+        "kwargs": {"add_generation_prompt": True},
+    },
+    {
+        "name": "multi_turn_no_thinking",
+        "messages": [
+            {"role": "user", "content": "First question"},
+            {"role": "assistant", "content": "First answer."},
+            {"role": "user", "content": "Second question"},
+        ],
+        "kwargs": {"add_generation_prompt": True, "enable_thinking": False},
+    },
 ]
 
 

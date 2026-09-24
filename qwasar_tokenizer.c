@@ -841,9 +841,24 @@ typedef struct {
     bool ok;
     int32_t im_start, im_end, think_open, think_close, tr_open, tr_close;
     int32_t vision_start, vision_end, image_pad, video_pad;
+    /* Text since the last control token, encoded in one piece when the next
+     * one arrives (qw_flush).  The model's own template renders a string and
+     * tokenises it split only at control tokens, so a run of text written in
+     * pieces here -- "\n", the reasoning, "\n" -- has to be encoded as one
+     * string to come out the same: an empty reasoning block is the single
+     * "\n\n" token the generation prompt writes, not two "\n" tokens, and a
+     * replayed turn then matches what the model generated. */
+    char  *pend;
+    size_t plen, pcap;
 } qw_chat;
 
+static void qw_flush(qw_chat *c) {
+    if (c->ok && c->plen) c->ok = qw_encode_into(c->t, c->pend, c->plen, &c->v);
+    c->plen = 0;
+}
+
 static void qw_put_id(qw_chat *c, int32_t id) {
+    qw_flush(c);
     if (!c->ok) return;
     if (id < 0) { c->ok = false; return; }
     c->ok = qw_tokvec_push(&c->v, id);
@@ -851,7 +866,34 @@ static void qw_put_id(qw_chat *c, int32_t id) {
 
 static void qw_put_text(qw_chat *c, const char *s, size_t len) {
     if (!c->ok || !s || !len) return;
-    c->ok = qw_encode_into(c->t, s, len, &c->v);
+    if (c->plen + len > c->pcap) {
+        size_t cap = c->pcap ? c->pcap : 256;
+        while (cap < c->plen + len) cap *= 2;
+        char *np = realloc(c->pend, cap);
+        if (!np) { c->ok = false; return; }
+        c->pend = np;
+        c->pcap = cap;
+    }
+    memcpy(c->pend + c->plen, s, len);
+    c->plen += len;
+}
+
+/* The rendering so far, pending text included; NULL (and nothing owned) if
+ * anything failed. */
+static int32_t *qw_chat_take(qw_chat *c, int32_t *out_n) {
+    qw_flush(c);
+    free(c->pend);
+    c->pend = NULL;
+    if (!c->ok) { free(c->v.v); return NULL; }
+    *out_n = c->v.n;
+    return c->v.v;
+}
+
+static void qw_chat_drop(qw_chat *c) {
+    free(c->pend);
+    free(c->v.v);
+    c->pend = NULL;
+    c->v.v = NULL;
 }
 
 static void qw_put_str(qw_chat *c, const char *s) { qw_put_text(c, s, s ? strlen(s) : 0); }
@@ -981,9 +1023,7 @@ int32_t *qwasar_render_tool_result(const qwasar_tokenizer *t, const char *result
     qw_put_str(&c, "\n");
     qw_put_generation_prompt(&c, opts);
 
-    if (!c.ok) { free(c.v.v); return NULL; }
-    *out_n = c.v.n;
-    return c.v.v;
+    return qw_chat_take(&c, out_n);
 }
 
 int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
@@ -1009,9 +1049,7 @@ int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
     qw_put_str(&c, "\n");
     qw_put_generation_prompt(&c, opts);
 
-    if (!c.ok) { free(c.v.v); return NULL; }
-    *out_n = c.v.n;
-    return c.v.v;
+    return qw_chat_take(&c, out_n);
 }
 
 int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
@@ -1077,7 +1115,7 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
         if (!strcmp(m->role, "system")) {
             if (i != 0) {
                 snprintf(err, errcap, "system message must come first");
-                free(c.v.v);
+                qw_chat_drop(&c);
                 return NULL;
             }
             continue;   /* already emitted above */
@@ -1134,7 +1172,7 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
             if (last) { qw_put_id(&c, c.im_end); qw_put_str(&c, "\n"); }
         } else {
             snprintf(err, errcap, "unknown message role '%s'", m->role);
-            free(c.v.v);
+            qw_chat_drop(&c);
             return NULL;
         }
     }
@@ -1143,11 +1181,7 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
                           && !strcmp(msgs[n_msgs - 1].role, "assistant");
     if (opts->add_generation_prompt && !continuing) qw_put_generation_prompt(&c, opts);
 
-    if (!c.ok) {
-        snprintf(err, errcap, "out of memory encoding the prompt");
-        free(c.v.v);
-        return NULL;
-    }
-    *out_n = c.v.n;
-    return c.v.v;
+    int32_t *out = qw_chat_take(&c, out_n);
+    if (!out) snprintf(err, errcap, "out of memory encoding the prompt");
+    return out;
 }

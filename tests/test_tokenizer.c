@@ -176,6 +176,17 @@ int main(int argc, char **argv) {
           { { "user", "First question", NULL, NULL },
             { "assistant", "First answer", "thinking here", NULL },
             { "user", "Second question", NULL, NULL } } },
+        /* A replayed turn without its reasoning: the empty block must be the
+         * one "\n\n" token the generation prompt writes, or a conversation
+         * never matches the session that produced it. */
+        { "multi_turn_no_reasoning", { true, "xhigh", true, NULL, 0, false }, 3,
+          { { "user", "First question", NULL, NULL },
+            { "assistant", "First answer.", NULL, NULL },
+            { "user", "Second question", NULL, NULL } } },
+        { "multi_turn_no_thinking", { false, "xhigh", true, NULL, 0, false }, 3,
+          { { "user", "First question", NULL, NULL },
+            { "assistant", "First answer.", NULL, NULL },
+            { "user", "Second question", NULL, NULL } } },
     };
 
     const qj_node *jchats = qj_get(&d, qj_root(&d), "chats");
@@ -192,7 +203,7 @@ int main(int argc, char **argv) {
         if (!ids) { fprintf(stderr, "FAIL chat '%s': %s\n", chats[i].name, err); fails++; continue; }
 
         if (ids_match(ids, n, &d, want)) {
-            printf("  chat %-16s %3d tokens  exact\n", chats[i].name, n);
+            printf("  chat %-24s %3d tokens  exact\n", chats[i].name, n);
         } else {
             fails++;
             fprintf(stderr, "FAIL chat template '%s'\n", chats[i].name);
