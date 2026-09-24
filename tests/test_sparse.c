@@ -567,6 +567,147 @@ static void test_select_scale(void) {
     }
 }
 
+/* One token's matvec at the real model's few-output shapes, where it splits
+ * K across a threadgroup (metal/qmv.metal), against scalar code. */
+static void test_splitk(void) {
+    static const struct { int32_t n, k; } shapes[] = { { 320, 10240 }, { 48, 2560 }, { 2560, 6144 },
+                                                       { 640, 2560 }, { 4096, 2048 }, { 7, 4096 } };
+    for (int gi = 0; gi < 2; gi++)
+        for (size_t i = 0; i < sizeof shapes / sizeof *shapes; i++) {
+            const int32_t n = shapes[i].n, k = shapes[i].k, G = gi ? 32 : 64, groups = k / G;
+            qw_buf wb = mkbuf((size_t)n * k / 2), sb = mkbuf((size_t)n * groups * 2),
+                   bb = mkbuf((size_t)n * groups * 2), xb = mkbuf((size_t)k * 4), yb = mkbuf((size_t)n * 4);
+            uint32_t *wp = qw_buf_contents(wb);
+            uint16_t *sp = qw_buf_contents(sb), *bp = qw_buf_contents(bb);
+            uint32_t st = 7u + (uint32_t)i * 31u + (uint32_t)gi;
+            for (size_t j = 0; j < (size_t)n * k / 8; j++) { st = st * 1664525u + 1013904223u; wp[j] = st; }
+            for (size_t j = 0; j < (size_t)n * groups; j++) {
+                st = st * 1664525u + 1013904223u;
+                sp[j] = f2bf(0.01f + (float)(st >> 24) * 1e-4f);
+                bp[j] = f2bf(-0.05f + (float)((st >> 8) & 255) * 4e-4f);
+            }
+            float *xp = qw_buf_contents(xb);
+            fill_random(xp, (size_t)k, 41 + (uint32_t)i);
+            qw_cmd c = qw_cmd_begin();
+            qw_op_qmat_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0), qw_ref_at(wb, 0), qw_ref_at(sb, 0),
+                          qw_ref_at(bb, 0), k, n, 1, G);
+            run(c, "split-k matvec");
+            float *ref = malloc((size_t)n * 4);
+            qw_cpu_qmv_q4(ref, xp, wp, sp, bp, k, n, 1, G);
+            char label[64];
+            snprintf(label, sizeof label, "matvec %dx%d g%d", n, k, G);
+            report(label, qw_buf_contents(yb), ref, (size_t)n, 1e-5);
+            free(ref);
+            qw_buf_free(wb); qw_buf_free(sb); qw_buf_free(bb); qw_buf_free(xb); qw_buf_free(yb);
+        }
+}
+
+/* Same-input matvecs in one dispatch (qw_op_qmv_q4_multi): wide parts
+ * (> 4096 rows, whole rows per simdgroup) beside narrow split ones, and
+ * part sizes that leave a threadgroup's rows partly empty. */
+static void test_multi(void) {
+    static const int32_t sets[][4] = { { 10240, 6144, 48, 48 }, { 4100, 512, 7, 0 }, { 640, 640, 0, 0 } };
+    const int32_t k = 2560;
+    for (int gi = 0; gi < 2; gi++)
+        for (size_t si = 0; si < sizeof sets / sizeof *sets; si++) {
+            const int32_t G = gi ? 32 : 64, groups = k / G;
+            int32_t count = 0;
+            while (count < 4 && sets[si][count]) count++;
+            qw_buf wb[4], sb[4], bb[4], yb[4], xb = mkbuf((size_t)k * 4);
+            qw_qmv_part parts[4];
+            uint32_t st = 5u + (uint32_t)si * 13u + (uint32_t)gi;
+            for (int32_t i = 0; i < count; i++) {
+                const int32_t n = sets[si][i];
+                wb[i] = mkbuf((size_t)n * k / 2); sb[i] = mkbuf((size_t)n * groups * 2);
+                bb[i] = mkbuf((size_t)n * groups * 2); yb[i] = mkbuf((size_t)n * 4);
+                uint32_t *wp = qw_buf_contents(wb[i]);
+                uint16_t *sp = qw_buf_contents(sb[i]), *bp = qw_buf_contents(bb[i]);
+                for (size_t j = 0; j < (size_t)n * k / 8; j++) { st = st * 1664525u + 1013904223u; wp[j] = st; }
+                for (size_t j = 0; j < (size_t)n * groups; j++) {
+                    st = st * 1664525u + 1013904223u;
+                    sp[j] = f2bf(0.01f + (float)(st >> 24) * 1e-4f);
+                    bp[j] = f2bf(-0.05f + (float)((st >> 8) & 255) * 4e-4f);
+                }
+                parts[i] = (qw_qmv_part){ qw_ref_at(yb[i], 0), qw_ref_at(wb[i], 0), qw_ref_at(sb[i], 0),
+                                          qw_ref_at(bb[i], 0), n };
+            }
+            float *xp = qw_buf_contents(xb);
+            fill_random(xp, (size_t)k, 91 + (uint32_t)si);
+            qw_cmd c = qw_cmd_begin();
+            CHECK(qw_op_qmv_q4_multi(c, qw_ref_at(xb, 0), k, G, count, parts), "multi not encoded");
+            run(c, "multi matvec");
+            for (int32_t i = 0; i < count; i++) {
+                const int32_t n = sets[si][i];
+                float *ref = malloc((size_t)n * 4);
+                qw_cpu_qmv_q4(ref, xp, qw_buf_contents(wb[i]), qw_buf_contents(sb[i]),
+                              qw_buf_contents(bb[i]), k, n, 1, G);
+                char label[64];
+                snprintf(label, sizeof label, "multi %d/%d %dx%d g%d", i + 1, count, n, k, G);
+                report(label, qw_buf_contents(yb[i]), ref, (size_t)n, 1e-5);
+                free(ref);
+                qw_buf_free(wb[i]); qw_buf_free(sb[i]); qw_buf_free(bb[i]); qw_buf_free(yb[i]);
+            }
+            qw_buf_free(xb);
+        }
+}
+
+/* The decode banks with the input split across a threadgroup (k >= 2048),
+ * one bank and two at once (gate and up), against the cpu matvec on each
+ * pair's expert.  Two tokens, so p / K picks the input. */
+static void test_bank_splitk(void) {
+    const int32_t E = 16, k = 2560, n = 640, K = 10, rows = 2, pairs = rows * K;
+    for (int gi = 0; gi < 2; gi++) {
+        const int32_t G = gi ? 32 : 64, words = k / 8, groups = k / G;
+        qw_buf wb[2], sb[2], bb[2];
+        uint32_t st = 17u + (uint32_t)gi;
+        for (int b = 0; b < 2; b++) {
+            wb[b] = mkbuf((size_t)E * n * words * 4);
+            sb[b] = mkbuf((size_t)E * n * groups * 2);
+            bb[b] = mkbuf((size_t)E * n * groups * 2);
+            uint32_t *wp = qw_buf_contents(wb[b]);
+            uint16_t *sp = qw_buf_contents(sb[b]), *bp = qw_buf_contents(bb[b]);
+            for (size_t i = 0; i < (size_t)E * n * words; i++) { st = st * 1664525u + 1013904223u; wp[i] = st; }
+            for (size_t i = 0; i < (size_t)E * n * groups; i++) {
+                st = st * 1664525u + 1013904223u;
+                sp[i] = f2bf(0.01f + (float)(st >> 24) * 1e-4f);
+                bp[i] = f2bf(-0.05f + (float)((st >> 8) & 255) * 4e-4f);
+            }
+        }
+        qw_buf xb = mkbuf((size_t)rows * k * 4), ib = mkbuf((size_t)pairs * 4);
+        qw_buf y1 = mkbuf((size_t)pairs * n * 4), y2 = mkbuf((size_t)2 * pairs * n * 4);
+        float *xp = qw_buf_contents(xb);
+        int32_t *ip = qw_buf_contents(ib);
+        fill_random(xp, (size_t)rows * k, 71 + (uint32_t)gi);
+        for (int32_t p = 0; p < pairs; p++) ip[p] = (p * 7 + 3) % E;
+        qw_cmd c = qw_cmd_begin();
+        qw_op_qmv_q4_bank(c, qw_ref_at(y1, 0), qw_ref_at(xb, 0), qw_ref_at(ib, 0), qw_ref_at(wb[0], 0),
+                          qw_ref_at(sb[0], 0), qw_ref_at(bb[0], 0), k, n, pairs, K, false, G);
+        CHECK(qw_op_qmv_q4_bank2(c, qw_ref_at(y2, 0), qw_ref_at(xb, 0), qw_ref_at(ib, 0),
+                                 qw_ref_at(wb[0], 0), qw_ref_at(sb[0], 0), qw_ref_at(bb[0], 0),
+                                 qw_ref_at(wb[1], 0), qw_ref_at(sb[1], 0), qw_ref_at(bb[1], 0),
+                                 k, n, pairs, K, G), "two banks at k %d not encoded", k);
+        run(c, "split-k banks");
+        float *ref = malloc((size_t)2 * pairs * n * 4);
+        for (int b = 0; b < 2; b++) {
+            const uint32_t *wp = qw_buf_contents(wb[b]);
+            const uint16_t *sp = qw_buf_contents(sb[b]), *bp = qw_buf_contents(bb[b]);
+            for (int32_t p = 0; p < pairs; p++) {
+                const size_t e = (size_t)ip[p];
+                qw_cpu_qmv_q4(ref + ((size_t)b * pairs + p) * n, xp + (size_t)(p / K) * k,
+                              wp + e * n * words, sp + e * n * groups, bp + e * n * groups, k, n, 1, G);
+            }
+        }
+        char label[64];
+        snprintf(label, sizeof label, "bank split-k g%d", G);
+        report(label, qw_buf_contents(y1), ref, (size_t)pairs * n, 1e-5);
+        snprintf(label, sizeof label, "two banks split-k g%d", G);
+        report(label, qw_buf_contents(y2), ref, (size_t)2 * pairs * n, 1e-5);
+        free(ref);
+        for (int b = 0; b < 2; b++) { qw_buf_free(wb[b]); qw_buf_free(sb[b]); qw_buf_free(bb[b]); }
+        qw_buf_free(xb); qw_buf_free(ib); qw_buf_free(y1); qw_buf_free(y2);
+    }
+}
+
 /* Grouped experts (prefill) against the per-pair matvec (decode) on the same
  * bank: every output of every pair.  A skewed routing -- one expert takes
  * over a thousand pairs, many get a few, some none -- so tiles are full,
@@ -686,6 +827,9 @@ int main(void) {
     printf("== qsa\n");               test_qsa(e);
     printf("== qsa selection at scale\n"); test_select_scale();
     printf("== grouped experts\n");  test_grouped_experts();
+    printf("== one-token matvec, few outputs\n"); test_splitk();
+    printf("== decode banks, split\n"); test_bank_splitk();
+    printf("== same-input matvecs, fused\n"); test_multi();
     printf("== reused ops\n");        test_reused(e);
 
     qwasar_engine_free(e);

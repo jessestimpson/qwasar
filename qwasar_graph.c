@@ -362,6 +362,21 @@ void qw_encode_qlinear(qw_cmd c, const qw_qlinear *ql, qw_ref out, qw_ref in,
                   ql->group_size);
 }
 
+void qw_encode_qlinear_many(qw_cmd c, qw_ref in, int32_t rows, int32_t count,
+                            const qw_qlinear *const *ql, const qw_ref *out) {
+    bool fuse = rows == 1 && count <= 4;
+    for (int32_t i = 1; fuse && i < count; i++)
+        fuse = ql[i]->in_features == ql[0]->in_features && ql[i]->group_size == ql[0]->group_size;
+    if (fuse) {
+        qw_qmv_part parts[4];
+        for (int32_t i = 0; i < count; i++)
+            parts[i] = (qw_qmv_part){ out[i], qw_tensor_ref(ql[i]->weight), qw_tensor_ref(ql[i]->scales),
+                                      qw_tensor_ref(ql[i]->biases), ql[i]->out_features };
+        if (qw_op_qmv_q4_multi(c, in, ql[0]->in_features, ql[0]->group_size, count, parts)) return;
+    }
+    for (int32_t i = 0; i < count; i++) qw_encode_qlinear(c, ql[i], out[i], in, rows);
+}
+
 /* The same projection over a contiguous run of output rows, writing them at
  * `out`.  A 4-bit affine row is in_features/2 bytes of nibbles and one bf16
  * scale and bias per group, all row-major, so a run of rows is just three
@@ -387,10 +402,11 @@ void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
     const size_t conv_stride = (size_t)(cfg->linear_conv_kernel_dim - 1) * sh->conv_dim;
     const size_t ssm_stride  = (size_t)hv * dv * dk;
 
-    qw_encode_qlinear(c, &L->in_proj_qkv, qw_ref_at(s->qkv, 0),    qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &L->in_proj_z,   qw_ref_at(s->z, 0),      qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &L->in_proj_a,   qw_ref_at(s->a_proj, 0), qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &L->in_proj_b,   qw_ref_at(s->b_proj, 0), qw_ref_at(s->hn, 0), rows);
+    qw_encode_qlinear_many(c, qw_ref_at(s->hn, 0), rows, 4,
+        (const qw_qlinear *const[]){ &L->in_proj_qkv, &L->in_proj_z, &L->in_proj_a, &L->in_proj_b },
+        (const qw_ref[]){ qw_ref_at(s->qkv, 0), qw_ref_at(s->z, 0),
+                          qw_ref_at(s->a_proj, 0), qw_ref_at(s->b_proj, 0) });
+    qw_cmd_mark(c, "delta: in projections");
 
     /* Causal conv writes back over qkv; the per-channel history lives in
      * conv_state and is advanced in place. */
@@ -429,12 +445,14 @@ void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
     qw_op_gdn_gates(c, qw_ref_at(s->g, 0), qw_ref_at(s->beta, 0),
                     qw_ref_at(s->a_proj, 0), qw_ref_at(s->b_proj, 0),
                     qw_tensor_ref(L->A_log), qw_tensor_ref(L->dt_bias), hv, rows);
+    qw_cmd_mark(c, "delta: conv, norms, gates");
 
     qw_op_gated_delta(c, qw_ref_at(s->gdn_y, 0), qw_ref_at(s->gq, 0), qw_ref_at(s->gk, 0),
                       qw_ref_at(s->gv, 0), qw_ref_at(s->g, 0), qw_ref_at(s->beta, 0),
                       qw_off(s->ssm_state, ssm_stride * li), hk, hv, dk, dv, rows,
                       qw_off(s->ssm_snap, ssm_stride * li), s->n_snap,
                       (int32_t)(ssm_stride * sh->n_linear_attn_layers));
+    qw_cmd_mark(c, "delta: recurrence");
 
     /* Output norm is per value head and gated by the family's activation of
      * z: silu for the 27B, sigmoid for Flash-Next (output_gate_type). */
@@ -457,9 +475,9 @@ static void qw_encode_attention_layer(qwasar_session *s, qw_cmd c,
     const int32_t hd = cfg->head_dim;
     const size_t kv_stride = (size_t)cfg->num_key_value_heads * s->max_ctx * hd;
 
-    qw_encode_qlinear(c, &L->q_proj, qw_ref_at(s->qg, 0), qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &L->k_proj, qw_ref_at(s->k, 0),  qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &L->v_proj, qw_ref_at(s->v, 0),  qw_ref_at(s->hn, 0), rows);
+    qw_encode_qlinear_many(c, qw_ref_at(s->hn, 0), rows, 3,
+        (const qw_qlinear *const[]){ &L->q_proj, &L->k_proj, &L->v_proj },
+        (const qw_ref[]){ qw_ref_at(s->qg, 0), qw_ref_at(s->k, 0), qw_ref_at(s->v, 0) });
 
     /* q_proj emits query and output gate interleaved per head. */
     qw_op_split_heads2(c, qw_ref_at(s->q, 0), qw_ref_at(s->gate, 0), qw_ref_at(s->qg, 0),
@@ -538,9 +556,9 @@ static void qw_encode_mtp_rows(qwasar_session *s, qw_cmd c, qw_ref hidden,
                    qw_tensor_ref(m->input_layernorm),
                    cfg->hidden_size, rows, cfg->rms_norm_eps, 1.0f);
 
-    qw_encode_qlinear(c, &m->q_q, qw_ref_at(s->qg, 0), qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &m->q_k, qw_ref_at(s->k, 0),  qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &m->q_v, qw_ref_at(s->v, 0),  qw_ref_at(s->hn, 0), rows);
+    qw_encode_qlinear_many(c, qw_ref_at(s->hn, 0), rows, 3,
+        (const qw_qlinear *const[]){ &m->q_q, &m->q_k, &m->q_v },
+        (const qw_ref[]){ qw_ref_at(s->qg, 0), qw_ref_at(s->k, 0), qw_ref_at(s->v, 0) });
 
     qw_op_split_heads2(c, qw_ref_at(s->q, 0), qw_ref_at(s->gate, 0), qw_ref_at(s->qg, 0),
                        rows, cfg->num_attention_heads, hd);
@@ -572,8 +590,9 @@ static void qw_encode_mtp_rows(qwasar_session *s, qw_cmd c, qw_ref hidden,
     qw_op_rms_norm(c, qw_ref_at(s->hn, 0), qw_ref_at(s->mtp_h, 0),
                    qw_tensor_ref(m->post_attention_layernorm),
                    cfg->hidden_size, rows, cfg->rms_norm_eps, 1.0f);
-    qw_encode_qlinear(c, &m->q_gate, qw_ref_at(s->mlp_gate, 0), qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &m->q_up,   qw_ref_at(s->mlp_up, 0),   qw_ref_at(s->hn, 0), rows);
+    qw_encode_qlinear_many(c, qw_ref_at(s->hn, 0), rows, 2,
+        (const qw_qlinear *const[]){ &m->q_gate, &m->q_up },
+        (const qw_ref[]){ qw_ref_at(s->mlp_gate, 0), qw_ref_at(s->mlp_up, 0) });
     qw_op_swiglu(c, qw_ref_at(s->mlp_act, 0), qw_ref_at(s->mlp_gate, 0),
                  qw_ref_at(s->mlp_up, 0), rows * cfg->intermediate_size);
     qw_encode_qlinear(c, &m->q_down, qw_ref_at(s->hn2, 0), qw_ref_at(s->mlp_act, 0), rows);
@@ -702,8 +721,9 @@ static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wa
         qw_op_rms_norm(c, qw_ref_at(s->hn, 0), qw_ref_at(s->h, 0),
                        qw_tensor_ref(L->post_attention_layernorm),
                        cfg->hidden_size, rows, cfg->rms_norm_eps, 1.0f);
-        qw_encode_qlinear(c, &L->gate_proj, qw_ref_at(s->mlp_gate, 0), qw_ref_at(s->hn, 0), rows);
-        qw_encode_qlinear(c, &L->up_proj,   qw_ref_at(s->mlp_up, 0),   qw_ref_at(s->hn, 0), rows);
+        qw_encode_qlinear_many(c, qw_ref_at(s->hn, 0), rows, 2,
+            (const qw_qlinear *const[]){ &L->gate_proj, &L->up_proj },
+            (const qw_ref[]){ qw_ref_at(s->mlp_gate, 0), qw_ref_at(s->mlp_up, 0) });
         qw_op_swiglu(c, qw_ref_at(s->mlp_act, 0), qw_ref_at(s->mlp_gate, 0),
                      qw_ref_at(s->mlp_up, 0), rows * cfg->intermediate_size);
         qw_encode_qlinear(c, &L->down_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->mlp_act, 0), rows);

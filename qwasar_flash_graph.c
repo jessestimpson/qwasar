@@ -27,6 +27,9 @@
  * per (token, expert) pair (decode, and the short chunks a verify makes). */
 #define QW_MOE_GROUP_ROWS 8
 
+/* Layers per command buffer in a forward (qw_cmd_flush). */
+#define QW_FLASH_FLUSH_LAYERS 4
+
 struct qw_flash_state {
     /* streams and mixers */
     qw_buf h4, n4, mixd, mixu, inj;
@@ -42,6 +45,12 @@ struct qw_flash_state {
     int32_t ple_state_len;
     int32_t last_eos;
     int32_t hist[8];
+    /* The table gather for the chunk being encoded runs on the CPU beside
+     * the encoding (qw_flash_prepare_chunk); `gathering` until it is joined. */
+    dispatch_group_t gather_group;
+    bool gathering;
+    int64_t *gather_ids;
+    void *gather_ctx;             /* struct ple_gather */
     /* diagnostics: stop the forward after this layer (-1: run it all) */
     int32_t dbg_stop_layer;
 };
@@ -126,8 +135,19 @@ struct qw_flash_state *qw_flash_state_new(qwasar_session *s, char *err, size_t e
     return f;
 }
 
+static void gather_join(struct qw_flash_state *f) {
+    if (!f->gathering) return;
+    dispatch_group_wait(f->gather_group, DISPATCH_TIME_FOREVER);
+    f->gathering = false;
+    free(f->gather_ids);
+    free(f->gather_ctx);
+    f->gather_ids = NULL;
+    f->gather_ctx = NULL;
+}
+
 void qw_flash_state_free(struct qw_flash_state *f) {
     if (!f) return;
+    if (f->gather_group) { gather_join(f); dispatch_release(f->gather_group); }
     qw_buf *all[] = {
         &f->h4, &f->n4, &f->mixd, &f->mixu, &f->inj,
         &f->route_logits, &f->route_idx, &f->route_w, &f->exp_gu, &f->exp_act, &f->exp_y,
@@ -158,19 +178,33 @@ struct ple_gather {
     const int64_t *ids;      /* [rows][n_heads] */
     float *emb;              /* [rows][E] */
     int32_t E;
+    size_t n;                /* rows * n_heads */
 };
 
-static void ple_gather_token(void *ctx, size_t r) {
+/* One (row, head) of the gather.  Each is a random read of the table --
+ * mostly a page fault to disk -- so they go in parallel even for a single
+ * token: its 16 heads one after another were 3.6 ms of every decode step,
+ * with the GPU idle. */
+static void ple_gather_head(void *ctx, size_t i) {
     const struct ple_gather *g = ctx;
     const int32_t NH = g->P->n_heads, HD = g->P->head_dim;
-    for (int32_t h = 0; h < NH; h++)
-        qw_ple_row(g->P, g->ids[r * NH + h], g->emb + r * g->E + (size_t)h * HD);
+    const size_t r = i / (size_t)NH, h = i % (size_t)NH;
+    qw_ple_row(g->P, g->ids[i], g->emb + r * g->E + h * HD);
 }
 
+static void ple_gather_all(void *ctx) {
+    struct ple_gather *g = ctx;
+    dispatch_apply_f(g->n, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), g, ple_gather_head);
+}
+
+/* The chunk's n-gram ids now, and the table rows behind them on other
+ * threads while the forward is encoded and its first layers run; the
+ * forward joins the gather before the engram layer (gather_join). */
 void qw_flash_prepare_chunk(qwasar_session *s, const int32_t *tokens, int32_t rows) {
     struct qw_flash_state *f = s->flash;
     const qw_config *c = s->cfg;
     if (c->ple_layer < 0) return;
+    gather_join(f);
     const qw_layer *L = qwasar_engine_layer(s->e, c->ple_layer);
     const qw_ple *P = L->ple;
     int64_t *ids = malloc((size_t)rows * P->n_heads * sizeof *ids);
@@ -187,11 +221,15 @@ void qw_flash_prepare_chunk(qwasar_session *s, const int32_t *tokens, int32_t ro
         if (tok == c->model_eos) f->last_eos = pos;
     }
 
-    struct ple_gather g = { P, ids, fcontents(f->ple_emb), c->ple_embed_dim };
-    if (rows == 1) ple_gather_token(&g, 0);
-    else dispatch_apply_f((size_t)rows, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-                          &g, ple_gather_token);
-    free(ids);
+    struct ple_gather *g = malloc(sizeof *g);
+    if (!f->gather_group) f->gather_group = dispatch_group_create();
+    if (!g || !f->gather_group) { free(g); free(ids); return; }
+    *g = (struct ple_gather){ P, ids, fcontents(f->ple_emb), c->ple_embed_dim, (size_t)rows * P->n_heads };
+    f->gather_ids = ids;
+    f->gather_ctx = g;
+    f->gathering = true;
+    dispatch_group_async_f(f->gather_group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                           g, ple_gather_all);
 }
 
 /* ---- the pieces --------------------------------------------------------------- */
@@ -258,9 +296,12 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
     const int32_t nq = cfg->indexer_n_heads, d = cfg->indexer_head_dim;
     const size_t kv_stride = (size_t)cfg->num_key_value_heads * s->max_ctx * hd;
 
-    qw_encode_qlinear(c, &L->q_proj, qw_ref_at(s->qg, 0), qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &L->k_proj, qw_ref_at(s->k, 0),  qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &L->v_proj, qw_ref_at(s->v, 0),  qw_ref_at(s->hn, 0), rows);
+    /* The indexer's projection with the attention's: same input, and one
+     * dispatch for a token (qw_encode_qlinear_many). */
+    qw_encode_qlinear_many(c, qw_ref_at(s->hn, 0), rows, 4,
+        (const qw_qlinear *const[]){ &L->q_proj, &L->k_proj, &L->v_proj, &L->indexer.qk_proj },
+        (const qw_ref[]){ qw_ref_at(s->qg, 0), qw_ref_at(s->k, 0), qw_ref_at(s->v, 0),
+                          qw_ref_at(f->iqk, 0) });
     qw_op_split_heads2(c, qw_ref_at(s->q, 0), qw_ref_at(s->gate, 0), qw_ref_at(s->qg, 0),
                        rows, cfg->num_attention_heads, hd);
     qw_op_rms_norm(c, qw_ref_at(s->q, 0), qw_ref_at(s->q, 0), qw_tensor_ref(L->q_norm),
@@ -281,7 +322,6 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
     /* The indexer: raw keys appended to this layer's key cache, always --
      * selection past the budget needs every one of them. */
     const qw_ref ikeys = qw_off(f->ikeys, (size_t)fi * s->max_ctx * d);
-    qw_encode_qlinear(c, &L->indexer.qk_proj, qw_ref_at(f->iqk, 0), qw_ref_at(s->hn, 0), rows);
     qw_op_slice_rows(c, qw_ref_offset(ikeys, (size_t)s->n_past * d * 4), qw_ref_at(f->iqk, 0),
                      rows, (nq + 1) * d, nq * d, d);
 
@@ -379,12 +419,19 @@ static void encode_moe(qwasar_session *s, qw_cmd c, const qw_moe *M, int32_t row
          * scratch the fused bank fills: [pairs, I] of gate, then of up. */
         const qw_ref g = qw_ref_at(f->exp_gu, 0);
         const qw_ref u = qw_ref_at(f->exp_gu, (size_t)pairs * I * sizeof(float));
-        qw_op_qmv_q4_bank(c, g, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
-                          qw_tensor_ref(M->gate.weight), qw_tensor_ref(M->gate.scales),
-                          qw_tensor_ref(M->gate.biases), H, I, pairs, K, false, M->gate.group_size);
-        qw_op_qmv_q4_bank(c, u, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
-                          qw_tensor_ref(M->up.weight), qw_tensor_ref(M->up.scales),
-                          qw_tensor_ref(M->up.biases), H, I, pairs, K, false, M->up.group_size);
+        if (M->gate.group_size != M->up.group_size ||
+            !qw_op_qmv_q4_bank2(c, g, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
+                                qw_tensor_ref(M->gate.weight), qw_tensor_ref(M->gate.scales),
+                                qw_tensor_ref(M->gate.biases), qw_tensor_ref(M->up.weight),
+                                qw_tensor_ref(M->up.scales), qw_tensor_ref(M->up.biases),
+                                H, I, pairs, K, M->gate.group_size)) {
+            qw_op_qmv_q4_bank(c, g, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
+                              qw_tensor_ref(M->gate.weight), qw_tensor_ref(M->gate.scales),
+                              qw_tensor_ref(M->gate.biases), H, I, pairs, K, false, M->gate.group_size);
+            qw_op_qmv_q4_bank(c, u, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
+                              qw_tensor_ref(M->up.weight), qw_tensor_ref(M->up.scales),
+                              qw_tensor_ref(M->up.biases), H, I, pairs, K, false, M->up.group_size);
+        }
         qw_op_swiglu(c, qw_ref_at(f->exp_act, 0), g, u, pairs * I);
     } else {
         qw_op_qmv_q4_bank(c, qw_ref_at(f->exp_gu, 0), qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
@@ -401,8 +448,9 @@ static void encode_moe(qwasar_session *s, qw_cmd c, const qw_moe *M, int32_t row
                       rows, K, H);
     qw_cmd_mark(c, "moe routed experts");
 
-    qw_encode_qlinear(c, &M->sh_gate, qw_ref_at(f->sh_g, 0), qw_ref_at(s->hn, 0), rows);
-    qw_encode_qlinear(c, &M->sh_up,   qw_ref_at(f->sh_u, 0), qw_ref_at(s->hn, 0), rows);
+    qw_encode_qlinear_many(c, qw_ref_at(s->hn, 0), rows, 2,
+        (const qw_qlinear *const[]){ &M->sh_gate, &M->sh_up },
+        (const qw_ref[]){ qw_ref_at(f->sh_g, 0), qw_ref_at(f->sh_u, 0) });
     qw_op_swiglu(c, qw_ref_at(f->sh_g, 0), qw_ref_at(f->sh_g, 0), qw_ref_at(f->sh_u, 0), rows * SI);
     qw_encode_qlinear(c, &M->sh_down, qw_ref_at(f->sh_out, 0), qw_ref_at(f->sh_g, 0), rows);
     qw_op_dmat_bf16(c, qw_ref_at(f->sh_gs, 0), qw_ref_at(s->hn, 0), qw_tensor_ref(M->sh_gate_w),
@@ -429,7 +477,17 @@ void qw_flash_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wan
 
     for (int32_t i = 0; i < cfg->num_hidden_layers; i++) {
         const qw_layer *L = qwasar_engine_layer(e, i);
-        if (L->ple) { encode_ple(s, c, L->ple, rows); qw_cmd_mark(c, "engram"); }
+        /* Commit every few layers: the GPU runs them while the rest encode
+         * (~0.65 ms of encoding a token, otherwise with the GPU idle). */
+        if (i > 0 && i % QW_FLASH_FLUSH_LAYERS == 0) qw_cmd_flush(c);
+        if (L->ple) {
+            /* The layers before this one are running; the table rows have to
+             * be in place before anything that reads them is submitted. */
+            qw_cmd_flush(c);
+            gather_join(f);
+            encode_ple(s, c, L->ple, rows);
+            qw_cmd_mark(c, "engram");
+        }
 
         encode_hc(s, c, &L->attn_hc, rows);
         qw_cmd_mark(c, "hyper-connections");
@@ -448,8 +506,10 @@ void qw_flash_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wan
         encode_inject(s, c, rows);
         qw_cmd_mark(c, "moe shared expert");
 
-        if (f->dbg_stop_layer == i) return;
+        if (f->dbg_stop_layer == i) break;
     }
+    gather_join(f);
+    if (f->dbg_stop_layer >= 0 && f->dbg_stop_layer < cfg->num_hidden_layers) return;
 
     if (!want_logits) return;
     /* The final mixer feeds lm_head directly: there is no norm between. */

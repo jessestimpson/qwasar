@@ -145,6 +145,11 @@ qw_ref qw_off(qw_buf b, size_t elems);
 
 /* Shared encoders. */
 void qw_encode_qlinear(qw_cmd c, const qw_qlinear *ql, qw_ref out, qw_ref in, int32_t rows);
+/* Several projections of the same input, out[i] = ql[i] . in: one dispatch
+ * for a single token (qw_op_qmv_q4_multi) where their shapes allow, else one
+ * each. */
+void qw_encode_qlinear_many(qw_cmd c, qw_ref in, int32_t rows, int32_t count,
+                            const qw_qlinear *const *ql, const qw_ref *out);
 /* Gated DeltaNet for one layer, reading s->hn and writing s->hn2; uses the
  * family's output gate (silu for the 27B, sigmoid for qwen4_exp). */
 void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c, const qw_layer *L,

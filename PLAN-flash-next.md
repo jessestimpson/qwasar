@@ -442,6 +442,21 @@ overrides).  One large model process at a time.
 target band is 30--60 t/s; the two kernels named under "Speed" above are the
 reason, and nothing about them has changed yet.
 
+**Where speed stands** (same machine, 2026-09-24): decode **~57 t/s**, prefill
+~400 t/s at 4K tokens, load ~15 s.  In decode, what got it here:
+a parallel router; split-K matvecs, where a threadgroup's simdgroups divide
+one row's input (one token's matvecs with few outputs, and the expert banks);
+same-input projections in a single dispatch (a delta layer's four
+in-projections, q/k/v with the indexer, shared gate/up, the split gate/up
+banks) -- separate dispatches on a serial encoder each drain before the next;
+and taking the engram gather off the critical path.  That gather is 16 random
+reads of a 30 GB table on disk.  One after another they were 3.6 ms of every
+token with the GPU idle.  Now they run in parallel, beside the encoding and
+the first layers, and the forward is committed every four layers.  What remains
+is mostly the routed experts, ~120 GB/s on 512 scattered banks where a
+16-expert bank reaches ~345 GB/s.  That is memory locality, not kernel
+structure.
+
 ## 4. Risks, named
 
 - **The engram hash** (silent quality rot; caught only by Phase 5's gate —

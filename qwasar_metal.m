@@ -232,9 +232,13 @@ static id<MTLComputePipelineState> qw_pipeline(NSString *name) {
  * per-kernel encoder setup and lets Metal overlap dispatches that do not
  * conflict. */
 
+#define QW_CMD_FLUSHED 64
+
 struct qw_cmd_s {
     void *cb;   /* id<MTLCommandBuffer>, +1 retained */
     void *enc;  /* id<MTLComputeCommandEncoder>, +1 retained */
+    void *flushed[QW_CMD_FLUSHED];   /* committed by qw_cmd_flush, +1 retained */
+    int   n_flushed;
     char  err[256];
 };
 
@@ -264,6 +268,23 @@ void qw_cmd_commit(qw_cmd c) {
     [(__bridge id<MTLCommandBuffer>)c->cb commit];
 }
 
+void qw_cmd_flush(qw_cmd c) {
+    if (!c || !c->cb || c->n_flushed == QW_CMD_FLUSHED) return;
+    qw_cmd_end_encoding(c);
+    @autoreleasepool {
+        [(__bridge id<MTLCommandBuffer>)c->cb commit];
+        c->flushed[c->n_flushed++] = c->cb;
+        id<MTLCommandBuffer> nb = [g_queue commandBuffer];
+        c->cb  = (void *)CFBridgingRetain(nb);
+        c->enc = (void *)CFBridgingRetain([nb computeCommandEncoder]);
+    }
+}
+
+static void qw_cmd_release_flushed(qw_cmd c) {
+    for (int i = 0; i < c->n_flushed; i++) CFBridgingRelease((CFTypeRef)c->flushed[i]);
+    c->n_flushed = 0;
+}
+
 void qw_cmd_wait(qw_cmd c) {
     if (!c || !c->cb) return;
     qw_cmd_end_encoding(c);
@@ -271,10 +292,20 @@ void qw_cmd_wait(qw_cmd c) {
         id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)c->cb;
         [cb commit];
         [cb waitUntilCompleted];
-        if ([cb error])
+        /* One queue runs its buffers in order, so these are done; the first
+         * error is the one worth reporting. */
+        for (int i = 0; i < c->n_flushed && !c->err[0]; i++) {
+            id<MTLCommandBuffer> fb = (__bridge id<MTLCommandBuffer>)c->flushed[i];
+            [fb waitUntilCompleted];
+            if ([fb error])
+                snprintf(c->err, sizeof c->err, "%s",
+                         [[[fb error] localizedDescription] UTF8String]);
+        }
+        if ([cb error] && !c->err[0])
             snprintf(c->err, sizeof c->err, "%s",
                      [[[cb error] localizedDescription] UTF8String]);
     }
+    qw_cmd_release_flushed(c);
 }
 
 /* ---- residency -------------------------------------------------------------
@@ -384,6 +415,10 @@ const char *qw_cmd_error(qw_cmd c) {
 void qw_cmd_free(qw_cmd c) {
     if (!c) return;
     qw_cmd_end_encoding(c);
+    /* Flushed and never waited for: let them finish before their buffers go. */
+    for (int i = 0; i < c->n_flushed; i++)
+        [(__bridge id<MTLCommandBuffer>)c->flushed[i] waitUntilCompleted];
+    qw_cmd_release_flushed(c);
     if (c->cb) CFBridgingRelease((CFTypeRef)c->cb);
     free(c);
 }
@@ -432,10 +467,66 @@ static void qw_set(id<MTLComputeCommandEncoder> enc, qw_ref r, NSUInteger idx) {
 
 typedef struct { uint32_t k, n, rows; } qw_matmul_args;
 
+/* One token's matvec splits K when there are few outputs to spread over the
+ * GPU and a long enough input to split: measured at Flash-Next's shapes,
+ * 320 x 10240 goes 36 -> 10 us, and 2560 x 640 goes 5 -> 9 us the wrong way. */
+#define QW_SPLITK_MAX_N 4096
+#define QW_SPLITK_MIN_K 2048
+
+#define QW_MULTI_MAX 4
+typedef struct { uint32_t k, count, wide, n[QW_MULTI_MAX], end[QW_MULTI_MAX]; } qw_multi_args;
+
+bool qw_op_qmv_q4_multi(qw_cmd c, qw_ref x, int32_t k, int32_t group,
+                        int32_t count, const qw_qmv_part *parts) {
+    if (count < 1 || count > QW_MULTI_MAX || k < QW_SPLITK_MIN_K) return false;
+    if (!c || !c->enc) return true;
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmv_q4_multi_splitk", group);
+    if (!ps) return true;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_multi_args args = { (uint32_t)k, (uint32_t)count, 0, { 0 }, { 0 } };
+    uint32_t blocks = 0;
+    qw_set(enc, x, 0);
+    for (int32_t i = 0; i < count; i++) {
+        /* Past QW_SPLITK_MAX_N rows, whole rows per simdgroup (8 per group). */
+        const bool wide = parts[i].n > QW_SPLITK_MAX_N;
+        if (wide) args.wide |= 1u << i;
+        blocks += ((uint32_t)parts[i].n + (wide ? 31 : 3)) / (wide ? 32 : 4);
+        args.n[i] = (uint32_t)parts[i].n;
+        args.end[i] = blocks;
+        qw_set(enc, parts[i].w, 2 + 4 * i); qw_set(enc, parts[i].scales, 3 + 4 * i);
+        qw_set(enc, parts[i].biases, 4 + 4 * i); qw_set(enc, parts[i].y, 5 + 4 * i);
+    }
+    /* Unused slots still need a binding; the first part's never gets read. */
+    for (int32_t i = count; i < QW_MULTI_MAX; i++) {
+        qw_set(enc, parts[0].w, 2 + 4 * i); qw_set(enc, parts[0].scales, 3 + 4 * i);
+        qw_set(enc, parts[0].biases, 4 + 4 * i); qw_set(enc, parts[0].y, 5 + 4 * i);
+    }
+    [enc setBytes:&args length:sizeof args atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake(blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(32 * 8, 1, 1)];
+    return true;
+}
+
 void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
                   int32_t k, int32_t n, int32_t rows, int32_t group) {
     if (!c || !c->enc) return;
+    /* One token against few outputs: split the input across a threadgroup's
+     * simdgroups (metal/qmv.metal, QW_SK_ROWS rows per threadgroup) -- the
+     * row-parallel kernel below leaves most of the GPU idle there. */
+    if (rows == 1 && n <= QW_SPLITK_MAX_N && k >= QW_SPLITK_MIN_K) {
+        id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmv_q4_splitk", group);
+        if (!ps) return;
+        id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+        [enc setComputePipelineState:ps];
+        qw_set(enc, w, 0); qw_set(enc, scales, 1); qw_set(enc, biases, 2);
+        qw_set(enc, x, 3); qw_set(enc, y, 4);
+        qw_matmul_args args = { (uint32_t)k, (uint32_t)n, 1 };
+        [enc setBytes:&args length:sizeof args atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + 3) / 4, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * 8, 1, 1)];
+        return;
+    }
     id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmv_q4_g64", group);
     if (!ps) return;
 
@@ -1148,7 +1239,11 @@ void qw_op_qmv_q4_bank(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
                        int32_t k, int32_t n, int32_t pairs, int32_t K, bool x_by_pair,
                        int32_t group) {
     if (!c || !c->enc) return;
-    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmv_q4_bank", group);
+    /* A long input splits across the threadgroup, as for one token's dense
+     * matvec (qw_op_qmv_q4). */
+    const bool split = k >= QW_SPLITK_MIN_K;
+    id<MTLComputePipelineState> ps = qw_pipeline_q(split ? @"qw_qmv_q4_bank_splitk"
+                                                         : @"qw_qmv_q4_bank", group);
     if (!ps) return;
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
     [enc setComputePipelineState:ps];
@@ -1156,9 +1251,34 @@ void qw_op_qmv_q4_bank(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
     qw_set(enc, x, 3); qw_set(enc, idx, 4); qw_set(enc, y, 5);
     qw_bank_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)pairs, (uint32_t)K, x_by_pair ? 1u : 0u };
     [enc setBytes:&args length:sizeof args atIndex:6];
+    if (split) {
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + 3) / 4, (NSUInteger)pairs, 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * 8, 1, 1)];
+        return;
+    }
     const NSUInteger kRows = 4, nsg = 8, per_tg = nsg * kRows;
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + per_tg - 1) / per_tg, (NSUInteger)pairs, 1)
         threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+}
+
+bool qw_op_qmv_q4_bank2(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
+                        qw_ref w, qw_ref scales, qw_ref biases,
+                        qw_ref w2, qw_ref scales2, qw_ref biases2,
+                        int32_t k, int32_t n, int32_t pairs, int32_t K, int32_t group) {
+    if (k < QW_SPLITK_MIN_K) return false;
+    if (!c || !c->enc) return true;
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmv_q4_bank2_splitk", group);
+    if (!ps) return true;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, w, 0); qw_set(enc, scales, 1); qw_set(enc, biases, 2);
+    qw_set(enc, x, 3); qw_set(enc, idx, 4); qw_set(enc, y, 5);
+    qw_set(enc, w2, 7); qw_set(enc, scales2, 8); qw_set(enc, biases2, 9);
+    qw_bank_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)pairs, (uint32_t)K, 0u };
+    [enc setBytes:&args length:sizeof args atIndex:6];
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + 3) / 4, (NSUInteger)pairs, 2)
+        threadsPerThreadgroup:MTLSizeMake(32 * 8, 1, 1)];
+    return true;
 }
 
 typedef struct { uint32_t pairs, E, BM, max_tiles; } qw_group_args;

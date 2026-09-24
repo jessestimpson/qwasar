@@ -185,6 +185,68 @@ kernel void qw_moe_route(
     }
 }
 
+/* The bank matvec with K split across a threadgroup, as qw_qmv_q4_splitk:
+ * a threadgroup per (QW_SK_ROWS rows, pair), its simdgroups each summing a
+ * run of the input.  qw_qmv_q4_bank gives a simdgroup whole rows, and ten
+ * pairs of a 640-row expert are 200 threadgroups: 110 GB/s at decode, the
+ * largest single cost in a Flash-Next token. */
+struct qw_bank_args { uint k, n, pairs, K, x_by_pair; };
+
+kernel void qw_qmv_q4_bank_splitk(
+    device const uint    *w       [[buffer(0)]],   /* [E, n, k/8] */
+    device const ushort  *scales  [[buffer(1)]],   /* [E, n, k/G] */
+    device const ushort  *biases  [[buffer(2)]],
+    device const float   *x       [[buffer(3)]],   /* [rows or pairs, k] */
+    device const int     *idx     [[buffer(4)]],   /* [pairs] */
+    device       float   *y       [[buffer(5)]],   /* [pairs, n] */
+    constant qw_bank_args &a      [[buffer(6)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint  sgid  [[simdgroup_index_in_threadgroup]],
+    uint  nsg   [[simdgroups_per_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]])
+{
+    threadgroup float part[32][QW_SK_ROWS];
+    const uint p = tgid.y;
+    const ulong e = (ulong)idx[p];
+    const uint words = a.k / QW_QPER_WORD, groups = a.k / QW_QGROUP;
+    qw_sk_rows(w + e * a.n * words, scales + e * a.n * groups, biases + e * a.n * groups,
+               x + (ulong)(a.x_by_pair ? p : p / a.K) * a.k, y + (ulong)p * a.n,
+               a.k, a.n, tgid.x * QW_SK_ROWS, part, sgid, nsg, lane);
+}
+
+/* Two banks of one shape against the same input in one dispatch -- MLX's
+ * split gate and up -- the second's output after the first's ([pairs, n]
+ * each).  Two dispatches on a serial encoder each drain before the next
+ * starts; one keeps twice the expert reads in flight: gate+up 68 -> 49 us. */
+kernel void qw_qmv_q4_bank2_splitk(
+    device const uint    *w       [[buffer(0)]],
+    device const ushort  *scales  [[buffer(1)]],
+    device const ushort  *biases  [[buffer(2)]],
+    device const float   *x       [[buffer(3)]],
+    device const int     *idx     [[buffer(4)]],
+    device       float   *y       [[buffer(5)]],   /* [2, pairs, n] */
+    constant qw_bank_args &a      [[buffer(6)]],
+    device const uint    *w2      [[buffer(7)]],
+    device const ushort  *scales2 [[buffer(8)]],
+    device const ushort  *biases2 [[buffer(9)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint  sgid  [[simdgroup_index_in_threadgroup]],
+    uint  nsg   [[simdgroups_per_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]])
+{
+    threadgroup float part[32][QW_SK_ROWS];
+    const uint p = tgid.y;
+    const ulong e = (ulong)idx[p];
+    const uint words = a.k / QW_QPER_WORD, groups = a.k / QW_QGROUP;
+    const bool second = tgid.z != 0;
+    qw_sk_rows((second ? w2 : w) + e * a.n * words,
+               (second ? scales2 : scales) + e * a.n * groups,
+               (second ? biases2 : biases) + e * a.n * groups,
+               x + (ulong)(a.x_by_pair ? p : p / a.K) * a.k,
+               y + ((ulong)tgid.z * a.pairs + p) * a.n,
+               a.k, a.n, tgid.x * QW_SK_ROWS, part, sgid, nsg, lane);
+}
+
 /* ---- grouped experts, for prefill ------------------------------------------
  *
  * A chunk of prefill routes rows*K (token, expert) pairs.  One matvec per pair
@@ -410,7 +472,6 @@ kernel void qw_qmm_q4_gather(
 /* Matvec against an expert bank: pair p reads matrix idx[p] of the bank and
  * activation row p (x_by_pair) or p / K.  Otherwise qw_qmv_q4_g64 exactly:
  * one simdgroup per QW_QMV_ROWS output rows, lanes walking words. */
-struct qw_bank_args { uint k, n, pairs, K, x_by_pair; };
 
 kernel void qw_qmv_q4_bank(
     device const uint    *w       [[buffer(0)]],   /* [E, n, k/8] */

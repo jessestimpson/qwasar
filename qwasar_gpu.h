@@ -56,6 +56,10 @@ typedef struct qw_cmd_s *qw_cmd;
 qw_cmd qw_cmd_begin(void);
 void   qw_cmd_commit(qw_cmd c);   /* submit, return immediately */
 void   qw_cmd_wait(qw_cmd c);     /* submit and block until done */
+/* Submit what is encoded so far and carry on in a fresh buffer: the GPU
+ * starts on it while the CPU encodes the rest.  qw_cmd_wait waits for all of
+ * it and reports the first error of any. */
+void   qw_cmd_flush(qw_cmd c);
 void   qw_cmd_free(qw_cmd c);
 /* Error string from the last completed command buffer, or NULL. */
 const char *qw_cmd_error(qw_cmd c);
@@ -94,6 +98,12 @@ void qw_prof_reset(void);
 void qw_op_qmat_q4(qw_cmd c, qw_ref y, qw_ref x,
                    qw_ref w, qw_ref scales, qw_ref biases,
                    int32_t k, int32_t n, int32_t rows, int32_t group);
+
+/* Several one-token matvecs sharing their input x [1, k] and group size, in
+ * one dispatch (at most 4; k >= 2048, else false and nothing encoded). */
+typedef struct { qw_ref y, w, scales, biases; int32_t n; } qw_qmv_part;
+bool qw_op_qmv_q4_multi(qw_cmd c, qw_ref x, int32_t k, int32_t group,
+                        int32_t count, const qw_qmv_part *parts);
 
 void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
@@ -383,6 +393,13 @@ void qw_op_qmv_q4_bank(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
                        qw_ref w, qw_ref scales, qw_ref biases,
                        int32_t k, int32_t n, int32_t pairs, int32_t K, bool x_by_pair,
                        int32_t group);
+/* Two banks of one shape, same input (x per token, p / K), in one dispatch:
+ * y is [2, pairs, n], the second bank's after the first's.  Only for inputs
+ * long enough to split (k >= 2048); returns false, encoding nothing, else. */
+bool qw_op_qmv_q4_bank2(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
+                        qw_ref w, qw_ref scales, qw_ref biases,
+                        qw_ref w2, qw_ref scales2, qw_ref biases2,
+                        int32_t k, int32_t n, int32_t pairs, int32_t K, int32_t group);
 /* act[p, i] = silu(gu[p, i]) * gu[p, I+i]. */
 /* Prefill's experts, grouped: pairs sorted by expert into up-to-QW_GMM_BM
  * tiles (qw_op_moe_group), then one tiled matmul per tile against its

@@ -196,3 +196,133 @@ kernel void qw_qmvb_q4_g64(
         }
     }
 }
+
+/* Split-K matvec, for one token against a matrix with few outputs.
+ *
+ * qw_qmv_q4_g64 gives each simdgroup its own output rows and walks the whole
+ * input for each, so its parallelism is n / 4 simdgroups.  Flash-Next's decode
+ * is full of matrices where that is a handful: the hyper-connection mixer's
+ * 320 x 10240 ran as 10 threadgroups at 57 GB/s -- 3.5 ms of every token --
+ * and the 48-, 512- and 640-row projections fared little better.  Here a
+ * threadgroup owns QW_SK_ROWS rows and its simdgroups split the input between
+ * them; partial sums meet in threadgroup memory.  The per-word arithmetic is
+ * qmv's. */
+#define QW_SK_ROWS 4
+
+/* QW_SK_ROWS rows of y = W . x from row0, the rows' input split across the
+ * threadgroup's simdgroups.  Shared by the dense, bank and fused kernels. */
+static inline void qw_sk_rows(device const uint *w, device const ushort *scales,
+                              device const ushort *biases, device const float *x,
+                              device float *y, uint k, uint nrows, uint row0,
+                              threadgroup float (*part)[QW_SK_ROWS],
+                              uint sgid, uint nsg, uint lane)
+{
+    const uint words  = k / QW_QPER_WORD;
+    const uint groups = k / QW_QGROUP;
+
+    /* This simdgroup's run of words, the same run for every row. */
+    const uint per = (words + nsg - 1) / nsg;
+    const uint w0 = min(sgid * per, words), w1 = min(w0 + per, words);
+
+    float acc[QW_SK_ROWS] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (uint wi = w0 + lane; wi < w1; wi += 32) {
+        const uint g = wi / QW_WORDS_PER_GROUP;
+        float xs[QW_QPER_WORD];
+#pragma unroll
+        for (int j = 0; j < QW_QPER_WORD; ++j) xs[j] = x[wi * QW_QPER_WORD + j];
+#pragma unroll
+        for (uint r = 0; r < QW_SK_ROWS; ++r) {
+            const uint n = row0 + r;
+            if (n >= nrows) break;
+            const uint  ww = w[(ulong)n * words + wi];
+            const float sc = qw_bf16_to_f32(scales[(ulong)n * groups + g]);
+            const float bi = qw_bf16_to_f32(biases[(ulong)n * groups + g]);
+            float4 ev, od;
+            qw_unpack8_affine(ww, sc * 255.0f, bi, &ev, &od);
+#pragma unroll
+            for (uint k = 0; k < 4; ++k) {
+                acc[r] = fma(ev[k], xs[2 * k],     acc[r]);
+                acc[r] = fma(od[k], xs[2 * k + 1], acc[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (uint r = 0; r < QW_SK_ROWS; ++r) {
+        const float v = simd_sum(acc[r]);
+        if (lane == 0) part[sgid][r] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0 && lane < QW_SK_ROWS && row0 + lane < nrows) {
+        float s = 0.0f;
+        for (uint i = 0; i < nsg; ++i) s += part[i][lane];
+        y[row0 + lane] = s;
+    }
+}
+
+kernel void qw_qmv_q4_splitk(
+    device const uint    *w       [[buffer(0)]],   /* [n, k/8] */
+    device const ushort  *scales  [[buffer(1)]],   /* [n, k/G] */
+    device const ushort  *biases  [[buffer(2)]],
+    device const float   *x       [[buffer(3)]],   /* [1, k] */
+    device       float   *y       [[buffer(4)]],   /* [1, n] */
+    constant qw_matmul_args &a    [[buffer(5)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint  sgid  [[simdgroup_index_in_threadgroup]],
+    uint  nsg   [[simdgroups_per_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]])
+{
+    threadgroup float part[32][QW_SK_ROWS];
+    qw_sk_rows(w, scales, biases, x, y, a.k, a.n, tgid.x * QW_SK_ROWS, part, sgid, nsg, lane);
+}
+
+/* Up to QW_MULTI_MAX one-token matvecs sharing their input in one dispatch:
+ * a gated-delta layer's four in-projections, an attention layer's q, k and
+ * v, an MLP's gate and up.  Separate dispatches on the serial encoder each
+ * drain before the next starts -- the small ones (a, b: 48 rows) leave the
+ * GPU nearly idle for their whole duration.  A threadgroup takes rows of
+ * whichever matrix its block falls in: QW_SK_ROWS of a narrow one, its input
+ * split across the simdgroups, or QW_SK_ROWS per simdgroup of a wide one
+ * (the `wide` bit), each row whole -- qw_qmv_q4_g64's plan, which a wide
+ * matrix fills the GPU with anyway and which beats the split there. */
+#define QW_MULTI_MAX 4
+struct qw_multi_args {
+    uint k;
+    uint count;
+    uint wide;                  /* bit i: part i one simdgroup per row block */
+    uint n[QW_MULTI_MAX];
+    uint end[QW_MULTI_MAX];     /* cumulative threadgroup blocks */
+};
+
+kernel void qw_qmv_q4_multi_splitk(
+    device const float   *x       [[buffer(0)]],   /* [1, k] */
+    constant qw_multi_args &a     [[buffer(1)]],
+    device const uint    *w0 [[buffer(2)]],  device const ushort *s0 [[buffer(3)]],
+    device const ushort  *b0 [[buffer(4)]],  device       float  *y0 [[buffer(5)]],
+    device const uint    *w1 [[buffer(6)]],  device const ushort *s1 [[buffer(7)]],
+    device const ushort  *b1 [[buffer(8)]],  device       float  *y1 [[buffer(9)]],
+    device const uint    *w2 [[buffer(10)]], device const ushort *s2 [[buffer(11)]],
+    device const ushort  *b2 [[buffer(12)]], device       float  *y2 [[buffer(13)]],
+    device const uint    *w3 [[buffer(14)]], device const ushort *s3 [[buffer(15)]],
+    device const ushort  *b3 [[buffer(16)]], device       float  *y3 [[buffer(17)]],
+    uint3 tgid  [[threadgroup_position_in_grid]],
+    uint  sgid  [[simdgroup_index_in_threadgroup]],
+    uint  nsg   [[simdgroups_per_threadgroup]],
+    uint  lane  [[thread_index_in_simdgroup]])
+{
+    threadgroup float part[32][QW_SK_ROWS];
+    const uint blk = tgid.x;
+    uint m = 0;
+    while (m + 1 < a.count && blk >= a.end[m]) ++m;
+    const uint local = blk - (m ? a.end[m - 1] : 0);
+    /* Wide: each simdgroup its own rows, as a threadgroup of one. */
+    const bool wide = (a.wide >> m) & 1u;
+    const uint row0 = (wide ? local * nsg + sgid : local) * QW_SK_ROWS;
+    threadgroup float (*pt)[QW_SK_ROWS] = wide ? part + sgid : part;
+    const uint sg = wide ? 0u : sgid, ns = wide ? 1u : nsg;
+    switch (m) {
+    case 0:  qw_sk_rows(w0, s0, b0, x, y0, a.k, a.n[0], row0, pt, sg, ns, lane); break;
+    case 1:  qw_sk_rows(w1, s1, b1, x, y1, a.k, a.n[1], row0, pt, sg, ns, lane); break;
+    case 2:  qw_sk_rows(w2, s2, b2, x, y2, a.k, a.n[2], row0, pt, sg, ns, lane); break;
+    default: qw_sk_rows(w3, s3, b3, x, y3, a.k, a.n[3], row0, pt, sg, ns, lane); break;
+    }
+}
