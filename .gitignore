@@ -42,3 +42,6 @@ crucible/vendor/highlight.js/highlight.bundle.js
 # mix.lock is NOT ignored -- it pins what Docker resolves.
 crucible/Guest/warden/_build/
 crucible/Guest/warden/deps/
+
+# Menu bar app build products
+menubar/build/

@@ -185,6 +185,28 @@ Anthropic specs (Python standard library only; `QWASAR_SERVER_URL` targets a
 running one). With the `openai` or `anthropic` package installed, the official
 clients are exercised too.
 
+### In the menu bar
+
+`menubar/` builds **Qwasar Server.app**, which runs the server and shows in the
+menu bar whether its port is open:
+
+```
+cd menubar && make run        # or: make install, to copy it to /Applications
+```
+
+The icon is read from the socket itself, probed once a second, rather than
+from whether a process was launched. The icon shows the state:
+
+- **plain Q:** listening
+- **pulsing amber dot:** loading the model
+- **red dot:** the server failed, or another program holds the port
+- **faded Q:** stopped
+
+The menu shows the port and has Copy API URL, Start/Stop, Port…, Model…,
+Open Log, Start at Login, and Quit. The server binary is bundled inside the
+app. It runs with `--exit-on-eof` on a pipe the app holds, so the server
+cannot outlive the app, even after a crash or `kill -9`.
+
 ## Images and video
 
 ```

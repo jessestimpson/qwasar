@@ -1935,6 +1935,17 @@ static void *conn_main(void *arg) {
     return NULL;
 }
 
+static void *stdin_watch(void *arg) {
+    (void)arg;
+    char buf[256];
+    for (;;) {
+        const ssize_t n = read(STDIN_FILENO, buf, sizeof buf);
+        if (n == 0 || (n < 0 && errno != EINTR)) break;
+    }
+    fprintf(stderr, "qwasar-server: standard input closed; exiting\n");
+    _exit(0);
+}
+
 static void usage(FILE *out) {
     fprintf(out,
         "qwasar-server -- OpenAI and Anthropic compatible HTTP API for Qwen3.8\n"
@@ -1947,6 +1958,8 @@ static void usage(FILE *out) {
         "      --ctx <n>       context size in tokens (default 32768)\n"
         "      --cors          emit Access-Control-Allow-* headers\n"
         "      --no-cache      do not use or write disk checkpoints\n"
+        "      --exit-on-eof   exit when standard input closes, so a supervising\n"
+        "                      app that holds the other end cannot be outlived\n"
         "  -v, --verbose       log requests\n"
         "  -h, --help          this message\n"
         "\n"
@@ -1983,6 +1996,7 @@ int main(int argc, char **argv) {
     const char *host = "127.0.0.1";
     int port = 8080;
     bool cors = false;
+    bool exit_on_eof = false;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1992,11 +2006,22 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--ctx") && i + 1 < argc) opts.context_size = atoi(argv[++i]);
         else if (!strcmp(a, "--cors")) cors = true;
         else if (!strcmp(a, "--no-cache")) sv.no_cache = true;
+        else if (!strcmp(a, "--exit-on-eof")) exit_on_eof = true;
         else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) sv.verbose = true;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
         else { fprintf(stderr, "qwasar-server: unknown argument '%s'\n\n", a); usage(stderr); return 2; }
     }
     if (!resolve_model(&opts, "qwasar-server")) return 2;
+
+    /* A supervisor -- the menu bar app -- runs the server with a pipe on stdin
+     * and never writes to it.  The pipe closes when the supervisor exits,
+     * however it exits, and the server goes with it rather than holding the
+     * port with nothing left to show that it is running.  Watched from the
+     * start, so a supervisor that dies during the model load is noticed too. */
+    if (exit_on_eof) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, stdin_watch, NULL) == 0) pthread_detach(t);
+    }
 
     /* A client that hangs up mid-stream would otherwise take the server with
      * it; write failures are detected and end the response instead. */
