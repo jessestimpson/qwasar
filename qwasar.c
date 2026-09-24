@@ -2031,6 +2031,12 @@ int32_t qwasar_engine_prefill_chunk(const qwasar_engine *e) { return e->prefill_
 
 int32_t qwasar_vocab_size(const qwasar_engine *e) { return e->config.vocab_size; }
 int32_t qwasar_n_layers  (const qwasar_engine *e) { return e->config.num_hidden_layers; }
+const char *qwasar_model_id(const qwasar_engine *e) {
+    return e->config.family == QW_FAMILY_QWEN4_EXP ? "qwen3.8-flash-next" : "qwen3.8-27b";
+}
+const char *qwasar_model_name(const qwasar_engine *e) {
+    return e->config.family == QW_FAMILY_QWEN4_EXP ? "Qwen3.8 Flash-Next" : "Qwen3.8 27B";
+}
 
 bool qwasar_is_eos(const qwasar_engine *e, int32_t token) {
     for (int32_t i = 0; i < e->config.n_eos; i++)

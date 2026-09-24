@@ -34,7 +34,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#define QW_MODEL_ID "qwen3.8-27b"
+/* The loaded model's id and display name (qwasar_model_id), set once the
+ * model is loaded and read-only from then on. */
+static const char *model_id = "";
+static const char *model_name = "";
 
 /* ---- growable text --------------------------------------------------------- */
 
@@ -263,6 +266,7 @@ typedef struct {
     qwasar_tokenizer *tok;
     qwasar_session   *s;
     int32_t           ctx;
+    int32_t           max_tokens;    /* output when a request names none; 0 = the context's room */
     bool              no_cache;
     int32_t           ckpt_n;        /* longest checkpoint the live session's prefix has */
     uint64_t          rng;
@@ -1298,7 +1302,7 @@ static void oai_delta(stream_ctx *st, bool reasoning, const char *s, size_t n) {
     str_printf(&b, "{\"id\": \"%s\", \"object\": \"chat.completion.chunk\", "
                    "\"created\": %ld, \"model\": \"%s\", \"choices\": "
                    "[{\"index\": 0, \"delta\": {",
-               st->id, st->created, QW_MODEL_ID);
+               st->id, st->created, model_id);
     str_puts(&b, reasoning ? "\"reasoning_content\": " : "\"content\": ");
     str_json(&b, s, n);
     str_puts(&b, "}, \"finish_reason\": null}]}");
@@ -1404,7 +1408,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
     read_sampling(&sp, d, root);
     sv->rng = sp.seed ? sp.seed : (uint64_t)time(NULL) * 6364136223846793005ull + 1;
 
-    const int32_t max_tokens = read_max_tokens(d, root, 2048);
+    int32_t max_tokens = read_max_tokens(d, root, sv->max_tokens);
     const qj_node *stream_n = qj_get(d, root, "stream");
     const bool stream = stream_n && stream_n->type == QJ_TRUE;
 
@@ -1445,6 +1449,12 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
         req_free(&req);
         return;
     }
+
+    /* Output fits in what the context has left: past it the cache has no row
+     * for the next token, and generation would fail partway through a
+     * response rather than end it with a length stop. */
+    const int32_t room = sv->ctx - n_prompt;
+    if (max_tokens <= 0 || max_tokens > room) max_tokens = room;
 
     if (n_prompt >= sv->ctx) {
         free(prompt);
@@ -1495,7 +1505,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
                            "\"type\": \"message\", \"role\": \"assistant\", \"model\": \"%s\", "
                            "\"content\": [], \"stop_reason\": null, \"stop_sequence\": null, "
                            "\"usage\": {\"input_tokens\": %d, \"output_tokens\": 0}}}",
-                       id, QW_MODEL_ID, n_prompt);
+                       id, model_id, n_prompt);
             sse_event(c, "message_start", b.p);
             str_free(&b);
         } else {
@@ -1503,7 +1513,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
             str_printf(&b, "{\"id\": \"%s\", \"object\": \"chat.completion.chunk\", "
                            "\"created\": %ld, \"model\": \"%s\", \"choices\": [{\"index\": 0, "
                            "\"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}",
-                       id, created, QW_MODEL_ID);
+                       id, created, model_id);
             sse_event(c, NULL, b.p);
             str_free(&b);
         }
@@ -1611,7 +1621,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
                                "\"created\": %ld, \"model\": \"%s\", \"choices\": [{\"index\": 0, "
                                "\"delta\": {\"tool_calls\": [{\"index\": %d, \"id\": \"%s\", "
                                "\"type\": \"function\", \"function\": {\"name\": ",
-                           id, created, QW_MODEL_ID, i, tid);
+                           id, created, model_id, i, tid);
                 str_jsons(&b, calls.calls[i].name);
                 str_puts(&b, ", \"arguments\": ");
                 str_jsons(&b, args.p ? args.p : "{}");
@@ -1628,14 +1638,14 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
             str_printf(&b, "{\"id\": \"%s\", \"object\": \"chat.completion.chunk\", "
                            "\"created\": %ld, \"model\": \"%s\", \"choices\": [{\"index\": 0, "
                            "\"delta\": {}, \"finish_reason\": \"%s\"}]",
-                       id, created, QW_MODEL_ID, finish);
+                       id, created, model_id, finish);
             if (oo.include_usage) {
                 str_puts(&b, "}");
                 sse_event(c, NULL, b.p);
                 b.len = 0;
                 str_printf(&b, "{\"id\": \"%s\", \"object\": \"chat.completion.chunk\", "
                                "\"created\": %ld, \"model\": \"%s\", \"choices\": []",
-                           id, created, QW_MODEL_ID);
+                           id, created, model_id);
             }
             str_printf(&b, ", \"usage\": {\"prompt_tokens\": %d, \"completion_tokens\": %d, "
                            "\"total_tokens\": %d}}",
@@ -1654,7 +1664,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
     str b = { 0 };
     if (anthropic) {
         str_printf(&b, "{\"id\": \"%s\", \"type\": \"message\", \"role\": \"assistant\", "
-                       "\"model\": \"%s\", \"content\": [", id, QW_MODEL_ID);
+                       "\"model\": \"%s\", \"content\": [", id, model_id);
         bool first = true;
         if (g.reasoning.len) {
             str_puts(&b, "{\"type\": \"thinking\", \"thinking\": ");
@@ -1688,7 +1698,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
         str_printf(&b, "{\"id\": \"%s\", \"object\": \"chat.completion\", \"created\": %ld, "
                        "\"model\": \"%s\", \"choices\": [{\"index\": 0, \"message\": "
                        "{\"role\": \"assistant\", \"refusal\": null, \"content\": ",
-                   id, created, QW_MODEL_ID);
+                   id, created, model_id);
         if (visible && *visible) str_jsons(&b, visible);
         else str_puts(&b, "null");
         if (g.reasoning.len) {
@@ -1736,18 +1746,18 @@ static void handle_models(conn *c, bool single, bool anthropic) {
         char when[32];
         strftime(when, sizeof when, "%Y-%m-%dT%H:%M:%SZ", gmtime(&started_at));
         str_printf(&one, "{\"type\": \"model\", \"id\": \"%s\", "
-                         "\"display_name\": \"Qwen3.8 27B\", \"created_at\": \"%s\"}",
-                   QW_MODEL_ID, when);
+                         "\"display_name\": \"%s\", \"created_at\": \"%s\"}",
+                   model_id, model_name, when);
     } else {
         str_printf(&one, "{\"id\": \"%s\", \"object\": \"model\", \"created\": %ld, "
-                         "\"owned_by\": \"qwasar\"}", QW_MODEL_ID, (long)started_at);
+                         "\"owned_by\": \"qwasar\"}", model_id, (long)started_at);
     }
     str b = { 0 };
     if (single)
         str_puts(&b, one.p);
     else if (anthropic)
         str_printf(&b, "{\"data\": [%s], \"has_more\": false, \"first_id\": \"%s\", "
-                       "\"last_id\": \"%s\"}", one.p, QW_MODEL_ID, QW_MODEL_ID);
+                       "\"last_id\": \"%s\"}", one.p, model_id, model_id);
     else
         str_printf(&b, "{\"object\": \"list\", \"data\": [%s]}", one.p);
     http_send(c, 200, "OK", "application/json", b.p, b.len);
@@ -1955,7 +1965,7 @@ static void serve(server *sv, conn *c) {
         } else if (!strcmp(r.method, "GET") && !strcmp(r.path, "/v1/models")) {
             handle_models(c, false, r.anthropic);
         } else if (!strcmp(r.method, "GET") && !strncmp(r.path, "/v1/models/", 11)) {
-            if (!strcmp(r.path + 11, QW_MODEL_ID)) handle_models(c, true, r.anthropic);
+            if (!strcmp(r.path + 11, model_id)) handle_models(c, true, r.anthropic);
             else http_error_at(c, 404, "Not Found", "no such model", "model", "model_not_found");
         } else if (!strcmp(r.method, "POST")
                    && (!strcmp(r.path, "/v1/chat/completions")
@@ -2033,6 +2043,10 @@ static void usage(FILE *out) {
         "      --host <addr>   bind address (default 127.0.0.1)\n"
         "      --port <n>      port (default 8080)\n"
         "      --ctx <n>       context size in tokens (default 32768)\n"
+        "      --max-tokens <n>\n"
+        "                      output limit for requests that set none (default\n"
+        "                      2048); 0 means whatever room the context has left.\n"
+        "                      A request's own limit is capped to that room too.\n"
         "      --cors          emit Access-Control-Allow-* headers\n"
         "      --no-cache      do not use or write disk checkpoints\n"
         "      --exit-on-eof   exit when standard input closes, so a supervising\n"
@@ -2070,6 +2084,7 @@ static bool resolve_model(qwasar_options *opts, const char *prog) {
 int main(int argc, char **argv) {
     qwasar_options opts = { 0 };
     server sv = { 0 };
+    sv.max_tokens = 2048;
     const char *host = "127.0.0.1";
     int port = 8080;
     bool cors = false;
@@ -2081,6 +2096,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(a, "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(a, "--ctx") && i + 1 < argc) opts.context_size = atoi(argv[++i]);
+        else if (!strcmp(a, "--max-tokens") && i + 1 < argc) sv.max_tokens = atoi(argv[++i]);
         else if (!strcmp(a, "--cors")) cors = true;
         else if (!strcmp(a, "--no-cache")) sv.no_cache = true;
         else if (!strcmp(a, "--exit-on-eof")) exit_on_eof = true;
@@ -2110,6 +2126,8 @@ int main(int argc, char **argv) {
     sv.tok = qwasar_tokenizer_load(opts.model_path, err, sizeof err);
     if (!sv.tok) { fprintf(stderr, "qwasar-server: %s\n", err); return 1; }
     sv.ctx = opts.context_size > 0 ? opts.context_size : 32768;
+    model_id = qwasar_model_id(sv.e);
+    model_name = qwasar_model_name(sv.e);
     started_at = time(NULL);
 
     int ls = socket(AF_INET, SOCK_STREAM, 0);
@@ -2129,7 +2147,7 @@ int main(int argc, char **argv) {
     if (listen(ls, 16) != 0) { perror("listen"); return 1; }
 
     fprintf(stderr, "qwasar-server on http://%s:%d  (model %s, ctx %d)\n",
-            host, port, QW_MODEL_ID, sv.ctx);
+            host, port, model_id, sv.ctx);
 
     pthread_mutex_init(&sv.lock, NULL);
     pthread_mutex_init(&sv.conns_lock, NULL);
