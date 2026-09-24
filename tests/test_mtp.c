@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
         qw_op_qmat_q4(c2, qw_ref_at(yq, 0), qw_ref_at(fb, 0),
                       qw_tensor_ref(m->q_fc.weight), qw_tensor_ref(m->q_fc.scales),
                       qw_tensor_ref(m->q_fc.biases),
-                      m->q_fc.in_features, m->q_fc.out_features, rows);
+                      m->q_fc.in_features, m->q_fc.out_features, rows, m->q_fc.group_size);
         qw_cmd_wait(c2);
         CHECK(qw_cmd_error(c2) == NULL, "GPU error: %s", qw_cmd_error(c2));
         qw_cmd_free(c2);
@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
             const int32_t row = step == 0 ? 0
                               : step == 1 ? m->q_fc.out_features - 1
                               : (int32_t)((int64_t)m->q_fc.out_features * step / 12);
-            qw_cpu_dequant_row(deq, qw, qs, qb, in, row);
+            qw_cpu_dequant_row(deq, qw, qs, qb, in, row, 64);
             for (int32_t i = 0; i < in; i++) {
                 const float want = qw_bf16_to_f32_c(orig[(size_t)row * in + i]);
                 const float step_sz = qw_bf16_to_f32_c(qs[(size_t)row * groups + i / 64]);

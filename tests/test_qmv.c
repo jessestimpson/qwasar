@@ -36,7 +36,7 @@ static double row_rel_err(const qw_qlinear *ql, const float *x, float got, int32
     const uint16_t *sc = qw_tensor_data(ql->scales);
     const uint16_t *bi = qw_tensor_data(ql->biases);
 
-    qw_cpu_dequant_row(scratch, w, sc, bi, ql->in_features, row);
+    qw_cpu_dequant_row(scratch, w, sc, bi, ql->in_features, row, ql->group_size);
 
     double acc = 0.0, mag = 0.0;
     for (int32_t i = 0; i < ql->in_features; i++) {
@@ -73,15 +73,15 @@ static void test_linear_impl(const qw_qlinear *ql, const char *label, int32_t ro
     if (impl == QW_USE_QMM)
         qw_op_qmm_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0),
                      qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
-                     qw_tensor_ref(ql->biases), k, n, rows);
+                     qw_tensor_ref(ql->biases), k, n, rows, ql->group_size);
     else if (impl == QW_USE_QMVB)
         qw_op_qmvb_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0),
                       qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
-                      qw_tensor_ref(ql->biases), k, n, rows);
+                      qw_tensor_ref(ql->biases), k, n, rows, ql->group_size);
     else
         qw_op_qmv_q4(c, qw_ref_at(yb, 0), qw_ref_at(xb, 0),
                      qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
-                     qw_tensor_ref(ql->biases), k, n, rows);
+                     qw_tensor_ref(ql->biases), k, n, rows, ql->group_size);
     qw_cmd_wait(c);
     CHECK(qw_cmd_error(c) == NULL, "%s: GPU error: %s", label, qw_cmd_error(c));
     qw_cmd_free(c);

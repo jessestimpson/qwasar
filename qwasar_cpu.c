@@ -19,29 +19,29 @@ float qw_bf16_to_f32_c(uint16_t v) {
 }
 
 void qw_cpu_dequant_row(float *out, const uint32_t *w, const uint16_t *scales,
-                        const uint16_t *biases, int32_t k, int32_t row) {
+                        const uint16_t *biases, int32_t k, int32_t row, int32_t group) {
     const int32_t words  = k / 8;
-    const int32_t groups = k / 64;
+    const int32_t groups = k / group;
     const uint32_t *wr = w + (size_t)row * words;
     const uint16_t *sr = scales + (size_t)row * groups;
     const uint16_t *br = biases + (size_t)row * groups;
 
     for (int32_t i = 0; i < k; i++) {
         /* Element i lives in word i/8 at bit 4*(i%8), and takes its scale and
-         * bias from group i/64.  The nibble is unsigned; the zero point is
+         * bias from group i/group.  The nibble is unsigned; the zero point is
          * folded into the bias, so there is nothing to subtract. */
         uint32_t nib = (wr[i / 8] >> (4 * (i % 8))) & 0xF;
-        float sc = qw_bf16_to_f32_c(sr[i / 64]);
-        float bi = qw_bf16_to_f32_c(br[i / 64]);
+        float sc = qw_bf16_to_f32_c(sr[i / group]);
+        float bi = qw_bf16_to_f32_c(br[i / group]);
         out[i] = sc * (float)nib + bi;
     }
 }
 
 void qw_cpu_qmv_q4(float *y, const float *x, const uint32_t *w,
                    const uint16_t *scales, const uint16_t *biases,
-                   int32_t k, int32_t n, int32_t rows) {
+                   int32_t k, int32_t n, int32_t rows, int32_t group) {
     const int32_t words  = k / 8;
-    const int32_t groups = k / 64;
+    const int32_t groups = k / group;
 
     for (int32_t r = 0; r < rows; r++) {
         const float *xv = x + (size_t)r * k;
@@ -53,8 +53,8 @@ void qw_cpu_qmv_q4(float *y, const float *x, const uint32_t *w,
             float acc = 0.0f;
             for (int32_t i = 0; i < k; i++) {
                 uint32_t nib = (wr[i / 8] >> (4 * (i % 8))) & 0xF;
-                float sc = qw_bf16_to_f32_c(sr[i / 64]);
-                float bi = qw_bf16_to_f32_c(br[i / 64]);
+                float sc = qw_bf16_to_f32_c(sr[i / group]);
+                float bi = qw_bf16_to_f32_c(br[i / group]);
                 acc += (sc * (float)nib + bi) * xv[i];
             }
             yv[o] = acc;
@@ -320,9 +320,9 @@ void qw_cpu_rope_partial(float *x, const int32_t *pos, const uint8_t *axis,
 
 void qw_cpu_embed_q4(float *y, const int32_t *tokens, const uint32_t *w,
                      const uint16_t *scales, const uint16_t *biases,
-                     int32_t hidden, int32_t n_tokens) {
+                     int32_t hidden, int32_t n_tokens, int32_t group) {
     for (int32_t t = 0; t < n_tokens; t++)
-        qw_cpu_dequant_row(y + (size_t)t * hidden, w, scales, biases, hidden, tokens[t]);
+        qw_cpu_dequant_row(y + (size_t)t * hidden, w, scales, biases, hidden, tokens[t], group);
 }
 
 /* The KV cache is fp16, so the reference must read exactly the values the

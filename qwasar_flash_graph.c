@@ -152,14 +152,12 @@ void qw_flash_prepare_chunk(qwasar_session *s, const int32_t *tokens, int32_t ro
         f->hist[0] = tok;
 
         qw_ple_ids(P, c, f->hist, pos - 1 - f->last_eos, ids);
-        for (int32_t h = 0; h < P->n_heads; h++) {
-            const uint16_t *row = qw_ple_row(P, ids[h]);
-            for (int32_t i = 0; i < HD; i++)
-                emb[(size_t)r * E + (size_t)h * HD + i] = qw_bf16_to_f32_c(row[i]);
-        }
+        for (int32_t h = 0; h < P->n_heads; h++)
+            qw_ple_row(P, ids[h], emb + (size_t)r * E + (size_t)h * HD);
 
-        for (int32_t k = 0; k < c->n_eos; k++)
-            if (tok == c->eos_token_ids[k]) { f->last_eos = pos; break; }
+        /* A segment ends at the model's own EOS only -- not at <|im_end|>,
+         * which closes every chat turn and is ordinary n-gram context. */
+        if (tok == c->model_eos) f->last_eos = pos;
     }
 }
 
@@ -284,13 +282,28 @@ static void encode_moe(qwasar_session *s, qw_cmd c, const qw_moe *M, int32_t row
                     qw_tensor_ref(M->router), H, M->n_experts, rows);
     qw_op_moe_route(c, qw_ref_at(f->route_idx, 0), qw_ref_at(f->route_w, 0),
                     qw_ref_at(f->route_logits, 0), rows, M->n_experts, K, cfg->norm_topk_prob);
-    qw_op_qmv_q4_bank(c, qw_ref_at(f->exp_gu, 0), qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
-                      qw_tensor_ref(M->gate_up.weight), qw_tensor_ref(M->gate_up.scales),
-                      qw_tensor_ref(M->gate_up.biases), H, 2 * I, pairs, K, false);
-    qw_op_swiglu_split(c, qw_ref_at(f->exp_act, 0), qw_ref_at(f->exp_gu, 0), pairs, I);
+    if (M->split) {
+        /* Gate and up as two banks (MLX's layout), into the two halves of the
+         * scratch the fused bank fills: [pairs, I] of gate, then of up. */
+        const qw_ref g = qw_ref_at(f->exp_gu, 0);
+        const qw_ref u = qw_ref_at(f->exp_gu, (size_t)pairs * I * sizeof(float));
+        qw_op_qmv_q4_bank(c, g, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
+                          qw_tensor_ref(M->gate.weight), qw_tensor_ref(M->gate.scales),
+                          qw_tensor_ref(M->gate.biases), H, I, pairs, K, false, M->gate.group_size);
+        qw_op_qmv_q4_bank(c, u, qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
+                          qw_tensor_ref(M->up.weight), qw_tensor_ref(M->up.scales),
+                          qw_tensor_ref(M->up.biases), H, I, pairs, K, false, M->up.group_size);
+        qw_op_swiglu(c, qw_ref_at(f->exp_act, 0), g, u, pairs * I);
+    } else {
+        qw_op_qmv_q4_bank(c, qw_ref_at(f->exp_gu, 0), qw_ref_at(s->hn, 0), qw_ref_at(f->route_idx, 0),
+                          qw_tensor_ref(M->gate_up.weight), qw_tensor_ref(M->gate_up.scales),
+                          qw_tensor_ref(M->gate_up.biases), H, 2 * I, pairs, K, false,
+                          M->gate_up.group_size);
+        qw_op_swiglu_split(c, qw_ref_at(f->exp_act, 0), qw_ref_at(f->exp_gu, 0), pairs, I);
+    }
     qw_op_qmv_q4_bank(c, qw_ref_at(f->exp_y, 0), qw_ref_at(f->exp_act, 0), qw_ref_at(f->route_idx, 0),
                       qw_tensor_ref(M->down.weight), qw_tensor_ref(M->down.scales),
-                      qw_tensor_ref(M->down.biases), I, H, pairs, K, true);
+                      qw_tensor_ref(M->down.biases), I, H, pairs, K, true, M->down.group_size);
     qw_op_moe_combine(c, qw_ref_at(s->hn2, 0), qw_ref_at(f->exp_y, 0), qw_ref_at(f->route_w, 0),
                       rows, K, H);
 
@@ -315,7 +328,8 @@ void qw_flash_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wan
     qw_op_embed_q4(c, qw_ref_at(s->h, 0), qw_ref_at(s->tokens, 0),
                    qw_tensor_ref(qwasar_engine_embed(e)->weight),
                    qw_tensor_ref(qwasar_engine_embed(e)->scales),
-                   qw_tensor_ref(qwasar_engine_embed(e)->biases), H, rows);
+                   qw_tensor_ref(qwasar_engine_embed(e)->biases), H, rows,
+                   qwasar_engine_embed(e)->group_size);
     qw_op_repeat_cols(c, qw_ref_at(f->h4, 0), qw_ref_at(s->h, 0), rows, H, S);
 
     for (int32_t i = 0; i < cfg->num_hidden_layers; i++) {

@@ -11,6 +11,7 @@
 #include "qwasar_json.h"
 #include "qwasar_model.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <stdarg.h>
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 /* ---- small utilities ----------------------------------------------------- */
@@ -47,6 +49,7 @@ const char *qw_dtype_name(qw_dtype d) {
     case QW_DT_U32:  return "U32";
     case QW_DT_I32:  return "I32";
     case QW_DT_U8:   return "U8";
+    case QW_DT_I64:  return "I64";
     default:         return "?";
     }
 }
@@ -56,14 +59,38 @@ size_t qw_dtype_size(qw_dtype d) {
     case QW_DT_F32: case QW_DT_U32: case QW_DT_I32: return 4;
     case QW_DT_F16: case QW_DT_BF16:                return 2;
     case QW_DT_U8:                                  return 1;
+    case QW_DT_I64:                                 return 8;
     default:                                        return 0;
     }
+}
+
+/* Reads exactly `n` bytes at `off`, through short reads and interruptions. */
+static bool qw_read_at(int fd, void *dst, size_t n, size_t off) {
+    char *p = dst;
+    while (n > 0) {
+        const size_t chunk = n < ((size_t)1 << 30) ? n : ((size_t)1 << 30);
+        const ssize_t r = pread(fd, p, chunk, (off_t)off);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return false;
+        p += r; off += (size_t)r; n -= (size_t)r;
+    }
+    return true;
+}
+
+/* Tensors that live on the host whatever file holds them: the engram table's
+ * row shards, in our naming (`shard_N`) and MLX's (`shards.N.{weight,...}`). */
+static bool qw_name_is_host(const char *name, size_t len) {
+    static const char mark[] = ".ngram_embedding.";
+    for (size_t i = 0; i + sizeof mark - 1 <= len; i++)
+        if (!memcmp(name + i, mark, sizeof mark - 1)) return true;
+    return false;
 }
 
 static qw_dtype qw_dtype_parse(const char *s, uint32_t len) {
     struct { const char *n; qw_dtype d; } map[] = {
         { "F32", QW_DT_F32 }, { "F16", QW_DT_F16 }, { "BF16", QW_DT_BF16 },
         { "U32", QW_DT_U32 }, { "I32", QW_DT_I32 }, { "U8", QW_DT_U8 },
+        { "I64", QW_DT_I64 },
     };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (strlen(map[i].n) == len && !memcmp(map[i].n, s, len)) return map[i].d;
@@ -217,14 +244,15 @@ static void qw_table_free(qw_table *t) {
  * (Phase 7's vectorised uint4 loads will want 16 here, at which point the right
  * answer is a disk-cached aligned repack rather than more resident copies.) */
 #define QW_TENSOR_ALIGN 4
+#define QW_PACK_ALIGN   16  /* where a repacked shard puts each tensor */
 
 typedef struct {
-    void  *addr;         /* mmap base, or NULL once materialized */
+    void  *addr;         /* mmap base */
     size_t len;          /* mapped length (page-rounded) */
     size_t file_len;
     size_t data_base;    /* byte offset of the data section within buf */
     qw_buf buf;
-    bool   materialized; /* data section was copied to satisfy alignment */
+    bool   materialized; /* device tensors were copied out to satisfy alignment */
     char   path[1024];
 } qw_shard;
 
@@ -259,6 +287,15 @@ struct qwasar_engine {
 
     int32_t context_size;      /* resolved from options and the model's limit */
     int32_t prefill_chunk;
+
+    /* Tensors the loader made rather than found: (1+w) norms given their +1,
+     * and small weights an MLX build quantises that the graph reads as BF16. */
+    qw_tensor **derived;
+    qw_buf     *derived_bufs;
+    int32_t     n_derived, cap_derived;
+    size_t      bytes_derived;
+    bool        norm_add_one;  /* the checkpoint's (1+w) gains are stored centred at 0 */
+    bool        mlx_experts;   /* experts stored as split switch_mlp banks */
 };
 
 /* ---- safetensors ---------------------------------------------------------
@@ -344,46 +381,89 @@ static bool qw_load_shard(qwasar_engine *e, const char *path, char *err, size_t 
         host_only = !strcmp(placement, "cpu");
     }
 
-    if (host_only) {
-        sh->addr      = map;
-        sh->len       = map_len;
-        sh->data_base = data_base;
-        sh->buf       = NULL;
+    /* The device buffer covers only the tensors the GPU reads.  The engram
+     * table stays on the host wherever it is stored: its rows are gathered by
+     * the CPU, a few per token, and a device buffer over it would make Metal
+     * wire gigabytes of cold rows alongside the weights.  Our converter gives
+     * the table files of its own; MLX conversions mix its shards into
+     * ordinary model files, so the buffer here spans just the byte range of
+     * everything else in the file, page-aligned, and a file holding nothing
+     * else gets no buffer at all. */
+    size_t dev_lo = SIZE_MAX, dev_hi = 0, packed_len = 0;
+    bool misaligned = false;
+    for (const qj_node *m = qj_first(&doc, qj_root(&doc)); m; m = qj_next(&doc, m)) {
+        if (m->type != QJ_OBJECT) continue;
+        if (host_only || qw_name_is_host(doc.text + m->key_off, m->key_len)) continue;
+        const qj_node *offs = qj_get(&doc, m, "data_offsets");
+        const qj_node *o0 = offs ? qj_idx(&doc, offs, 0) : NULL, *o1 = offs ? qj_idx(&doc, offs, 1) : NULL;
+        if (!o0 || !o1) continue;
+        if ((size_t)o0->u.num < dev_lo) dev_lo = (size_t)o0->u.num;
+        if ((size_t)o1->u.num > dev_hi) dev_hi = (size_t)o1->u.num;
+        if ((data_base + (size_t)o0->u.num) % QW_TENSOR_ALIGN) misaligned = true;
+        packed_len += ((size_t)o1->u.num - (size_t)o0->u.num + QW_PACK_ALIGN - 1) & ~(size_t)(QW_PACK_ALIGN - 1);
+    }
+    const bool has_device = dev_lo < dev_hi;
+    size_t buf_lo = 0;                  /* file offset where the device buffer starts */
+    size_t packed_at = 0;               /* next free byte of a repacked buffer */
+
+    sh->addr = map;
+    sh->len  = map_len;
+    sh->data_base = data_base;
+    if (!has_device) {
+        sh->buf = NULL;
         e->bytes_mapped += data_len;
-    } else if (data_base % QW_TENSOR_ALIGN == 0) {
-        sh->addr      = map;
-        sh->len       = map_len;
-        sh->data_base = data_base;
-        sh->buf       = qw_buf_wrap(map, map_len);
+    } else if (!misaligned) {
+        buf_lo = (data_base + dev_lo) & ~(page - 1);
+        const size_t buf_hi = (data_base + dev_hi + page - 1) & ~(page - 1);
+        sh->buf = qw_buf_wrap((char *)map + buf_lo, (buf_hi < map_len ? buf_hi : map_len) - buf_lo);
         if (sh->buf) e->bytes_mapped += data_len;
     } else {
-        /* The writer left the data section at an odd byte.  Copy it once into
-         * an aligned buffer; tensor offsets then become relative to the buffer
-         * start, which is 16-byte aligned by allocation. */
+        /* A kernel reading packed words needs them 4-byte aligned, and a
+         * device buffer can only begin on a page, so a tensor at an odd
+         * offset cannot be handed to the GPU where it lies.  MLX's writer
+         * packs tensors with no padding: one BF16 tensor of odd length (the
+         * [1,1] scales of a one-group 8-bit gate) shifts every tensor after
+         * it by two bytes -- 62 GB of Flash-Next's 80.  Such a file's device
+         * tensors are copied once into a buffer of their own, each on a
+         * 16-byte boundary, below as they are registered.  The copy is what
+         * the GPU reads from then on; the mapping's pages behind it are clean
+         * file cache the system can drop. */
         sh->materialized = true;
-        sh->data_base    = 0;
-        sh->buf          = qw_buf_alloc(data_len);
+        sh->buf = qw_buf_alloc(packed_len);
         if (sh->buf) {
-            memcpy(qw_buf_contents(sh->buf), (const char *)map + data_base, data_len);
-            e->bytes_copied += data_len;
+            e->bytes_copied += packed_len;
             if (e->opts.verbose)
-                fprintf(stderr, "qwasar: %s data section is %zu-byte misaligned, "
-                                "copied %.2f GB into aligned memory\n",
-                        path, data_base % QW_TENSOR_ALIGN,
-                        (double)data_len / (1024.0 * 1024.0 * 1024.0));
+                fprintf(stderr, "qwasar: %s has tensors off 4-byte alignment; "
+                                "copying %.2f GB of them into aligned memory\n",
+                        path, (double)packed_len / (1024.0 * 1024.0 * 1024.0));
         }
-        munmap(map, map_len);
     }
 
-    if (!sh->buf && !host_only) {
+    if (has_device && !sh->buf) {
         free(header);
         qj_free(&doc);
-        if (sh->addr) { munmap(sh->addr, sh->len); sh->addr = NULL; }
+        munmap(map, map_len);
+        sh->addr = NULL;
         qw_errf(err, errcap, "cannot bind %s as a device buffer", path);
         return false;
     }
     e->n_shards++;
     free(header);
+
+    /* A repacked shard is read, not faulted in through the mapping: one
+     * sequential read per tensor streams at the disk's speed where a page
+     * fault per 16 KB did not, and F_NOCACHE keeps the file's pages out of
+     * the cache, so the tensors are not held twice while the model loads. */
+    int copy_fd = -1;
+    if (sh->materialized) {
+        copy_fd = open(path, O_RDONLY);
+        if (copy_fd < 0) {
+            qw_errf(err, errcap, "cannot reopen %s", path);
+            qj_free(&doc);
+            return false;
+        }
+        fcntl(copy_fd, F_NOCACHE, 1);
+    }
 
     const qj_node *root = qj_root(&doc);
     for (const qj_node *m = qj_first(&doc, root); m; m = qj_next(&doc, m)) {
@@ -399,27 +479,142 @@ static bool qw_load_shard(qwasar_engine *e, const char *path, char *err, size_t 
         if (!o0 || !o1) continue;
 
         qw_tensor *t = qw_table_add(&e->tensors);
-        if (!t) { qj_free(&doc); qw_errf(err, errcap, "out of memory"); return false; }
+        if (!t) { if (copy_fd >= 0) close(copy_fd); qj_free(&doc); qw_errf(err, errcap, "out of memory"); return false; }
 
+        const bool host = !has_device || qw_name_is_host(doc.text + m->key_off, m->key_len);
         t->name   = qw_arena_str(&e->names, doc.text + m->key_off, m->key_len);
-        t->buf    = sh->buf;
-        t->offset = sh->data_base + (size_t)o0->u.num;
         t->nbytes = (size_t)o1->u.num - (size_t)o0->u.num;
-        t->cpu    = host_only ? (const char *)sh->addr + t->offset : NULL;
+        if (host) {
+            t->buf    = NULL;
+            t->offset = data_base + (size_t)o0->u.num;       /* into the mapping */
+            t->cpu    = (const char *)sh->addr + t->offset;
+        } else if (sh->materialized) {
+            t->buf    = sh->buf;
+            t->offset = packed_at;
+            t->cpu    = NULL;
+            if (!qw_read_at(copy_fd, (char *)qw_buf_contents(sh->buf) + packed_at, t->nbytes,
+                            data_base + (size_t)o0->u.num)) {
+                qw_errf(err, errcap, "short read of %s from %s", t->name, path);
+                close(copy_fd);
+                qj_free(&doc);
+                return false;
+            }
+            packed_at += (t->nbytes + QW_PACK_ALIGN - 1) & ~(size_t)(QW_PACK_ALIGN - 1);
+        } else {
+            t->buf    = sh->buf;
+            t->offset = data_base + (size_t)o0->u.num - buf_lo;
+            t->cpu    = NULL;
+        }
         t->dtype  = qw_dtype_parse(doc.text + dt->u.str.off, dt->u.str.len);
         t->ndim   = 0;
         for (const qj_node *d = qj_first(&doc, shp); d && t->ndim < QW_MAX_DIMS;
              d = qj_next(&doc, d))
             t->shape[t->ndim++] = (int64_t)d->u.num;
 
-        if (!t->name) { qj_free(&doc); qw_errf(err, errcap, "out of memory"); return false; }
-        if (t->offset + t->nbytes > (host_only ? sh->file_len : qw_buf_length(sh->buf))) {
+        if (!t->name) { if (copy_fd >= 0) close(copy_fd); qj_free(&doc); qw_errf(err, errcap, "out of memory"); return false; }
+        if (t->offset + t->nbytes > (host ? sh->file_len : qw_buf_length(sh->buf))) {
             qw_errf(err, errcap, "tensor %s runs past end of %s", t->name, path);
+            if (copy_fd >= 0) close(copy_fd);
             qj_free(&doc);
             return false;
         }
     }
+    if (copy_fd >= 0) close(copy_fd);
     qj_free(&doc);
+    return true;
+}
+
+/* Bytes of a shard the GPU will hold: every tensor but the host-only ones.
+ * Reads the header alone. */
+static bool qw_shard_device_bytes(const char *path, uint64_t *bytes, char *err, size_t errcap) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { qw_errf(err, errcap, "cannot open %s", path); return false; }
+    uint64_t header_len = 0;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || pread(fd, &header_len, 8, 0) != 8
+        || header_len == 0 || header_len > (uint64_t)st.st_size - 8) {
+        close(fd);
+        qw_errf(err, errcap, "bad safetensors header in %s", path);
+        return false;
+    }
+    char *header = malloc(header_len + 1);
+    if (!header || (uint64_t)pread(fd, header, header_len, 8) != header_len) {
+        free(header); close(fd);
+        qw_errf(err, errcap, "short header read on %s", path);
+        return false;
+    }
+    close(fd);
+    qj_doc doc;
+    const bool ok = qj_parse(&doc, header, header_len);
+    free(header);
+    if (!ok) { qw_errf(err, errcap, "bad safetensors header in %s", path); qj_free(&doc); return false; }
+    const qj_node *meta = qj_get(&doc, qj_root(&doc), "__metadata__");
+    char placement[16] = "";
+    if (meta) qj_str_copy(&doc, meta, "placement", placement, sizeof placement);
+    if (!strcmp(placement, "cpu")) { qj_free(&doc); return true; }
+    for (const qj_node *m = qj_first(&doc, qj_root(&doc)); m; m = qj_next(&doc, m)) {
+        if (m->type != QJ_OBJECT || qw_name_is_host(doc.text + m->key_off, m->key_len)) continue;
+        const qj_node *offs = qj_get(&doc, m, "data_offsets");
+        const qj_node *o0 = offs ? qj_idx(&doc, offs, 0) : NULL, *o1 = offs ? qj_idx(&doc, offs, 1) : NULL;
+        if (o0 && o1) *bytes += (uint64_t)(o1->u.num - o0->u.num);
+    }
+    qj_free(&doc);
+    return true;
+}
+
+/* Refuses a model that does not fit in the memory the machine has free now.
+ *
+ * The weights the GPU reads are wired while it reads them: the system can
+ * neither compress nor swap them, so a model that does not fit squeezes
+ * everything else until the kernel itself cannot run.  Two 80 GB loads side
+ * by side on a 128 GB machine end in a watchdog panic, not an error message.
+ * So the check comes first, from the headers, before a byte is mapped.
+ *
+ * "Free" is the system's own figure (kern.memorystatus_level, what
+ * memory_pressure reports): unused memory plus what can be reclaimed without
+ * compressing anyone, file cache included -- this model's own files, if a
+ * previous run left them cached, count as available.  The margin covers the
+ * KV cache, scratch buffers and the rest of the system at a modest context.
+ * QWASAR_SKIP_MEMORY_CHECK=1 loads regardless; QWASAR_MEMORY_FREE_GB=<n>
+ * pretends n GB are free, which is how tests reach the refusal. */
+static bool qw_memory_check(qwasar_engine *e, uint64_t device_bytes, char *err, size_t errcap) {
+    const char *skip = getenv("QWASAR_SKIP_MEMORY_CHECK");
+    if (skip && *skip && strcmp(skip, "0")) return true;
+    const double gb = 1024.0 * 1024.0 * 1024.0;
+    const uint64_t need = device_bytes + device_bytes / 10 + ((uint64_t)2 << 30);
+
+    const uint64_t limit = qw_gpu_working_set_limit();
+    if (limit && need > limit) {
+        qw_errf(err, errcap, "this model needs about %.1f GB of GPU memory and this Mac allows "
+                "%.1f GB; it cannot run here", need / gb, limit / gb);
+        return false;
+    }
+    uint64_t total = 0;
+    size_t len = sizeof total;
+    if (sysctlbyname("hw.memsize", &total, &len, NULL, 0) != 0 || !total) return true;
+    const char *pretend = getenv("QWASAR_MEMORY_FREE_GB");   /* for testing the check */
+
+    /* A process that just exited -- the previous server, on a restart -- is
+     * still handing its memory back for a second or two; the figure climbs
+     * as it does.  Look again for up to five seconds before refusing. */
+    uint64_t avail = 0;
+    for (int tries = 0; ; tries++) {
+        int level = -1;
+        len = sizeof level;
+        if (sysctlbyname("kern.memorystatus_level", &level, &len, NULL, 0) != 0 || level < 0)
+            return true;                                /* cannot tell: do not guess */
+        avail = pretend && *pretend ? (uint64_t)(atof(pretend) * gb) : total / 100 * (uint64_t)level;
+        if (need <= avail || tries >= 10 || (pretend && *pretend)) break;
+        usleep(500 * 1000);
+    }
+    if (need > avail) {
+        qw_errf(err, errcap, "this model needs about %.1f GB of memory and only %.1f GB of %.0f GB "
+                "is free now; close other large programs (another model, a VM) and try again, "
+                "or set QWASAR_SKIP_MEMORY_CHECK=1 to load anyway", need / gb, avail / gb, total / gb);
+        return false;
+    }
+    if (e->opts.verbose)
+        fprintf(stderr, "qwasar: memory check: %.1f GB needed, %.1f GB free\n", need / gb, avail / gb);
     return true;
 }
 
@@ -459,6 +654,13 @@ static bool qw_load_shards(qwasar_engine *e, char *err, size_t errcap) {
         }
         qj_free(&idx);
 
+        uint64_t device_bytes = 0;
+        for (int i = 0; i < n_seen; i++) {
+            snprintf(path, sizeof path, "%s/%s", e->model_path, seen[i]);
+            if (!qw_shard_device_bytes(path, &device_bytes, err, errcap)) return false;
+        }
+        if (!qw_memory_check(e, device_bytes, err, errcap)) return false;
+
         for (int i = 0; i < n_seen; i++) {
             snprintf(path, sizeof path, "%s/%s", e->model_path, seen[i]);
             if (!qw_load_shard(e, path, err, errcap)) return false;
@@ -468,6 +670,9 @@ static bool qw_load_shards(qwasar_engine *e, char *err, size_t errcap) {
     qj_free(&idx);
 
     snprintf(path, sizeof path, "%s/model.safetensors", e->model_path);
+    uint64_t device_bytes = 0;
+    if (!qw_shard_device_bytes(path, &device_bytes, err, errcap)) return false;
+    if (!qw_memory_check(e, device_bytes, err, errcap)) return false;
     return qw_load_shard(e, path, err, errcap);
 }
 
@@ -622,6 +827,12 @@ static bool qw_load_config(qwasar_engine *e, char *err, size_t errcap) {
     } else if (eos && eos->type == QJ_NUMBER) {
         c->eos_token_ids[c->n_eos++] = (int32_t)eos->u.num;
     }
+    {
+        const qj_node *me = qj_get(&d, tc ? tc : root, "eos_token_id");
+        if (me && me->type == QJ_ARRAY) me = qj_first(&d, me);
+        c->model_eos = (me && me->type == QJ_NUMBER) ? (int32_t)me->u.num
+                     : (c->n_eos ? c->eos_token_ids[0] : -1);
+    }
 
     const qj_node *vc = qj_get(&d, root, "vision_config");
     if (vc) {
@@ -644,10 +855,13 @@ static bool qw_load_config(qwasar_engine *e, char *err, size_t errcap) {
         qw_errf(err, errcap, "unsupported num_hidden_layers %d", c->num_hidden_layers);
         return false;
     }
-    if (c->quant_bits != 4 || c->quant_group_size != 64) {
+    /* The default here is only a default: every quantised tensor's group is
+     * read from its own shapes at bind, since MLX builds mix them (group 32
+     * for most of Flash-Next, 64 for its 8-bit router). */
+    if (c->quant_bits != 4 || (c->quant_group_size != 64 && c->quant_group_size != 32)) {
         qw_errf(err, errcap,
                 "unsupported quantisation (bits=%d group_size=%d); qwasar implements "
-                "MLX affine 4-bit with group_size 64",
+                "MLX affine 4-bit with group_size 64 or 32",
                 c->quant_bits, c->quant_group_size);
         return false;
     }
@@ -656,6 +870,20 @@ static bool qw_load_config(qwasar_engine *e, char *err, size_t errcap) {
 }
 
 /* ---- weight resolution ---------------------------------------------------- */
+
+/* The quantisation group of a bound linear or bank, from the scales' last
+ * dimension: in_features / groups.  The kernels are built for 32 and 64. */
+static bool qw_qgroup_from_shapes(qw_qlinear *ql, const char *prefix, char *err, size_t errcap) {
+    const int64_t groups = ql->scales->shape[ql->scales->ndim - 1];
+    const int32_t g = groups > 0 ? (int32_t)(ql->in_features / groups) : 0;
+    if ((g != 32 && g != 64) || (int64_t)g * groups != ql->in_features) {
+        qw_errf(err, errcap, "%s: %lld scale groups over %d inputs is not group 32 or 64",
+                prefix, (long long)groups, ql->in_features);
+        return false;
+    }
+    ql->group_size = g;
+    return true;
+}
 
 /* Binds one quantised linear and cross-checks the shapes implied by the MLX
  * affine layout, which is where a mis-parsed config shows up first. */
@@ -673,7 +901,8 @@ static bool qw_bind_qlinear(qwasar_engine *e, qw_qlinear *ql, const char *prefix
     ql->out_features = out_features;
 
     const int32_t words   = in_features / 8;                    /* 8 nibbles per u32 */
-    const int32_t groups  = in_features / e->config.quant_group_size;
+    if (!qw_qgroup_from_shapes(ql, prefix, err, errcap)) return false;
+    const int32_t groups  = in_features / ql->group_size;
     if (ql->weight->ndim != 2 || ql->weight->shape[0] != out_features
         || ql->weight->shape[1] != words) {
         qw_errf(err, errcap, "%s.weight is [%lld,%lld], expected [%d,%d]", prefix,
@@ -842,7 +1071,7 @@ static void qw_quant_dense(qwasar_engine *e, qw_qlinear *ql, const qw_dense *d,
                      bi + (size_t)r * groups);
 
     ql->weight = tw; ql->scales = ts; ql->biases = tb;
-    ql->in_features = in; ql->out_features = out;
+    ql->in_features = in; ql->out_features = out; ql->group_size = 64;
     *off += w_bytes + 2 * sb_bytes;
     e->weight_bytes_mtp_q4 += w_bytes + 2 * sb_bytes;
 }
@@ -1095,6 +1324,105 @@ static bool qw_bind_vision(qwasar_engine *e, char *err, size_t errcap) {
 
 /* ---- qwen4_exp binding ------------------------------------------------------ */
 
+static const qw_tensor *qw_bind_bf16(qwasar_engine *e, const char *name, int ndim,
+                                     int64_t d0, int64_t d1, char *err, size_t errcap);
+
+/* A BF16 tensor the loader makes: its own device buffer, owned by the engine.
+ * `*data` receives the bytes to fill. */
+static qw_tensor *qw_derived_bf16(qwasar_engine *e, const char *name, int ndim,
+                                  int64_t d0, int64_t d1, uint16_t **data) {
+    if (e->n_derived == e->cap_derived) {
+        const int32_t cap = e->cap_derived ? e->cap_derived * 2 : 256;
+        qw_tensor **t = realloc(e->derived, (size_t)cap * sizeof *t);
+        if (!t) return NULL;
+        e->derived = t;
+        qw_buf *b = realloc(e->derived_bufs, (size_t)cap * sizeof *b);
+        if (!b) return NULL;
+        e->derived_bufs = b;
+        e->cap_derived = cap;
+    }
+    const size_t n = (size_t)d0 * (size_t)(ndim > 1 ? d1 : 1);
+    qw_buf buf = qw_buf_alloc(n * 2);
+    qw_tensor *t = calloc(1, sizeof *t);
+    const char *nm = qw_arena_str(&e->names, name, strlen(name));
+    if (!buf || !t || !nm) { if (buf) qw_buf_free(buf); free(t); return NULL; }
+    t->name = nm;
+    t->buf = buf;
+    t->nbytes = n * 2;
+    t->dtype = QW_DT_BF16;
+    t->ndim = ndim;
+    t->shape[0] = d0;
+    if (ndim > 1) t->shape[1] = d1;
+    e->derived[e->n_derived] = t;
+    e->derived_bufs[e->n_derived++] = buf;
+    e->bytes_derived += n * 2;
+    *data = qw_buf_contents(buf);
+    return t;
+}
+
+/* A (1+w) RMSNorm gain, BF16 [dim].  The engine applies the gain as stored,
+ * so a checkpoint that keeps it centred at zero -- the released weights, and
+ * MLX's builds of them -- gets a copy with the +1 added, rounded to BF16 as
+ * our converter rounds it when it folds. */
+static const qw_tensor *qw_bind_gain(qwasar_engine *e, const char *name, int64_t dim,
+                                     char *err, size_t errcap) {
+    const qw_tensor *t = qw_bind_bf16(e, name, 1, dim, 0, err, errcap);
+    if (!t || !e->norm_add_one) return t;
+    uint16_t *out;
+    qw_tensor *d = qw_derived_bf16(e, name, 1, dim, 0, &out);
+    if (!d) { qw_errf(err, errcap, "out of memory for %s", name); return NULL; }
+    const uint16_t *in = qw_tensor_data(t);
+    for (int64_t i = 0; i < dim; i++)
+        out[i] = qw_f32_to_bf16_c(qw_bf16_to_f32_c(in[i]) + 1.0f);
+    return d;
+}
+
+/* A small matrix the graph reads as BF16 [rows, cols]: bound as stored when
+ * it is BF16, or dequantised into a BF16 copy when the checkpoint quantised
+ * it -- MLX stores the router 8-bit and the injection weights 4-bit.  Both
+ * are a few MB in all, and the router decides top-k, so it is not worth a
+ * kernel of its own. */
+static const qw_tensor *qw_bind_small(qwasar_engine *e, const char *prefix, int64_t rows,
+                                      int64_t cols, char *err, size_t errcap) {
+    char p[320];
+    snprintf(p, sizeof p, "%s.weight", prefix);
+    const qw_tensor *w = qw_table_find(&e->tensors, p);
+    if (w && w->dtype == QW_DT_BF16) return qw_bind_bf16(e, p, 2, rows, cols, err, errcap);
+    const qw_tensor *sc = qw_table_findf(&e->tensors, "%s.scales", prefix);
+    const qw_tensor *bi = qw_table_findf(&e->tensors, "%s.biases", prefix);
+    if (!w || !sc || !bi || w->ndim != 2 || w->shape[0] != rows || sc->ndim != 2
+        || sc->shape[0] != rows || bi->nbytes != sc->nbytes) {
+        qw_errf(err, errcap, "%s: neither bf16 [%lld,%lld] nor a quantised matrix of that shape",
+                prefix, (long long)rows, (long long)cols);
+        return NULL;
+    }
+    const int64_t bits = w->shape[1] * 32 / cols, groups = sc->shape[1];
+    const int64_t group = groups ? cols / groups : 0;
+    if ((bits != 4 && bits != 8) || w->shape[1] * 32 != bits * cols || group * groups != cols
+        || group % (32 / bits) != 0) {
+        qw_errf(err, errcap, "%s: %lld words and %lld groups per row do not describe %lld inputs",
+                prefix, (long long)w->shape[1], (long long)groups, (long long)cols);
+        return NULL;
+    }
+    uint16_t *out;
+    qw_tensor *d = qw_derived_bf16(e, p, 2, rows, cols, &out);
+    if (!d) { qw_errf(err, errcap, "out of memory for %s", p); return NULL; }
+    const uint32_t *wd = qw_tensor_data(w);
+    const uint16_t *sd = qw_tensor_data(sc), *bd = qw_tensor_data(bi);
+    const int64_t per_word = 32 / bits;
+    const uint32_t mask = (1u << bits) - 1;
+    for (int64_t r = 0; r < rows; r++)
+        for (int64_t j = 0; j < cols; j++) {
+            const uint32_t word = wd[r * w->shape[1] + j / per_word];
+            const uint32_t q = (word >> (bits * (j % per_word))) & mask;
+            const float v = qw_bf16_to_f32_c(sd[r * groups + j / group]) * (float)q
+                          + qw_bf16_to_f32_c(bd[r * groups + j / group]);
+            out[r * cols + j] = qw_f32_to_bf16_c(v);
+        }
+    e->weight_bytes_text += w->nbytes + sc->nbytes + bi->nbytes;
+    return d;
+}
+
 /* A bank of `count` quantised matrices in one 3-D tensor, quantised along
  * the input axis: weight [count, out, in/8], scales/biases [count, out, in/64]. */
 static bool qw_bind_qbank(qwasar_engine *e, qw_qlinear *ql, const char *prefix, int32_t count,
@@ -1108,7 +1436,8 @@ static bool qw_bind_qbank(qwasar_engine *e, qw_qlinear *ql, const char *prefix, 
     }
     ql->in_features = in_features;
     ql->out_features = out_features;
-    const int32_t words = in_features / 8, groups = in_features / e->config.quant_group_size;
+    if (!qw_qgroup_from_shapes(ql, prefix, err, errcap)) return false;
+    const int32_t words = in_features / 8, groups = in_features / ql->group_size;
     if (ql->weight->ndim != 3 || ql->weight->shape[0] != count
         || ql->weight->shape[1] != out_features || ql->weight->shape[2] != words) {
         qw_errf(err, errcap, "%s.weight is [%lld,%lld,%lld], expected [%d,%d,%d]", prefix,
@@ -1146,15 +1475,15 @@ static bool qw_bind_hc(qwasar_engine *e, qw_hc *hc, const char *prefix, bool inj
     const int32_t HH = e->shape.hc_hidden;
     char p[300];
     snprintf(p, sizeof p, "%s.hc_norm.weight", prefix);
-    if (!(hc->hc_norm = qw_bind_bf16(e, p, 1, HH, 0, err, errcap))) return false;
+    if (!(hc->hc_norm = qw_bind_gain(e, p, HH, err, errcap))) return false;
     snprintf(p, sizeof p, "%s.input_mix_weight_down", prefix);
     if (!qw_bind_qlinear(e, &hc->mix_down, p, HH, c->hc_lowrank, err, errcap)) return false;
     snprintf(p, sizeof p, "%s.input_mix_weight_up", prefix);
     if (!qw_bind_qlinear(e, &hc->mix_up, p, c->hc_lowrank, HH, err, errcap)) return false;
     hc->block_inject = NULL;
     if (inject) {
-        snprintf(p, sizeof p, "%s.block_inject_weight.weight", prefix);
-        if (!(hc->block_inject = qw_bind_bf16(e, p, 2, c->hc_count, HH, err, errcap))) return false;
+        snprintf(p, sizeof p, "%s.block_inject_weight", prefix);
+        if (!(hc->block_inject = qw_bind_small(e, p, c->hc_count, HH, err, errcap))) return false;
     }
     return true;
 }
@@ -1164,11 +1493,20 @@ static bool qw_bind_moe(qwasar_engine *e, qw_moe *m, const char *prefix, char *e
     const int32_t H = c->hidden_size, I = c->moe_intermediate_size, SI = c->shared_expert_intermediate_size;
     char p[300];
     m->n_experts = c->num_experts;
-    snprintf(p, sizeof p, "%s.gate.weight", prefix);
-    if (!(m->router = qw_bind_bf16(e, p, 2, c->num_experts, H, err, errcap))) return false;
-    snprintf(p, sizeof p, "%s.experts.gate_up_proj", prefix);
-    if (!qw_bind_qbank(e, &m->gate_up, p, c->num_experts, H, 2 * I, err, errcap)) return false;
-    snprintf(p, sizeof p, "%s.experts.down_proj", prefix);
+    snprintf(p, sizeof p, "%s.gate", prefix);
+    if (!(m->router = qw_bind_small(e, p, c->num_experts, H, err, errcap))) return false;
+    m->split = e->mlx_experts;
+    if (m->split) {
+        snprintf(p, sizeof p, "%s.switch_mlp.gate_proj", prefix);
+        if (!qw_bind_qbank(e, &m->gate, p, c->num_experts, H, I, err, errcap)) return false;
+        snprintf(p, sizeof p, "%s.switch_mlp.up_proj", prefix);
+        if (!qw_bind_qbank(e, &m->up, p, c->num_experts, H, I, err, errcap)) return false;
+        snprintf(p, sizeof p, "%s.switch_mlp.down_proj", prefix);
+    } else {
+        snprintf(p, sizeof p, "%s.experts.gate_up_proj", prefix);
+        if (!qw_bind_qbank(e, &m->gate_up, p, c->num_experts, H, 2 * I, err, errcap)) return false;
+        snprintf(p, sizeof p, "%s.experts.down_proj", prefix);
+    }
     if (!qw_bind_qbank(e, &m->down, p, c->num_experts, I, H, err, errcap)) return false;
     snprintf(p, sizeof p, "%s.shared_expert.gate_proj", prefix);
     if (!qw_bind_qlinear(e, &m->sh_gate, p, H, SI, err, errcap)) return false;
@@ -1176,8 +1514,8 @@ static bool qw_bind_moe(qwasar_engine *e, qw_moe *m, const char *prefix, char *e
     if (!qw_bind_qlinear(e, &m->sh_up, p, H, SI, err, errcap)) return false;
     snprintf(p, sizeof p, "%s.shared_expert.down_proj", prefix);
     if (!qw_bind_qlinear(e, &m->sh_down, p, SI, H, err, errcap)) return false;
-    snprintf(p, sizeof p, "%s.shared_expert_gate.weight", prefix);
-    if (!(m->sh_gate_w = qw_bind_bf16(e, p, 2, 1, H, err, errcap))) return false;
+    snprintf(p, sizeof p, "%s.shared_expert_gate", prefix);
+    if (!(m->sh_gate_w = qw_bind_small(e, p, 1, H, err, errcap))) return false;
     return true;
 }
 
@@ -1216,20 +1554,74 @@ static bool qw_bind_ple(qwasar_engine *e, qw_ple *P, const char *prefix, char *e
     P->table_rows = (P->table_rows + c->ngram_divisor - 1) / c->ngram_divisor * c->ngram_divisor;
     qw_ple_multipliers(P->mult, c->vocab_size, c->ngram_size, 0, c->ngram_seed);
 
+    /* The hash, checked against the checkpoint's own copy of it.  A wrong
+     * multiplier or head size would not fail anywhere else: every id would
+     * still land in the table, on the wrong rows, and the model would get
+     * quietly worse.  Checkpoints that dropped these buffers load unchecked. */
+    {
+        static const char *const names[3] = { "layer_multipliers", "ngram_heads_vocab_sizes",
+                                              "ngram_heads_offsets" };
+        const int64_t *mine[3] = { P->mult, P->head_size, P->head_off };
+        const int32_t count[3] = { c->ngram_size, P->n_heads, P->n_heads };
+        for (int k = 0; k < 3; k++) {
+            const qw_tensor *t = qw_table_findf(&e->tensors, "%s.ple_embedding.%s", prefix, names[k]);
+            if (!t) continue;
+            if (t->dtype != QW_DT_I64 || t->ndim != 1 || t->shape[0] != count[k]) {
+                qw_errf(err, errcap, "%s.ple_embedding.%s is not I64 [%d]", prefix, names[k], count[k]);
+                return false;
+            }
+            int64_t v[QW_MAX_NGRAM_HEADS];
+            memcpy(v, t->cpu ? t->cpu : qw_tensor_data(t), (size_t)count[k] * sizeof *v);
+            for (int32_t i = 0; i < count[k]; i++)
+                if (v[i] != mine[k][i]) {
+                    qw_errf(err, errcap, "engram hash: %s[%d] is %lld in the checkpoint, "
+                            "%lld as derived from config", names[k], i, (long long)v[i],
+                            (long long)mine[k][i]);
+                    return false;
+                }
+        }
+    }
+
     /* The table's shards, in order, until the names run out; together they
      * must be exactly the padded row count the hash was sized for. */
+    /* Our converter keeps the table BF16 as `shard_N`; MLX quantises it
+     * 4-bit as `shards.N.{weight,scales,biases}`. */
     P->n_shards = 0;
+    P->q_group = 0;
     P->shard_start[0] = 0;
     for (;;) {
         snprintf(p, sizeof p, "%s.ple_embedding.ngram_embedding.shard_%d.weight", prefix, P->n_shards);
-        const qw_tensor *t = qw_table_find(&e->tensors, p);
+        const qw_tensor *t = qw_table_find(&e->tensors, p), *ts = NULL, *tb = NULL;
+        if (!t) {
+            snprintf(p, sizeof p, "%s.ple_embedding.ngram_embedding.shards.%d.weight", prefix, P->n_shards);
+            t = qw_table_find(&e->tensors, p);
+            ts = qw_table_findf(&e->tensors, "%s.ple_embedding.ngram_embedding.shards.%d.scales", prefix, P->n_shards);
+            tb = qw_table_findf(&e->tensors, "%s.ple_embedding.ngram_embedding.shards.%d.biases", prefix, P->n_shards);
+        }
         if (!t) break;
         if (P->n_shards >= QW_MAX_ENGRAM_SHARDS) {
             qw_errf(err, errcap, "qwen4_exp: more than %d engram shards", QW_MAX_ENGRAM_SHARDS);
             return false;
         }
-        if (t->dtype != QW_DT_BF16 || t->ndim != 2 || t->shape[1] != P->head_dim) {
+        if (ts || tb) {
+            const int64_t groups = ts && ts->ndim == 2 ? ts->shape[1] : 0;
+            const int32_t g = groups ? (int32_t)(P->head_dim / groups) : 0;
+            if (!ts || !tb || t->dtype != QW_DT_U32 || t->ndim != 2 || t->shape[1] * 8 != P->head_dim
+                || g * groups != P->head_dim || g % 8 != 0 || ts->shape[0] != t->shape[0]
+                || tb->nbytes != ts->nbytes || (P->q_group && P->q_group != g)) {
+                qw_errf(err, errcap, "%s is not a 4-bit table of %d-wide rows", p, P->head_dim);
+                return false;
+            }
+            P->q_group = g;
+            P->shard_scales[P->n_shards] = ts;
+            P->shard_biases[P->n_shards] = tb;
+        } else if (t->dtype != QW_DT_BF16 || t->ndim != 2 || t->shape[1] != P->head_dim
+                   || P->q_group) {
             qw_errf(err, errcap, "%s is not bf16 [rows, %d]", p, P->head_dim);
+            return false;
+        }
+        if (!t->cpu) {
+            qw_errf(err, errcap, "%s is not host-mapped", p);
             return false;
         }
         P->shard[P->n_shards] = t;
@@ -1250,11 +1642,11 @@ static bool qw_bind_ple(qwasar_engine *e, qw_ple *P, const char *prefix, char *e
     snprintf(p, sizeof p, "%s.value_proj", prefix);
     if (!qw_bind_qlinear(e, &P->value_proj, p, E, H, err, errcap)) return false;
     snprintf(p, sizeof p, "%s.norm_key.weight", prefix);
-    if (!(P->norm_key = qw_bind_bf16(e, p, 1, HH, 0, err, errcap))) return false;
+    if (!(P->norm_key = qw_bind_gain(e, p, HH, err, errcap))) return false;
     snprintf(p, sizeof p, "%s.norm_query.weight", prefix);
-    if (!(P->norm_query = qw_bind_bf16(e, p, 1, HH, 0, err, errcap))) return false;
+    if (!(P->norm_query = qw_bind_gain(e, p, HH, err, errcap))) return false;
     snprintf(p, sizeof p, "%s.norm_conv.weight", prefix);
-    if (!(P->norm_conv = qw_bind_bf16(e, p, 1, HH, 0, err, errcap))) return false;
+    if (!(P->norm_conv = qw_bind_gain(e, p, HH, err, errcap))) return false;
     snprintf(p, sizeof p, "%s.conv1d.weight", prefix);
     P->conv1d = qw_table_find(&e->tensors, p);
     if (!P->conv1d || P->conv1d->ndim != 3 || P->conv1d->shape[0] != HH
@@ -1270,6 +1662,27 @@ static bool qw_bind_weights_qwen4(qwasar_engine *e, char *err, size_t errcap) {
     const qw_config *c = &e->config;
     const qw_shape  *s = &e->shape;
     char p[300];
+
+    e->mlx_experts = qw_table_find(&e->tensors,
+                                   "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight") != NULL;
+    /* Which convention the (1+w) gains follow is read from the gains
+     * themselves -- the check MLX's own build notes describe.  Stored centred
+     * at zero (the released weights; MLX builds since mlx-vlm #2032) they
+     * average near +0.2; with the +1 folded in (our converter; earlier MLX
+     * builds) near +1.2.  A hyper-connection gain is 4 x hidden values and
+     * every layer has two, so the first is a fair sample. */
+    {
+        const qw_tensor *g = qw_table_find(&e->tensors,
+                                           "language_model.model.layers.0.attn_hyper_connection.hc_norm.weight");
+        if (!g || g->dtype != QW_DT_BF16 || g->ndim != 1) {
+            qw_errf(err, errcap, "missing layer 0 hyper-connection norm");
+            return false;
+        }
+        const uint16_t *v = qw_tensor_data(g);
+        double sum = 0.0;
+        for (int64_t i = 0; i < g->shape[0]; i++) sum += qw_bf16_to_f32_c(v[i]);
+        e->norm_add_one = sum / (double)g->shape[0] < 0.5;
+    }
 
     if (!qw_bind_qlinear(e, &e->embed_tokens, "language_model.model.embed_tokens",
                          c->hidden_size, c->vocab_size, err, errcap)) return false;
@@ -1325,16 +1738,20 @@ static bool qw_bind_weights_qwen4(qwasar_engine *e, char *err, size_t errcap) {
             if (!qw_bind_qlinear(e, &L->v_proj, p, c->hidden_size, s->kv_dim, err, errcap)) return false;
             snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.o_proj", i);
             if (!qw_bind_qlinear(e, &L->o_proj, p, s->q_dim, c->hidden_size, err, errcap)) return false;
-            L->q_norm = qw_bind_norm(e, "language_model.model.layers.%d.self_attn.q_norm.weight", i, c->head_dim, err, errcap);
-            L->k_norm = qw_bind_norm(e, "language_model.model.layers.%d.self_attn.k_norm.weight", i, c->head_dim, err, errcap);
+            snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.q_norm.weight", i);
+            L->q_norm = qw_bind_gain(e, p, c->head_dim, err, errcap);
+            snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.k_norm.weight", i);
+            if (L->q_norm) L->k_norm = qw_bind_gain(e, p, c->head_dim, err, errcap);
             if (!L->q_norm || !L->k_norm) return false;
 
             const int32_t idim = c->indexer_head_dim;
             snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.indexer.index_qk_proj", i);
             if (!qw_bind_qlinear(e, &L->indexer.qk_proj, p, c->hidden_size,
                                  (c->indexer_n_heads + c->indexer_kv_heads) * idim, err, errcap)) return false;
-            L->indexer.q_norm = qw_bind_norm(e, "language_model.model.layers.%d.self_attn.indexer.q_layernorm.weight", i, idim, err, errcap);
-            L->indexer.k_norm = qw_bind_norm(e, "language_model.model.layers.%d.self_attn.indexer.k_layernorm.weight", i, idim, err, errcap);
+            snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.indexer.q_layernorm.weight", i);
+            L->indexer.q_norm = qw_bind_gain(e, p, idim, err, errcap);
+            snprintf(p, sizeof p, "language_model.model.layers.%d.self_attn.indexer.k_layernorm.weight", i);
+            if (L->indexer.q_norm) L->indexer.k_norm = qw_bind_gain(e, p, idim, err, errcap);
             if (!L->indexer.q_norm || !L->indexer.k_norm) return false;
         }
 
@@ -1548,6 +1965,12 @@ fail:
 
 void qwasar_engine_free(qwasar_engine *e) {
     if (!e) return;
+    for (int32_t i = 0; i < e->n_derived; i++) {
+        qw_buf_free(e->derived_bufs[i]);
+        free(e->derived[i]);
+    }
+    free(e->derived);
+    free(e->derived_bufs);
     for (int i = 0; i < e->n_shards; i++) {
         if (e->shards[i].buf)  qw_buf_free(e->shards[i].buf);
         if (e->shards[i].addr) munmap(e->shards[i].addr, e->shards[i].len);
@@ -1653,12 +2076,18 @@ void qwasar_engine_print_info(const qwasar_engine *e, FILE *out) {
         fprintf(out, "qsa        indexer %d heads x %d, budget %d tokens in blocks of %d\n",
                 c->indexer_n_heads, c->indexer_head_dim, c->indexer_budget,
                 c->indexer_compress_ratio);
-        if (c->ple_layer >= 0)
+        if (c->ple_layer >= 0) {
+            size_t tbytes = 0;
+            for (int32_t i = 0; i < P->n_shards; i++)
+                tbytes += P->shard[i]->nbytes
+                        + (P->q_group ? P->shard_scales[i]->nbytes + P->shard_biases[i]->nbytes : 0);
+            char q[32] = "bf16";
+            if (P->q_group) snprintf(q, sizeof q, "4-bit, group %d", P->q_group);
             fprintf(out, "engram     layer %d: %d heads x %d, %lld rows in %d host shard%s "
-                         "(%.2f GB, not on the device)\n",
+                         "(%s, %.2f GB, not on the device)\n",
                     c->ple_layer, P->n_heads, P->head_dim, (long long)P->table_rows,
-                    P->n_shards, P->n_shards == 1 ? "" : "s",
-                    qw_gb((size_t)P->table_rows * P->head_dim * 2));
+                    P->n_shards, P->n_shards == 1 ? "" : "s", q, qw_gb(tbytes));
+        }
     }
 
     if (c->has_vision)

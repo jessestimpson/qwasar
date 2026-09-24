@@ -198,7 +198,7 @@ static void test_moe(qwasar_engine *e) {
     c = qw_cmd_begin();
     qw_op_qmv_q4_bank(c, qw_ref_at(gu, 0), qw_ref_at(x, 0), qw_ref_at(idx, 0),
                       qw_tensor_ref(M->gate_up.weight), qw_tensor_ref(M->gate_up.scales),
-                      qw_tensor_ref(M->gate_up.biases), H, 2 * I, pairs, K, false);
+                      qw_tensor_ref(M->gate_up.biases), H, 2 * I, pairs, K, false, M->gate_up.group_size);
     run(c, "qmv_q4_bank (gate_up)");
     float *guref = malloc((size_t)pairs * 2 * I * 4);
     const uint32_t *bw = qw_tensor_data(M->gate_up.weight);
@@ -207,7 +207,7 @@ static void test_moe(qwasar_engine *e) {
         const int32_t ex = idxp[p];
         qw_cpu_qmv_q4(guref + (size_t)p * 2 * I, xp + (size_t)(p / K) * H,
                       bw + (size_t)ex * 2 * I * (H / 8), bs + (size_t)ex * 2 * I * (H / 64),
-                      bb + (size_t)ex * 2 * I * (H / 64), H, 2 * I, 1);
+                      bb + (size_t)ex * 2 * I * (H / 64), H, 2 * I, 1, 64);
     }
     report("qmv_q4_bank (gate_up)", qw_buf_contents(gu), guref, (size_t)pairs * 2 * I, 1e-4);
 
@@ -223,7 +223,7 @@ static void test_moe(qwasar_engine *e) {
     c = qw_cmd_begin();
     qw_op_qmv_q4_bank(c, qw_ref_at(y, 0), qw_ref_at(act, 0), qw_ref_at(idx, 0),
                       qw_tensor_ref(M->down.weight), qw_tensor_ref(M->down.scales),
-                      qw_tensor_ref(M->down.biases), I, H, pairs, K, true);
+                      qw_tensor_ref(M->down.biases), I, H, pairs, K, true, M->down.group_size);
     run(c, "qmv_q4_bank (down)");
     const float *actp = qw_buf_contents(act);
     float *yref = malloc((size_t)pairs * H * 4);
@@ -233,7 +233,7 @@ static void test_moe(qwasar_engine *e) {
         const int32_t ex = idxp[p];
         qw_cpu_qmv_q4(yref + (size_t)p * H, actp + (size_t)p * I,
                       dw + (size_t)ex * H * (I / 8), ds + (size_t)ex * H * (I / 64),
-                      db + (size_t)ex * H * (I / 64), I, H, 1);
+                      db + (size_t)ex * H * (I / 64), I, H, 1, 64);
     }
     report("qmv_q4_bank (down)", qw_buf_contents(y), yref, (size_t)pairs * H, 1e-4);
 
@@ -490,10 +490,10 @@ static void test_reused(qwasar_engine *e) {
             fill_random(xp, (size_t)rows * k, 81 + (uint32_t)i);
             qw_cmd c = qw_cmd_begin();
             qw_op_qmat_q4(c, qw_ref_at(y, 0), qw_ref_at(x, 0), qw_tensor_ref(q->weight), qw_tensor_ref(q->scales),
-                          qw_tensor_ref(q->biases), k, n, rows);
+                          qw_tensor_ref(q->biases), k, n, rows, q->group_size);
             run(c, "qmat_q4");
             float *ref = malloc((size_t)rows * n * 4);
-            qw_cpu_qmv_q4(ref, xp, qw_tensor_data(q->weight), qw_tensor_data(q->scales), qw_tensor_data(q->biases), k, n, rows);
+            qw_cpu_qmv_q4(ref, xp, qw_tensor_data(q->weight), qw_tensor_data(q->scales), qw_tensor_data(q->biases), k, n, rows, q->group_size);
             char label[64];
             snprintf(label, sizeof label, "qmat_q4 %s rows=%d", names[i], rows);
             /* From QW_QMM_MIN_ROWS the tiled matmul runs, with fp16 operand
@@ -502,6 +502,59 @@ static void test_reused(qwasar_engine *e) {
             free(ref);
             qw_buf_free(x); qw_buf_free(y);
         }
+}
+
+/* MLX's layout: split gate and up banks and a group-32 embedding, each
+ * against scalar code over the same bound tensors. */
+static void test_mlx_layout(qwasar_engine *e) {
+    const qw_config *cfg = qwasar_engine_config(e);
+    const qw_moe *M = &qwasar_engine_layer(e, 0)->moe;
+    CHECK(M->split, "the MLX fixture's experts are split");
+    const int32_t H = cfg->hidden_size, I = cfg->moe_intermediate_size, K = cfg->num_experts_per_tok;
+    const int32_t rows = 3, pairs = rows * K;
+    qw_buf x = mkbuf((size_t)rows * H * 4), idx = mkbuf((size_t)pairs * 4), y = mkbuf((size_t)pairs * I * 4);
+    float *xp = qw_buf_contents(x);
+    int32_t *ip = qw_buf_contents(idx);
+    fill_random(xp, (size_t)rows * H, 5);
+    for (int32_t p = 0; p < pairs; p++) ip[p] = (p * 5 + 3) % M->n_experts;
+    const qw_qlinear *banks[2] = { &M->gate, &M->up };
+    const char *names[2] = { "qmv_q4_bank g32 (gate)", "qmv_q4_bank g32 (up)" };
+    for (int b = 0; b < 2; b++) {
+        const qw_qlinear *q = banks[b];
+        qw_cmd c = qw_cmd_begin();
+        qw_op_qmv_q4_bank(c, qw_ref_at(y, 0), qw_ref_at(x, 0), qw_ref_at(idx, 0),
+                          qw_tensor_ref(q->weight), qw_tensor_ref(q->scales), qw_tensor_ref(q->biases),
+                          H, I, pairs, K, false, q->group_size);
+        run(c, names[b]);
+        float *ref = malloc((size_t)pairs * I * 4);
+        const uint32_t *bw = qw_tensor_data(q->weight);
+        const uint16_t *bs = qw_tensor_data(q->scales), *bb = qw_tensor_data(q->biases);
+        const int32_t G = H / q->group_size;
+        for (int32_t p = 0; p < pairs; p++)
+            qw_cpu_qmv_q4(ref + (size_t)p * I, xp + (size_t)(p / K) * H,
+                          bw + (size_t)ip[p] * I * (H / 8), bs + (size_t)ip[p] * I * G,
+                          bb + (size_t)ip[p] * I * G, H, I, 1, q->group_size);
+        report(names[b], qw_buf_contents(y), ref, (size_t)pairs * I, 1e-4);
+        free(ref);
+    }
+    qw_buf_free(x); qw_buf_free(idx); qw_buf_free(y);
+
+    const qw_qlinear *emb = qwasar_engine_embed(e);
+    CHECK(emb->group_size == 32, "embedding group %d", emb->group_size);
+    const int32_t n_tok = 4;
+    qw_buf tb = mkbuf(n_tok * 4), yb = mkbuf((size_t)n_tok * H * 4);
+    int32_t *tp = qw_buf_contents(tb);
+    for (int32_t t = 0; t < n_tok; t++) tp[t] = (t * 37 + 11) % cfg->vocab_size;
+    qw_cmd c = qw_cmd_begin();
+    qw_op_embed_q4(c, qw_ref_at(yb, 0), qw_ref_at(tb, 0), qw_tensor_ref(emb->weight),
+                   qw_tensor_ref(emb->scales), qw_tensor_ref(emb->biases), H, n_tok, emb->group_size);
+    run(c, "embed_q4 g32");
+    float *ref = malloc((size_t)n_tok * H * 4);
+    qw_cpu_embed_q4(ref, tp, qw_tensor_data(emb->weight), qw_tensor_data(emb->scales),
+                    qw_tensor_data(emb->biases), H, n_tok, emb->group_size);
+    report("embed_q4 g32", qw_buf_contents(yb), ref, (size_t)n_tok * H, 1e-6);
+    free(ref);
+    qw_buf_free(tb); qw_buf_free(yb);
 }
 
 int main(void) {
@@ -517,6 +570,14 @@ int main(void) {
     printf("== reused ops\n");        test_reused(e);
 
     qwasar_engine_free(e);
+
+    qwasar_options om = { .model_path = "tests/fixtures/flashnext-tiny-mlx", .context_size = 256 };
+    e = qwasar_engine_load(&om, err, sizeof err);
+    if (!e) { fprintf(stderr, "cannot load the MLX toy checkpoint: %s\n", err); return 1; }
+    printf("== MLX layout\n");        test_mlx_layout(e);
+    printf("== reused ops, group 32\n"); test_reused(e);
+    qwasar_engine_free(e);
+
     if (fails) { fprintf(stderr, "%d failure(s)\n", fails); return 1; }
     printf("sparse: all checks pass\n");
     return 0;

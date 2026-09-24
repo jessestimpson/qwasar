@@ -278,7 +278,7 @@ static void test_embed(qwasar_engine *e, const qw_config *cfg) {
 
     qw_cmd c = qw_cmd_begin();
     qw_op_embed_q4(c, qw_ref_at(yb, 0), qw_ref_at(tb, 0), qw_tensor_ref(w),
-                   qw_tensor_ref(sc), qw_tensor_ref(bi), cfg->hidden_size, n_tok);
+                   qw_tensor_ref(sc), qw_tensor_ref(bi), cfg->hidden_size, n_tok, 64);
     qw_cmd_wait(c);
     CHECK(qw_cmd_error(c) == NULL, "embed: %s", qw_cmd_error(c));
     qw_cmd_free(c);
@@ -286,7 +286,7 @@ static void test_embed(qwasar_engine *e, const qw_config *cfg) {
     size_t n = (size_t)n_tok * cfg->hidden_size;
     float *ref = malloc(n * sizeof(float));
     qw_cpu_embed_q4(ref, ids, qw_tensor_data(w), qw_tensor_data(sc), qw_tensor_data(bi),
-                    cfg->hidden_size, n_tok);
+                    cfg->hidden_size, n_tok, 64);
 
     size_t at = 0;
     double worst = max_rel(y, ref, n, &at);

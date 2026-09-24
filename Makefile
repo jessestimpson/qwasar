@@ -98,7 +98,8 @@ QWASAR_TEST_MTP ?= $(HOME)/.cache/qwasar/mtp/Qwen3.8-27B-MTP-bf16
 
 TESTS := tests/test_json tests/test_toolcall tests/test_sample tests/test_tokenizer tests/test_qmv tests/test_ops \
          tests/test_gdn tests/test_attn tests/test_kvstore tests/test_mtp tests/test_verify tests/test_vision tests/test_forward \
-         tests/test_select tests/test_tui tests/test_flashnext tests/test_sparse tests/test_tokenizer_marks
+         tests/test_select tests/test_tui tests/test_flashnext tests/test_sparse tests/test_tokenizer_marks \
+         tests/test_flashnext_real
 
 tests/test_flashnext: tests/test_flashnext.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_flashnext.c $(CORE_OBJS) $(LDLIBS)
@@ -108,6 +109,12 @@ tests/test_tokenizer_marks: tests/test_tokenizer_marks.c qwasar_tokenizer.o qwas
 
 tests/test_sparse: tests/test_sparse.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_sparse.c $(CORE_OBJS) $(LDLIBS)
+
+# Flash-Next on its real weights against mlx-vlm on the same weights.  Skips
+# unless QWASAR_TEST_FLASHNEXT names mlx-community's build: it loads ~75 GB.
+QWASAR_TEST_FLASHNEXT ?=
+tests/test_flashnext_real: tests/test_flashnext_real.c $(CORE_OBJS) qwasar.h qwasar_model.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_flashnext_real.c $(CORE_OBJS) $(LDLIBS)
 
 tests/test_tui: tests/test_tui.c qwasar_tui.o linenoise.o qwasar_tui.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_tui.c qwasar_tui.o linenoise.o $(LDLIBS)
@@ -159,7 +166,8 @@ tests/test_sample: tests/test_sample.c qwasar_sample.o qwasar.h
 test: $(TESTS)
 	@for t in $(TESTS); do echo "== $$t"; \
 		QWASAR_TEST_MODEL="$(QWASAR_TEST_MODEL)" \
-		QWASAR_TEST_MTP="$(QWASAR_TEST_MTP)" ./$$t || exit 1; done
+		QWASAR_TEST_MTP="$(QWASAR_TEST_MTP)" \
+		QWASAR_TEST_FLASHNEXT="$(QWASAR_TEST_FLASHNEXT)" ./$$t || exit 1; done
 
 # Integration tests for the HTTP API: starts ./qwasar-server on a free port
 # and checks it against the OpenAI and Anthropic specs, one server for both.

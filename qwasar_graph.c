@@ -358,22 +358,23 @@ qw_ref qw_off(qw_buf b, size_t elems) { return qw_ref_at(b, elems * 4); }
 void qw_encode_qlinear(qw_cmd c, const qw_qlinear *ql, qw_ref out, qw_ref in,
                        int32_t rows) {
     qw_op_qmat_q4(c, out, in, qw_tensor_ref(ql->weight), qw_tensor_ref(ql->scales),
-                  qw_tensor_ref(ql->biases), ql->in_features, ql->out_features, rows);
+                  qw_tensor_ref(ql->biases), ql->in_features, ql->out_features, rows,
+                  ql->group_size);
 }
 
 /* The same projection over a contiguous run of output rows, writing them at
- * `out`.  A 4-bit affine row is in_features/2 bytes of nibbles and
- * in_features/32 bytes each of scales and biases, all row-major, so a run of
- * rows is just three offsets and a smaller n -- no copy and no repack. */
+ * `out`.  A 4-bit affine row is in_features/2 bytes of nibbles and one bf16
+ * scale and bias per group, all row-major, so a run of rows is just three
+ * offsets and a smaller n -- no copy and no repack. */
 static void qw_encode_qlinear_rows(qw_cmd c, const qw_qlinear *ql, qw_ref out, qw_ref in,
                                    int32_t rows, int32_t row0, int32_t n_rows) {
     const size_t wstride = (size_t)ql->in_features / 2;
-    const size_t sstride = (size_t)ql->in_features / 32;
+    const size_t sstride = (size_t)ql->in_features / (size_t)ql->group_size * 2;
     qw_op_qmat_q4(c, out, in,
                   qw_ref_offset(qw_tensor_ref(ql->weight), (size_t)row0 * wstride),
                   qw_ref_offset(qw_tensor_ref(ql->scales), (size_t)row0 * sstride),
                   qw_ref_offset(qw_tensor_ref(ql->biases), (size_t)row0 * sstride),
-                  ql->in_features, n_rows, rows);
+                  ql->in_features, n_rows, rows, ql->group_size);
 }
 
 void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c,
@@ -632,7 +633,8 @@ static void qw_encode_mtp_upkeep(qwasar_session *s, qw_cmd c, int32_t rows) {
 
         qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_ref_at(s->mtp_tokens, 0),
                        qw_tensor_ref(embed->weight), qw_tensor_ref(embed->scales),
-                       qw_tensor_ref(embed->biases), cfg->hidden_size, n_up);
+                       qw_tensor_ref(embed->biases), cfg->hidden_size, n_up,
+                       embed->group_size);
         qw_encode_mtp_rows(s, c,
                            qw_off(s->mtp_hidden,
                                   s->mtp_pending ? 0 : (size_t)cfg->hidden_size),
@@ -657,7 +659,7 @@ static void qw_encode_forward(qwasar_session *s, qw_cmd c, int32_t rows, bool wa
                    qw_tensor_ref(qwasar_engine_embed(e)->weight),
                    qw_tensor_ref(qwasar_engine_embed(e)->scales),
                    qw_tensor_ref(qwasar_engine_embed(e)->biases),
-                   cfg->hidden_size, rows);
+                   cfg->hidden_size, rows, qwasar_engine_embed(e)->group_size);
 
     /* Image rows replace what the embedding table produced for the pad tokens.
      * They arrive in runs, so this copies spans rather than scattering rows --
@@ -920,7 +922,8 @@ int32_t qwasar_session_draft(qwasar_session *s, int32_t emitted,
 
         qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_off(s->mtp_tokens, tok_slot),
                        qw_tensor_ref(embed->weight), qw_tensor_ref(embed->scales),
-                       qw_tensor_ref(embed->biases), cfg->hidden_size, rows);
+                       qw_tensor_ref(embed->biases), cfg->hidden_size, rows,
+                       embed->group_size);
         qw_encode_mtp_rows(s, c, hidden, rows, qw_off(s->mtp_positions, pos_slot));
         /* The pending slot has to end up holding the last CONFIRMED hidden
          * state, which is the one the drafted row was built from.  It is
@@ -1192,7 +1195,8 @@ static bool qw_mtp_flush_owed(qwasar_session *s, char *err, size_t errcap) {
     if (!c) { qw_gerrf(err, errcap, "cannot begin a command buffer"); return false; }
     qw_op_embed_q4(c, qw_ref_at(s->mtp_embed, 0), qw_ref_at(s->mtp_tokens, 0),
                    qw_tensor_ref(embed->weight), qw_tensor_ref(embed->scales),
-                   qw_tensor_ref(embed->biases), cfg->hidden_size, rows);
+                   qw_tensor_ref(embed->biases), cfg->hidden_size, rows,
+                       embed->group_size);
     qw_encode_mtp_rows(s, c, qw_off(s->mtp_hidden, (size_t)cfg->hidden_size), rows,
                        qw_ref_at(s->mtp_positions, 0));
     qw_op_slice_rows(c, qw_ref_at(s->mtp_hidden, 0),

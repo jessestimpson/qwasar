@@ -31,6 +31,9 @@ ap.add_argument("seed", nargs="?", type=int, default=1)
 ap.add_argument("--vocab", type=int, default=256)
 ap.add_argument("--bos", type=int, default=250)
 ap.add_argument("--eos", type=int, default=251)
+ap.add_argument("--ple-embed-dim", type=int, default=64,
+                help="16 heads share it; 512 gives 32-wide rows, which MLX's group-32 "
+                     "quantisation needs (tools/flashnext_mlx_toy.py)")
 args = ap.parse_args()
 out, seed = args.out, args.seed
 
@@ -73,7 +76,7 @@ cfg = Qwen4ExpTextConfig(
     indexer_compress_ratio=4,
     # PLE on layer 2 (one-indexed): 16 heads x 4 dims, tiny prime vocabs
     ple_layer_ids=[2],
-    ple_embed_dim=64,
+    ple_embed_dim=args.ple_embed_dim,
     ple_conv_kernel_size=4,
     ngram_size=3,
     heads_per_ngram=8,

@@ -58,6 +58,7 @@ typedef enum {
     QW_DT_U32,   /* packed 4-bit quantised weights */
     QW_DT_I32,
     QW_DT_U8,
+    QW_DT_I64,   /* the engram hash buffers; read at bind, never a kernel operand */
 } qw_dtype;
 
 const char *qw_dtype_name(qw_dtype d);
@@ -91,6 +92,10 @@ typedef struct {
     const qw_tensor *biases;
     int32_t in_features;
     int32_t out_features;
+    /* Weights per scale/bias pair: 64 for the 27B and our own conversions,
+     * 32 for MLX's Flash-Next builds.  Read from the tensors' shapes at bind,
+     * per tensor, and handed to the kernel, which is specialised for it. */
+    int32_t group_size;
 } qw_qlinear;
 
 /* An unquantised projection.  Only the MTP draft head has these: the base
@@ -127,10 +132,16 @@ typedef struct {
 
 /* Experts are BANKS: one quantised tensor holding every expert, quantised
  * along the input axis, so expert e is the contiguous slice
- * [e*out, (e+1)*out) of rows.  The router stays BF16 -- it decides top-k. */
+ * [e*out, (e+1)*out) of rows.  The router is BF16 -- it decides top-k; an MLX
+ * build stores it 8-bit, and it is dequantised to BF16 at load.
+ *
+ * Our converter fuses gate and up into one bank, as the checkpoint does; MLX
+ * splits them (`switch_mlp.gate_proj` / `up_proj`).  `split` says which. */
 typedef struct {
     const qw_tensor *router;         /* BF16 [n_experts, hidden] */
     qw_qlinear gate_up;              /* bank [E, 2*inter, hidden]; gate rows first */
+    qw_qlinear gate, up;             /* banks [E, inter, hidden], when split */
+    bool split;
     qw_qlinear down;                 /* bank [E, hidden, inter] */
     qw_qlinear sh_gate, sh_up, sh_down;   /* the shared expert, an ordinary SwiGLU */
     const qw_tensor *sh_gate_w;      /* BF16 [1, hidden]: sigmoid scales the shared expert */
@@ -154,6 +165,12 @@ typedef struct {
      * ~2.5M rows in the real checkpoint, host-only (see qw_tensor.cpu).
      * shard_start[i] is the first global row of shard i; [n_shards] the total. */
     const qw_tensor *shard[QW_MAX_ENGRAM_SHARDS];
+    /* An MLX build quantises the table, 4-bit in groups of `q_group`: then
+     * shard[] holds the packed words [rows, head_dim/8] and these the
+     * per-group scales and biases [rows, head_dim/q_group]. */
+    const qw_tensor *shard_scales[QW_MAX_ENGRAM_SHARDS];
+    const qw_tensor *shard_biases[QW_MAX_ENGRAM_SHARDS];
+    int32_t q_group;                 /* 0: BF16 rows */
     int64_t shard_start[QW_MAX_ENGRAM_SHARDS + 1];
     int32_t n_shards;
     qw_qlinear key_proj, value_proj;
@@ -324,6 +341,12 @@ typedef struct {
     int32_t bos_token_id;
     int32_t eos_token_ids[8];
     int32_t n_eos;
+    /* The model's own end-of-text token, text_config.eos_token_id -- not the
+     * list above, which is when generation STOPS and leads with <|im_end|>.
+     * Flash-Next's engram hash pads a sequence's start with it and resets its
+     * n-gram context only where it occurs, so an <|im_end|> between chat
+     * turns is ordinary context.  Falls back to the first stop token. */
+    int32_t model_eos;
     int32_t image_token_id, video_token_id;
     int32_t vision_start_token_id, vision_end_token_id;
 
@@ -472,7 +495,7 @@ float qw_bf16_to_f32_c(uint16_t v);
 
 void qw_cpu_qmv_q4(float *y, const float *x, const uint32_t *w,
                    const uint16_t *scales, const uint16_t *biases,
-                   int32_t k, int32_t n, int32_t rows);
+                   int32_t k, int32_t n, int32_t rows, int32_t group);
 
 void qw_cpu_rms_norm(float *y, const float *x, const uint16_t *w,
                      int32_t dim, int32_t rows, float eps, float out_scale);
@@ -508,7 +531,7 @@ void qw_cpu_rope_partial(float *x, const int32_t *pos, const uint8_t *axis,
                          int32_t head_dim, int32_t rotary_dim);
 void qw_cpu_embed_q4(float *y, const int32_t *tokens, const uint32_t *w,
                      const uint16_t *scales, const uint16_t *biases,
-                     int32_t hidden, int32_t n_tokens);
+                     int32_t hidden, int32_t n_tokens, int32_t group);
 
 float    qw_f16_to_f32_c(uint16_t v);
 uint16_t qw_f32_to_f16_c(float v);
@@ -523,7 +546,7 @@ void qw_cpu_attn_decode(float *out, const float *q, const uint16_t *kc,
 
 /* Dequantises one full row of a quantised linear into `out` (length k). */
 void qw_cpu_dequant_row(float *out, const uint32_t *w, const uint16_t *scales,
-                        const uint16_t *biases, int32_t k, int32_t row);
+                        const uint16_t *biases, int32_t k, int32_t row, int32_t group);
 
 /* Diagnostics for the Metal forward: stop after `layer` (-1 runs it all),
  * and read the residual streams of the last chunk, [rows, hc_hidden]. */
@@ -554,6 +577,7 @@ void           qw_flash_ref_debug(qw_flash_ref *r, bool on);
 const int32_t *qw_flash_ref_routes(const qw_flash_ref *r, int32_t layer, int32_t pos);
 const uint8_t *qw_flash_ref_mask(const qw_flash_ref *r, int32_t layer, int32_t pos);
 float          qw_flash_ref_select_gap(const qw_flash_ref *r, int32_t layer, int32_t pos);
+float          qw_flash_ref_route_gap(const qw_flash_ref *r, int32_t layer, int32_t pos);
 /* The engram hash, exposed for the cross-check against the checkpoint's
  * own multipliers. */
 void qw_ple_multipliers(int64_t out[8], int64_t unigram_vocab, int32_t ngram_size,
@@ -562,7 +586,8 @@ void qw_ple_multipliers(int64_t out[8], int64_t unigram_vocab, int32_t ngram_siz
  * back, `in_seg` its position within the EOS-delimited segment. */
 void qw_ple_ids(const qw_ple *P, const qw_config *c, const int32_t *hist, int32_t in_seg,
                 int64_t *ids);
-/* One row of the engram table, wherever its shard is. */
-const uint16_t *qw_ple_row(const qw_ple *P, int64_t row);
+/* One row of the engram table, wherever its shard is, as head_dim floats --
+ * dequantised when the table is quantised. */
+void qw_ple_row(const qw_ple *P, int64_t row, float *out);
 
 #endif /* QWASAR_MODEL_H */

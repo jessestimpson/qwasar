@@ -283,6 +283,42 @@ void qw_cmd_free(qw_cmd c) {
     free(c);
 }
 
+/* A quantised kernel specialised for its group: the function constant
+ * qw_qgroup_fc, one pipeline per (kernel, group).  Metal will not build a
+ * pipeline from a function that reads a function constant without one, even
+ * an optional constant, so 64 is specialised too. */
+static id<MTLComputePipelineState> qw_pipeline_q(NSString *name, int32_t group) {
+    if (group == 0) group = 64;
+    NSString *key = [NSString stringWithFormat:@"%@/g%d", name, group];
+    id<MTLComputePipelineState> ps = g_pipelines[key];
+    if (ps) return ps;
+
+    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+    uint32_t g = (uint32_t)group;
+    [cv setConstantValue:&g type:MTLDataTypeUInt atIndex:0];
+    NSError *err = nil;
+    id<MTLFunction> fn = [g_library newFunctionWithName:name constantValues:cv error:&err];
+    if (!fn) {
+        fprintf(stderr, "qwasar: Metal function %s (group %d): %s\n", [name UTF8String], group,
+                [[err localizedDescription] UTF8String]);
+        return nil;
+    }
+    MTLComputePipelineDescriptor *desc = [MTLComputePipelineDescriptor new];
+    desc.computeFunction = fn;
+    if (g_archive) desc.binaryArchives = @[ g_archive ];
+    ps = [g_device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone
+                                              reflection:nil error:&err];
+    if (!ps) {
+        fprintf(stderr, "qwasar: pipeline %s (group %d) failed: %s\n", [name UTF8String], group,
+                [[err localizedDescription] UTF8String]);
+        return nil;
+    }
+    if (g_archive && [g_archive addComputePipelineFunctionsWithDescriptor:desc error:nil])
+        g_archive_dirty = true;
+    g_pipelines[key] = ps;
+    return ps;
+}
+
 /* ---- ops ------------------------------------------------------------------ */
 
 static void qw_set(id<MTLComputeCommandEncoder> enc, qw_ref r, NSUInteger idx) {
@@ -293,9 +329,9 @@ typedef struct { uint32_t k, n, rows; } qw_matmul_args;
 
 void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
-                  int32_t k, int32_t n, int32_t rows) {
+                  int32_t k, int32_t n, int32_t rows, int32_t group) {
     if (!c || !c->enc) return;
-    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_qmv_q4_g64");
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmv_q4_g64", group);
     if (!ps) return;
 
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
@@ -319,7 +355,7 @@ void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
 
 void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
-                  int32_t k, int32_t n, int32_t rows) {
+                  int32_t k, int32_t n, int32_t rows, int32_t group) {
     if (!c || !c->enc) return;
     /* The tile walks K in steps of 32 with no remainder handling; every
      * projection in this model has k divisible by 64, so refuse loudly rather
@@ -328,7 +364,7 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
         fprintf(stderr, "qwasar: qmm needs k divisible by %d, got %d\n", QW_QMM_BK, k);
         return;
     }
-    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_qmm_q4_g64");
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmm_q4_g64", group);
     if (!ps) return;
 
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
@@ -353,9 +389,9 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
  * kernel has to spare. */
 void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
                    qw_ref w, qw_ref scales, qw_ref biases,
-                   int32_t k, int32_t n, int32_t rows) {
+                   int32_t k, int32_t n, int32_t rows, int32_t group) {
     if (!c || !c->enc) return;
-    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_qmvb_q4_g64");
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmvb_q4_g64", group);
     if (!ps) return;
 
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
@@ -434,13 +470,13 @@ void qw_op_dmm_bf16(qw_cmd c, qw_ref y, qw_ref x, qw_ref w,
 
 void qw_op_qmat_q4(qw_cmd c, qw_ref y, qw_ref x,
                    qw_ref w, qw_ref scales, qw_ref biases,
-                   int32_t k, int32_t n, int32_t rows) {
+                   int32_t k, int32_t n, int32_t rows, int32_t group) {
     if (rows >= QW_QMM_MIN_ROWS && k % 32 == 0)
-        qw_op_qmm_q4(c, y, x, w, scales, biases, k, n, rows);
+        qw_op_qmm_q4(c, y, x, w, scales, biases, k, n, rows, group);
     else if (rows > 1)
-        qw_op_qmvb_q4(c, y, x, w, scales, biases, k, n, rows);
+        qw_op_qmvb_q4(c, y, x, w, scales, biases, k, n, rows, group);
     else
-        qw_op_qmv_q4(c, y, x, w, scales, biases, k, n, rows);
+        qw_op_qmv_q4(c, y, x, w, scales, biases, k, n, rows, group);
 }
 
 typedef struct { uint32_t dim, rows; float eps, out_scale; uint32_t has_weight; } qw_norm_args;
@@ -693,9 +729,9 @@ typedef struct { uint32_t hidden, n_tokens; } qw_embed_args;
 
 void qw_op_embed_q4(qw_cmd c, qw_ref y, qw_ref tokens,
                     qw_ref w, qw_ref scales, qw_ref biases,
-                    int32_t hidden, int32_t n_tokens) {
+                    int32_t hidden, int32_t n_tokens, int32_t group) {
     if (!c || !c->enc) return;
-    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_embed_q4");
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_embed_q4", group);
     if (!ps) return;
 
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
@@ -984,8 +1020,13 @@ void qw_op_moe_route(qw_cmd c, qw_ref idx, qw_ref w, qw_ref logits,
 
 void qw_op_qmv_q4_bank(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
                        qw_ref w, qw_ref scales, qw_ref biases,
-                       int32_t k, int32_t n, int32_t pairs, int32_t K, bool x_by_pair) {
-    QW_BEGIN("qw_qmv_q4_bank")
+                       int32_t k, int32_t n, int32_t pairs, int32_t K, bool x_by_pair,
+                       int32_t group) {
+    if (!c || !c->enc) return;
+    id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmv_q4_bank", group);
+    if (!ps) return;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
     qw_set(enc, w, 0); qw_set(enc, scales, 1); qw_set(enc, biases, 2);
     qw_set(enc, x, 3); qw_set(enc, idx, 4); qw_set(enc, y, 5);
     qw_bank_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)pairs, (uint32_t)K, x_by_pair ? 1u : 0u };

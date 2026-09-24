@@ -36,9 +36,9 @@ static const void *tdata(const qw_tensor *t) {
 static void qmv(float *y, const float *x, const qw_qlinear *q, int64_t row0, int32_t rows) {
     const int32_t k = q->in_features;
     const uint32_t *w = (const uint32_t *)tdata(q->weight) + (size_t)row0 * (k / 8);
-    const uint16_t *s = (const uint16_t *)tdata(q->scales) + (size_t)row0 * (k / 64);
-    const uint16_t *b = (const uint16_t *)tdata(q->biases) + (size_t)row0 * (k / 64);
-    qw_cpu_qmv_q4(y, x, w, s, b, k, rows, 1);
+    const uint16_t *s = (const uint16_t *)tdata(q->scales) + (size_t)row0 * (k / q->group_size);
+    const uint16_t *b = (const uint16_t *)tdata(q->biases) + (size_t)row0 * (k / q->group_size);
+    qw_cpu_qmv_q4(y, x, w, s, b, k, rows, 1, q->group_size);
 }
 static void qlin(float *y, const float *x, const qw_qlinear *q) { qmv(y, x, q, 0, q->out_features); }
 
@@ -103,14 +103,28 @@ void qw_ple_multipliers(int64_t out[8], int64_t unigram_vocab, int32_t ngram_siz
     }
 }
 
-const uint16_t *qw_ple_row(const qw_ple *P, int64_t row) {
+void qw_ple_row(const qw_ple *P, int64_t row, float *out) {
     int32_t lo = 0, hi = P->n_shards - 1;
     while (lo < hi) {
         const int32_t mid = (lo + hi + 1) / 2;
         if (P->shard_start[mid] <= row) lo = mid; else hi = mid - 1;
     }
-    const qw_tensor *t = P->shard[lo];
-    return (const uint16_t *)qw_tensor_data(t) + (size_t)(row - P->shard_start[lo]) * P->head_dim;
+    const int64_t local = row - P->shard_start[lo];
+    const int32_t HD = P->head_dim;
+    if (!P->q_group) {
+        const uint16_t *r = (const uint16_t *)qw_tensor_data(P->shard[lo]) + (size_t)local * HD;
+        for (int32_t i = 0; i < HD; i++) out[i] = qw_bf16_to_f32_c(r[i]);
+        return;
+    }
+    /* 4-bit, MLX affine: w = scale * nibble + bias, per group of q_group. */
+    const int32_t groups = HD / P->q_group;
+    const uint32_t *w = (const uint32_t *)qw_tensor_data(P->shard[lo]) + (size_t)local * (HD / 8);
+    const uint16_t *sc = (const uint16_t *)qw_tensor_data(P->shard_scales[lo]) + (size_t)local * groups;
+    const uint16_t *bi = (const uint16_t *)qw_tensor_data(P->shard_biases[lo]) + (size_t)local * groups;
+    for (int32_t i = 0; i < HD; i++) {
+        const float s = qw_bf16_to_f32_c(sc[i / P->q_group]), b = qw_bf16_to_f32_c(bi[i / P->q_group]);
+        out[i] = s * (float)((w[i / 8] >> (4 * (i % 8))) & 0xF) + b;
+    }
 }
 
 /* torch.remainder: the result takes the divisor's sign, i.e. non-negative. */
@@ -126,7 +140,7 @@ static int64_t pymod(int64_t a, int64_t p) {
  * contiguous: bigram heads first, then trigram. */
 void qw_ple_ids(const qw_ple *P, const qw_config *c, const int32_t *hist, int32_t in_seg,
                 int64_t *ids) {
-    const int32_t eos = c->eos_token_ids[0];
+    const int32_t eos = c->model_eos;
     const int32_t per = c->heads_per_ngram;
     int64_t shifted[8];
     for (int32_t s = 0; s < c->ngram_size && s < 8; s++)
@@ -173,6 +187,7 @@ struct qw_flash_ref {
     int32_t *dbg_routes;     /* [layers][max_ctx][K] */
     uint8_t *dbg_mask;       /* [layers][max_ctx][max_ctx] */
     float   *dbg_gap;        /* [layers][max_ctx]: k-th minus (k+1)-th block score */
+    float   *dbg_route_gap;  /* [layers][max_ctx]: k-th minus (k+1)-th router probability */
     int32_t  cur_layer;
 };
 
@@ -183,12 +198,16 @@ void qw_flash_ref_debug(qw_flash_ref *r, bool on) {
     if (!r->dbg_routes) r->dbg_routes = calloc((size_t)NL * C * K, sizeof(int32_t));
     if (!r->dbg_mask)   r->dbg_mask   = calloc((size_t)NL * C * C, 1);
     if (!r->dbg_gap)    r->dbg_gap    = calloc((size_t)NL * C, sizeof(float));
+    if (!r->dbg_route_gap) r->dbg_route_gap = calloc((size_t)NL * C, sizeof(float));
 }
 const int32_t *qw_flash_ref_routes(const qw_flash_ref *r, int32_t layer, int32_t pos) {
     return r->dbg_routes ? r->dbg_routes + ((size_t)layer * r->max_ctx + pos) * r->c->num_experts_per_tok : NULL;
 }
 const uint8_t *qw_flash_ref_mask(const qw_flash_ref *r, int32_t layer, int32_t pos) {
     return r->dbg_mask ? r->dbg_mask + ((size_t)layer * r->max_ctx + pos) * r->max_ctx : NULL;
+}
+float qw_flash_ref_route_gap(const qw_flash_ref *r, int32_t layer, int32_t pos) {
+    return r->dbg_route_gap ? r->dbg_route_gap[(size_t)layer * r->max_ctx + pos] : 0.0f;
 }
 float qw_flash_ref_select_gap(const qw_flash_ref *r, int32_t layer, int32_t pos) {
     return r->dbg_gap ? r->dbg_gap[(size_t)layer * r->max_ctx + pos] : 0.0f;
@@ -232,7 +251,7 @@ void qw_flash_ref_free(qw_flash_ref *r) {
         free(r->L[i].kc); free(r->L[i].vc); free(r->L[i].ikeys);
     }
     free(r->L); free(r->ple_conv_state);
-    free(r->dbg_routes); free(r->dbg_mask); free(r->dbg_gap);
+    free(r->dbg_routes); free(r->dbg_mask); free(r->dbg_gap); free(r->dbg_route_gap);
     free(r);
 }
 
@@ -493,6 +512,12 @@ static void moe_step(qw_flash_ref *r, const qw_moe *M, const float *x, float *ou
         idx[n] = best; w[n] = logits[best]; wsum += w[n];
         logits[best] = -1.0f;
     }
+    if (r->dbg) {
+        /* How decisive the cut was: the k-th pick against the best one left. */
+        float next = 0.0f;
+        for (int32_t e = 0; e < E; e++) if (logits[e] > next) next = logits[e];
+        r->dbg_route_gap[(size_t)r->cur_layer * r->max_ctx + r->n_past] = w[K - 1] - next;
+    }
     if (c->norm_topk_prob) for (int32_t n = 0; n < K; n++) w[n] /= wsum;
     if (r->dbg) memcpy(r->dbg_routes + ((size_t)r->cur_layer * r->max_ctx + r->n_past) * K,
                        idx, (size_t)K * sizeof(int32_t));
@@ -503,7 +528,12 @@ static void moe_step(qw_flash_ref *r, const qw_moe *M, const float *x, float *ou
     float *y = malloc((size_t)H * sizeof(float));
     for (int32_t n = 0; n < K; n++) {
         const int64_t e = idx[n];
-        qmv(gu, x, &M->gate_up, e * (int64_t)(2 * I), 2 * I);
+        if (M->split) {
+            qmv(gu, x, &M->gate, e * (int64_t)I, I);
+            qmv(gu + I, x, &M->up, e * (int64_t)I, I);
+        } else {
+            qmv(gu, x, &M->gate_up, e * (int64_t)(2 * I), 2 * I);
+        }
         for (int32_t i = 0; i < I; i++) act[i] = silu(gu[i]) * gu[I + i];
         qmv(y, act, &M->down, e * (int64_t)H, H);
         for (int32_t i = 0; i < H; i++) out[i] += w[n] * y[i];
@@ -532,16 +562,13 @@ static void ple_step(qw_flash_ref *r, const qw_ple *P, const float *h4, float *o
     const int32_t E = c->ple_embed_dim, NH = P->n_heads, HD = P->head_dim;
     const int32_t per = c->heads_per_ngram;
     const int32_t pos = r->n_past;                 /* current position */
-    const int32_t eos = c->eos_token_ids[0];
+    const int32_t eos = c->model_eos;
 
     /* hashed ids, one per head, then the gather */
     int64_t ids[QW_MAX_NGRAM_HEADS];
     qw_ple_ids(P, c, r->hist, pos - 1 - r->last_eos, ids);
     float *emb = malloc((size_t)E * sizeof(float));
-    for (int32_t h = 0; h < NH; h++) {
-        const uint16_t *row = qw_ple_row(P, ids[h]);
-        for (int32_t i = 0; i < HD; i++) emb[(size_t)h * HD + i] = qw_bf16_to_f32_c(row[i]);
-    }
+    for (int32_t h = 0; h < NH; h++) qw_ple_row(P, ids[h], emb + (size_t)h * HD);
     (void)per; (void)eos;
 
     float *key = malloc((size_t)HH * sizeof(float));
@@ -616,7 +643,7 @@ bool qw_flash_ref_forward(qw_flash_ref *r, const int32_t *tokens, int32_t n,
 
         qw_cpu_embed_q4(x, &tok, (const uint32_t *)tdata(emb->weight),
                         (const uint16_t *)tdata(emb->scales),
-                        (const uint16_t *)tdata(emb->biases), H, 1);
+                        (const uint16_t *)tdata(emb->biases), H, 1, emb->group_size);
         for (int32_t s = 0; s < c->hc_count; s++)
             memcpy(h4 + (size_t)s * H, x, (size_t)H * sizeof(float));
 
@@ -647,9 +674,9 @@ bool qw_flash_ref_forward(qw_flash_ref *r, const int32_t *tokens, int32_t n,
         hc_mix(r, qwasar_engine_final_hc(e), h4, nrm, x, NULL);
         qlin(logits + (size_t)t * c->vocab_size, x, qwasar_engine_head(e));
 
-        /* the EOS bookkeeping for the NEXT token's engram context */
-        for (int32_t k = 0; k < c->n_eos; k++)
-            if (tok == c->eos_token_ids[k]) { r->last_eos = pos; break; }
+        /* the EOS bookkeeping for the NEXT token's engram context: the
+         * model's own EOS, not every stop token */
+        if (tok == c->model_eos) r->last_eos = pos;
         r->n_past++;
     }
 

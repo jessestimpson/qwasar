@@ -79,15 +79,15 @@ const char *qw_cmd_error(qw_cmd c);
  * benchmarks. */
 void qw_op_qmat_q4(qw_cmd c, qw_ref y, qw_ref x,
                    qw_ref w, qw_ref scales, qw_ref biases,
-                   int32_t k, int32_t n, int32_t rows);
+                   int32_t k, int32_t n, int32_t rows, int32_t group);
 
 void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
-                  int32_t k, int32_t n, int32_t rows);
+                  int32_t k, int32_t n, int32_t rows, int32_t group);
 
 void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
-                  int32_t k, int32_t n, int32_t rows);
+                  int32_t k, int32_t n, int32_t rows, int32_t group);
 
 /* y = x * w^T for an unquantised bf16 weight, blocked like qw_op_qmvb_q4.
  * Only the MTP draft head is dense. */
@@ -103,7 +103,7 @@ void qw_op_dmm_bf16(qw_cmd c, qw_ref y, qw_ref x, qw_ref w,
  * Correct for any row count; only worth calling below QW_QMM_MIN_ROWS. */
 void qw_op_qmvb_q4(qw_cmd c, qw_ref y, qw_ref x,
                    qw_ref w, qw_ref scales, qw_ref biases,
-                   int32_t k, int32_t n, int32_t rows);
+                   int32_t k, int32_t n, int32_t rows, int32_t group);
 
 /* Token count at or above which qw_op_qmat_q4 switches to the tiled matmul.
  *
@@ -255,7 +255,7 @@ void qw_op_gated_delta(qw_cmd c, qw_ref y, qw_ref q, qw_ref k, qw_ref v,
 /* Dequantises one embedding row per token into y[n_tokens, hidden]. */
 void qw_op_embed_q4(qw_cmd c, qw_ref y, qw_ref tokens,
                     qw_ref w, qw_ref scales, qw_ref biases,
-                    int32_t hidden, int32_t n_tokens);
+                    int32_t hidden, int32_t n_tokens, int32_t group);
 
 /* Partial multimodal RoPE, applied in place to [rows, heads, head_dim].
  *
@@ -359,7 +359,8 @@ void qw_op_moe_route(qw_cmd c, qw_ref idx, qw_ref w, qw_ref logits,
 /* y[p] = bank[idx[p]] . x[x_by_pair ? p : p / K] for `pairs` (token, slot) pairs. */
 void qw_op_qmv_q4_bank(qw_cmd c, qw_ref y, qw_ref x, qw_ref idx,
                        qw_ref w, qw_ref scales, qw_ref biases,
-                       int32_t k, int32_t n, int32_t pairs, int32_t K, bool x_by_pair);
+                       int32_t k, int32_t n, int32_t pairs, int32_t K, bool x_by_pair,
+                       int32_t group);
 /* act[p, i] = silu(gu[p, i]) * gu[p, I+i]. */
 void qw_op_swiglu_split(qw_cmd c, qw_ref act, qw_ref gu, int32_t pairs, int32_t I);
 /* out[r] = sum_k w[r, k] * y[r*K + k]. */

@@ -1,9 +1,20 @@
 /* The Flash-Next (qwen4_exp) family, against the reference.
  *
- * Loads the toy checkpoint tools/flashnext_tiny.py built and
- * tools/flashnext_convert.py quantised, and holds the engine's CPU reference
- * forward to the logits `transformers` produced from the SAME dequantised
- * values (tools/flashnext_oracle.py).  Every feature of the real model is on
+ * Two fixtures, one toy, two on-disk formats:
+ *
+ *   flashnext-tiny-q4   our converter's (tools/flashnext_convert.py): group 64,
+ *                       fused expert banks, BF16 engram table, gains folded.
+ *                       Held to `transformers` on the SAME dequantised values
+ *                       (tools/flashnext_oracle.py), routing and selection
+ *                       included.
+ *   flashnext-tiny-mlx  MLX's (tools/flashnext_mlx_toy.py, through mlx-vlm's own
+ *                       conversion code): group 32, 8-bit router, split
+ *                       banks, 4-bit engram table, gains centred at zero --
+ *                       the format of mlx-community's Flash-Next build.  Held
+ *                       to mlx-vlm run on those same files.
+ *
+ * For each, the engine's CPU reference forward is held to the oracle and the
+ * Metal forward to the CPU reference.  Every feature of the real model is on
  * in the toy -- four residual streams, MoE with a shared expert, the sigmoid
  * DeltaNet gate, QSA selecting blocks past 11 visible tokens, one PLE layer
  * with an EOS mid-prompt -- so a mechanic that is wrong anywhere shows up as
@@ -42,14 +53,14 @@ static int32_t read_floats(const qj_doc *d, const qj_node *arr, float *out, int3
     return n;
 }
 
-int main(void) {
-    const char *dir = "tests/fixtures/flashnext-tiny-q4";
+static void check_fixture(const char *dir, bool mlx) {
     char err[512] = "";
+    printf("== %s\n", dir);
 
     qwasar_options o = { .model_path = dir, .context_size = 256 };
     qwasar_engine *e = qwasar_engine_load(&o, err, sizeof err);
     CHECK(e != NULL, "load %s: %s", dir, err);
-    if (!e) return 1;
+    if (!e) return;
     const qw_config *c = qwasar_engine_config(e);
     CHECK(c->family == QW_FAMILY_QWEN4_EXP, "family");
     CHECK(c->ple_layer == 1, "ple_layer = %d, expected 1 (zero-indexed)", c->ple_layer);
@@ -73,13 +84,30 @@ int main(void) {
                   (long long)P->head_size[i], (long long)want_size[i]);
         CHECK(P->head_off[15] == 2027, "head 15 offset %lld", (long long)P->head_off[15]);
         CHECK(P->table_rows == 2304, "table rows %lld", (long long)P->table_rows);
+        CHECK(P->q_group == (mlx ? 32 : 0), "engram table group %d", P->q_group);
+    }
+
+    /* The format was read the way it was written. */
+    const qw_layer *L0 = qwasar_engine_layer(e, 0);
+    CHECK(L0->moe.split == mlx, "expert banks %s", L0->moe.split ? "split" : "fused");
+    CHECK(qwasar_engine_embed(e)->group_size == (mlx ? 32 : 64), "embedding group %d",
+          qwasar_engine_embed(e)->group_size);
+    CHECK(L0->moe.router && L0->moe.router->dtype == QW_DT_BF16, "router bound as BF16");
+    {
+        /* Every (1+w) gain carries its +1 once bound, whichever way it was
+         * stored: a gain near zero here is a norm that zeroes its input. */
+        const uint16_t *g = qw_tensor_data(L0->attn_hc.hc_norm);
+        double sum = 0.0;
+        for (int64_t i = 0; i < L0->attn_hc.hc_norm->shape[0]; i++) sum += qw_bf16_to_f32_c(g[i]);
+        const double mean = sum / (double)L0->attn_hc.hc_norm->shape[0];
+        CHECK(mean > 0.5 && mean < 1.5, "layer 0 hyper-connection gain averages %.3f once bound", mean);
     }
 
     /* The oracle. */
     char path[512];
     snprintf(path, sizeof path, "%s/oracle.json", dir);
     qj_doc d;
-    if (!qj_parse_file(&d, path)) { CHECK(false, "cannot parse %s: %s", path, d.err); return 1; }
+    if (!qj_parse_file(&d, path)) { CHECK(false, "cannot parse %s: %s", path, d.err); return; }
     const qj_node *root = qj_root(&d);
     const qj_node *tk = qj_get(&d, root, "tokens");
     int32_t tokens[64];
@@ -88,8 +116,12 @@ int main(void) {
     const int32_t vocab = (int32_t)qj_int_or(&d, root, "vocab", 0);
     CHECK(vocab == c->vocab_size, "vocab %d vs config %d", vocab, c->vocab_size);
 
+    /* The engine's reference steps one token at a time; mlx-vlm's prefill and
+     * its decode differ by ~1e-3 on this toy, so its decode is the like-for-
+     * like comparison.  transformers' two agree, and the prefill is kept. */
     float *want = malloc((size_t)n * vocab * sizeof(float));
-    int32_t got_n = read_floats(&d, qj_get(&d, root, "logits_full"), want, n * vocab);
+    int32_t got_n = read_floats(&d, qj_get(&d, root, mlx ? "logits_step" : "logits_full"),
+                                want, n * vocab);
     CHECK(got_n == n * vocab, "oracle logits: %d values, expected %d", got_n, n * vocab);
     const int32_t HH = qwasar_engine_shape(e)->hc_hidden;
     const int32_t NL = c->num_hidden_layers;
@@ -120,7 +152,7 @@ int main(void) {
      * differs at one position with these equal is a bug; with these unequal
      * it is a tie -- and the gap check below says a tie is the fixture's
      * fault, not the engine's. */
-    {
+    if (qj_get(&d, root, "routes_per_layer")) {
         const int32_t K = c->num_experts_per_tok;
         int32_t route_bad = 0, mask_bad = 0;
         const qj_node *rl = qj_get(&d, root, "routes_per_layer");
@@ -160,6 +192,17 @@ int main(void) {
                 }
             }
         }
+        printf("  routing: %d expert choices differ; selection: %d mask entries differ\n",
+               route_bad, mask_bad);
+        CHECK(route_bad == 0, "%d expert choices differ from the oracle", route_bad);
+        CHECK(mask_bad == 0, "%d QSA mask entries differ from the oracle", mask_bad);
+    }
+
+    /* How decisive the fixture's block selection is, from the reference alone:
+     * a cut between two near-equal scores is a coin two correct
+     * implementations may toss differently, and then nothing downstream can
+     * be compared. */
+    {
         float min_gap = FLT_MAX;
         for (int32_t i = 0; i < NL; i++) {
             if (qwasar_engine_layer(e, i)->is_linear_attn) continue;
@@ -169,12 +212,18 @@ int main(void) {
                 if (g < min_gap) min_gap = g;
             }
         }
-        printf("  routing: %d expert choices differ; selection: %d mask entries differ; "
-               "least decisive block cut %.3e\n", route_bad, mask_bad, min_gap);
+        printf("  least decisive block cut %.3e\n", min_gap);
         CHECK(min_gap > 1e-4f, "the fixture has a near-tie in block selection (gap %.3e); regenerate it", min_gap);
-        CHECK(route_bad == 0, "%d expert choices differ from the oracle", route_bad);
-        CHECK(mask_bad == 0, "%d QSA mask entries differ from the oracle", mask_bad);
     }
+
+    /* How close the oracle can be held.  transformers agrees with itself
+     * (prefill vs decode) to ~1e-7 and the engine meets it at ~5e-7.  mlx-vlm
+     * does not: its own prefill and decode differ by 8.7e-4 on this toy, and
+     * the engine sits within ~2e-3 per layer and ~4e-3 on logits of it, with
+     * no argmax flips -- matching mlx-vlm's BF16 rounding of the 8-bit router
+     * moves that by nothing measurable.  A wrong format decision (a group, a
+     * +1, a bank) is off by 0.1 or more, so these bounds still catch one. */
+    const float tol_layer = mlx ? 5e-3f : 1e-3f, tol_logit = mlx ? 1e-2f : 2e-3f;
 
     /* Per-layer, per-position residuals: name the first place that diverges. */
     for (int32_t i = 0; i < NL; i++) {
@@ -187,7 +236,7 @@ int main(void) {
                 if (fabsf(a - b) > md) { md = fabsf(a - b); at = t; }
                 if (fabsf(b) > scale) scale = fabsf(b);
             }
-        const bool pass = md <= 1e-3f * (scale > 1.0f ? scale : 1.0f);
+        const bool pass = md <= tol_layer * (scale > 1.0f ? scale : 1.0f);
         printf("  layer %d (%s%s): residual max |diff| %.2e at position %d (scale %.2f)%s\n", i,
                qwasar_engine_layer(e, i)->is_linear_attn ? "delta" : "qsa",
                qwasar_engine_layer(e, i)->ple ? "+ple" : "", md, at, scale,
@@ -210,11 +259,11 @@ int main(void) {
         }
         if (mt > md) { md = mt; worst = t; }
         if (ag != aw) argmax_mismatch++;
-        if (mt > 2e-3f) printf("  position %d: max |diff| %.2e\n", t, mt);
+        if (mt > tol_logit) printf("  position %d: max |diff| %.2e\n", t, mt);
     }
     printf("  logits: max |diff| %.2e (position %d) over %d positions, argmax mismatches %d\n",
            md, worst, n, argmax_mismatch);
-    CHECK(md < 2e-3f, "logits max |diff| %.3e", md);
+    CHECK(md < tol_logit, "logits max |diff| %.3e", md);
     CHECK(argmax_mismatch == 0, "%d argmax mismatches", argmax_mismatch);
 
     /* And the same sequence split across two calls: the state must carry. */
@@ -308,7 +357,26 @@ int main(void) {
     free(want); free(want_h); free(got); free(got_hid); free(got2);
     qj_free(&d);
     qwasar_engine_free(e);
+}
 
+/* A model that does not fit in free memory is refused before anything is
+ * mapped -- wired weights past that point take the whole machine down. */
+static void check_memory_guard(void) {
+    char err[512] = "";
+    setenv("QWASAR_MEMORY_FREE_GB", "0.5", 1);
+    qwasar_options o = { .model_path = "tests/fixtures/flashnext-tiny-mlx", .context_size = 256 };
+    qwasar_engine *e = qwasar_engine_load(&o, err, sizeof err);
+    CHECK(e == NULL, "a model larger than free memory loaded");
+    CHECK(strstr(err, "free now") != NULL, "refusal says why: %s", err);
+    qwasar_engine_free(e);
+    unsetenv("QWASAR_MEMORY_FREE_GB");
+    printf("== memory guard: %s\n", e ? "LOADED" : "refused as it should be");
+}
+
+int main(void) {
+    check_memory_guard();
+    check_fixture("tests/fixtures/flashnext-tiny-q4", false);
+    check_fixture("tests/fixtures/flashnext-tiny-mlx", true);
     if (fails) { fprintf(stderr, "%d failure(s)\n", fails); return 1; }
     printf("flashnext: all checks pass\n");
     return 0;

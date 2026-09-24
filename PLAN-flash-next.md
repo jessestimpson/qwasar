@@ -385,6 +385,63 @@ weights need the Max:
 3. Phase 7 (MTP), the checkpoint format for the indexer cache and engram
    state, and Crucible's `MemoryProfile` for a 70 GB model (Phase 8).
 
+## Status — 2026-09-24, on the M5 Max: the real model runs
+
+**The weights are mlx-community's build, not ours.** By September mlx-vlm had
+`qwen4_exp`, and `mlx-community/Qwen3.8-Flash-Next-4bit` (111.5 GB, made with
+mlx-vlm `d1bd74ed`) was on the hub.  Rather than convert 360 GB ourselves, the
+engine learned that build's format.  It differs from our converter's in six
+ways, each now handled at load:
+
+| | our converter | mlx-community |
+|---|---|---|
+| quantisation group | 64 | **32** (kernels take the group as a Metal function constant) |
+| router, shared-expert gate | BF16 | **8-bit, group 64** -- dequantised to BF16 at load |
+| block-inject weights | BF16 | 4-bit -- dequantised at load |
+| expert banks | fused `gate_up_proj` | **split** `switch_mlp.gate_proj` / `up_proj` |
+| engram table | BF16 `shard_N` files, `placement: cpu` | **4-bit** `shards.N`, mixed into model files |
+| (1+w) gains | +1 folded | **centred at zero** -- detected from the gains' mean, not the format |
+
+Two loader facts the toys could not have shown: MLX's writer packs tensors with
+no padding, so one odd-length BF16 tensor leaves **62 of the 80 GB of device
+tensors 2 bytes off 4-byte alignment** -- those files are repacked into aligned
+buffers at load (`pread` with `F_NOCACHE`, so nothing is held twice) -- and the
+engram shards share files with ordinary weights, so host-only placement is now
+by tensor name and a file's device buffer spans only its device tensors.
+
+**There is a real-weight oracle after all.** transformers cannot hold the BF16
+checkpoint, but mlx-vlm holds the 4-bit build.  `tools/flashnext_real_oracle.py`
+records its logits and greedy continuations; `tests/test_flashnext_real`
+(opt-in, `QWASAR_TEST_FLASHNEXT=<dir>`) holds the engine to them, and with
+`QWASAR_FLASHNEXT_CPU=<n>` holds Metal to the fp32 CPU reference on the real
+weights.  Results: Metal matches the CPU reference to ~1e-4 of the logit scale;
+against mlx-vlm, every top-1 agrees and greedy continuations match until a
+near-tie.  What remains between them is BF16 on mlx-vlm's side and **routing
+ties**: every layer takes 10 of 512 experts, and a 10th and 11th within ~1e-7
+are picked by summation order.  One such tie moves the logits a few percent
+from that token on, and neither side is wrong.  The toy fixture
+`flashnext-tiny-mlx` goes through mlx-vlm's own conversion code and is held to
+mlx-vlm in fp32 (`tools/flashnext_mlx_toy.py`).
+
+**The oracle found a bug the toys could not.** The engram hash pads a sequence
+and resets its n-gram context at the model's own EOS, `text_config.eos_token_id`
+= 248044 (`<|endoftext|>`) -- not at the first stop token, 248046
+(`<|im_end|>`), which is what the engine used.  Toys have one EOS.  The effect
+was every position's engram rows at a sequence start, and a context reset at
+every chat turn boundary.  `qw_config.model_eos` now carries it.
+
+**Memory is a hard limit, and it was hit.** 111 GB on disk, ~74 GB wired for
+the weights (the engram table stays on disk), ~83 GB with margin.  Running that
+beside an fp32 mlx-vlm oracle (110 GB) and other work drove the machine into a
+watchdog panic.  The engine now refuses, before mapping anything, a model that
+does not fit in the memory free at the time (`QWASAR_SKIP_MEMORY_CHECK=1`
+overrides).  One large model process at a time.
+
+**First numbers** (M5 Max, no tuning): decode ~10.7 t/s, prefill ~64 t/s on a
+31-token prompt, load ~50--60 s (most of it the alignment repack).  The plan's
+target band is 30--60 t/s; the two kernels named under "Speed" above are the
+reason, and nothing about them has changed yet.
+
 ## 4. Risks, named
 
 - **The engram hash** (silent quality rot; caught only by Phase 5's gate —

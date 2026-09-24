@@ -37,18 +37,29 @@ using namespace metal;
 /* ---- MLX affine 4-bit dequantisation -------------------------------------
  *
  *   weight  U32  [out, in/8]    element i of a row is at bit 4*(i%8) of word i/8
- *   scales  BF16 [out, in/64]
- *   biases  BF16 [out, in/64]
+ *   scales  BF16 [out, in/G]
+ *   biases  BF16 [out, in/G]
  *
- *   w[o][i] = scales[o][i/64] * nibble(o, i) + biases[o][i/64]
+ *   w[o][i] = scales[o][i/G] * nibble(o, i) + biases[o][i/G]      G = group
  *
  * The nibble is unsigned in [0,15]; there is no separate zero point, the bias
  * absorbs it.  Scales are signed, so a "min" of a group can be either end. */
 
 #define QW_QBITS       4
-#define QW_QGROUP      64
 #define QW_QPER_WORD   8    /* 32 / QW_QBITS */
-#define QW_WORDS_PER_GROUP (QW_QGROUP / QW_QPER_WORD)   /* 8 */
+
+/* The group is a function constant, not a macro: the 27B and our own
+ * conversions quantise in groups of 64, MLX's Flash-Next builds in groups of
+ * 32, and the host builds one pipeline per group a model uses.  It is
+ * compiled in as a literal either way, so the division below costs what it
+ * did when 64 was spelled out.  Any multiple of 8 works -- a packed word never
+ * spans two groups.  Metal requires the constant to be supplied for every
+ * pipeline built from a kernel that reads it (qw_pipeline_q in
+ * qwasar_metal.m); the fallback below serves only `make check-metal`. */
+constant uint qw_qgroup_fc [[function_constant(0)]];
+constant uint qw_qgroup = is_function_constant_defined(qw_qgroup_fc) ? qw_qgroup_fc : 64;
+#define QW_QGROUP          qw_qgroup
+#define QW_WORDS_PER_GROUP (QW_QGROUP / QW_QPER_WORD)
 
 /* Unpacks the 8 nibbles of one word into floats, low nibble first. */
 inline void qw_unpack8(uint w, thread float *out) {
