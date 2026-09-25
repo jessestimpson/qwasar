@@ -438,7 +438,9 @@ void qw_prof_report(FILE *out, long tokens) {
             1e3 * total / (tokens > 0 ? (double)tokens : 1.0));
 }
 
-void qw_prof_reset(void) { g_prof_n = 0; }
+/* Entries are reused by label order, so their sums go too -- a decode table
+ * once carried the prefill's time in it. */
+void qw_prof_reset(void) { memset(g_prof, 0, sizeof g_prof); g_prof_n = 0; }
 
 const char *qw_cmd_error(qw_cmd c) {
     return (c && c->err[0]) ? c->err : NULL;
@@ -1278,7 +1280,7 @@ typedef struct { uint32_t pairs, I; } qw_swiglu_split_args;
 typedef struct { uint32_t rows, K, H; } qw_combine_args;
 typedef struct { uint32_t rows, dim; } qw_rowscale_args;
 typedef struct { uint32_t rows, nq, d, ratio, base_pos, rotary_dim, max_blocks; float eps; } qw_qsa_score_args;
-typedef struct { uint32_t rows, ratio, base_pos, block_topk, max_ctx, max_blocks; } qw_qsa_select_args;
+typedef struct { uint32_t rows, ratio, base_pos, block_topk, max_ctx, max_blocks, list_cap; } qw_qsa_select_args;
 typedef struct { uint32_t channels, rows; } qw_dconv_args;
 
 /* The elementwise kernels share one launch shape. */
@@ -1553,29 +1555,63 @@ void qw_op_qsa_scores(qw_cmd c, qw_ref scores, qw_ref qn, qw_ref ikeys, qw_ref k
         threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
 }
 
-void qw_op_qsa_select(qw_cmd c, qw_ref mask, qw_ref scores, int32_t rows, int32_t ratio,
+typedef struct { uint32_t d, ratio, b0, n; float eps; } qw_qsa_pool_args;
+
+void qw_op_qsa_pool(qw_cmd c, qw_ref pool, qw_ref ikeys, qw_ref k_norm, qw_ref inv_freq,
+                    int32_t d, int32_t ratio, int32_t b0, int32_t b1, int32_t rotary_dim, float eps) {
+    if (b1 <= b0) return;
+    if (rotary_dim != 64 || d % 32 != 0 || d > 256) {
+        fprintf(stderr, "qwasar: QSA indexer shape (rotary %d, head %d) unsupported\n", rotary_dim, d);
+        return;
+    }
+    QW_BEGIN("qw_qsa_pool")
+    qw_set(enc, ikeys, 0); qw_set(enc, k_norm, 1); qw_set(enc, inv_freq, 2); qw_set(enc, pool, 3);
+    qw_qsa_pool_args args = { (uint32_t)d, (uint32_t)ratio, (uint32_t)b0, (uint32_t)(b1 - b0), eps };
+    [enc setBytes:&args length:sizeof args atIndex:4];
+    const NSUInteger nsg = 8, n = (NSUInteger)(b1 - b0);
+    [enc dispatchThreadgroups:MTLSizeMake((n + nsg - 1) / nsg, 1, 1) threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+}
+
+void qw_op_qsa_scores_pooled(qw_cmd c, qw_ref scores, qw_ref qn, qw_ref pool, int32_t rows,
+                             int32_t nq, int32_t d, int32_t ratio, int32_t base_pos, int32_t max_blocks) {
+    QW_BEGIN("qw_qsa_scores_pooled")
+    qw_set(enc, qn, 0); qw_set(enc, pool, 1); qw_set(enc, scores, 4);
+    qw_qsa_score_args args = { (uint32_t)rows, (uint32_t)nq, (uint32_t)d, (uint32_t)ratio,
+                               (uint32_t)base_pos, 64u, (uint32_t)max_blocks, 0.0f };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+    const NSUInteger nsg = 8;
+    const NSUInteger blocks = (NSUInteger)((base_pos + rows) / ratio);
+    if (blocks == 0) return;
+    [enc dispatchThreadgroups:MTLSizeMake((blocks + nsg - 1) / nsg, (NSUInteger)rows, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * nsg, 1, 1)];
+}
+
+void qw_op_qsa_select(qw_cmd c, qw_ref mask, qw_ref list, qw_ref scores, int32_t rows, int32_t ratio,
                       int32_t base_pos, int32_t block_topk, int32_t max_ctx, int32_t max_blocks) {
     QW_BEGIN("qw_qsa_select")
-    qw_set(enc, scores, 0); qw_set(enc, mask, 1);
+    qw_set(enc, scores, 0); qw_set(enc, mask, 1); qw_set(enc, list, 3);
     qw_qsa_select_args args = { (uint32_t)rows, (uint32_t)ratio, (uint32_t)base_pos,
-                                (uint32_t)block_topk, (uint32_t)max_ctx, (uint32_t)max_blocks };
+                                (uint32_t)block_topk, (uint32_t)max_ctx, (uint32_t)max_blocks,
+                                (uint32_t)qw_qsa_list_cap(block_topk, ratio) };
     [enc setBytes:&args length:sizeof args atIndex:2];
     /* One threadgroup of QW_SEL_THREADS (metal/sparse.metal) per query. */
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
 }
 
-void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache, qw_ref mask,
+void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache, qw_ref list,
                        int32_t rows, int32_t q_heads, int32_t kv_heads, int32_t head_dim,
-                       int32_t max_ctx, int32_t base_pos, float scale) {
+                       int32_t max_ctx, int32_t base_pos, float scale, int32_t block_topk, int32_t ratio) {
     if (head_dim != 256) {
         fprintf(stderr, "qwasar: attention head_dim %d unsupported (kernel is built for 256)\n", head_dim);
         return;
     }
     QW_BEGIN("qw_attn_masked")
-    qw_set(enc, q, 0); qw_set(enc, kcache, 1); qw_set(enc, vcache, 2); qw_set(enc, out, 3); qw_set(enc, mask, 4);
+    qw_set(enc, q, 0); qw_set(enc, kcache, 1); qw_set(enc, vcache, 2); qw_set(enc, out, 3); qw_set(enc, list, 4);
     qw_attn_args args = { (uint32_t)rows, (uint32_t)q_heads, (uint32_t)kv_heads,
                           (uint32_t)(q_heads / kv_heads), (uint32_t)max_ctx, (uint32_t)base_pos, scale };
     [enc setBytes:&args length:sizeof args atIndex:5];
+    const uint32_t list_cap = (uint32_t)qw_qsa_list_cap(block_topk, ratio);
+    [enc setBytes:&list_cap length:sizeof list_cap atIndex:6];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows * q_heads), 1, 1)
         threadsPerThreadgroup:MTLSizeMake(32 * 32, 1, 1)];
 }

@@ -39,6 +39,8 @@ struct qw_flash_state {
     qw_buf sh_g, sh_u, sh_out, sh_gs;
     /* QSA */
     qw_buf iqk, iq, iscores, mask, ikeys;   /* ikeys: [n_full, max_ctx, d] fp32 */
+    qw_buf qlist;                           /* per query: selected positions (qw_op_qsa_select) */
+    qw_buf ipool;                           /* [n_full, max_blocks, d] fp32 block keys (qw_op_qsa_pool) */
     int32_t max_blocks;
     /* PLE */
     qw_buf ple_emb, ple_key, ple_keyn, ple_val, ple_qn, ple_gv, ple_gvn, ple_conv, ple_state;
@@ -103,7 +105,11 @@ struct qw_flash_state *qw_flash_state_new(qwasar_session *s, char *err, size_t e
         { &f->iq,      (size_t)R * nq * d * 4, "index q" },
         { &f->iscores, (size_t)R * (f->max_blocks > 0 ? f->max_blocks : 1) * 4, "index scores" },
         { &f->mask,    (size_t)R * s->max_ctx, "qsa mask" },
+        { &f->qlist,   (size_t)R * (1 + qw_qsa_list_cap(c->indexer_budget / c->indexer_compress_ratio,
+                                                        c->indexer_compress_ratio)) * 4, "qsa list" },
         { &f->ikeys,   (size_t)sh->n_full_attn_layers * s->max_ctx * d * 4, "index keys" },
+        { &f->ipool,   (size_t)sh->n_full_attn_layers * (f->max_blocks > 0 ? f->max_blocks : 1) * d * 4,
+          "index block keys" },
     };
     for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
         *want[i].b = qw_buf_alloc(want[i].n);
@@ -153,7 +159,7 @@ void qw_flash_state_free(struct qw_flash_state *f) {
         &f->route_logits, &f->route_idx, &f->route_w, &f->exp_gu, &f->exp_act, &f->exp_y,
         &f->grp_perm, &f->grp_tiles, &f->grp_cursor,
         &f->sh_g, &f->sh_u, &f->sh_out, &f->sh_gs,
-        &f->iqk, &f->iq, &f->iscores, &f->mask, &f->ikeys,
+        &f->iqk, &f->iq, &f->iscores, &f->mask, &f->qlist, &f->ikeys, &f->ipool,
         &f->ple_emb, &f->ple_key, &f->ple_keyn, &f->ple_val, &f->ple_qn, &f->ple_gv,
         &f->ple_gvn, &f->ple_conv, &f->ple_state,
     };
@@ -169,8 +175,10 @@ void qw_flash_state_free(struct qw_flash_state *f) {
  * last few inputs; and the n-gram context -- the last eight tokens and where
  * the current segment began.  Scratch buffers are rebuilt by every step and
  * are not state. */
+/* The indexer keys up to n, and the block keys of the blocks they complete. */
 static size_t flash_ikeys_bytes(const qwasar_session *s, int32_t n) {
-    return (size_t)s->shape->n_full_attn_layers * (size_t)n * s->cfg->indexer_head_dim * 4;
+    const size_t blocks = (size_t)(n / s->cfg->indexer_compress_ratio);
+    return (size_t)s->shape->n_full_attn_layers * ((size_t)n + blocks) * s->cfg->indexer_head_dim * 4;
 }
 
 static size_t flash_ple_bytes(const qwasar_session *s) {
@@ -206,23 +214,29 @@ size_t qw_flash_state_bytes(const qwasar_session *s, int32_t n) {
 }
 
 char *qw_flash_pack(const qwasar_session *s, char *out) {
+    const struct qw_flash_state *f = s->flash;
     const int32_t n = s->n_past, d = s->cfg->indexer_head_dim;
     const size_t used = (size_t)n * d * 4, stride = (size_t)s->max_ctx * d * 4;
-    const char *ik = qw_buf_contents(s->flash->ikeys);
+    const size_t pused = (size_t)(n / s->cfg->indexer_compress_ratio) * d * 4;
+    const size_t pstride = (size_t)f->max_blocks * d * 4;
+    const char *ik = qw_buf_contents(f->ikeys), *ip = qw_buf_contents(f->ipool);
     for (int32_t l = 0; l < s->shape->n_full_attn_layers; l++) {
-        memcpy(out, ik + (size_t)l * stride, used);
-        out += used;
+        memcpy(out, ik + (size_t)l * stride, used);   out += used;
+        memcpy(out, ip + (size_t)l * pstride, pused); out += pused;
     }
     return qw_flash_tail_save(s, out);
 }
 
 const char *qw_flash_unpack(qwasar_session *s, const char *in, int32_t n) {
+    struct qw_flash_state *f = s->flash;
     const int32_t d = s->cfg->indexer_head_dim;
     const size_t used = (size_t)n * d * 4, stride = (size_t)s->max_ctx * d * 4;
-    char *ik = qw_buf_contents(s->flash->ikeys);
+    const size_t pused = (size_t)(n / s->cfg->indexer_compress_ratio) * d * 4;
+    const size_t pstride = (size_t)f->max_blocks * d * 4;
+    char *ik = qw_buf_contents(f->ikeys), *ip = qw_buf_contents(f->ipool);
     for (int32_t l = 0; l < s->shape->n_full_attn_layers; l++) {
-        memcpy(ik + (size_t)l * stride, in, used);
-        in += used;
+        memcpy(ik + (size_t)l * stride, in, used);   in += used;
+        memcpy(ip + (size_t)l * pstride, in, pused); in += pused;
     }
     return qw_flash_tail_load(s, in);
 }
@@ -422,6 +436,13 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
     qw_op_rope_partial(c, qw_ref_at(s->k, 0), qw_ref_at(s->positions, 0),
                        qw_ref_at(s->rope_axis, 0), qw_ref_at(s->rope_inv_freq, 0),
                        rows, cfg->num_key_value_heads, hd, cfg->rotary_dim);
+    /* The blocks this chunk completes, their keys stored for scoring from
+     * now on (qw_op_qsa_pool) -- below the budget too, so they are all there
+     * when the context passes it. */
+    const qw_ref ipool = qw_off(f->ipool, (size_t)fi * f->max_blocks * d);
+    qw_op_qsa_pool(c, ipool, ikeys, qw_tensor_ref(L->indexer.k_norm), qw_ref_at(s->rope_inv_freq, 0),
+                   d, ratio, s->n_past / ratio, (s->n_past + rows) / ratio, cfg->rotary_dim,
+                   cfg->rms_norm_eps);
     /* Past the budget: the indexer's query heads normed and rotated at their
      * own positions, to score blocks against the cached keys. */
     if (!dense)
@@ -454,20 +475,19 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
         return;
     }
 
-    qw_op_qsa_scores(c, qw_ref_at(f->iscores, 0), iq, ikeys,
-                     qw_tensor_ref(L->indexer.k_norm), qw_ref_at(s->rope_inv_freq, 0),
-                     rows, nq, d, cfg->indexer_compress_ratio, s->n_past, cfg->rotary_dim,
-                     f->max_blocks, cfg->rms_norm_eps);
-    qw_op_qsa_select(c, qw_ref_at(f->mask, 0), qw_ref_at(f->iscores, 0), rows,
-                     cfg->indexer_compress_ratio, s->n_past,
-                     cfg->indexer_budget / cfg->indexer_compress_ratio, s->max_ctx, f->max_blocks);
+    qw_op_qsa_scores_pooled(c, qw_ref_at(f->iscores, 0), iq, ipool, rows, nq, d,
+                            cfg->indexer_compress_ratio, s->n_past, f->max_blocks);
+    const int32_t block_topk = cfg->indexer_budget / cfg->indexer_compress_ratio;
+    qw_op_qsa_select(c, qw_ref_at(f->mask, 0), qw_ref_at(f->qlist, 0), qw_ref_at(f->iscores, 0), rows,
+                     cfg->indexer_compress_ratio, s->n_past, block_topk, s->max_ctx, f->max_blocks);
 
     qw_op_attn_masked(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->q, 0),
                       qw_ref_at(s->kcache, kv_stride * fi * sizeof(uint16_t)),
                       qw_ref_at(s->vcache, kv_stride * fi * sizeof(uint16_t)),
-                      qw_ref_at(f->mask, 0),
+                      qw_ref_at(f->qlist, 0),
                       rows, cfg->num_attention_heads, cfg->num_key_value_heads,
-                      hd, s->max_ctx, s->n_past, 1.0f / sqrtf((float)hd));
+                      hd, s->max_ctx, s->n_past, 1.0f / sqrtf((float)hd),
+                      block_topk, cfg->indexer_compress_ratio);
     qw_op_mul_sigmoid(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->gate, 0), rows * sh->q_dim);
     qw_encode_qlinear(c, &L->o_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->attn_out, 0), rows);
 }

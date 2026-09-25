@@ -797,6 +797,49 @@ struct qw_qsa_score_args {
 
 #define QW_QSA_MAXM 8   /* index head dims per lane: d <= 256 */
 
+/* Block b's key as the indexer scores it: the mean of its `ratio` raw keys,
+ * RMS-normed with the k_layernorm gain, rotated at the block's first
+ * position.  Lane-strip layout: this lane's dims lane, lane+32, ... */
+static inline void qw_qsa_block_key(device const float *ikeys, device const ushort *kw,
+                                    device const float *inv_freq, uint b, uint d, uint ratio,
+                                    float eps, uint lane, thread float *kn) {
+    const uint M = d / 32;
+    float ss = 0.0f;
+    for (uint m = 0; m < M; ++m) {
+        const uint dim = lane + 32 * m;
+        float acc = 0.0f;
+        for (uint t = 0; t < ratio; ++t) acc += ikeys[(ulong)(b * ratio + t) * d + dim];
+        kn[m] = acc / float(ratio);
+        ss = fma(kn[m], kn[m], ss);
+    }
+    ss = simd_sum(ss);
+    const float inv = rsqrt(ss / float(d) + eps);
+    for (uint m = 0; m < M; ++m) kn[m] = kn[m] * inv * qw_bf16_to_f32(kw[lane + 32 * m]);
+
+    /* rope on the first rotary_dim dims at the block's first position:
+     * pairs (j, j+32) are lane strips 0 and 1. */
+    const float angle = float(b * ratio) * inv_freq[lane];
+    const float c = cos(angle), s = sin(angle);
+    const float x0 = kn[0], x1 = kn[1];
+    kn[0] = x0 * c - x1 * s;
+    kn[1] = x1 * c + x0 * s;
+}
+
+/* A query row's score for block b: the positive parts of its heads' dots. */
+static inline float qw_qsa_block_score(device const float *qn, uint r, uint nq, uint d,
+                                       uint lane, thread const float *kn) {
+    const uint M = d / 32;
+    float score = 0.0f;
+    for (uint h = 0; h < nq; ++h) {
+        device const float *qh = qn + ((ulong)r * nq + h) * d;
+        float dot = 0.0f;
+        for (uint m = 0; m < M; ++m) dot = fma(qh[lane + 32 * m], kn[m], dot);
+        dot = simd_sum(dot);
+        if (dot > 0.0f) score += dot;
+    }
+    return score / sqrt(float(d));
+}
+
 kernel void qw_qsa_scores(
     device const float  *qn       [[buffer(0)]],   /* [rows, nq, d] normed + rotated */
     device const float  *ikeys    [[buffer(1)]],   /* [max_ctx, d] raw keys */
@@ -811,51 +854,65 @@ kernel void qw_qsa_scores(
 {
     const uint r = tgid.y;
     const uint b = tgid.x * nsg + sgid;
-    const uint visible  = a.base_pos + r + 1;
-    const uint n_blocks = visible / a.ratio;
+    const uint n_blocks = (a.base_pos + r + 1) / a.ratio;
     if (b >= n_blocks) return;
-    const uint M = a.d / 32;
-
-    /* pooled raw key, one lane strip at a time */
     float kn[QW_QSA_MAXM];
-    float ss = 0.0f;
-    for (uint m = 0; m < M; ++m) {
-        const uint dim = lane + 32 * m;
-        float acc = 0.0f;
-        for (uint t = 0; t < a.ratio; ++t) acc += ikeys[(ulong)(b * a.ratio + t) * a.d + dim];
-        kn[m] = acc / float(a.ratio);
-        ss = fma(kn[m], kn[m], ss);
-    }
-    ss = simd_sum(ss);
-    const float inv = rsqrt(ss / float(a.d) + a.eps);
-    for (uint m = 0; m < M; ++m) kn[m] = kn[m] * inv * qw_bf16_to_f32(kw[lane + 32 * m]);
+    qw_qsa_block_key(ikeys, kw, inv_freq, b, a.d, a.ratio, a.eps, lane, kn);
+    const float score = qw_qsa_block_score(qn, r, a.nq, a.d, lane, kn);
+    if (lane == 0) scores[(ulong)r * a.max_blocks + b] = score;
+}
 
-    /* rope on the first rotary_dim dims at the block's first position:
-     * pairs (j, j+32) are lane strips 0 and 1. */
-    {
-        const float angle = float(b * a.ratio) * inv_freq[lane];
-        const float c = cos(angle), s = sin(angle);
-        const float x0 = kn[0], x1 = kn[1];
-        kn[0] = x0 * c - x1 * s;
-        kn[1] = x1 * c + x0 * s;
-    }
+/* The block keys, computed once: when a block's last position is cached its
+ * key never changes, so it is stored here as it completes, and scoring reads
+ * one vector per block where it read `ratio`, normed and rotated each time --
+ * at 32K tokens of context, 16.7 MB a layer every step, now 4. */
+struct qw_qsa_pool_args { uint d, ratio, b0, n; float eps; };
 
-    float score = 0.0f;
-    for (uint h = 0; h < a.nq; ++h) {
-        device const float *qh = qn + ((ulong)r * a.nq + h) * a.d;
-        float dot = 0.0f;
-        for (uint m = 0; m < M; ++m) dot = fma(qh[lane + 32 * m], kn[m], dot);
-        dot = simd_sum(dot);
-        if (dot > 0.0f) score += dot;
-    }
-    if (lane == 0) scores[(ulong)r * a.max_blocks + b] = score / sqrt(float(a.d));
+kernel void qw_qsa_pool(
+    device const float  *ikeys    [[buffer(0)]],   /* [max_ctx, d] raw keys */
+    device const ushort *kw       [[buffer(1)]],
+    device const float  *inv_freq [[buffer(2)]],
+    device       float  *pool     [[buffer(3)]],   /* [max_blocks, d] */
+    constant qw_qsa_pool_args &a  [[buffer(4)]],
+    uint  tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  nsg  [[simdgroups_per_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    const uint i = tgid * nsg + sgid;
+    if (i >= a.n) return;
+    const uint b = a.b0 + i;
+    float kn[QW_QSA_MAXM];
+    qw_qsa_block_key(ikeys, kw, inv_freq, b, a.d, a.ratio, a.eps, lane, kn);
+    for (uint m = 0; m < a.d / 32; ++m) pool[(ulong)b * a.d + lane + 32 * m] = kn[m];
+}
+
+/* qw_qsa_scores from the stored block keys (qw_qsa_pool). */
+kernel void qw_qsa_scores_pooled(
+    device const float  *qn       [[buffer(0)]],
+    device const float  *pool     [[buffer(1)]],   /* [max_blocks, d] */
+    device       float  *scores   [[buffer(4)]],
+    constant qw_qsa_score_args &a [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  nsg  [[simdgroups_per_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    const uint r = tgid.y;
+    const uint b = tgid.x * nsg + sgid;
+    const uint n_blocks = (a.base_pos + r + 1) / a.ratio;
+    if (b >= n_blocks) return;
+    float kn[QW_QSA_MAXM];
+    for (uint m = 0; m < a.d / 32; ++m) kn[m] = pool[(ulong)b * a.d + lane + 32 * m];
+    const float score = qw_qsa_block_score(qn, r, a.nq, a.d, lane, kn);
+    if (lane == 0) scores[(ulong)r * a.max_blocks + b] = score;
 }
 
 /* Top-k blocks per query into a byte mask over cache positions, plus the
  * tail.  One threadgroup per query; k rounds of a parallel argmax, ties to
  * the lowest index, matching the reference.  O(k * n_blocks) per query --
  * the simplest correct shape, and the one to measure before replacing. */
-struct qw_qsa_select_args { uint rows, ratio, base_pos, block_topk, max_ctx, max_blocks; };
+struct qw_qsa_select_args { uint rows, ratio, base_pos, block_topk, max_ctx, max_blocks, list_cap; };
 
 /* Block selection: mark the `block_topk` best-scoring complete blocks (ties to
  * the lower index) and the incomplete tail as visible.
@@ -878,16 +935,40 @@ static inline void qw_sel_mark(device uchar *mr, uint b, uint ratio) {
     for (uint t = 0; t < ratio; ++t) mr[b * ratio + t] = 1;
 }
 
+/* Exclusive prefix sum of one value per thread across the threadgroup
+ * (up to 32 simdgroups): within each simdgroup, then over their totals.
+ * Every thread must call it.  `tmp` is 32 words of threadgroup memory. */
+static inline uint qw_tg_scan(uint v, uint lane, uint sgid, uint nsg,
+                              threadgroup uint *tmp, threadgroup uint *total) {
+    const uint x = simd_prefix_exclusive_sum(v);
+    if (lane == 31) tmp[sgid] = x + v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0) {
+        const uint t = lane < nsg ? tmp[lane] : 0u;
+        const uint e = simd_prefix_exclusive_sum(t);
+        tmp[lane] = e;
+        if (lane == 31) *total = e + t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint r = x + tmp[sgid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* tmp free for the next scan */
+    return r;
+}
+
 kernel void qw_qsa_select(
     device       float *scores [[buffer(0)]],   /* [rows, max_blocks] */
     device       uchar *mask   [[buffer(1)]],   /* [rows, max_ctx] */
     constant qw_qsa_select_args &a [[buffer(2)]],
+    device       uint  *list   [[buffer(3)]],   /* [rows, 1 + list_cap]: count, positions */
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]],
-    uint ntg  [[threads_per_threadgroup]])
+    uint ntg  [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint nsg  [[simdgroups_per_threadgroup]])
 {
     threadgroup atomic_uint hist[256];
-    threadgroup uint counts[QW_SEL_THREADS];
+    threadgroup uint scan_tmp[32], scan_total;
     threadgroup uint sh_prefix, sh_need;
 
     const uint r = tgid;
@@ -899,73 +980,87 @@ kernel void qw_qsa_select(
     for (uint t = tid; t < n_keys; t += ntg) mr[t] = (t >= n_blocks * a.ratio) ? 1 : 0;
     threadgroup_barrier(mem_flags::mem_device);
 
-    const uint take = min(a.block_topk, n_blocks);
-    if (take == 0) return;
-    if (take == n_blocks) {
-        for (uint b = tid; b < n_blocks; b += ntg) qw_sel_mark(mr, b, a.ratio);
-        return;
-    }
-
-    /* The k-th best key, eight bits at a time from the top. */
-    uint prefix = 0, known = 0, need = take;
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        for (uint i = tid; i < 256; i += ntg) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint b = tid; b < n_blocks; b += ntg) {
-            const uint key = qw_order_key(sc[b]);
-            if ((key & known) == prefix)
-                atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {
-            uint above = 0;
-            int d = 255;
-            for (; d > 0; --d) {
-                const uint h = atomic_load_explicit(&hist[d], memory_order_relaxed);
-                if (above + h >= need) break;
-                above += h;
-            }
-            sh_prefix = prefix | ((uint)d << shift);
-            sh_need = need - above;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        prefix = sh_prefix;
-        need = sh_need;
-        known |= 255u << shift;
-    }
-    const uint T = prefix;           /* `need` of the keys equal to T are still to take */
-
-    /* Everything above T; then the first `need` equal to T, by index.  Each
-     * thread owns a contiguous run of blocks so index order is a prefix sum. */
+    /* Each thread owns a contiguous run of blocks, so index order is a
+     * prefix sum over threads -- for the tie-break below, and for the list. */
     const uint per = (n_blocks + ntg - 1) / ntg;
     const uint lo = min(tid * per, n_blocks), hi = min(lo + per, n_blocks);
-    uint eq = 0;
-    for (uint b = lo; b < hi; ++b) {
-        const uint key = qw_order_key(sc[b]);
-        if (key > T) qw_sel_mark(mr, b, a.ratio);
-        else if (key == T) eq++;
+
+    const uint take = min(a.block_topk, n_blocks);
+    if (take == n_blocks) {
+        for (uint b = lo; b < hi; ++b) qw_sel_mark(mr, b, a.ratio);
+    } else if (take > 0) {
+        /* The k-th best key, eight bits at a time from the top. */
+        uint prefix = 0, known = 0, need = take;
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            for (uint i = tid; i < 256; i += ntg) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint b = tid; b < n_blocks; b += ntg) {
+                const uint key = qw_order_key(sc[b]);
+                if ((key & known) == prefix)
+                    atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            /* The bin, from the top, where the count reaches `need`: a scan
+             * over the bins high to low, thread i holding bin 255 - i.  The
+             * one thread whose run crosses `need` records it -- or bin 0's,
+             * if none does before it. */
+            const uint h = tid < 256 ? atomic_load_explicit(&hist[255 - tid], memory_order_relaxed) : 0u;
+            const uint above = qw_tg_scan(h, lane, sgid, nsg, scan_tmp, &scan_total);
+            if (tid < 256 && above < need && (above + h >= need || tid == 255)) {
+                sh_prefix = prefix | ((255u - tid) << shift);
+                sh_need = need - above;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            prefix = sh_prefix;
+            need = sh_need;
+            known |= 255u << shift;
+        }
+        const uint T = prefix;       /* `need` of the keys equal to T are still to take */
+
+        /* Everything above T; then the first `need` equal to T, by index. */
+        uint eq = 0;
+        for (uint b = lo; b < hi; ++b) {
+            const uint key = qw_order_key(sc[b]);
+            if (key > T) qw_sel_mark(mr, b, a.ratio);
+            else if (key == T) eq++;
+        }
+        uint rank = qw_tg_scan(eq, lane, sgid, nsg, scan_tmp, &scan_total);
+        for (uint b = lo; b < hi && rank < need; ++b)
+            if (qw_order_key(sc[b]) == T) { qw_sel_mark(mr, b, a.ratio); rank++; }
     }
-    counts[tid] = eq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* The visible positions as a list, ascending: what attention walks, in
+     * place of scanning the whole mask for the few it keeps -- at 30K tokens
+     * of context, ~2K of them.  Selected blocks in index order, then the tail. */
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    uint mine = 0;
+    for (uint b = lo; b < hi; ++b) mine += mr[b * a.ratio] ? 1u : 0u;
+    const uint first = qw_tg_scan(mine, lane, sgid, nsg, scan_tmp, &scan_total);
+    const uint n_sel = scan_total;
+    device uint *lr = list + (ulong)r * (1 + a.list_cap);
+    uint at = first * a.ratio;
+    for (uint b = lo; b < hi; ++b)
+        if (mr[b * a.ratio]) for (uint t = 0; t < a.ratio; ++t) lr[1 + at++] = b * a.ratio + t;
     if (tid == 0) {
-        uint run = 0;
-        for (uint t = 0; t < ntg; ++t) { const uint c = counts[t]; counts[t] = run; run += c; }
+        uint n = n_sel * a.ratio;
+        for (uint t = n_blocks * a.ratio; t < n_keys; ++t) lr[1 + n++] = t;
+        lr[0] = n;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint rank = counts[tid];
-    for (uint b = lo; b < hi && rank < need; ++b)
-        if (qw_order_key(sc[b]) == T) { qw_sel_mark(mr, b, a.ratio); rank++; }
 }
 
-/* qw_attn_decode with a per-(query, position) byte mask: a masked key
- * contributes nothing.  Identical otherwise, head_dim 256. */
+/* qw_attn_decode over the positions qw_qsa_select kept for each query
+ * (its list: count, then positions ascending) rather than every position --
+ * the cost follows the budget, not the context.  Head_dim 256. */
+struct qw_attn_list_args { uint list_cap; };
+
 kernel void qw_attn_masked(
     device const float   *q    [[buffer(0)]],
     device const half    *kc   [[buffer(1)]],
     device const half    *vc   [[buffer(2)]],
     device       float   *out  [[buffer(3)]],
-    device const uchar   *mask [[buffer(4)]],   /* [rows, max_ctx] */
+    device const uint    *list [[buffer(4)]],   /* [rows, 1 + list_cap] */
     constant qw_attn_args &a   [[buffer(5)]],
+    constant qw_attn_list_args &la [[buffer(6)]],
     uint tgid     [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]])
@@ -977,12 +1072,12 @@ kernel void qw_attn_masked(
     const uint row = tgid / a.q_heads;
     const uint qh  = tgid % a.q_heads;
     const uint kvh = qh / a.gqa;
-    const int n_keys = (int)(a.base_pos + row) + 1;
-    device const uchar *mr = mask + (ulong)row * a.max_ctx;
+    device const uint *lr = list + (ulong)row * (1 + la.list_cap);
+    const int n_sel = (int)lr[0];
 
     const device float *qp = q + ((ulong)row * a.q_heads + qh) * QW_ATTN_D + simd_lid * QW_ATTN_PER_THREAD;
-    const device half  *kp = kc + ((ulong)kvh * a.max_ctx + simd_gid) * QW_ATTN_D + simd_lid * QW_ATTN_PER_THREAD;
-    const device half  *vp = vc + ((ulong)kvh * a.max_ctx + simd_gid) * QW_ATTN_D + simd_lid * QW_ATTN_PER_THREAD;
+    const device half  *kbase = kc + (ulong)kvh * a.max_ctx * QW_ATTN_D + simd_lid * QW_ATTN_PER_THREAD;
+    const device half  *vbase = vc + (ulong)kvh * a.max_ctx * QW_ATTN_D + simd_lid * QW_ATTN_PER_THREAD;
 
     float qv[QW_ATTN_PER_THREAD];
     float acc[QW_ATTN_PER_THREAD];
@@ -991,22 +1086,21 @@ kernel void qw_attn_masked(
 
     float run_max = -FLT_MAX;
     float run_sum = 0.0f;
-    for (int t = (int)simd_gid; t < n_keys; t += QW_ATTN_SIMDS) {
-        if (mr[t]) {
-            float score = 0.0f;
+    for (int j = (int)simd_gid; j < n_sel; j += QW_ATTN_SIMDS) {
+        const ulong t = lr[1 + j];
+        const device half *kp = kbase + t * QW_ATTN_D;
+        const device half *vp = vbase + t * QW_ATTN_D;
+        float score = 0.0f;
 #pragma unroll
-            for (int i = 0; i < QW_ATTN_PER_THREAD; ++i) score = fma(qv[i], float(kp[i]), score);
-            score = simd_sum(score);
-            const float new_max = max(run_max, score);
-            const float factor  = exp(run_max - new_max);
-            const float w       = exp(score - new_max);
-            run_max = new_max;
-            run_sum = run_sum * factor + w;
+        for (int i = 0; i < QW_ATTN_PER_THREAD; ++i) score = fma(qv[i], float(kp[i]), score);
+        score = simd_sum(score);
+        const float new_max = max(run_max, score);
+        const float factor  = exp(run_max - new_max);
+        const float w       = exp(score - new_max);
+        run_max = new_max;
+        run_sum = run_sum * factor + w;
 #pragma unroll
-            for (int i = 0; i < QW_ATTN_PER_THREAD; ++i) acc[i] = fma(acc[i], factor, w * float(vp[i]));
-        }
-        kp += QW_ATTN_SIMDS * QW_ATTN_D;
-        vp += QW_ATTN_SIMDS * QW_ATTN_D;
+        for (int i = 0; i < QW_ATTN_PER_THREAD; ++i) acc[i] = fma(acc[i], factor, w * float(vp[i]));
     }
 
     if (simd_lid == 0) { tg_max[simd_gid] = run_max; tg_sum[simd_gid] = run_sum; }

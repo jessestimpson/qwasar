@@ -461,11 +461,25 @@ void qw_op_rms_norm_gated_sigmoid(qw_cmd c, qw_ref y, qw_ref x, qw_ref weight, q
 void qw_op_qsa_scores(qw_cmd c, qw_ref scores, qw_ref qn, qw_ref ikeys, qw_ref k_norm,
                       qw_ref inv_freq, int32_t rows, int32_t nq, int32_t d, int32_t ratio,
                       int32_t base_pos, int32_t rotary_dim, int32_t max_blocks, float eps);
-void qw_op_qsa_select(qw_cmd c, qw_ref mask, qw_ref scores, int32_t rows, int32_t ratio,
+/* The indexer's block keys, stored as blocks complete: blocks [b0, b1) of
+ * a layer's raw keys, mean-pooled, normed and rotated exactly as
+ * qw_op_qsa_scores does on every call, into pool [max_blocks, d] fp32.
+ * qw_op_qsa_scores_pooled then scores from them; the scores are identical. */
+void qw_op_qsa_pool(qw_cmd c, qw_ref pool, qw_ref ikeys, qw_ref k_norm, qw_ref inv_freq,
+                    int32_t d, int32_t ratio, int32_t b0, int32_t b1, int32_t rotary_dim, float eps);
+void qw_op_qsa_scores_pooled(qw_cmd c, qw_ref scores, qw_ref qn, qw_ref pool, int32_t rows,
+                             int32_t nq, int32_t d, int32_t ratio, int32_t base_pos, int32_t max_blocks);
+/* Selection writes the byte mask and, per query, the visible positions as a
+ * list -- [rows, 1 + qw_qsa_list_cap] uint32: a count, then positions
+ * ascending -- which masked attention walks instead of the whole context. */
+static inline int32_t qw_qsa_list_cap(int32_t block_topk, int32_t ratio) {
+    return block_topk * ratio + ratio;
+}
+void qw_op_qsa_select(qw_cmd c, qw_ref mask, qw_ref list, qw_ref scores, int32_t rows, int32_t ratio,
                       int32_t base_pos, int32_t block_topk, int32_t max_ctx, int32_t max_blocks);
-void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache, qw_ref mask,
+void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache, qw_ref list,
                        int32_t rows, int32_t q_heads, int32_t kv_heads, int32_t head_dim,
-                       int32_t max_ctx, int32_t base_pos, float scale);
+                       int32_t max_ctx, int32_t base_pos, float scale, int32_t block_topk, int32_t ratio);
 /* PLE: the per-stream gate, and the dilated depthwise conv (kernel 4, dilation 3). */
 void qw_op_ple_gate(qw_cmd c, qw_ref gv, qw_ref keyn, qw_ref qn, qw_ref value,
                     int32_t rows, int32_t H, int32_t S);

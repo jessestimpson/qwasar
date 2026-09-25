@@ -149,6 +149,25 @@ static void test_hc(void) {
     qw_buf_free(out); qw_buf_free(d); qw_buf_free(rep); qw_buf_free(mix); qw_buf_free(gv);
 }
 
+/* The position list qw_qsa_select writes beside its mask must be exactly the
+ * mask's visible positions, ascending, with their count first. */
+static int32_t list_vs_mask(const uint32_t *list, const uint8_t *mask, int32_t rows, int32_t base_pos,
+                            int32_t max_ctx, int32_t cap) {
+    int32_t bad = 0;
+    for (int32_t r = 0; r < rows; r++) {
+        const uint32_t *lr = list + (size_t)r * (1 + cap);
+        const uint8_t *mr = mask + (size_t)r * max_ctx;
+        uint32_t j = 0;
+        for (int32_t t = 0; t < base_pos + r + 1; t++) {
+            if (!mr[t]) continue;
+            if (j >= lr[0] || lr[1 + j] != (uint32_t)t) bad++;
+            j++;
+        }
+        if (j != lr[0]) bad++;
+    }
+    return bad;
+}
+
 /* ---- MoE -------------------------------------------------------------------- */
 
 static void test_moe(qwasar_engine *e) {
@@ -345,6 +364,30 @@ static void test_qsa(qwasar_engine *e) {
     qw_op_qsa_scores(c, qw_ref_at(sc, 0), qw_ref_at(qn, 0), qw_ref_at(ik, 0), qw_tensor_ref(L->indexer.k_norm),
                      qw_ref_at(invf, 0), rows, nq, d, ratio, base_pos, rd, max_blocks, cfg->rms_norm_eps);
     run(c, "qsa_scores");
+
+    /* The same scores from block keys stored as blocks complete -- pooled in
+     * two stretches, as a prefill chunk then decode steps would -- must be
+     * identical, not merely close: the same arithmetic, done earlier. */
+    {
+        qw_buf pool = mkbuf((size_t)max_blocks * d * 4), sc2 = mkbuf((size_t)rows * max_blocks * 4);
+        const int32_t all = (base_pos + rows) / ratio;
+        c = qw_cmd_begin();
+        qw_op_qsa_pool(c, qw_ref_at(pool, 0), qw_ref_at(ik, 0), qw_tensor_ref(L->indexer.k_norm),
+                       qw_ref_at(invf, 0), d, ratio, 0, all / 2, rd, cfg->rms_norm_eps);
+        qw_op_qsa_pool(c, qw_ref_at(pool, 0), qw_ref_at(ik, 0), qw_tensor_ref(L->indexer.k_norm),
+                       qw_ref_at(invf, 0), d, ratio, all / 2, all, rd, cfg->rms_norm_eps);
+        qw_op_qsa_scores_pooled(c, qw_ref_at(sc2, 0), qw_ref_at(qn, 0), qw_ref_at(pool, 0), rows, nq, d,
+                                ratio, base_pos, max_blocks);
+        run(c, "qsa_scores_pooled");
+        const float *a1 = qw_buf_contents(sc), *a2 = qw_buf_contents(sc2);
+        int32_t differ = 0;
+        for (int32_t r = 0; r < rows; r++)
+            for (int32_t b = 0; b < (base_pos + r + 1) / ratio; b++)
+                differ += a1[(size_t)r * max_blocks + b] != a2[(size_t)r * max_blocks + b];
+        printf("  %-28s %d of the scores differ\n", "qsa_scores from stored keys", differ);
+        CHECK(differ == 0, "qsa_scores_pooled: %d scores differ from qsa_scores", differ);
+        qw_buf_free(pool); qw_buf_free(sc2);
+    }
     const uint16_t *kw = qw_tensor_data(L->indexer.k_norm);
     float *sref = calloc((size_t)rows * max_blocks, 4);
     const float *scp = qw_buf_contents(sc);
@@ -379,13 +422,15 @@ static void test_qsa(qwasar_engine *e) {
 
     /* select on random distinct scores: top-k blocks plus the tail */
     qw_buf mask = mkbuf((size_t)rows * max_ctx);
+    qw_buf qlist = mkbuf((size_t)rows * (1 + qw_qsa_list_cap(2, ratio)) * 4);
     float *scr = qw_buf_contents(sc);
     fill_random(scr, (size_t)rows * max_blocks, 53);
     float *keep = malloc((size_t)rows * max_blocks * 4);
     memcpy(keep, scr, (size_t)rows * max_blocks * 4);
     const int32_t block_topk = 2;
     c = qw_cmd_begin();
-    qw_op_qsa_select(c, qw_ref_at(mask, 0), qw_ref_at(sc, 0), rows, ratio, base_pos, block_topk, max_ctx, max_blocks);
+    qw_op_qsa_select(c, qw_ref_at(mask, 0), qw_ref_at(qlist, 0), qw_ref_at(sc, 0), rows, ratio, base_pos,
+                     block_topk, max_ctx, max_blocks);
     run(c, "qsa_select");
     const uint8_t *mp = qw_buf_contents(mask);
     int32_t mask_bad = 0;
@@ -407,6 +452,10 @@ static void test_qsa(qwasar_engine *e) {
     }
     printf("  %-28s mismatches %d\n", "qsa_select", mask_bad);
     CHECK(mask_bad == 0, "qsa_select: %d mask entries differ", mask_bad);
+    const int32_t list_bad = list_vs_mask(qw_buf_contents(qlist), mp, rows, base_pos, max_ctx,
+                                          qw_qsa_list_cap(block_topk, ratio));
+    printf("  %-28s mismatches %d\n", "qsa_select position list", list_bad);
+    CHECK(list_bad == 0, "qsa_select: the position list disagrees with the mask in %d places", list_bad);
 
     /* masked attention against a scalar softmax over fp16-rounded K/V */
     const int32_t QH = cfg->num_attention_heads, KVH = cfg->num_key_value_heads, D = cfg->head_dim;
@@ -418,8 +467,8 @@ static void test_qsa(qwasar_engine *e) {
     qw_cpu_kv_write(qw_buf_contents(kc), qw_buf_contents(vc), kk, vv, n_keys_max, KVH, D, max_ctx, 0);
     const float scale = 1.0f / sqrtf((float)D);
     c = qw_cmd_begin();
-    qw_op_attn_masked(c, qw_ref_at(out, 0), qw_ref_at(q, 0), qw_ref_at(kc, 0), qw_ref_at(vc, 0), qw_ref_at(mask, 0),
-                      rows, QH, KVH, D, max_ctx, base_pos, scale);
+    qw_op_attn_masked(c, qw_ref_at(out, 0), qw_ref_at(q, 0), qw_ref_at(kc, 0), qw_ref_at(vc, 0), qw_ref_at(qlist, 0),
+                      rows, QH, KVH, D, max_ctx, base_pos, scale, block_topk, ratio);
     run(c, "attn_masked");
     float *aref = calloc((size_t)rows * QH * D, 4);
     const uint16_t *kcp = qw_buf_contents(kc), *vcp = qw_buf_contents(vc);
@@ -445,7 +494,7 @@ static void test_qsa(qwasar_engine *e) {
     report("attn_masked", qw_buf_contents(out), aref, (size_t)rows * QH * D, 1e-4);
 
     free(sref); free(keep); free(aref);
-    qw_buf_free(qn); qw_buf_free(ik); qw_buf_free(sc); qw_buf_free(invf); qw_buf_free(mask);
+    qw_buf_free(qn); qw_buf_free(ik); qw_buf_free(sc); qw_buf_free(invf); qw_buf_free(mask); qw_buf_free(qlist);
     qw_buf_free(q); qw_buf_free(k); qw_buf_free(v); qw_buf_free(kc); qw_buf_free(vc); qw_buf_free(out);
 }
 
@@ -533,9 +582,15 @@ static void test_select_scale(void) {
         float *copy = malloc((size_t)rows * max_blocks * 4);
         memcpy(copy, sc, (size_t)rows * max_blocks * 4);
         qw_cmd c = qw_cmd_begin();
-        qw_op_qsa_select(c, qw_ref_at(mb, 0), qw_ref_at(sb, 0), rows, ratio, base, topk, max_ctx, max_blocks);
+        qw_buf lb = mkbuf((size_t)rows * (1 + qw_qsa_list_cap(topk, ratio)) * 4);
+        qw_op_qsa_select(c, qw_ref_at(mb, 0), qw_ref_at(lb, 0), qw_ref_at(sb, 0), rows, ratio, base, topk,
+                         max_ctx, max_blocks);
         run(c, "qsa_select at scale");
         const uint8_t *m = qw_buf_contents(mb);
+        const int32_t lbad = list_vs_mask(qw_buf_contents(lb), m, rows, base, max_ctx,
+                                          qw_qsa_list_cap(topk, ratio));
+        CHECK(lbad == 0, "qsa_select at scale: the position list disagrees with the mask in %d places", lbad);
+        qw_buf_free(lb);
         int32_t bad = 0;
         int *order = malloc((size_t)max_blocks * sizeof *order);
         uint8_t *want = malloc((size_t)max_ctx);

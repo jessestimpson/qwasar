@@ -344,7 +344,7 @@ Three things learned that the plan did not know:
 2. ~~*Checkpoints.*~~ — done. A Flash-Next checkpoint carries the
    indexer's key cache, the engram's dilated-conv window and its n-gram
    context beside the attention caches and delta states (~127 MB fixed plus
-   ~28 KB a token); a restored session continues bit-identically
+   ~30 KB a token); a restored session continues bit-identically
    (tests/test_kvstore, both toy formats and the real weights).  The server
    now writes them too: at the end of the system prompt, and at the last
    complete turn of a long conversation (every ~4K new tokens).
