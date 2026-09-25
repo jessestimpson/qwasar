@@ -89,24 +89,34 @@ struct CrucibleMain {
 
     /// Off-main: the engine load, which is the 16 GB mmap the gate is about.
     private static func gatePhase2(modelPath: String, prompt: String?) async {
-        print("\n-- engine (the 16 GB mmap)")
+        // Sized for the model in that folder, which is the 27B or Flash-Next;
+        // phase 1 printed the 27B's profile before it knew which.
+        let inspected: ModelInspection
+        do { inspected = try ModelInspection.inspect(URL(fileURLWithPath: modelPath)) } catch {
+            print("\n-- engine\n  FAILED: \(modelPath): \(error)")
+            summarise(engineLoaded: false)
+            return
+        }
+        print(String(format: "\n-- engine (%@, %.1f GB resident)", inspected.family.title,
+                     Double(inspected.residentWeightsBytes) / 1e9))
         // --mtp <dir> loads the speculative draft head. Headless, so this is
         // the one place speculation can be exercised end to end without a
         // screen -- and the sandbox grant a GUI run needs does not apply here.
         let mtp = value(of: "--mtp", in: CommandLine.arguments)
-        if mtp != nil { profile = MemoryProfile.derive(mtpAvailable: true) }
+        profile = MemoryProfile.derive(model: inspected, mtpAvailable: mtp != nil)
+        if inspected.family != .dense { print(profile.summary) }
         let p = profile
         let host = EngineHost()
         var loaded: EngineInfo?
         var failure: String?
         do {
             loaded = try await host.load(modelPath: modelPath, contextSize: p.contextSize,
-                                         mtpPath: mtp)
+                                         mtpPath: inspected.family.supportsDraftHead ? mtp : nil)
         } catch { failure = String(describing: error) }
 
         if let i = loaded {
-            print(String(format: "  loaded in %.1fs · %d layers · vocab %d · context %d",
-                         i.loadSeconds, i.layers, i.vocabSize, i.contextSize))
+            print(String(format: "  %@ loaded in %.1fs · %d layers · vocab %d · context %d",
+                         i.modelName, i.loadSeconds, i.layers, i.vocabSize, i.contextSize))
             print("  speculation: \(i.mtpActive ? "ON (MTP draft head)" : "off")")
             if let why = host.mtpDropped { print("  \(why)") }
             print(String(format: "  phys_footprint %.2f GB", Double(i.footprintBytes) / 1_073_741_824))

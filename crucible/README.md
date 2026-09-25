@@ -104,9 +104,15 @@ self-contained apart from the weights.
 Then, on first launch:
 
 1. **Choose Model…** in the toolbar — the directory holding `config.json` and
-   the safetensors shards. Binding takes ~9 s, after which the toolbar shows
-   the context and live-session budget derived from your machine (e.g.
-   `90112 ctx · 1 live`; see spec §2.3).
+   the safetensors shards: Qwen3.8 27B or Qwen3.8 Flash-Next, told apart by
+   the config, as the engine does. Binding takes ~9–15 s, after which the
+   toolbar shows the model and the context and live-session budget derived
+   for it on your machine (e.g. `Qwen3.8 27B · 90112 ctx · 1 live`; see spec
+   §2.3). Each model's folder is remembered once chosen, so **Crucible ›
+   Model** switches between them; the live session is checkpointed first,
+   and a conversation continues under the other model by replaying its
+   history (both share a tokenizer and template), with a note in the
+   transcript.
 2. **Add Project…** at the foot of the sidebar. That folder is the only thing
    a session can see; a session is created automatically.
 3. Type, and **⌘↵**.
@@ -116,8 +122,14 @@ The session header should say **`sandboxed · booted in 0.6s`**. If it says
 
 ## What to expect
 
-* **~6 tokens a second.** A dense 27B on ~120 GB/s of memory bandwidth; the
-  ceiling is a bandwidth identity, not an efficiency problem.
+* **~6 tokens a second on the 27B.** A dense 27B on ~120 GB/s of memory
+  bandwidth; the ceiling is a bandwidth identity, not an efficiency problem.
+* **~68 tokens a second on Flash-Next**, on an M5 Max (125B total, 6B
+  active; ~465 tok/s prefill). It needs ~80 GB resident, so it is a 128 GB
+  machine's model: on 32 GB it does not load, and the engine says so up
+  front. At 32 KB of cache per token it gets the full 262K window; its turn
+  budget is 32K tokens against the 27B's 4K. No draft head for it yet — the
+  27B's is kept and ignored while Flash-Next runs.
 * **A pause before the first token, once per project.** The system turn is
   ~2200 tokens (the ten tool schemas render into it), so a cold project
   spends roughly a minute reading its own prompt. It is then checkpointed and
@@ -137,7 +149,7 @@ The session header should say **`sandboxed · booted in 0.6s`**. If it says
   pin temperature 0 so runs stay comparable. Design: spec §7.5.
 * **⌘.** stops a turn at the next token.
 * **Switching sessions is not free.** Only one session is live at a time on a
-  32 GB machine; switching re-prefills (helped by the engine's LRU cache).
+  32 GB machine (or under Flash-Next on 128 GB); switching re-prefills (helped by the engine's LRU cache).
   Reading a parked transcript costs nothing; sending it a message pays.
 
 ## Headless and make targets

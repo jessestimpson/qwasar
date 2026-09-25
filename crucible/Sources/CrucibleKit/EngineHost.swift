@@ -39,6 +39,11 @@ public enum EngineError: Error, CustomStringConvertible {
 /// What a loaded engine can tell us about itself.
 public struct EngineInfo: Sendable {
     public let modelPath: String
+    /// Which model the engine found in that folder, in its own words
+    /// (`qwasar_model_id`, `qwasar_model_name`) -- reported rather than
+    /// inferred from what the app thought it was loading.
+    public let modelID: String
+    public let modelName: String
     public let vocabSize: Int32
     public let layers: Int32
     public let contextSize: Int32
@@ -50,6 +55,8 @@ public struct EngineInfo: Sendable {
     /// failed to bind leaves a working engine that simply decodes serially, and
     /// a UI that claimed otherwise would be lying about why it is slow.
     public let mtpActive: Bool
+
+    public var family: ModelFamily? { ModelFamily(modelID: modelID) }
 }
 
 public final class EngineHost: @unchecked Sendable {
@@ -77,7 +84,9 @@ public final class EngineHost: @unchecked Sendable {
 
     // MARK: Lifecycle
 
-    /// Loads config and binds weights. Roughly 16 GB of mmap; several seconds.
+    /// Loads config and binds weights: ~16 GB for the 27B, ~80 GB wired for
+    /// Flash-Next. Seconds either way; the engine refuses up front, with a
+    /// reason, a model that does not fit in the memory free right now.
     ///
     /// `contextSize` comes from the caller because PLAN.md 2.3 makes it a
     /// property of the machine's profile, not of the engine: the KV cache is
@@ -96,6 +105,7 @@ public final class EngineHost: @unchecked Sendable {
                           _ mtpPath: String?) throws -> EngineInfo {
         Self.assertOnEngineQueue()
         if engine != nil { throw EngineError.load("already loaded") }
+        mtpDropped = nil
 
         let t0 = Date()
         let arena = CStringArena()
@@ -137,6 +147,8 @@ public final class EngineHost: @unchecked Sendable {
         }
 
         let i = EngineInfo(modelPath: modelPath,
+                           modelID: String(cString: qwasar_model_id(e)),
+                           modelName: String(cString: qwasar_model_name(e)),
                            vocabSize: qwasar_vocab_size(e),
                            layers: qwasar_n_layers(e),
                            contextSize: contextSize,
@@ -188,6 +200,20 @@ public final class EngineHost: @unchecked Sendable {
                     continuation.finish(); return
                 }
                 if self.sessions[id] != nil { continuation.finish(); return }
+                // A session is only as large as the window it was created in,
+                // and the window belongs to the loaded model and machine: a
+                // 262K Flash-Next conversation reopened under the 27B's 90K
+                // does not fit. Said here, in those words, rather than as an
+                // evaluation failure a third of the way through the replay.
+                let limit = Int(self.info?.contextSize ?? 0)
+                if limit > 0, history.count >= limit {
+                    continuation.yield(.failed(
+                        "this session holds \(history.count) tokens and "
+                        + "\(self.info?.modelName ?? "the loaded model") has a \(limit)-token "
+                        + "window here; switch back to a model with room for it, or start "
+                        + "a new session"))
+                    continuation.finish(); return
+                }
 
                 let (sp, err) = withErrorBuffer { buf, cap in qwasar_session_new(e, buf, cap) }
                 guard let handle = sp else {

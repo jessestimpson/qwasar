@@ -27,10 +27,37 @@ struct CrucibleApp: App {
                     .keyboardShortcut("n", modifiers: [.command, .shift])
             }
             CommandGroup(after: .appSettings) {
+                // Two models, each a folder granted once (ModelLibrary).
+                // Switching checkpoints the live session and reloads; a
+                // conversation continues under the new model by replaying
+                // its history, and the transcript notes the change.
+                Menu("Model") {
+                    ForEach(ModelFamily.allCases, id: \.self) { f in
+                        if state.knownModels.contains(f) {
+                            Button {
+                                state.switchModel(to: f)
+                            } label: {
+                                if state.activeFamily == f {
+                                    Label(f.title, systemImage: "checkmark")
+                                } else {
+                                    Text(f.title)
+                                }
+                            }
+                        } else {
+                            Button("\(f.title) — choose its folder…") { state.chooseModel() }
+                        }
+                    }
+                    Divider()
+                    Button("Choose Model Folder…") { state.chooseModel() }
+                }
+                Divider()
                 // Speculation needs a folder the sandbox cannot reach on its
                 // own, so it is a grant the user makes once, like the model.
+                // The 27B's; Flash-Next's MTP layer is not wired yet
+                // (PLAN-flash-next.md, Phase 7), so under it the head is kept
+                // and unused.
                 Button(state.hasDraftHead
-                       ? "Replace MTP Draft Head…" : "Add MTP Draft Head…") {
+                       ? "Replace MTP Draft Head (27B)…" : "Add MTP Draft Head (27B)…") {
                     state.chooseDraftHead()
                 }
                 if state.hasDraftHead {
@@ -374,7 +401,7 @@ struct StatusToolbar: ToolbarContent {
                         Label(n, systemImage: "info.circle")
                             .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     } else if let i = state.engineInfo {
-                        let label = "\(i.contextSize) ctx · "
+                        let label = "\(i.modelName) · \(i.contextSize) ctx · "
                                   + "\(state.profile.liveSessions) live"
                                   + (i.mtpActive ? " · spec" : "")
                         Text(label)
@@ -385,7 +412,7 @@ struct StatusToolbar: ToolbarContent {
                         // in the app menu; a one-time grant deserves a
                         // one-click home where the eye already checks status.
                         // Gone once granted -- the ctx label gains "spec".
-                        if !i.mtpActive {
+                        if !i.mtpActive, i.family?.supportsDraftHead ?? true {
                             Button {
                                 state.chooseDraftHead()
                             } label: {

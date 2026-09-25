@@ -136,6 +136,9 @@ struct RateReadout: View {
     /// decode regime changes, sampled reasoning versus speculative answer.
     let instantaneous: Double
     let generated: Int
+    /// What speed to expect from the model that is running -- ~6 tok/s and
+    /// ~68 tok/s are both healthy, for different models.
+    let speedNote: String
 
     var body: some View {
         HStack(spacing: 4) {
@@ -149,9 +152,7 @@ struct RateReadout: View {
         }
         .foregroundStyle(.secondary)
         .help("Current decode rate, then the turn's average, then \(generated) "
-              + "tokens generated this turn. This is a dense 27B model; about "
-              + "6 tok/s is the serial bandwidth ceiling — higher means "
-              + "speculation is paying.")
+              + "tokens generated this turn. " + speedNote)
     }
 }
 
@@ -345,7 +346,8 @@ struct StatusFooter: View {
                     if state.tokensPerSecond > 0 {
                         RateReadout(rate: state.tokensPerSecond,
                                     instantaneous: state.instantaneousTokensPerSecond,
-                                    generated: state.generatedThisTurn)
+                                    generated: state.generatedThisTurn,
+                                    speedNote: state.activeFamily?.speedNote ?? "")
                     }
                     EffortControl(state: state)
                     // Right-aligned and persistent, because it is state rather

@@ -28,10 +28,14 @@ final class AppState {
 
     // Engine
     var phase: Phase = .needsModel
-    /// Recomputed when a draft head is granted or removed: the head costs
+    /// Recomputed when a model is chosen and when a draft head is granted or
+    /// removed: the two models cost very different amounts, and the head costs
     /// weights and per-token cache out of the same budget the context comes
-    /// from, so it changes the answer (PLAN.md 2.3).
+    /// from, so each changes the answer (PLAN.md 2.3).
     private(set) var profile = MemoryProfile.derive()
+    /// What the active model folder holds, read from its config before the
+    /// engine binds it. nil until a folder is chosen.
+    private(set) var model: ModelInspection?
     let gate = GateCheck.run()
     var engineInfo: EngineInfo?
 
@@ -154,7 +158,6 @@ final class AppState {
         // was the bug that made speculation silently vanish on every relaunch
         // until the head was picked again.
         draftAccess.restore()
-        profile = MemoryProfile.derive(mtpAvailable: draftAccess.url != nil)
         if let u = access.restore() { Task { await load(u) } }
     }
 
@@ -170,7 +173,8 @@ final class AppState {
         // something a user should have to know to complete the first step.
         panel.showsHiddenFiles = true
         panel.canCreateDirectories = false
-        panel.message = "Choose the Qwen3.8 model directory (config.json + *.safetensors)."
+        panel.message = "Choose a model directory — Qwen3.8 27B or Qwen3.8 Flash-Next "
+                      + "(config.json + *.safetensors)."
         panel.prompt = "Use Model"
         guard panel.runModal() == .OK, let u = panel.url else { return }
         let resolved = u.resolvingSymlinksInPath()
@@ -178,22 +182,96 @@ final class AppState {
             phase = .failed("\(resolved.lastPathComponent) has no config.json and *.safetensors")
             return
         }
-        guard access.store(resolved) else {
-            phase = .failed("could not hold a security-scoped grant for that folder")
+        // Refused here, in a millisecond and with the reason, rather than
+        // seconds into binding -- or, for an unsupported model, never.
+        do { _ = try ModelInspection.inspect(resolved) } catch {
+            phase = .failed("\(resolved.lastPathComponent): \(error)")
             return
         }
-        Task { await load(resolved) }
+        Task {
+            await releaseEngine()
+            guard access.store(resolved) else {
+                phase = .failed("could not hold a security-scoped grant for that folder")
+                return
+            }
+            await load(resolved)
+        }
+    }
+
+    /// Families with a remembered folder, for the Model menu.
+    var knownModels: [ModelFamily] {
+        ModelFamily.allCases.filter { ModelLibrary.bookmark(for: $0) != nil }
+    }
+
+    /// The family of the model that is loaded, or being loaded.
+    var activeFamily: ModelFamily? { engineInfo?.family ?? model?.family }
+
+    /// Switches to the folder remembered for `family`. The live session is
+    /// checkpointed first -- the same conversation reopens under the new
+    /// model by replaying its tokens, and a checkpoint is what makes coming
+    /// back to the old one a read rather than a re-prefill.
+    func switchModel(to family: ModelFamily) {
+        guard family != activeFamily, let data = ModelLibrary.bookmark(for: family) else { return }
+        guard phase != .opening, !isLoading else { return }
+        Task {
+            await releaseEngine()
+            guard let u = access.use(bookmark: data) else {
+                // The grant no longer resolves: the folder moved or went.
+                ModelLibrary.forget(family)
+                phase = .failed("the \(family.title) folder is no longer reachable — choose it again")
+                return
+            }
+            await load(u)
+        }
+    }
+
+    private var isLoading: Bool { if case .loading = phase { return true } else { return false } }
+
+    /// Winds everything down that holds the engine: the turn in flight, the
+    /// live session (checkpointed, never just dropped), then the weights.
+    private func releaseEngine() async {
+        await settleTurn()
+        if let id = liveSessionID {
+            phase = .loading("checkpointing the session")
+            await engine.closeAndCheckpoint(id)
+            liveSessionID = nil
+        }
+        await engine.unload()
+        engineInfo = nil
     }
 
     private func load(_ u: URL) async {
-        phase = .loading("binding weights")
+        let inspected: ModelInspection
+        do { inspected = try ModelInspection.inspect(u) } catch {
+            phase = .failed("\(u.lastPathComponent): \(error)")
+            return
+        }
+        model = inspected
+        let family = inspected.family
+        // Whatever the last engine had to say was about the last engine.
+        engineNote = nil
+        // Sized for THIS model: 16 GB of weights and 64 KB/token, or 79.5 GB
+        // and 32 KB/token. A draft head only counts where the engine can use
+        // it -- it refuses the 27B's head for Flash-Next outright.
+        profile = MemoryProfile.derive(model: inspected,
+                                       mtpAvailable: draftAccess.url != nil)
+        if !profile.note.isEmpty { engineNote = profile.note }
+        phase = .loading("binding \(family.title)")
         do {
             engineInfo = try await engine.load(modelPath: u.path,
                                                contextSize: profile.contextSize,
                                                mtpPath: profile.mtpEnabled
                                                         ? draftAccess.url?.path : nil)
             if let why = engine.mtpDropped { engineNote = why }
+            // Remembered under the family the ENGINE reports, so the Model
+            // menu can come back here without the open panel.
+            if let data = access.bookmark {
+                ModelLibrary.remember(data, as: engineInfo?.family ?? family)
+            }
             phase = .ready
+            // The live session went with the old engine, so the meter goes
+            // back to the selected session's own record.
+            select(selectedSessionID)
             refreshWarm()
         } catch {
             phase = .failed(String(describing: error))
@@ -252,20 +330,25 @@ final class AppState {
     /// Re-derives the profile and asks for a reload, because a draft head can
     /// only be bound at `qwasar_engine_load`.
     private func applyDraftHead() {
-        profile = MemoryProfile.derive(mtpAvailable: draftAccess.url != nil)
-        guard let model = access.url else { return }
-        engineNote = draftAccess.url == nil
-            ? "Draft head removed — reloading; context returns to \(profile.contextSize)."
-            : "Draft head accepted — reloading with speculation; context becomes "
-              + "\(profile.contextSize)." 
+        guard let folder = access.url else { return }
+        // The head is the 27B's. Under Flash-Next it is kept for later and
+        // changes nothing now, so there is nothing to reload for.
+        if let m = model, !m.family.supportsDraftHead {
+            engineNote = draftAccess.url == nil
+                ? "Draft head removed."
+                : "Draft head kept for Qwen3.8 27B; \(m.family.title) does not use one yet."
+            return
+        }
+        let next = MemoryProfile.derive(model: model, mtpAvailable: draftAccess.url != nil)
         Task {
             // A turn in flight would otherwise hold the engine queue, and the
-            // unload behind it would look like the app hanging.
-            await settleTurn()
-            await engine.unload()
-            engineInfo = nil
-            liveSessionID = nil
-            await load(model)
+            // unload behind it would look like the app hanging. The live
+            // session is checkpointed on the way, not just dropped.
+            await releaseEngine()
+            await load(folder)
+            engineNote = draftAccess.url == nil
+                ? "Draft head removed; context is \(next.contextSize)."
+                : "Draft head accepted; speculating, and context is \(next.contextSize)."
         }
     }
 
@@ -784,7 +867,8 @@ final class AppState {
 
                 for await ev in engine.openSession(id: rec.id, runner: runner,
                                                    config: SessionConfig(system: p.systemPrompt,
-                                                                         effort: rec.effort),
+                                                                         effort: rec.effort,
+                                                                         maxTokensPerTurn: activeFamily?.turnBudget ?? 4096),
                                                    history: history) {
                     switch ev {
                     case .prefill(let d, let t): prefillDone = d; prefillTotal = t
@@ -812,6 +896,16 @@ final class AppState {
                 pendingHandoff = nil
                 appendItem(TranscriptItem(.note("the delegation result was attached to this message")))
             }
+            // The two models share a tokenizer and a template, so a session
+            // moves between them by replaying its history -- but it is a
+            // different model answering from here on, and that belongs in the
+            // record rather than being noticed from the prose.
+            // A record from before there were two models ran the 27B.
+            let was = rec.modelID ?? (rec.tokenCount > 0 ? ModelFamily.dense.id : nil)
+            if let now = engineInfo, let was, was != now.modelID {
+                let wasName = ModelFamily(modelID: was)?.title ?? was
+                appendItem(TranscriptItem(.note("continued on \(now.modelName) (was \(wasName))")))
+            }
             appendItem(TranscriptItem(.user(text)))
 
             let flag = cancelFlag
@@ -834,6 +928,7 @@ final class AppState {
             if let i = sessions.firstIndex(where: { $0.id == rec.id }) {
                 if !toks.isEmpty { sessions[i].tokenCount = toks.count }
                 sessions[i].state = .live
+                if let id = engineInfo?.modelID { sessions[i].modelID = id }
                 if sessions[i].title == "New session" {
                     sessions[i].title = String(text.prefix(48))
                 }

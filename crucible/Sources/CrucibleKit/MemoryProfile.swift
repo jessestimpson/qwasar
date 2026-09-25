@@ -6,6 +6,13 @@
 // them. Nothing here is a constant except the model's own ceiling and the
 // reserve.
 //
+// They are derived for the model the user chose, not for "the model": the
+// 27B and Flash-Next differ by 4.6x in resident weights and 2x in KV per
+// token (ModelFamily holds both sets of costs). On a 32 GB Air the 27B gets
+// ~90K of context and Flash-Next does not fit at all; on a 128 GB Max the
+// 27B gets the full 262K with room for more live sessions, and Flash-Next
+// gets the full 262K beside 79.5 GB of weights.
+//
 // NOTE ON A PLAN CHANGE: PLAN.md 2.3 proposed adding a working-set accessor to
 // qwasar.h, on the grounds that qw_gpu_working_set_limit() lives in a header the
 // module map excludes. That ask is unnecessary -- the app links Metal already,
@@ -21,6 +28,7 @@ public struct MemoryProfile: Sendable, Equatable {
     public var mtpEnabled: Bool
 
     /// Everything that went into the decision, so the UI can show its working.
+    public var family: ModelFamily
     public var workingSetBytes: UInt64
     public var physicalBytes: UInt64
     public var reserveFraction: Double
@@ -28,10 +36,10 @@ public struct MemoryProfile: Sendable, Equatable {
     public var perSessionBytes: UInt64
     public var note: String
 
+    /// Both models were trained to 262,144 positions; the config says so and
+    /// the derivation takes the config's word when it has one.
     public static let modelMaxContext: Int32 = 262_144
 
-    /// KV is 64 KB/token: 16 full-attention layers x 4 KV heads x 256 x 2 x fp16.
-    public static let kvBytesPerToken: UInt64 = 64 * 1024
     /// The MTP draft head keeps its own single-layer KV cache.
     public static let mtpBytesPerToken: UInt64 = 4 * 1024
     /// The head's own weights: a single BF16 layer, measured at 810 MB on disk.
@@ -39,11 +47,6 @@ public struct MemoryProfile: Sendable, Equatable {
     /// Below this, the context the head costs is worth more than the speed it
     /// buys, and it stays off however much memory is free.
     public static let mtpContextFloor: Int32 = 32_768
-    /// 151 MB of SSM/conv state plus ~200 MB of activation scratch, both
-    /// independent of context length.
-    public static let sessionFixedBytes: UInt64 = 351 * 1024 * 1024
-    /// 15.1 GB of 4-bit text weights plus a 0.92 GB BF16 vision tower.
-    public static let weightsBytesDefault: UInt64 = 16_020_000_000
 
     /// Exceeding recommendedMaxWorkingSetSize does not fail an allocation, it
     /// starts evicting GPU resources to swap -- which on a 16 GB weight set is
@@ -56,24 +59,48 @@ public struct MemoryProfile: Sendable, Equatable {
     /// switch latency and nothing else.
     public static let maxLiveSessions = 4
 
+    /// The profile for a model on THIS machine.
+    ///
+    /// `model` is what the chosen folder holds; nil (nothing chosen yet) sizes
+    /// for the 27B, which is what every profile was before there were two.
     /// `mtpAvailable` says whether a draft head has been granted; without one
-    /// there is nothing to enable, so the memory question does not arise.
-    public static func derive(weightsBytes: UInt64 = weightsBytesDefault,
+    /// there is nothing to enable, so the memory question does not arise -- and
+    /// for a model the engine cannot speculate on, it does not arise either.
+    public static func derive(model: ModelInspection? = nil,
                               mtpAvailable: Bool = false) -> MemoryProfile {
         let physical = ProcessInfo.processInfo.physicalMemory
         let device = MTLCreateSystemDefaultDevice()
         let workingSet = UInt64(device?.recommendedMaxWorkingSetSize ?? (physical * 84 / 100))
+        let family = model?.family ?? .dense
+        return derive(family: family,
+                      weightsBytes: model?.residentWeightsBytes ?? family.fallbackWeightsBytes,
+                      maxContext: model?.maxContext ?? modelMaxContext,
+                      mtpAvailable: mtpAvailable,
+                      workingSetBytes: workingSet, physicalBytes: physical)
+    }
+
+    /// The arithmetic alone, with the machine passed in -- so a 128 GB
+    /// derivation can be checked on a 32 GB laptop.
+    public static func derive(family: ModelFamily, weightsBytes: UInt64, maxContext: Int32,
+                              mtpAvailable: Bool,
+                              workingSetBytes workingSet: UInt64,
+                              physicalBytes physical: UInt64) -> MemoryProfile {
+        let fixed = family.sessionFixedBytes
+        let kvPerToken = family.kvBytesPerToken
+        let ceiling = min(maxContext, modelMaxContext)
 
         let usable = Double(workingSet) * reserve
         let forSessions = usable - Double(weightsBytes)
 
-        guard forSessions > Double(sessionFixedBytes) else {
+        guard forSessions > Double(fixed) else {
             return MemoryProfile(contextSize: 4096, liveSessions: 1, mtpEnabled: false,
+                                 family: family,
                                  workingSetBytes: workingSet, physicalBytes: physical,
                                  reserveFraction: reserve, weightsBytes: weightsBytes,
-                                 perSessionBytes: sessionFixedBytes,
-                                 note: "This machine cannot hold the weights and a "
-                                     + "usable session at once. Expect swapping.")
+                                 perSessionBytes: fixed,
+                                 note: "This machine cannot hold \(family.title)'s weights "
+                                     + "and a usable session at once. Expect swapping, or "
+                                     + "the engine refusing to load it.")
         }
 
         // The draft head is a real trade, not a free win: 811 MB of weights plus
@@ -81,50 +108,55 @@ public struct MemoryProfile: Sendable, Equatable {
         // comes from. On a 32 GB machine that is 1.14 GB of a 6.30 GB session
         // budget -- about 12% of the context -- bought with faster decode.
         //
-        // So it is enabled when a head is actually present and the context that
-        // survives is still worth having. The previous rule (`forSessions >
-        // 24 GB`) was a guess made while nothing loaded the head at all, and it
-        // said no on every machine that could comfortably have said yes.
-        let mtp = mtpAvailable
-            && forSessions > Double(mtpWeightsBytes + sessionFixedBytes)
+        // So it is enabled when a head is actually present, the model can use
+        // it, and the context that survives is still worth having. The previous
+        // rule (`forSessions > 24 GB`) was a guess made while nothing loaded the
+        // head at all, and it said no on every machine that could comfortably
+        // have said yes.
+        let mtp = mtpAvailable && family.supportsDraftHead
+            && forSessions > Double(mtpWeightsBytes + fixed)
             && contextFitting(budget: forSessions - Double(mtpWeightsBytes),
-                              sessions: 1,
-                              perToken: kvBytesPerToken + mtpBytesPerToken) >= mtpContextFloor
-        let perToken = kvBytesPerToken + (mtp ? mtpBytesPerToken : 0)
+                              sessions: 1, fixed: fixed, ceiling: ceiling,
+                              perToken: kvPerToken + mtpBytesPerToken) >= mtpContextFloor
+        let perToken = kvPerToken + (mtp ? mtpBytesPerToken : 0)
         // The head's weights come out of the same budget the context does.
         let budget = mtp ? forSessions - Double(mtpWeightsBytes) : forSessions
 
         // Prefer context first, then extra live sessions, but never more than
         // the cap and never more context than the model has positions for.
         var live = 1
-        var context = contextFitting(budget: budget, sessions: 1, perToken: perToken)
+        var context = contextFitting(budget: budget, sessions: 1, fixed: fixed,
+                                     ceiling: ceiling, perToken: perToken)
 
         while live < maxLiveSessions {
             let next = live + 1
-            let c = contextFitting(budget: budget, sessions: next, perToken: perToken)
+            let c = contextFitting(budget: budget, sessions: next, fixed: fixed,
+                                   ceiling: ceiling, perToken: perToken)
             // Only take another live session if the context it leaves is still
             // the model's full window -- context is the resource that extends
             // what a session can do; live count only removes a park and a
             // restore.
-            if c >= modelMaxContext { live = next; context = c } else { break }
+            if c >= ceiling { live = next; context = c } else { break }
         }
 
-        let per = sessionFixedBytes + UInt64(context) * perToken
+        let per = fixed + UInt64(context) * perToken
         return MemoryProfile(contextSize: context, liveSessions: live, mtpEnabled: mtp,
+                             family: family,
                              workingSetBytes: workingSet, physicalBytes: physical,
                              reserveFraction: reserve, weightsBytes: weightsBytes,
                              perSessionBytes: per,
                              note: "")
     }
 
-    private static func contextFitting(budget: Double, sessions: Int, perToken: UInt64) -> Int32 {
-        let each = budget / Double(sessions) - Double(sessionFixedBytes)
+    private static func contextFitting(budget: Double, sessions: Int, fixed: UInt64,
+                                       ceiling: Int32, perToken: UInt64) -> Int32 {
+        let each = budget / Double(sessions) - Double(fixed)
         guard each > 0 else { return 0 }
         let raw = each / Double(perToken)
         // Round down to a multiple of 8192: a tidy number to show a user, and
         // well below any allocator granularity that would matter.
         let stepped = (Int32(min(raw, Double(Int32.max))) / 8192) * 8192
-        return min(stepped, modelMaxContext)
+        return min(stepped, ceiling)
     }
 
     /// Decimal GB throughout, because that is what Metal reports and what
@@ -134,7 +166,7 @@ public struct MemoryProfile: Sendable, Equatable {
     public var summary: String {
         let gb = { (b: UInt64) in String(format: "%.2f GB", Double(b) / 1e9) }
         return """
-        physical \(gb(physicalBytes)) · Metal working set \(gb(workingSetBytes)) \
+        \(family.title) · physical \(gb(physicalBytes)) · Metal working set \(gb(workingSetBytes)) \
         · reserve \(Int(reserveFraction * 100))%
         weights \(gb(weightsBytes)) · per session \(gb(perSessionBytes))
         → \(liveSessions) live session\(liveSessions == 1 ? "" : "s") \

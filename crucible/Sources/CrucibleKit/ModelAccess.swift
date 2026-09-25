@@ -6,7 +6,8 @@
 // it apply to this process. Discovering this after building the file layer is a
 // bad day, so it is in M0.
 //
-// The engine mmaps ~16 GB out of this directory. That the sandbox permits it at
+// The engine mmaps ~16 GB (the 27B) or ~111 GB (Flash-Next) out of this
+// directory. That the sandbox permits it at
 // all is half of the M0 gate.
 
 import Foundation
@@ -47,6 +48,17 @@ public final class ModelAccess {
                                              relativeTo: nil) else { return false }
         UserDefaults.standard.set(data, forKey: defaultsKey)
         return adopt(u)
+    }
+
+    /// The stored grant itself, to be remembered elsewhere (ModelLibrary).
+    public var bookmark: Data? { UserDefaults.standard.data(forKey: defaultsKey) }
+
+    /// Switches to a grant made earlier and remembered as bookmark data --
+    /// the only way back into a folder the sandbox has no current access to.
+    @discardableResult
+    public func use(bookmark data: Data) -> URL? {
+        UserDefaults.standard.set(data, forKey: defaultsKey)
+        return restore()
     }
 
     private func adopt(_ u: URL) -> Bool {
@@ -104,5 +116,36 @@ public final class ModelAccess {
     public static var conventionalDraftHead: URL {
         let home = String(cString: getpwuid(getuid()).pointee.pw_dir)
         return URL(fileURLWithPath: home).appendingPathComponent(".cache/qwasar/mtp")
+    }
+}
+
+/// One remembered model folder per family.
+///
+/// There are two models now, and they live in different folders the user
+/// granted separately. Keeping one grant per family is what makes switching a
+/// menu pick rather than a trip through the open panel each time. Only the
+/// ACTIVE folder is accessed (ModelAccess); these are just the grants, kept.
+public enum ModelLibrary {
+    private static func key(_ f: ModelFamily) -> String { "dev.crucible.modelBookmark.\(f.rawValue)" }
+
+    public static func remember(_ bookmark: Data, as f: ModelFamily) {
+        UserDefaults.standard.set(bookmark, forKey: key(f))
+    }
+
+    public static func bookmark(for f: ModelFamily) -> Data? {
+        UserDefaults.standard.data(forKey: key(f))
+    }
+
+    /// Where the remembered folder is, for display. Resolving does not start
+    /// access, so this is a path to show and nothing more.
+    public static func path(for f: ModelFamily) -> String? {
+        guard let data = bookmark(for: f) else { return nil }
+        var stale = false
+        return (try? URL(resolvingBookmarkData: data, options: .withSecurityScope,
+                         relativeTo: nil, bookmarkDataIsStale: &stale))?.path
+    }
+
+    public static func forget(_ f: ModelFamily) {
+        UserDefaults.standard.removeObject(forKey: key(f))
     }
 }

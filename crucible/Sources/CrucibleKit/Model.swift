@@ -196,6 +196,12 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
     /// What this session's delegations have cost (spec §15.3), summed. The
     /// escalation budget is enforced against this, so it persists.
     public var spentUSD: Double?
+    /// The engine's id for the model that last ran this session
+    /// (`qwasar_model_id`). The two models share a tokenizer and a template, so
+    /// a conversation can move between them -- the history replays either way
+    /// -- but a different model is a different voice, so the transcript says
+    /// when it happens. Optional so old records decode; they were all the 27B.
+    public var modelID: String?
 
     public var effort: ReasoningEffort { storedEffort ?? .medium }
 

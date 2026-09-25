@@ -2,6 +2,7 @@
 //
 // The suites, in order of how much they cost to run:
 //   pathguard  no I/O beyond a temp tree; the security boundary
+//   models     pure; which model a folder holds, and each one's memory profile
 //   store      persistence, including what survives a crash mid-turn
 //   utf8       pure; the transcript's silent corruption bug
 //   markdown   blocks out of Foundation's parse; the highlighter's reconstruction
@@ -23,6 +24,7 @@ struct TestMain {
         print("== network");    failures += NetworkPolicySuite.run()
         print("== overlay");    failures += SandboxOverlaySuite.run()
         print("== delegation");  failures += EscalationSuite.run()
+        print("== models");     failures += ModelFamilySuite.run()
         print("== store");      failures += StoreSuite.run()
         print("== guestimage"); failures += GuestImageSuite.run()
         print("== utf8");       failures += UTF8Suite.run()
