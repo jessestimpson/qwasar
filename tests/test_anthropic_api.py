@@ -47,6 +47,23 @@ WEATHER_TOOL = {
 TOOL_PROMPT = [{"role": "user", "content":
                 "What's the weather in Paris right now? Use the get_weather tool."}]
 
+# See the OpenAI suite: a quote- and newline-heavy document, for a big call.
+LONG_DOC = "".join(f'{i:02d}. say "hello" to "{w}" and "goodbye" to "{w}s"\n'
+                   for i, w in enumerate(["cat", "dog", "fox", "owl", "elk", "bee", "ant", "yak"] * 6))
+
+WRITE_TOOL = {
+    "name": "write",
+    "description": "Write text to a file.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "filePath": {"type": "string", "description": "Absolute path."},
+            "content": {"type": "string", "description": "The whole file."},
+        },
+        "required": ["filePath", "content"],
+    },
+}
+
 COUNT_PROMPT = [{"role": "user", "content":
                  "Count from 1 to 10, digits separated by single spaces, nothing else."}]
 
@@ -633,6 +650,22 @@ class Streaming(Case):
                   and d["content_block"]["type"] == "tool_use"]
         self.assertEqual(starts[0]["content_block"]["input"], {},
                          "a streamed tool_use starts with empty input")
+
+    def test_large_tool_use(self):
+        # As the OpenAI test of the same name: a tool call's input goes out in
+        # one input_json_delta, which a 2 KB formatting buffer once truncated.
+        status, _, events = messages_stream(
+            messages=[{"role": "user", "content":
+                       "Use the write tool to save this exact text to /tmp/qw_notes.txt:\n\n"
+                       + LONG_DOC}],
+            tools=[WRITE_TOOL], tool_choice={"type": "tool", "name": "write"},
+            thinking={"type": "disabled"}, temperature=0, max_tokens=2048)
+        self.assertOk(status, events)   # every event parsed as JSON on the way in
+        biggest = max(len(json.dumps(d)) for _, d in events)
+        if biggest < 2600:
+            self.skipTest(f"the model wrote a short call ({biggest} bytes); nothing over 2 KB to check")
+        message = self.assertStream(events)
+        self.assertIn("content", blocks(message, "tool_use")[0]["input"])
 
     def test_thinking(self):
         status, _, events = messages_stream(

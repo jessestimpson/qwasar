@@ -335,6 +335,13 @@ float   qwasar_rng_uniform(uint64_t *state);
 int32_t qwasar_session_common_prefix(const qwasar_session *s,
                                      const int32_t *tokens, int32_t n);
 
+/* Where `tokens` first departs from what the session has evaluated: the
+ * length of their common prefix, whether or not it covers the session.  For
+ * diagnosing a prompt that cannot reuse the session; `history` and
+ * `n_history`, when given, receive the session's own tokens. */
+int32_t qwasar_session_divergence(const qwasar_session *s, const int32_t *tokens, int32_t n,
+                                  const int32_t **history, int32_t *n_history);
+
 /* A rewind point, for when the next prompt keeps this one but not what was
  * generated after it -- a client that drops the reasoning it was sent, a
  * reply cut at a stop sequence, a retry of the same request.

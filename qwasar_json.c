@@ -247,6 +247,12 @@ bool qj_parse(qj_doc *d, const char *text, size_t len) {
     if (root == QJ_NOMEM) return false;
     if (root != 1) { snprintf(d->err, sizeof d->err, "internal: root is not node 1"); return false; }
     qj_ws(&s);
+    /* One value and nothing after it: "00. text" is not the number 0. */
+    if (s.p < s.end) {
+        snprintf(d->err, sizeof d->err, "unexpected text after the value at offset %ld",
+                 (long)(s.p - d->text));
+        return false;
+    }
     return true;
 }
 

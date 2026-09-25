@@ -60,13 +60,27 @@ static bool str_add(str *s, const char *d, size_t n) {
 static bool str_puts(str *s, const char *t) { return t ? str_add(s, t, strlen(t)) : true; }
 static void str_free(str *s) { free(s->p); s->p = NULL; s->len = s->cap = 0; }
 
+/* Formats onto the end of `s`, whatever the length: on the stack when it
+ * fits, else sized and formatted again on the heap.  (It once cut at 2 KB,
+ * silently -- which truncated any SSE event carrying a large tool call.) */
 static void str_printf(str *s, const char *fmt, ...) {
     char buf[2048];
-    va_list ap;
+    va_list ap, again;
     va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_copy(again, ap);
+    const int n = vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
-    if (n > 0) str_add(s, buf, (size_t)n < sizeof buf ? (size_t)n : sizeof buf - 1);
+    if (n > 0 && (size_t)n < sizeof buf) {
+        str_add(s, buf, (size_t)n);
+    } else if (n > 0) {
+        char *big = malloc((size_t)n + 1);
+        if (big) {
+            vsnprintf(big, (size_t)n + 1, fmt, again);
+            str_add(s, big, (size_t)n);
+            free(big);
+        }
+    }
+    va_end(again);
 }
 
 /* Appends `t` as a JSON string, quotes included. */
@@ -249,8 +263,10 @@ static void sse_chunk(conn *c, const char *data, size_t n) {
 
 static void sse_event(conn *c, const char *event, const char *json) {
     str f = { 0 };
-    if (event) str_printf(&f, "event: %s\n", event);
-    str_printf(&f, "data: %s\n\n", json);
+    if (event) { str_puts(&f, "event: "); str_puts(&f, event); str_puts(&f, "\n"); }
+    str_puts(&f, "data: ");
+    str_puts(&f, json);
+    str_puts(&f, "\n\n");
     sse_chunk(c, f.p, f.len);
     str_free(&f);
 }
@@ -270,6 +286,10 @@ typedef struct {
     int32_t           max_tokens;    /* output when a request names none; 0 = the context's room */
     bool              no_cache;
     int32_t           ckpt_n;        /* longest checkpoint the live session's prefix has */
+    /* The last prompt that could not reuse the live session (-v): where it
+     * departed from it, and the text on each side, for the request's log. */
+    int32_t           miss_at, miss_of;
+    char              miss_had[160], miss_got[160];
     uint64_t          rng;
     bool              verbose;
     pthread_mutex_t   lock;          /* held for the whole of a completion */
@@ -307,6 +327,26 @@ static void srv_log(const char *fmt, ...) {
 
 /* Tokens per second, 0 for no time. */
 static double srv_rate(int32_t n, double secs) { return secs > 0 ? n / secs : 0.0; }
+
+/* Tokens [from, to) as printable text for the log: control characters and
+ * newlines escaped, cut to fit. */
+static void srv_token_text(server *sv, const int32_t *toks, int32_t from, int32_t to,
+                           char *out, size_t cap) {
+    size_t o = 0;
+    for (int32_t i = from < 0 ? 0 : from; i < to && o + 8 < cap; i++) {
+        size_t len = 0;
+        bool special = false;
+        const char *b = qwasar_token_bytes(sv->tok, toks[i], &len, &special);
+        for (size_t k = 0; b && k < len && o + 8 < cap; k++) {
+            const unsigned char ch = (unsigned char)b[k];
+            if (ch == '\n')      { out[o++] = '\\'; out[o++] = 'n'; }
+            else if (ch == '\t') { out[o++] = '\\'; out[o++] = 't'; }
+            else if (ch < 0x20)  o += (size_t)snprintf(out + o, cap - o, "\\x%02x", ch);
+            else                 out[o++] = (char)ch;
+        }
+    }
+    out[o] = 0;
+}
 
 /* Where the prompt is worth a disk checkpoint (srv_eval_from). */
 typedef struct {
@@ -417,6 +457,23 @@ static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
         *reused = back;
         *how = "the live session, rewound to the last prompt";
         return srv_eval_from(sv, tokens, back, n, mk, err, cap);
+    }
+
+    /* Neither: say where this prompt departs from the session, before the
+     * session goes -- the one thing that explains a client's misses. */
+    sv->miss_at = -1;
+    if (sv->s && sv->verbose) {
+        const int32_t *had = NULL;
+        int32_t n_had = 0;
+        const int32_t at = qwasar_session_divergence(sv->s, tokens, n, &had, &n_had);
+        if (had && n_had > 0) {
+            sv->miss_at = at;
+            sv->miss_of = n_had;
+            srv_token_text(sv, had, at - 6, at + 14 < n_had ? at + 14 : n_had,
+                           sv->miss_had, sizeof sv->miss_had);
+            srv_token_text(sv, tokens, at - 6, at + 14 < n ? at + 14 : n,
+                           sv->miss_got, sizeof sv->miss_got);
+        }
     }
 
     if (sv->s) qwasar_session_free(sv->s);
@@ -1303,31 +1360,88 @@ static bool read_openai_opts(const qj_doc *d, const qj_node *root, req_opts *o,
 
 /* ---- response building ------------------------------------------------------ */
 
-/* Tool arguments arrive from the model as text.  A value that is valid JSON on
- * its own is emitted as JSON so numbers and booleans survive the round trip;
- * anything else is emitted as a string, which is what it is. */
-static void emit_arg_value(str *out, const char *v) {
-    qj_doc probe;
-    if (v && *v && qj_parse(&probe, v, strlen(v))) {
-        const qj_node *r = qj_root(&probe);
-        if (r->type == QJ_NUMBER || r->type == QJ_TRUE || r->type == QJ_FALSE
-            || r->type == QJ_OBJECT || r->type == QJ_ARRAY) {
-            str_puts(out, v);
-            qj_free(&probe);
-            return;
+/* Whether the request's tool `tool` declares parameter `param` a string --
+ * "type": "string", or a type list of only "string" and "null".  Tools come
+ * in OpenAI's shape (function.parameters) or Anthropic's (input_schema). */
+static bool param_is_string(const qj_doc *d, const char *tool, const char *param) {
+    const qj_node *tools = qj_get(d, qj_root(d), "tools");
+    for (const qj_node *t = qj_first(d, tools); t; t = qj_next(d, t)) {
+        const qj_node *fn = qj_get(d, t, "function");
+        if (!fn) fn = t;
+        if (!qj_str_eq(d, qj_get(d, fn, "name"), tool)) continue;
+        const qj_node *schema = qj_get(d, fn, "parameters");
+        if (!schema) schema = qj_get(d, t, "input_schema");
+        const qj_node *props = qj_get(d, schema, "properties");
+        const size_t pl = strlen(param);
+        /* Keys compared directly: a parameter name may contain a dot, which
+         * qj_get would read as a path. */
+        for (const qj_node *m = qj_first(d, props); m; m = qj_next(d, m)) {
+            if (m->key_len != pl || memcmp(d->text + m->key_off, param, pl)) continue;
+            const qj_node *type = qj_get(d, m, "type");
+            if (qj_str_eq(d, type, "string")) return true;
+            if (type && type->type == QJ_ARRAY) {
+                bool str = false, other = false;
+                for (const qj_node *e = qj_first(d, type); e; e = qj_next(d, e)) {
+                    if (qj_str_eq(d, e, "string")) str = true;
+                    else if (!qj_str_eq(d, e, "null")) other = true;
+                }
+                return str && !other;
+            }
+            return false;
         }
+        return false;
     }
-    qj_free(&probe);
-    str_jsons(out, v);
+    return false;
 }
 
-static void emit_args_object(str *out, const qw_tool_call *c) {
+/* Strict JSON number syntax: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
+ * -- "007" or "1." are text, however a lenient parser reads them. */
+static bool json_number_syntax(const char *v) {
+    const char *p = v;
+    if (*p == '-') p++;
+    if (*p == '0') p++;
+    else if (*p >= '1' && *p <= '9') while (*p >= '0' && *p <= '9') p++;
+    else return false;
+    if (*p == '.') { p++; if (!(*p >= '0' && *p <= '9')) return false; while (*p >= '0' && *p <= '9') p++; }
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (!(*p >= '0' && *p <= '9')) return false;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    return *p == 0;
+}
+
+/* Tool arguments arrive from the model as text.  A parameter its tool
+ * declares a string is a string, whatever it looks like -- "42", "true", a
+ * file that begins "00. ..." (which once went out as a bare number followed
+ * by the rest of the file: invalid JSON).  Otherwise a value that is, whole,
+ * a JSON number, boolean, object or array is emitted as JSON, so those survive
+ * the round trip; anything else is a string. */
+static void emit_arg_value(str *out, const char *v, bool is_string) {
+    if (!is_string && v && *v) {
+        qj_doc probe;
+        if (qj_parse(&probe, v, strlen(v))) {
+            const qj_node *r = qj_root(&probe);
+            const bool json = (r->type == QJ_NUMBER && json_number_syntax(v))
+                           || r->type == QJ_TRUE || r->type == QJ_FALSE
+                           || r->type == QJ_OBJECT || r->type == QJ_ARRAY;
+            qj_free(&probe);
+            if (json) { str_puts(out, v); return; }
+        } else {
+            qj_free(&probe);
+        }
+    }
+    str_jsons(out, v ? v : "");
+}
+
+static void emit_args_object(str *out, const qw_tool_call *c, const qj_doc *d) {
     str_puts(out, "{");
     for (int i = 0; i < c->n_params; i++) {
         if (i) str_puts(out, ", ");
         str_jsons(out, c->params[i].key);
         str_puts(out, ": ");
-        emit_arg_value(out, c->params[i].value);
+        emit_arg_value(out, c->params[i].value, param_is_string(d, c->name, c->params[i].key));
     }
     str_puts(out, "}");
 }
@@ -1558,8 +1672,34 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
      * it here -- which is where it used to happen -- released them one call
      * before they were read. */
     const double t_prefill = srv_now();
+    sv->miss_at = -1;
     const float *logits = srv_prefill(sv, prompt, n_prompt, req.images, req.n_images,
                                       &marks, &reused, &how, err, sizeof err);
+    if (sv->verbose && sv->miss_at >= 0) {
+        /* Which message the departure falls in: the first whose rendering
+         * reaches past it. */
+        int32_t msg = -1;
+        qwasar_chat_options upto = chat;
+        upto.add_generation_prompt = false;
+        upto.continue_final_message = false;
+        for (int32_t k = 1; k <= req.n && msg < 0; k++) {
+            char e2[64];
+            int32_t m = 0;
+            int32_t *p = qwasar_apply_chat_template(sv->tok, req.msgs, k, &upto, &m, e2, sizeof e2);
+            free(p);
+            if (p && m > sv->miss_at) msg = k - 1;
+        }
+        char where[96];
+        if (msg >= 0)
+            snprintf(where, sizeof where, "message %d of %d (%s)", msg + 1, req.n,
+                     req.msgs[msg].role ? req.msgs[msg].role : "?");
+        else
+            snprintf(where, sizeof where, "after the last message");
+        srv_log("  cannot reuse the live session (%d tokens): this prompt departs from it "
+                "at token %d, in %s", sv->miss_of, sv->miss_at, where);
+        srv_log("    session had: ...%s...", sv->miss_had);
+        srv_log("    prompt has:  ...%s...", sv->miss_got);
+    }
     req_free(&req);
     free(prompt);
     const double prefill_s = srv_now() - t_prefill;
@@ -1687,7 +1827,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
                 str_free(&b);
 
                 str args = { 0 };
-                emit_args_object(&args, &calls.calls[i]);
+                emit_args_object(&args, &calls.calls[i], d);
                 str db = { 0 };
                 str_printf(&db, "{\"type\": \"content_block_delta\", \"index\": %d, "
                                 "\"delta\": {\"type\": \"input_json_delta\", "
@@ -1716,7 +1856,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
                 char tid[64];
                 gen_id(tid, sizeof tid, "call_");
                 str args = { 0 };
-                emit_args_object(&args, &calls.calls[i]);
+                emit_args_object(&args, &calls.calls[i], d);
                 str b = { 0 };
                 str_printf(&b, "{\"id\": \"%s\", \"object\": \"chat.completion.chunk\", "
                                "\"created\": %ld, \"model\": \"%s\", \"choices\": [{\"index\": 0, "
@@ -1788,7 +1928,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
             str_printf(&b, "{\"type\": \"tool_use\", \"id\": \"%s\", \"name\": ", tid);
             str_jsons(&b, calls.calls[i].name);
             str_puts(&b, ", \"input\": ");
-            emit_args_object(&b, &calls.calls[i]);
+            emit_args_object(&b, &calls.calls[i], d);
             str_puts(&b, "}");
             first = false;
         }
@@ -1812,7 +1952,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
                 char tid[64];
                 gen_id(tid, sizeof tid, "call_");
                 str args = { 0 };
-                emit_args_object(&args, &calls.calls[i]);
+                emit_args_object(&args, &calls.calls[i], d);
                 if (i) str_puts(&b, ", ");
                 str_printf(&b, "{\"id\": \"%s\", \"type\": \"function\", \"function\": "
                                "{\"name\": ", tid);

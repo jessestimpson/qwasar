@@ -409,6 +409,17 @@ int32_t qwasar_session_rewind_to_mark(qwasar_session *s) {
     return s->mark_n;
 }
 
+int32_t qwasar_session_divergence(const qwasar_session *s, const int32_t *tokens, int32_t n,
+                                  const int32_t **history, int32_t *n_history) {
+    if (history) *history = s ? s->history : NULL;
+    if (n_history) *n_history = s ? s->n_history : 0;
+    if (!s || !s->history || !tokens) return 0;
+    const int32_t limit = s->n_history < n ? s->n_history : n;
+    int32_t i = 0;
+    while (i < limit && s->history[i] == tokens[i]) i++;
+    return i;
+}
+
 const int32_t *qw_session_history(const qwasar_session *s, int32_t *n) {
     if (n) *n = s ? s->n_history : 0;
     return s ? s->history : NULL;

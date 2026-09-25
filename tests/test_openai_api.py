@@ -28,6 +28,27 @@ from qwasar_api import TIMEOUT, nullable, request
 # server's documented extension) and keep the budget small.
 FAST = {"enable_thinking": False, "temperature": 0, "max_tokens": 64}
 
+# A document an agent might write: quotes and newlines, escaped twice on the
+# way out (JSON arguments inside a JSON event), so a call carrying it is big.
+LONG_DOC = "".join(f'{i:02d}. say "hello" to "{w}" and "goodbye" to "{w}s"\n'
+                   for i, w in enumerate(["cat", "dog", "fox", "owl", "elk", "bee", "ant", "yak"] * 6))
+
+WRITE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "write",
+        "description": "Write text to a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filePath": {"type": "string", "description": "Absolute path."},
+                "content": {"type": "string", "description": "The whole file."},
+            },
+            "required": ["filePath", "content"],
+        },
+    },
+}
+
 WEATHER_TOOL = {
     "type": "function",
     "function": {
@@ -615,6 +636,30 @@ class Streaming(Case):
         self.assertEqual(sorted(calls), list(range(len(calls))), "tool_call indexes not 0..n-1")
         self.assertEqual(calls[0]["name"], "get_weather")
         self.assertIsInstance(json.loads(calls[0]["arguments"]), dict)
+
+    def test_streamed_large_tool_call(self):
+        # A tool call's arguments go out in one chunk.  An agent writing a file
+        # makes that chunk tens of kilobytes -- and the server once formatted
+        # every event through a 2 KB buffer, cutting it mid-string and running
+        # the next event into it.  The content is quote- and newline-heavy, so
+        # its JSON-in-JSON escaping crosses that size quickly.
+        status, _, events = chat_stream(
+            messages=[{"role": "user", "content":
+                       "Use the write tool to save this exact text to /tmp/qw_notes.txt:\n\n"
+                       + LONG_DOC}],
+            tools=[WRITE_TOOL], tool_choice={"type": "function", "function": {"name": "write"}},
+            enable_thinking=False, temperature=0, max_tokens=2048)
+        self.assertOk(status, events)   # every event parsed as JSON on the way in
+        args = ""
+        for c in events:
+            if c == "[DONE]" or not c["choices"]:
+                continue
+            for tc in c["choices"][0]["delta"].get("tool_calls") or []:
+                args += tc.get("function", {}).get("arguments") or ""
+        biggest = max(len(json.dumps(c)) for c in events if c != "[DONE]")
+        if biggest < 2600:
+            self.skipTest(f"the model wrote a short call ({biggest} bytes); nothing over 2 KB to check")
+        self.assertIn("content", json.loads(args))
 
     def test_non_ascii_deltas_are_whole_characters(self):
         # A token can end partway through a multi-byte character.  Every delta
