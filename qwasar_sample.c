@@ -45,9 +45,80 @@ static int qw_cand_desc(const void *a, const void *b) {
  * with candidates carrying unnormalised weights, ordered descending, and
  * returns how many survived -- or -1 when the scratch allocation failed, in
  * which case callers fall back to argmax exactly as qwasar_sample always has. */
+/* The k largest logits, ids in `top` ordered by logit descending (ties to
+ * the lower id): a size-k min-heap over one pass, so the vocabulary is never
+ * sorted.  Returns k (n if smaller). */
+static void qw_heap_down(int32_t *h, int32_t k, int32_t i, const float *l) {
+    for (;;) {
+        int32_t c = 2 * i + 1;
+        if (c >= k) return;
+        /* The heap's root is the weakest kept: smallest logit, highest id. */
+        if (c + 1 < k && (l[h[c + 1]] < l[h[c]] || (l[h[c + 1]] == l[h[c]] && h[c + 1] > h[c]))) c++;
+        if (l[h[i]] < l[h[c]] || (l[h[i]] == l[h[c]] && h[i] > h[c])) return;
+        const int32_t t = h[i]; h[i] = h[c]; h[c] = t;
+        i = c;
+    }
+}
+
+static int qw_by_logit_desc(const void *a, const void *b, void *ctx) {
+    const float *l = ctx;
+    const int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
+    return l[x] > l[y] ? -1 : l[x] < l[y] ? 1 : (x < y ? -1 : x > y);
+}
+
+/* qsort_r's comparator takes the context first on this platform. */
+static int qw_by_logit_desc_r(void *ctx, const void *a, const void *b) {
+    return qw_by_logit_desc(a, b, ctx);
+}
+
+static int32_t qw_top_k(const float *logits, int32_t n, int32_t k, int32_t *top) {
+    if (k > n) k = n;
+    for (int32_t i = 0; i < k; i++) top[i] = i;
+    for (int32_t i = k / 2 - 1; i >= 0; i--) qw_heap_down(top, k, i, logits);
+    for (int32_t i = k; i < n; i++) {
+        if (logits[i] > logits[top[0]]) { top[0] = i; qw_heap_down(top, k, 0, logits); }
+    }
+    qsort_r(top, (size_t)k, sizeof *top, (void *)logits, qw_by_logit_desc_r);
+    return k;
+}
+
 static int32_t qw_filter(const float *logits, int32_t n, const qwasar_sampling *sp,
                          float max_logit, qw_cand **out) {
     const float inv_t = 1.0f / sp->temperature;
+    /* With top_k -- the model's own defaults set 20 -- only the k largest
+     * logits can survive, and min_p and top_p only ever keep a prefix of
+     * that ranking, so the vocabulary is never weighted or sorted whole:
+     * one pass with a k-heap, then the k.  Sorting all 248K candidates, as
+     * below, was ~15 ms of every sampled token. */
+    if (sp->top_k > 0 && sp->top_k < n) {
+        const float keep = sp->min_p > 0.0f ? sp->min_p : 0.0f;
+        int32_t *top = malloc((size_t)sp->top_k * sizeof *top);
+        qw_cand *cand = malloc((size_t)sp->top_k * sizeof *cand);
+        *out = cand;
+        if (!top || !cand) { free(top); return -1; }
+        const int32_t k = qw_top_k(logits, n, sp->top_k, top);
+        int32_t m = 0;
+        for (int32_t i = 0; i < k; i++) {
+            const float w = (float)exp((double)(logits[top[i]] - max_logit) * inv_t);
+            if (w < keep) break;                  /* the rest weigh less still */
+            cand[m].id = top[i];
+            cand[m].p = w;
+            m++;
+        }
+        free(top);
+        if (sp->top_p > 0.0f && sp->top_p < 1.0f && m > 0) {
+            double total = 0.0;
+            for (int32_t i = 0; i < m; i++) total += cand[i].p;
+            double want = total * (double)sp->top_p, acc = 0.0;
+            int32_t cut = m;
+            for (int32_t i = 0; i < m; i++) {
+                acc += cand[i].p;
+                if (acc >= want) { cut = i + 1; break; }
+            }
+            m = cut;
+        }
+        return m;
+    }
     /* Prune before ordering.  exp(x - max) is 1 at the mode, so a candidate is
      * kept when its unnormalised weight clears min_p; that is the same test as
      * against the normalised max probability, without needing the sum yet. */
