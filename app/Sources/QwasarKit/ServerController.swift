@@ -104,7 +104,15 @@ public final class ServerController {
         do {
             try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(),
                                                     withIntermediateDirectories: true)
-            FileManager.default.createFile(atPath: logURL.path, contents: nil)   // truncates
+            // The previous run's log is kept beside this one: it is where the
+            // evidence is when something went wrong and the server was
+            // restarted since -- which relaunching the app always does.
+            let previous = logURL.deletingLastPathComponent().appendingPathComponent("server.previous.log")
+            if FileManager.default.fileExists(atPath: logURL.path) {
+                try? FileManager.default.removeItem(at: previous)
+                try? FileManager.default.moveItem(at: logURL, to: previous)
+            }
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
             log = try FileHandle(forWritingTo: logURL)
         } catch {
             state = .failed("Cannot write the log: \(error.localizedDescription)")

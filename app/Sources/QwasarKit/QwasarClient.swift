@@ -182,6 +182,12 @@ public enum APIEvent: Sendable, Equatable {
     }
 }
 
+/// An event with its id (`step.seq`), which is what reattaching needs.
+public struct StreamEvent: Sendable {
+    public var id: String
+    public var event: APIEvent
+}
+
 /// Server-sent events, line by line.  Feed each line without its terminator;
 /// an empty line completes an event.
 public struct SSEParser: Sendable {
@@ -337,7 +343,7 @@ public final class QwasarClient: Sendable {
     /// ends after `done` or `error`.  A refusal before the stream starts
     /// throws ClientError.refused.
     public func turn(_ id: String, text: String, attachments: [Attachment] = [],
-                     temperature: Float? = nil, maxTokens: Int = 0) -> AsyncThrowingStream<APIEvent, Error> {
+                     temperature: Float? = nil, maxTokens: Int = 0) -> AsyncThrowingStream<StreamEvent, Error> {
         var body: [String: Any] = ["text": text]
         if maxTokens > 0 { body["max_tokens"] = maxTokens }
         if let temperature { body["sampling"] = ["temperature": temperature] }
@@ -349,7 +355,7 @@ public final class QwasarClient: Sendable {
     }
 
     public func continueStep(_ id: String, results: [ToolResultPayload], temperature: Float? = nil,
-                             maxTokens: Int = 0) -> AsyncThrowingStream<APIEvent, Error> {
+                             maxTokens: Int = 0) -> AsyncThrowingStream<StreamEvent, Error> {
         var body: [String: Any] = ["results": results.map { ["id": $0.id, "content": $0.content] }]
         if maxTokens > 0 { body["max_tokens"] = maxTokens }
         if let temperature { body["sampling"] = ["temperature": temperature] }
@@ -357,13 +363,13 @@ public final class QwasarClient: Sendable {
     }
 
     /// Reattaches to the step in flight after `lastEventID` (API.md §4.6).
-    public func events(_ id: String, after lastEventID: String?) -> AsyncThrowingStream<APIEvent, Error> {
+    public func events(_ id: String, after lastEventID: String?) -> AsyncThrowingStream<StreamEvent, Error> {
         stream("v1/sessions/\(id)/events", body: nil, method: "GET",
                headers: lastEventID.map { ["Last-Event-ID": $0] } ?? [:])
     }
 
     private func stream(_ path: String, body: Any?, method: String = "POST",
-                        headers: [String: String] = [:]) -> AsyncThrowingStream<APIEvent, Error> {
+                        headers: [String: String] = [:]) -> AsyncThrowingStream<StreamEvent, Error> {
         // The request is built here, before the task: URLRequest is Sendable
         // and the JSON body is not.
         let req: URLRequest
@@ -392,9 +398,9 @@ public final class QwasarClient: Sendable {
                         if line.last == 0x0D { line.removeLast() }
                         let text = String(decoding: line, as: UTF8.self)
                         line.removeAll(keepingCapacity: true)
-                        if let (_, name, data) = parser.feed(line: text) {
+                        if let (id, name, data) = parser.feed(line: text) {
                             let ev = APIEvent.decode(name: name, data: data)
-                            continuation.yield(ev)
+                            continuation.yield(StreamEvent(id: id, event: ev))
                             if case .done = ev { finished = true }
                             if case .error = ev { finished = true }
                             if finished { break }

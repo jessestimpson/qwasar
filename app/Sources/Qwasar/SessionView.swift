@@ -15,33 +15,33 @@ struct SessionView: View {
         VStack(spacing: 0) {
             SessionHeader(state: state)
             Divider()
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 16) {
-                        ForEach(state.transcript) { item in
-                            // Only the tail item can be mid-generation, and
-                            // only then is a fence possibly still open.
-                            TranscriptRow(item: item,
-                                          isStreaming: state.phase == .generating
-                                                       && item.id == state.transcript.last?.id)
-                                .id(item.id)
-                        }
-                        if let p = state.pendingCall {
-                            PendingCallRow(name: p.name, keys: p.keys, tokens: p.tokens)
-                        }
-                        if let d = state.liveDelegation {
-                            DelegationCard(model: d.model, task: d.task, log: d.log,
-                                           costUSD: d.costUSD, ended: d.ended,
-                                           waiting: d.waiting, state: state)
-                        }
-                        Color.clear.frame(height: 1).id("bottom")
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 16) {
+                    ForEach(state.transcript) { item in
+                        // Only the tail item can be mid-generation, and
+                        // only then is a fence possibly still open.
+                        TranscriptRow(item: item,
+                                      isStreaming: state.phase == .generating
+                                                   && state.isTurnSelected
+                                                   && item.id == state.transcript.last?.id)
+                            .id(item.id)
                     }
-                    .padding(20)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    if state.isTurnSelected, let p = state.pendingCall {
+                        PendingCallRow(name: p.name, keys: p.keys, tokens: p.tokens)
+                    }
+                    if let d = state.liveDelegationHere {
+                        DelegationCard(model: d.model, task: d.task, log: d.log,
+                                       costUSD: d.costUSD, ended: d.ended,
+                                       waiting: d.waiting, state: state)
+                    }
                 }
-                .onChange(of: state.transcript.count) {
-                    withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
-                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                // Follows the tail while the view is at the bottom, and
+                // leaves it alone once the user scrolls up.  Re-pinned when
+                // a session is opened or a message is sent from it.
+                .background(BottomFollower(repin: [AnyHashable(state.selectedSessionID),
+                                                   AnyHashable(state.sentCount)]))
             }
             Divider()
             if state.pendingHandoff != nil {
@@ -324,7 +324,7 @@ struct StatusFooter: View {
     /// reader for -- a long prompt being read, and a session being rebuilt --
     /// are both transient.
     private var isPrefilling: Bool {
-        state.prefillTotal > 0 && state.prefillDone < state.prefillTotal
+        state.isTurnSelected && state.prefillTotal > 0 && state.prefillDone < state.prefillTotal
     }
 
     private var hasContext: Bool { state.contextLimit > 0 && state.contextUsed > 0 }
@@ -343,7 +343,7 @@ struct StatusFooter: View {
                 HStack(spacing: 16) {
                     content
                     Spacer(minLength: 12)
-                    if state.tokensPerSecond > 0 {
+                    if state.isTurnSelected, state.tokensPerSecond > 0 {
                         RateReadout(rate: state.tokensPerSecond,
                                     instantaneous: state.instantaneousTokensPerSecond,
                                     generated: state.generatedThisTurn,
@@ -644,7 +644,13 @@ struct Composer: View {
                 .onSubmit { state.send() }
                 .disabled(state.phase == .generating)
 
-            if state.phase == .generating {
+            if state.phase == .generating, !state.isTurnSelected {
+                // One engine, one turn: this session waits for the other.
+                Text("busy with “\(state.turnSessionTitle ?? "another session")”")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .help("The model is working in another session. Select it to watch "
+                          + "or stop the turn; this one can send when it finishes.")
+            } else if state.phase == .generating {
                 Button(role: .destructive) {
                     state.interrupt()
                 } label: {

@@ -108,8 +108,8 @@ enum Gate {
                 var calls: [(String, ToolCall)] = []
                 var stop = ""
                 var sawText = false
-                for try await ev in stream {
-                    switch ev {
+                for try await se in stream {
+                    switch se.event {
                     case .resume(let from, let restored, let prefill, _):
                         print("  [resume: \(from), \(restored) restored, \(prefill) to prefill]")
                     case .prefill(let d, let t):

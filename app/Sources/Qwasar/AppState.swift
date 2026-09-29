@@ -49,10 +49,39 @@ final class AppState {
     var projects: [Project] = []
     var sessions: [SessionRecord] = []
     var selectedSessionID: UUID?
-    var transcript: [TranscriptItem] = []
+    /// What the window shows for the selected session: its saved transcript,
+    /// and the turn in flight's items when the turn is THIS session's.
+    ///
+    /// Computed rather than stored, because a turn belongs to the session it
+    /// started in, not to whatever is selected while it runs.  When it was a
+    /// stored array, the turn streamed into it, and selecting another session
+    /// mid-turn swapped the array underneath: the first session's tokens
+    /// rendered in the second, and -- since streamed text appended to the
+    /// visible tail -- went missing from the first session's saved transcript.
+    var transcript: [TranscriptItem] {
+        isTurnSelected ? savedTranscript + pendingItems : savedTranscript
+    }
+    /// The selected session's transcript as it is on disk.
+    private var savedTranscript: [TranscriptItem] = []
+    /// The session the turn in flight belongs to, from the moment send()
+    /// takes it until its items are persisted.  Everything the turn writes
+    /// -- items, the pending call, the meters -- is that session's.
+    private(set) var turnSessionID: UUID?
+    var isTurnSelected: Bool { turnSessionID != nil && turnSessionID == selectedSessionID }
+    /// The turn's session, for a view that is showing a different one.
+    var turnSessionTitle: String? {
+        turnSessionID.flatMap { id in sessions.first { $0.id == id }?.title }
+    }
+    /// The turn session's context, kept apart from the displayed meter so
+    /// that a selection elsewhere does not overwrite it and a selection back
+    /// restores it.
+    private var turnContext: (used: Int, limit: Int) = (0, 0)
 
     // Turn state
     var draft = ""
+    /// Counts messages sent, so the transcript can snap to its end on each
+    /// one: sending is looking at the bottom, wherever you had scrolled to.
+    private(set) var sentCount = 0
     var prefillDone = 0
     var prefillTotal = 0
     /// Live, reported by the session rather than guessed at. Zero means there is
@@ -97,6 +126,11 @@ final class AppState {
         var waiting = false
     }
     var liveDelegation: LiveDelegation?
+    /// The session the live delegation belongs to; its card shows there only.
+    private(set) var delegationSessionID: UUID?
+    var liveDelegationHere: LiveDelegation? {
+        delegationSessionID == selectedSessionID ? liveDelegation : nil
+    }
     var delegationDraft = ""
     var showingAPIKeySheet = false
     /// The user-initiated delegation sheet (spec §15).
@@ -403,7 +437,7 @@ final class AppState {
     func startDelegation(task: String, model: String?, includeContext: Bool) {
         guard canDelegate, let rec = selectedSession, let p = project(of: rec),
               !task.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        if case .generating = phase { interrupt() }
+        if case .generating = phase, turnSessionID == rec.id { interrupt() }
 
         let settings = SandboxSettings.resolve(global: globalSandbox, project: p.overlay,
                                                session: rec.sandbox)
@@ -481,12 +515,12 @@ final class AppState {
         return String(parts.reversed().joined(separator: "\n\n").suffix(cap))
     }
 
-    func pendingItemsAppend(_ i: TranscriptItem) { pendingItems.append(i) }
 
     private func handleDelegation(_ ev: DelegationEvent, session sid: UUID) {
         switch ev {
         case .started(let model, let task):
             liveDelegation = LiveDelegation(model: model, task: task)
+            delegationSessionID = sid
         case .delta(let piece):
             liveDelegation?.log += piece
             liveDelegation?.waiting = false
@@ -523,18 +557,22 @@ final class AppState {
                 let item = TranscriptItem(.delegation(model: live.model, task: live.task,
                                                       log: live.log, costUSD: usd,
                                                       ended: reason))
-                // A tool-driven delegation ends inside a turn and rides that
-                // turn's persistence; a user-driven one can end while idle,
-                // where pendingItems would be wiped before the next persist.
-                transcript.append(item)
-                if case .generating = phase { pendingItemsAppend(item) }
-                else { store?.appendTranscript(sid, [item]) }
+                // A tool-driven delegation ends inside its session's turn and
+                // rides that turn's persistence; a user-driven one can end
+                // while idle, or while another session's turn runs.
+                if turnSessionID == sid {
+                    pendingItems.append(item)
+                } else {
+                    store?.appendTranscript(sid, [item])
+                    if selectedSessionID == sid { savedTranscript.append(item) }
+                }
             }
             if let i = sessions.firstIndex(where: { $0.id == sid }) {
                 sessions[i].spentUSD = (sessions[i].spentUSD ?? 0) + usd
                 store?.save(sessions[i])
             }
             liveDelegation = nil
+            delegationSessionID = nil
         }
     }
 
@@ -612,16 +650,20 @@ final class AppState {
         if let sandboxes { Task { await sandboxes.discard(session: id) } }
         store?.delete(id)
         sessions.removeAll { $0.id == id }
-        if selectedSessionID == id { selectedSessionID = sessions.first?.id; loadTranscript() }
+        if selectedSessionID == id { select(sessions.first?.id) }
     }
 
     func select(_ id: UUID?) {
         selectedSessionID = id
         loadTranscript()
-        // The meter belongs to the live session. Showing the previous one's
-        // figure against a newly selected session would be a precise number
-        // about the wrong thing.
-        if id != liveSessionID {
+        // The meter is the selected session's: the turn's live figure when
+        // the turn is this session's, its record's otherwise.  Showing the
+        // previous one's figure against a newly selected session would be a
+        // precise number about the wrong thing.
+        if let id, id == turnSessionID {
+            contextUsed = turnContext.used
+            contextLimit = turnContext.limit
+        } else {
             let rec = sessions.first { $0.id == id }
             contextUsed = rec?.tokenCount ?? 0
             contextLimit = Int(rec?.contextSize ?? 0)
@@ -629,8 +671,15 @@ final class AppState {
     }
 
     private func loadTranscript() {
-        guard let id = selectedSessionID else { transcript = []; return }
-        transcript = store?.loadTranscript(id) ?? []
+        guard let id = selectedSessionID else { savedTranscript = []; return }
+        savedTranscript = store?.loadTranscript(id) ?? []
+    }
+
+    /// A session's whole transcript, whether or not it is selected: saved,
+    /// plus the turn's items when the turn is its.
+    private func fullTranscript(of id: UUID) -> [TranscriptItem] {
+        let saved = id == selectedSessionID ? savedTranscript : (store?.loadTranscript(id) ?? [])
+        return id == turnSessionID ? saved + pendingItems : saved
     }
 
     /// Working directory for a session: the project root plus its subpath.
@@ -725,7 +774,17 @@ final class AppState {
         guard !text.isEmpty else { return }
         draft = ""
 
+        sentCount += 1
+        // The turn is this record's from here until its items are persisted,
+        // whatever is selected in the meantime.
+        turnSessionID = rec.id
+        pendingItems = []
+        turnContext = (rec.tokenCount, Int(rec.contextSize))
+
         Task {
+            // However it ends -- persisted, refused, failed to open -- the
+            // turn stops being anyone's.
+            defer { turnSessionID = nil }
             guard let client, let sidx = sessions.firstIndex(where: { $0.id == rec.id }) else {
                 phase = .failed("the server is not running"); return
             }
@@ -842,12 +901,12 @@ final class AppState {
             }
             guard let sid else { return }
             liveSessionID = rec.id
-            contextLimit = Int(sessions[sidx].contextSize)
+            turnContext.limit = Int(sessions[sidx].contextSize)
+            if isTurnSelected { contextLimit = turnContext.limit }
 
             phase = .generating
             cancelFlag.clear()
             prefillDone = 0; prefillTotal = 0
-            pendingItems = []
 
             var promptText = text
             if let handoff = pendingHandoff {
@@ -867,11 +926,17 @@ final class AppState {
             var steps = 0
             var ended = false
             let maxSteps = 24
+            // The last event heard, and how often this step's stream has had
+            // to be picked up again.
+            var lastEventID: String?
+            var reattaches = 0
+            var calls: [(String, ToolCall)] = []
             do {
                 while !ended {
-                    var calls: [(String, ToolCall)] = []
                     var stop = ""
-                    for try await ev in stream {
+                    for try await se in stream {
+                        if !se.id.isEmpty { lastEventID = se.id }
+                        let ev = se.event
                         switch ev {
                         case .queued(let pos):
                             apply(.note("waiting for the engine (position \(pos))"))
@@ -914,6 +979,25 @@ final class AppState {
                         }
                     }
                     if ended { break }
+                    if stop.isEmpty {
+                        // The stream ended without the step's `done`: the
+                        // connection was lost, not the turn.  The server
+                        // carries on and keeps the step's events, so pick
+                        // them up after the last one heard (API.md 4.6).
+                        // Treating this as the model finishing is what left
+                        // a written tool call waiting, unrun, with nothing on
+                        // screen to say so.
+                        if reattaches < 3 {
+                            reattaches += 1
+                            apply(.note("lost the stream from the server mid-step; picking it up again"))
+                            stream = client.events(sid, after: lastEventID)
+                            continue
+                        }
+                        apply(.failed("the stream from the server kept ending before the step did; "
+                                    + "the server may still hold the step's result -- send a message to continue"))
+                        break
+                    }
+                    reattaches = 0
                     switch stop {
                     case "tool_calls":
                         var results: [ToolResultPayload] = []
@@ -926,6 +1010,7 @@ final class AppState {
                             results.append(ToolResultPayload(id: id, content: r))
                             stats.toolCalls += 1
                         }
+                        calls = []
                         steps += 1
                         if steps >= maxSteps {
                             apply(.note("stopped after \(steps) tool calls"))
@@ -956,6 +1041,7 @@ final class AppState {
             // is deliberate: a crash mid-generation loses this turn and
             // nothing else (spec 4.2).
             store?.appendTranscript(rec.id, pendingItems)
+            if selectedSessionID == rec.id { savedTranscript += pendingItems }
             pendingItems = []
             if let i = sessions.firstIndex(where: { $0.id == rec.id }) {
                 if stats.contextUsed > 0 { sessions[i].tokenCount = stats.contextUsed }
@@ -983,12 +1069,14 @@ final class AppState {
         Task { try? await client.cancel(sid) }
     }
 
-    /// Completed delegations of the SELECTED session, newest first, for the
+    /// Completed delegations of the turn's session, newest first, for the
     /// local model's delegation_log tool (spec 15.2). Reads the live
     /// transcript, so a delegation finished a moment ago is inspectable in
     /// the same turn.
     private func delegationRecord(_ nth: Int) -> DelegationRecord? {
-        let all = transcript.compactMap { item -> DelegationRecord? in
+        // The turn's session: it is the local model in that turn asking.
+        guard let id = turnSessionID ?? selectedSessionID else { return nil }
+        let all = fullTranscript(of: id).compactMap { item -> DelegationRecord? in
             if case .delegation(let m, let t, let l, _, let e) = item.kind {
                 return DelegationRecord(model: m, task: t, log: l, ended: e)
             }
@@ -1124,7 +1212,7 @@ final class AppState {
             let item = TranscriptItem(.note("git refresh armed: the sandbox reboots on "
                 + "your next message and re-seeds its private .git copy from the "
                 + "repository's current state. Your files and your real .git are untouched."))
-            if selectedSessionID == rec.id { transcript.append(item) }
+            if selectedSessionID == rec.id { savedTranscript.append(item) }
             store?.appendTranscript(rec.id, [item])
             if liveSessionID == rec.id {
                 park(rec.id)
@@ -1134,34 +1222,27 @@ final class AppState {
         }
     }
 
+    /// Appends to the turn in flight.  Never to what is on screen: the view
+    /// derives that (`transcript`), and shows it only in the turn's session.
     private func appendItem(_ i: TranscriptItem) {
-        transcript.append(i)
         pendingItems.append(i)
     }
 
-    /// Appends into the tail item when the kind matches, so streaming produces
-    /// one paragraph rather than one item per token (PLAN.md 5.3).
-    ///
-    /// The pending copy is found by id, not by position. The two arrays do not
-    /// stay in lockstep -- a reloaded transcript starts non-empty while pending
-    /// starts empty -- and indexing pending by its own tail would append this
-    /// turn's text onto whatever happened to be last.
+    /// Appends into the turn's tail item when the kind matches, so streaming
+    /// produces one paragraph rather than one item per token (spec 5.3).
     private func appendStreaming(_ s: String, reasoning: Bool, tokens: Int = 0) {
         let matches: Bool
-        switch transcript.last?.kind {
+        switch pendingItems.last?.kind {
         case .reasoning: matches = reasoning
         case .assistant: matches = !reasoning
         default: matches = false
         }
-        guard matches, let tail = transcript.last else {
+        guard matches else {
             appendItem(TranscriptItem(reasoning ? .reasoning(s) : .assistant(s),
                                       tokens: tokens > 0 ? tokens : nil))
             return
         }
-        transcript[transcript.count - 1].append(s, tokens: tokens)
-        if let j = pendingItems.firstIndex(where: { $0.id == tail.id }) {
-            pendingItems[j].append(s, tokens: tokens)
-        }
+        pendingItems[pendingItems.count - 1].append(s, tokens: tokens)
     }
 
     private func apply(_ ev: SessionEvent) {
@@ -1178,8 +1259,11 @@ final class AppState {
                 prefillTotal = 0
             }
         case .context(let used, let limit):
-            contextUsed = used
-            contextLimit = limit
+            turnContext = (used, limit)
+            if isTurnSelected {
+                contextUsed = used
+                contextLimit = limit
+            }
         case .rate(let generated, let rate, let inst):
             generatedThisTurn = generated
             tokensPerSecond = rate
@@ -1205,14 +1289,11 @@ final class AppState {
                 recordDefine(source: src, result: r)
             }
             // Fill the open card rather than adding a second item.
-            if let i = transcript.lastIndex(where: {
+            if let i = pendingItems.lastIndex(where: {
                 if case .tool(let n, _, let res) = $0.kind { return n == name && res == nil }
                 return false
-            }), case .tool(let n, let a, _) = transcript[i].kind {
-                transcript[i].kind = .tool(name: n, arguments: a, result: r)
-                if let j = pendingItems.lastIndex(where: { $0.id == transcript[i].id }) {
-                    pendingItems[j].kind = transcript[i].kind
-                }
+            }), case .tool(let n, let a, _) = pendingItems[i].kind {
+                pendingItems[i].kind = .tool(name: n, arguments: a, result: r)
             } else {
                 appendItem(TranscriptItem(.tool(name: name, arguments: [:], result: r)))
             }
