@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static int fails;
@@ -170,6 +171,21 @@ static void check_files(qwasar_engine *e, int32_t vocab, const char *home) {
     CHECK(qwasar_session_restore_file(c, e, path, tok, n - 1) == 0, "restored into a shorter history");
     CHECK(qwasar_session_n_past(c) == 0, "a refused restore touched the session");
     CHECK(qwasar_session_restore_file(b, e, path, tok, n + 1) == 0, "restored into a session that is not fresh");
+
+    /* A reset session is a fresh one that kept its memory: it takes the
+     * restore and continues exactly -- and, evaluating from nothing, it
+     * matches a new session too, so no state survived the reset. */
+    CHECK(qwasar_session_reset(b, err, sizeof err), "reset: %s", err);
+    CHECK(qwasar_session_n_past(b) == 0, "reset left n_past %d", qwasar_session_n_past(b));
+    CHECK(qwasar_session_restore_file(b, e, path, tok, n + 1) == n, "restore_file into a reset session");
+    lb = qwasar_session_eval(b, &probe, 1, err, sizeof err);
+    CHECK(lb && la && rel_l2(lb, ref, (size_t)vocab) == 0.0, "logits differ after a reset and restore");
+    CHECK(qwasar_session_reset(a, err, sizeof err), "reset: %s", err);
+    CHECK(qwasar_session_eval(a, tok, n, err, sizeof err) != NULL, "eval after reset: %s", err);
+    la = qwasar_session_eval(a, &probe, 1, err, sizeof err);
+    CHECK(la && rel_l2(la, ref, (size_t)vocab) == 0.0, "logits differ after a reset and prefill");
+    if (la) printf("  reset session: restore and prefill both match\n");
+
     char missing[1100];
     snprintf(missing, sizeof missing, "%s/nothing-here.qwkv", home);
     CHECK(qwasar_session_restore_file(c, e, missing, tok, n) == 0, "restored a missing file");
@@ -324,6 +340,99 @@ static int check_model(const char *model) {
     return 0;
 }
 
+/* ---- timing a step after a restore (opt-in) ---------------------------------
+ *
+ * QWASAR_TEST_RESTORE_TIMING=<tokens> with QWASAR_TEST_MODEL: times a short
+ * step on a fresh session, on that session once it holds <tokens>, on a
+ * new session restored from its checkpoint, and on a reset one (the parked
+ * session's memory kept) restored from it -- the first step and the one
+ * after it each time.  Prints the numbers; asserts only that the restore
+ * covered the tokens.  The context is the server's, 262144, since what a
+ * session allocates scales with it. */
+
+static double secs(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + tv.tv_usec * 1e-6;
+}
+
+static double timed_step(qwasar_session *s, int32_t base, int32_t n, int32_t vocab) {
+    int32_t tok[64];
+    for (int32_t i = 0; i < n; i++) tok[i] = (base + i * 7919) % vocab;
+    char err[256];
+    const double t0 = secs();
+    const float *l = qwasar_session_eval(s, tok, n, err, sizeof err);
+    const double dt = secs() - t0;
+    CHECK(l != NULL, "step: %s", err);
+    return dt;
+}
+
+static void time_restore(const char *model, int32_t n) {
+    printf("== restore timing: %s, %d tokens\n", model, n);
+    char home[] = "/tmp/qwasar_kvtime_XXXXXX";
+    if (!mkdtemp(home)) return;
+    setenv("HOME", home, 1);
+    char err[512], path[1024];
+    snprintf(path, sizeof path, "%s/timed.qwkv", home);
+
+    qwasar_options opts = { .model_path = model, .context_size = 262144 };
+    qwasar_engine *e = qwasar_engine_load(&opts, err, sizeof err);
+    if (!e) { fprintf(stderr, "load failed: %s\n", err); fails++; return; }
+    const int32_t vocab = qwasar_vocab_size(e);
+    const int32_t step = 19;
+
+    double t0 = secs();
+    qwasar_session *a = qwasar_session_new(e, err, sizeof err);
+    printf("  new session: %.2fs\n", secs() - t0);
+    printf("  fresh session, first step:  %.3fs\n", timed_step(a, 1000, step, vocab));
+    printf("  fresh session, second step: %.3fs\n", timed_step(a, 2000, step, vocab));
+
+    int32_t *tok = malloc((size_t)n * sizeof *tok);
+    for (int32_t i = 0; i < n; i++) tok[i] = (3000 + (i * 104729)) % vocab;
+    t0 = secs();
+    CHECK(qwasar_session_eval(a, tok, n, err, sizeof err) != NULL, "prefill: %s", err);
+    printf("  prefill %d tokens: %.1fs\n", n, secs() - t0);
+    printf("  at %d tokens, a step:       %.3fs\n", qwasar_session_n_past(a), timed_step(a, 4000, step, vocab));
+    printf("  at %d tokens, another step: %.3fs\n", qwasar_session_n_past(a), timed_step(a, 5000, step, vocab));
+
+    int32_t hn = 0;
+    const int32_t *hist = qw_session_history(a, &hn);
+    int32_t *keep = malloc((size_t)hn * sizeof *keep);
+    memcpy(keep, hist, (size_t)hn * sizeof *keep);
+    t0 = secs();
+    CHECK(qwasar_session_save_file(a, e, path, err, sizeof err), "save_file: %s", err);
+    struct stat st;
+    stat(path, &st);
+    printf("  save_file: %.2fs, %.2f GB\n", secs() - t0, st.st_size / 1e9);
+    qwasar_session_free(a);                      /* as a park does */
+
+    t0 = secs();
+    qwasar_session *b = qwasar_session_new(e, err, sizeof err);
+    printf("  new session: %.2fs\n", secs() - t0);
+    t0 = secs();
+    const int32_t got = qwasar_session_restore_file(b, e, path, keep, hn);
+    printf("  restore_file: %.2fs (%d tokens)\n", secs() - t0, got);
+    CHECK(got == hn, "restored %d of %d", got, hn);
+    printf("  restored, first step:       %.3fs\n", timed_step(b, 6000, step, vocab));
+    printf("  restored, second step:      %.3fs\n", timed_step(b, 7000, step, vocab));
+
+    t0 = secs();
+    CHECK(qwasar_session_reset(b, err, sizeof err), "reset: %s", err);
+    printf("  reset session: %.2fs\n", secs() - t0);
+    t0 = secs();
+    const int32_t again = qwasar_session_restore_file(b, e, path, keep, hn);
+    printf("  restore_file into it: %.2fs (%d tokens)\n", secs() - t0, again);
+    CHECK(again == hn, "restored %d of %d into a reset session", again, hn);
+    printf("  reset+restored, first step:  %.3fs\n", timed_step(b, 6000, step, vocab));
+    printf("  reset+restored, second step: %.3fs\n", timed_step(b, 7000, step, vocab));
+
+    qwasar_session_free(b);
+    unlink(path);
+    rmdir(home);
+    free(tok); free(keep);
+    qwasar_engine_free(e);
+}
+
 /* The dense model when one is given; Flash-Next's toys always, in both
  * formats -- its checkpoint carries the indexer keys and the engram's state
  * too, and the toys' 8-token QSA budget puts a 300-token prompt well past
@@ -331,6 +440,12 @@ static int check_model(const char *model) {
 int main(int argc, char **argv) {
     const char *model = getenv("QWASAR_TEST_MODEL");
     if (argc > 1) model = argv[1];
+    const char *timing = getenv("QWASAR_TEST_RESTORE_TIMING");
+    if (timing && *timing && model && *model) {
+        time_restore(model, atoi(timing));
+        if (fails) { fprintf(stderr, "%d check(s) failed\n", fails); return 1; }
+        return 0;
+    }
     if (model && *model) { if (check_model(model)) return 1; }
     else printf("skip: dense model (set QWASAR_TEST_MODEL)\n");
     const char *toys[] = { "tests/fixtures/flashnext-tiny-q4", "tests/fixtures/flashnext-tiny-mlx" };

@@ -164,6 +164,9 @@ void qw_encode_gated_delta_layer(qwasar_session *s, qw_cmd c, const qw_layer *L,
 
 /* The Flash-Next forward (qwasar_flash_graph.c). */
 struct qw_flash_state *qw_flash_state_new(qwasar_session *s, char *err, size_t errcap);
+/* A new state that takes over `old`'s buffers (and frees the rest of it). */
+struct qw_flash_state *qw_flash_state_renew(qwasar_session *s, struct qw_flash_state *old,
+                                            char *err, size_t errcap);
 void qw_flash_state_free(struct qw_flash_state *f);
 /* Host-side work a chunk needs before encoding: the engram ids and rows. */
 void qw_flash_prepare_chunk(qwasar_session *s, const int32_t *tokens, int32_t rows);

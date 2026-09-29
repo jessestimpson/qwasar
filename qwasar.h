@@ -147,6 +147,15 @@ int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
 qwasar_session *qwasar_session_new(qwasar_engine *e, char *err, size_t errcap);
 void            qwasar_session_free(qwasar_session *s);
 
+/* Makes `s` a new session again -- n_past 0, nothing evaluated, as
+ * qwasar_session_new returns it -- while keeping its cache and scratch
+ * memory.  For a caller that frees one session and starts another: a new
+ * session's pages are committed on first write, by the CPU on a restore and
+ * again by the GPU on the first eval that reads them, and at a long context
+ * that costs seconds a reset session does not pay.  Returns false (with
+ * `err`) if the reset session could not be completed; free it then. */
+bool            qwasar_session_reset(qwasar_session *s, char *err, size_t errcap);
+
 /* Appends `n` tokens and returns logits for the last one, valid until the next
  * eval on this session.  Returns NULL and fills `err` on failure. */
 const float *qwasar_session_eval(qwasar_session *s, const int32_t *tokens, int32_t n,

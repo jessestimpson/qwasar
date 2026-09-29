@@ -68,7 +68,7 @@ static bool qw_alloc_all(qwasar_session *s, char *err, size_t errcap) {
     };
 
     for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
-        *want[i].b = qw_buf_alloc(want[i].n);
+        if (!*want[i].b) *want[i].b = qw_buf_alloc(want[i].n);
         if (!*want[i].b) {
             qw_gerrf(err, errcap, "cannot allocate %s scratch (%.1f MB)",
                      want[i].name, want[i].n / (1024.0 * 1024.0));
@@ -82,14 +82,14 @@ static bool qw_alloc_all(qwasar_session *s, char *err, size_t errcap) {
      * the resident set still tracks how much context is actually used. */
     const size_t kv_per_layer = (size_t)c->num_key_value_heads * s->max_ctx
                               * c->head_dim * sizeof(uint16_t);
-    s->kcache = qw_buf_alloc(kv_per_layer * sh->n_full_attn_layers);
-    s->vcache = qw_buf_alloc(kv_per_layer * sh->n_full_attn_layers);
+    if (!s->kcache) s->kcache = qw_buf_alloc(kv_per_layer * sh->n_full_attn_layers);
+    if (!s->vcache) s->vcache = qw_buf_alloc(kv_per_layer * sh->n_full_attn_layers);
 
     const size_t ssm_per_layer = (size_t)c->linear_num_value_heads
                                * c->linear_value_head_dim * c->linear_key_head_dim * 4;
     const size_t conv_per_layer = (size_t)(c->linear_conv_kernel_dim - 1) * sh->conv_dim * 4;
-    s->ssm_state  = qw_buf_alloc(ssm_per_layer * sh->n_linear_attn_layers);
-    s->conv_state = qw_buf_alloc(conv_per_layer * sh->n_linear_attn_layers);
+    if (!s->ssm_state)  s->ssm_state  = qw_buf_alloc(ssm_per_layer * sh->n_linear_attn_layers);
+    if (!s->conv_state) s->conv_state = qw_buf_alloc(conv_per_layer * sh->n_linear_attn_layers);
 
     if (!s->kcache || !s->vcache || !s->ssm_state || !s->conv_state) {
         qw_gerrf(err, errcap, "cannot allocate cache for %d tokens of context", s->max_ctx);
@@ -107,21 +107,23 @@ static bool qw_alloc_all(qwasar_session *s, char *err, size_t errcap) {
     if (m->present) {
         const size_t mtp_kv = (size_t)c->num_key_value_heads * s->max_ctx
                             * c->head_dim * sizeof(uint16_t);
-        s->mtp_kcache = qw_buf_alloc(mtp_kv);
-        s->mtp_vcache = qw_buf_alloc(mtp_kv);
-        s->mtp_hidden = qw_buf_alloc((size_t)(1 + R) * c->hidden_size * 4);
-        s->mtp_tokens = qw_buf_alloc((size_t)R * sizeof(int32_t));
-        s->mtp_positions = qw_buf_alloc((size_t)3 * R * sizeof(int32_t));
-        s->mtp_embed  = qw_buf_alloc((size_t)R * c->hidden_size * 4);
-        s->mtp_fused  = qw_buf_alloc((size_t)R * 2 * c->hidden_size * 4);
-        s->mtp_h      = qw_buf_alloc((size_t)R * c->hidden_size * 4);
-        s->mtp_out    = qw_buf_alloc((size_t)R * c->hidden_size * 4);
-        s->mtp_logits = qw_buf_alloc((size_t)c->vocab_size * 4);
+        if (!s->mtp_kcache) s->mtp_kcache = qw_buf_alloc(mtp_kv);
+        if (!s->mtp_vcache) s->mtp_vcache = qw_buf_alloc(mtp_kv);
+        if (!s->mtp_hidden) s->mtp_hidden = qw_buf_alloc((size_t)(1 + R) * c->hidden_size * 4);
+        if (!s->mtp_tokens) s->mtp_tokens = qw_buf_alloc((size_t)R * sizeof(int32_t));
+        if (!s->mtp_positions) s->mtp_positions = qw_buf_alloc((size_t)3 * R * sizeof(int32_t));
+        if (!s->mtp_embed)  s->mtp_embed  = qw_buf_alloc((size_t)R * c->hidden_size * 4);
+        if (!s->mtp_fused)  s->mtp_fused  = qw_buf_alloc((size_t)R * 2 * c->hidden_size * 4);
+        if (!s->mtp_h)      s->mtp_h      = qw_buf_alloc((size_t)R * c->hidden_size * 4);
+        if (!s->mtp_out)    s->mtp_out    = qw_buf_alloc((size_t)R * c->hidden_size * 4);
+        if (!s->mtp_logits) s->mtp_logits = qw_buf_alloc((size_t)c->vocab_size * 4);
         /* Sized for a full block so the verify can select every row at once;
          * the draft only ever asks for the first. */
-        s->sel_out     = qw_buf_alloc((size_t)(QWASAR_MAX_DRAFT + 1) * sizeof(qw_cand));
-        s->sel_scratch = qw_buf_alloc((size_t)(QWASAR_MAX_DRAFT + 1)
-                                      * QW_SEL_TILES * sizeof(qw_cand));
+        if (!s->sel_out)
+            s->sel_out = qw_buf_alloc((size_t)(QWASAR_MAX_DRAFT + 1) * sizeof(qw_cand));
+        if (!s->sel_scratch)
+            s->sel_scratch = qw_buf_alloc((size_t)(QWASAR_MAX_DRAFT + 1)
+                                          * QW_SEL_TILES * sizeof(qw_cand));
         if (!s->mtp_kcache || !s->mtp_vcache || !s->mtp_hidden || !s->mtp_tokens
             || !s->mtp_positions || !s->mtp_embed || !s->mtp_fused || !s->mtp_h
             || !s->mtp_out || !s->mtp_logits || !s->sel_out || !s->sel_scratch) {
@@ -133,8 +135,8 @@ static bool qw_alloc_all(qwasar_session *s, char *err, size_t errcap) {
 
     /* rope tables */
     const int32_t nfreq = c->rotary_dim / 2;
-    s->rope_axis     = qw_buf_alloc((size_t)nfreq);
-    s->rope_inv_freq = qw_buf_alloc((size_t)nfreq * 4);
+    if (!s->rope_axis)     s->rope_axis     = qw_buf_alloc((size_t)nfreq);
+    if (!s->rope_inv_freq) s->rope_inv_freq = qw_buf_alloc((size_t)nfreq * 4);
     if (!s->rope_axis || !s->rope_inv_freq) {
         qw_gerrf(err, errcap, "cannot allocate rope tables");
         return false;
@@ -144,10 +146,8 @@ static bool qw_alloc_all(qwasar_session *s, char *err, size_t errcap) {
     return true;
 }
 
-qwasar_session *qwasar_session_new(qwasar_engine *e, char *err, size_t errcap) {
-    qwasar_session *s = calloc(1, sizeof *s);
-    if (!s) { qw_gerrf(err, errcap, "out of memory"); return NULL; }
-
+/* The fields a session starts with, before anything is allocated. */
+static bool qw_session_init(qwasar_session *s, qwasar_engine *e, char *err, size_t errcap) {
     s->e     = e;
     s->cfg   = qwasar_engine_config(e);
     s->shape = qwasar_engine_shape(e);
@@ -156,10 +156,17 @@ qwasar_session *qwasar_session_new(qwasar_engine *e, char *err, size_t errcap) {
     s->n_past   = 0;
 
     s->kind_index = calloc((size_t)s->cfg->num_hidden_layers, sizeof *s->kind_index);
-    if (!s->kind_index) { qw_gerrf(err, errcap, "out of memory"); goto fail; }
+    if (!s->kind_index) { qw_gerrf(err, errcap, "out of memory"); return false; }
     for (int32_t i = 0, lin = 0, full = 0; i < s->cfg->num_hidden_layers; i++)
         s->kind_index[i] = qw_layer_is_linear(s->cfg, i) ? lin++ : full++;
+    return true;
+}
 
+qwasar_session *qwasar_session_new(qwasar_engine *e, char *err, size_t errcap) {
+    qwasar_session *s = calloc(1, sizeof *s);
+    if (!s) { qw_gerrf(err, errcap, "out of memory"); return NULL; }
+
+    if (!qw_session_init(s, e, err, errcap)) goto fail;
     if (!qw_alloc_all(s, err, errcap)) goto fail;
     if (s->cfg->family == QW_FAMILY_QWEN4_EXP) {
         s->flash = qw_flash_state_new(s, err, errcap);
@@ -172,8 +179,8 @@ fail:
     return NULL;
 }
 
-void qwasar_session_free(qwasar_session *s) {
-    if (!s) return;
+/* Everything a session owns, short of the struct itself. */
+static void qw_session_release(qwasar_session *s) {
     qw_buf *all[] = {
         &s->kcache, &s->vcache, &s->ssm_state, &s->conv_state,
         &s->rope_axis, &s->rope_inv_freq, &s->positions,
@@ -196,7 +203,53 @@ void qwasar_session_free(qwasar_session *s) {
     free(s->mark);
     free(s->mrope);
     free(s->kind_index);
+}
+
+void qwasar_session_free(qwasar_session *s) {
+    if (!s) return;
+    qw_session_release(s);
     free(s);
+}
+
+/* A reset session is a new one in every respect but where its memory came
+ * from: the buffers every session has, sized by the engine alone, are kept --
+ * pages the CPU and the GPU have both already touched -- and everything else
+ * starts over as qwasar_session_new would start it.  Stale rows past n_past
+ * are harmless for the same reason a fresh cache needs no clearing: nothing
+ * reads a position before it is written. */
+bool qwasar_session_reset(qwasar_session *s, char *err, size_t errcap) {
+    if (!s) return false;
+    qwasar_session old = *s;
+    memset(s, 0, sizeof *s);
+    if (!qw_session_init(s, old.e, err, errcap)) { qw_session_release(&old); return false; }
+
+#define QW_KEEP(f) do { s->f = old.f; old.f = NULL; } while (0)
+    QW_KEEP(kcache); QW_KEEP(vcache); QW_KEEP(ssm_state); QW_KEEP(conv_state);
+    QW_KEEP(rope_axis); QW_KEEP(rope_inv_freq); QW_KEEP(positions);
+    QW_KEEP(tokens); QW_KEEP(h); QW_KEEP(hn); QW_KEEP(hn2);
+    QW_KEEP(qkv); QW_KEEP(z); QW_KEEP(a_proj); QW_KEEP(b_proj); QW_KEEP(g); QW_KEEP(beta);
+    QW_KEEP(gq); QW_KEEP(gk); QW_KEEP(gv); QW_KEEP(gdn_y); QW_KEEP(gdn_norm);
+    QW_KEEP(qg); QW_KEEP(q); QW_KEEP(gate); QW_KEEP(k); QW_KEEP(v); QW_KEEP(attn_out);
+    QW_KEEP(mlp_gate); QW_KEEP(mlp_up); QW_KEEP(mlp_act); QW_KEEP(logits);
+    QW_KEEP(mtp_kcache); QW_KEEP(mtp_vcache); QW_KEEP(mtp_hidden); QW_KEEP(mtp_tokens);
+    QW_KEEP(sel_out); QW_KEEP(sel_scratch);
+    QW_KEEP(mtp_positions); QW_KEEP(mtp_embed); QW_KEEP(mtp_fused); QW_KEEP(mtp_h);
+    QW_KEEP(mtp_out); QW_KEEP(mtp_logits);
+    QW_KEEP(history);
+#undef QW_KEEP
+    struct qw_flash_state *flash = old.flash;
+    old.flash = NULL;
+    /* Draft depth, images, capture, the rewind point: set per use, gone. */
+    qw_session_release(&old);
+
+    if (!qw_alloc_all(s, err, errcap)) { qw_flash_state_free(flash); return false; }
+    if (s->cfg->family == QW_FAMILY_QWEN4_EXP) {
+        s->flash = qw_flash_state_renew(s, flash, err, errcap);
+        if (!s->flash) return false;
+    } else {
+        qw_flash_state_free(flash);
+    }
+    return true;
 }
 
 int32_t qwasar_session_n_past(const qwasar_session *s) { return s ? s->n_past : 0; }

@@ -66,7 +66,23 @@ const float *qw_flash_debug_h4(const qwasar_session *s) {
 
 static void *fcontents(qw_buf b) { return qw_buf_contents(b); }
 
+static void gather_join(struct qw_flash_state *f);
+
+#define QW_FLASH_BUFS(f) \
+    &f->h4, &f->n4, &f->mixd, &f->mixu, &f->inj, \
+    &f->route_logits, &f->route_idx, &f->route_w, &f->exp_gu, &f->exp_act, &f->exp_y, \
+    &f->grp_perm, &f->grp_tiles, &f->grp_cursor, \
+    &f->sh_g, &f->sh_u, &f->sh_out, &f->sh_gs, \
+    &f->iqk, &f->iq, &f->iscores, &f->mask, &f->qlist, &f->ikeys, &f->ipool, \
+    &f->ple_emb, &f->ple_key, &f->ple_keyn, &f->ple_val, &f->ple_qn, &f->ple_gv, \
+    &f->ple_gvn, &f->ple_conv, &f->ple_state
+
 struct qw_flash_state *qw_flash_state_new(qwasar_session *s, char *err, size_t errcap) {
+    return qw_flash_state_renew(s, NULL, err, errcap);
+}
+
+struct qw_flash_state *qw_flash_state_renew(qwasar_session *s, struct qw_flash_state *old,
+                                            char *err, size_t errcap) {
     const qw_config *c = s->cfg;
     const qw_shape *sh = s->shape;
     const int32_t R = s->max_rows, H = c->hidden_size, S = c->hc_count, HH = sh->hc_hidden;
@@ -75,7 +91,15 @@ struct qw_flash_state *qw_flash_state_new(qwasar_session *s, char *err, size_t e
     const int32_t nq = c->indexer_n_heads, d = c->indexer_head_dim;
 
     struct qw_flash_state *f = calloc(1, sizeof *f);
-    if (!f) { qw_verrf(err, errcap, "out of memory"); return NULL; }
+    if (!f) { qw_verrf(err, errcap, "out of memory"); qw_flash_state_free(old); return NULL; }
+    if (old) {
+        /* Its buffers, not its state: those the allocation below finds
+         * already in place, it keeps. */
+        gather_join(old);
+        qw_buf *from[] = { QW_FLASH_BUFS(old) }, *to[] = { QW_FLASH_BUFS(f) };
+        for (size_t i = 0; i < sizeof from / sizeof *from; i++) { *to[i] = *from[i]; *from[i] = NULL; }
+        qw_flash_state_free(old);
+    }
     f->max_blocks = s->max_ctx / c->indexer_compress_ratio;
     f->ple_state_len = (c->ple_conv_kernel_size - 1) * c->ngram_size;
     f->last_eos = -1;
@@ -112,7 +136,7 @@ struct qw_flash_state *qw_flash_state_new(qwasar_session *s, char *err, size_t e
           "index block keys" },
     };
     for (size_t i = 0; i < sizeof want / sizeof *want; i++) {
-        *want[i].b = qw_buf_alloc(want[i].n);
+        if (!*want[i].b) *want[i].b = qw_buf_alloc(want[i].n);
         if (!*want[i].b) {
             qw_verrf(err, errcap, "cannot allocate %s (%.1f MB)", want[i].name, want[i].n / 1048576.0);
             qw_flash_state_free(f);
@@ -129,7 +153,7 @@ struct qw_flash_state *qw_flash_state_new(qwasar_session *s, char *err, size_t e
             { &f->ple_state, (size_t)f->ple_state_len * HH * 4 },
         };
         for (size_t i = 0; i < sizeof pw / sizeof *pw; i++) {
-            *pw[i].b = qw_buf_alloc(pw[i].n);
+            if (!*pw[i].b) *pw[i].b = qw_buf_alloc(pw[i].n);
             if (!*pw[i].b) {
                 qw_verrf(err, errcap, "cannot allocate the engram scratch");
                 qw_flash_state_free(f);
@@ -154,15 +178,7 @@ static void gather_join(struct qw_flash_state *f) {
 void qw_flash_state_free(struct qw_flash_state *f) {
     if (!f) return;
     if (f->gather_group) { gather_join(f); dispatch_release(f->gather_group); }
-    qw_buf *all[] = {
-        &f->h4, &f->n4, &f->mixd, &f->mixu, &f->inj,
-        &f->route_logits, &f->route_idx, &f->route_w, &f->exp_gu, &f->exp_act, &f->exp_y,
-        &f->grp_perm, &f->grp_tiles, &f->grp_cursor,
-        &f->sh_g, &f->sh_u, &f->sh_out, &f->sh_gs,
-        &f->iqk, &f->iq, &f->iscores, &f->mask, &f->qlist, &f->ikeys, &f->ipool,
-        &f->ple_emb, &f->ple_key, &f->ple_keyn, &f->ple_val, &f->ple_qn, &f->ple_gv,
-        &f->ple_gvn, &f->ple_conv, &f->ple_state,
-    };
+    qw_buf *all[] = { QW_FLASH_BUFS(f) };
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) qw_buf_free(*all[i]);
     free(f);
 }
