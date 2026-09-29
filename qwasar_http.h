@@ -79,7 +79,58 @@ typedef struct {
  * malformed; `body` is left owning the payload. */
 bool read_request(conn *c, str *carry, http_req *r, str *body);
 
+/* ---- the client side --------------------------------------------------------
+ *
+ * For qwasar-agent, which speaks the Session API over the same code.  One
+ * connection per request; a streaming response is read incrementally so the
+ * caller can poll its own input between events. */
+
+typedef struct {
+    int    status;
+    char   ctype[64];
+    size_t content_length;
+    bool   chunked;
+    bool   close;          /* Connection: close, or no framing: read to EOF */
+} http_resp;
+
+/* Connects to host:port (an IPv4 literal or a name); -1 on failure. */
+int  http_connect(const char *host, int port);
+/* Writes one request.  `bearer` may be NULL; `extra` is raw header lines
+ * ending in CRLF, or NULL. */
+bool http_send_request(conn *c, const char *method, const char *path, const char *host,
+                       const char *bearer, const char *extra, const char *body, size_t len);
+/* Reads the status line and headers; the body is left in `carry`. */
+bool http_read_response(conn *c, str *carry, http_resp *r);
+/* Reads a whole body after http_read_response, framed however `r` says. */
+bool http_read_body(conn *c, str *carry, const http_resp *r, str *body);
+/* Everything at once: request, response, body.  Returns false when the
+ * connection failed; the status is the server's otherwise. */
+bool http_call(const char *host, int port, const char *bearer, const char *method,
+               const char *path, const char *body, http_resp *r, str *out);
+
+/* A server-sent event stream, decoded incrementally: feed it bytes off the
+ * socket as they arrive, take events as they complete.  Chunked transfer is
+ * undone here, so the caller reads the socket with plain read(). */
+typedef struct {
+    str    raw;        /* undecoded bytes, when chunked */
+    str    text;       /* decoded stream, events consumed from its front */
+    size_t remaining;  /* bytes left in the chunk being read */
+    bool   chunked;
+    bool   ended;      /* the terminating chunk arrived */
+} sse_reader;
+
+void sse_reader_init(sse_reader *rd, bool chunked);
+void sse_reader_free(sse_reader *rd);
+bool sse_reader_feed(sse_reader *rd, const char *bytes, size_t n);
+/* The next complete event, or false.  `id` and `event` may come back empty;
+ * `data` is the joined data lines.  The strings are the reader's until the
+ * next call. */
+bool sse_reader_next(sse_reader *rd, const char **id, const char **event, const char **data);
+
 /* ---- odds and ends --------------------------------------------------------- */
+
+/* Bytes to base64 (no line breaks).  Caller frees. */
+char *b64_encode(const unsigned char *src, size_t n);
 
 /* Base64 to bytes; padding and whitespace are skipped.  Caller frees. */
 unsigned char *b64_decode(const char *src, size_t n, size_t *out_len);

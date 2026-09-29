@@ -117,8 +117,20 @@ maximum. Rebuilt and ran: mean=2.80 max=5.00
 ```
 
 With no task it opens a REPL. Six tools (`read`, `write`, `edit`, `list`,
-`grep`, `bash`); commands `/help`, `/new`, `/effort`, `/think`, `/yes`, `/ctx`,
-`/save`, `/quit`; `/image` and `/video` attach media mid-conversation.
+`grep`, `bash`); commands `/help`, `/new`, `/sessions`, `/effort`, `/think`,
+`/yes`, `/ctx`, `/save`, `/quit`; `/image` and `/video` attach media
+mid-conversation.
+
+**The agent is a client of the server.** It talks to `qwasar-server`'s
+Session API ([API.md](API.md)): its system prompt and tools become a session
+the server owns, and every turn sends only what is new, so the conversation
+is never re-sent and never re-prefilled by accident. If nothing is listening
+on the port it starts a server itself (`-m` or `$QWASAR_MODEL` names the
+model) and holds a pipe on its stdin, so that server stops when the agent
+does. Conversations persist on the server: `--resume last` continues this
+directory's most recent one, `/sessions` lists them, `/save` parks the
+current one warm on disk. The agent links no engine: it is 170 KB and starts
+instantly.
 
 Worth knowing:
 
@@ -280,7 +292,6 @@ load):
 
 ```
 qwasar --mtp ./qwasar-mtp --spec -p "..."
-qwasar-agent --mtp ./qwasar-mtp        # on by default once the head is given
 ```
 
 **1.5x on prose, sustained.** Three alternating serial/speculative pairs of
@@ -360,8 +371,9 @@ CLI and agent never learn what a tensor is.
 
 # What is not implemented
 
-* **Sampling in the CLI.** The server samples; `qwasar` and `qwasar-agent` are
-  still greedy.
+* **Sampling in `qwasar`.** The server samples (and so does the agent,
+  through it; `--temperature 0` makes it greedy); the plain CLI is still
+  greedy.
 * **`/v1/responses`, `/v1/completions`, and concurrent requests** in the
   server.
 * **NFC normalisation** in the tokenizer (a no-op for ASCII and

@@ -38,7 +38,10 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("QWASAR_SERVER_BIN", os.path.join(ROOT, "qwasar-server"))
-MODEL = os.environ.get("QWASAR_TEST_MODEL") or os.path.join(ROOT, "tests/fixtures/flashnext-tiny-q4")
+# Absolute, because the agent runs in a working directory of its own and
+# passes the path on to a server it starts.
+MODEL = os.path.abspath(os.environ.get("QWASAR_TEST_MODEL")
+                        or os.path.join(ROOT, "tests/fixtures/flashnext-tiny-q4"))
 TOY = "fixtures" in MODEL
 TIMEOUT = 900
 
@@ -468,6 +471,79 @@ class ToolCalls(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(ev2[0][2]["from"], "live")
         self.assertIn(ev2[-1][2]["stop"], ("end_turn", "tool_calls", "length"))
+
+
+AGENT = os.environ.get("QWASAR_AGENT_BIN", os.path.join(ROOT, "qwasar-agent"))
+
+
+@unittest.skipUnless(os.access(AGENT, os.X_OK), "qwasar-agent not built")
+class Agent(unittest.TestCase):
+    """qwasar-agent as a client: one-shot tasks against the module's server,
+    a resumed conversation, and a server the agent starts for itself."""
+
+    def run_agent(self, args, port=None, timeout=180):
+        # realpath: the agent records getcwd(), which resolves /var to /private/var.
+        work = os.path.realpath(tempfile.mkdtemp(prefix="agent-work-", dir=HOME))
+        env = dict(os.environ, HOME=HOME)
+        url = f"http://127.0.0.1:{port or SRV.port}"
+        cmd = [AGENT, "--server", url, "-y", "-n", "12", "--temperature", "0", *args]
+        p = subprocess.run(cmd, cwd=work, env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+        return p.returncode, p.stdout.decode(errors="replace"), work
+
+    def agent_sessions(self, work, server=None):
+        _, _, r = (server or SRV).request("GET", "/v1/sessions")
+        return [s for s in r["sessions"]
+                if s["metadata"].get("client") == "qwasar-agent" and s["metadata"].get("cwd") == work]
+
+    def test_one_shot_and_resume(self):
+        rc, out, work = self.run_agent(["say hi"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("tools", out)
+        sess = self.agent_sessions(work)
+        self.assertEqual(len(sess), 1, out)
+        self.assertEqual(sess[0]["metadata"]["title"], "say hi")
+        self.assertGreater(sess[0]["tokens"], sess[0]["prefix_tokens"])
+        # Parked on the way out: warm if it passed the store's floor.
+        self.assertIn(sess[0]["warmth"]["state"], ("warm", "cold"))
+        n = sess[0]["tokens"]
+        # The same directory resumes its last conversation, which grows.
+        env = dict(os.environ, HOME=HOME)
+        p = subprocess.run([AGENT, "--server", f"http://127.0.0.1:{SRV.port}", "-y", "-n", "8",
+                            "--resume", "last", "and again"], cwd=work, env=env,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
+        out2 = p.stdout.decode(errors="replace")
+        self.assertEqual(p.returncode, 0, out2)
+        self.assertIn("resuming", out2)
+        sess2 = self.agent_sessions(work)
+        self.assertEqual(len(sess2), 1)
+        self.assertEqual(sess2[0]["id"], sess[0]["id"])
+        self.assertGreater(sess2[0]["tokens"], n)
+
+    def test_refuses_without_a_server_or_model(self):
+        env = dict(os.environ, HOME=HOME)
+        env.pop("QWASAR_MODEL", None)
+        p = subprocess.run([AGENT, "--server", f"http://127.0.0.1:{free_port()}", "hi"], cwd=HOME, env=env,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("nothing is listening", p.stdout.decode(errors="replace"))
+
+    def test_starts_its_own_server(self):
+        port = free_port()
+        rc, out, work = self.run_agent(["-m", MODEL, "hello there"], port=port)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("starting qwasar-server", out)
+        self.assertIn("server ready", out)
+        # The lifeline: the server goes when the agent does.
+        for _ in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    time.sleep(0.1)
+                    continue
+            except OSError:
+                break
+        else:
+            self.fail("the agent's server outlived it")
 
 
 class Restart(unittest.TestCase):

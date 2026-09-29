@@ -42,8 +42,10 @@ help:
 qwasar: qwasar_cli.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-qwasar-agent: qwasar_agent.o qwasar_tui.o linenoise.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+# The agent is a client of the server (API.md) and links no engine: the
+# tool-call parser and editor, JSON, the HTTP core, the TUI.
+qwasar-agent: qwasar_agent.o qwasar_toolcall.o qwasar_json.o qwasar_http.o qwasar_tui.o linenoise.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm -pthread
 
 qwasar-server: qwasar_server.o qwasar_api.o qwasar_sessions.o qwasar_profile.o qwasar_http.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -66,7 +68,7 @@ qwasar_profile.o: qwasar_profile.c qwasar_sessions.h qwasar_gpu.h qwasar_json.h
 
 qwasar_api.o: qwasar_api.c qwasar_api.h qwasar_sessions.h qwasar_http.h
 
-qwasar_agent.o: qwasar_agent.c qwasar.h qwasar_toolcall.h qwasar_tui.h
+qwasar_agent.o: qwasar_agent.c qwasar_http.h qwasar_json.h qwasar_toolcall.h qwasar_tui.h
 qwasar_tui.o:   qwasar_tui.c qwasar_tui.h linenoise.h
 linenoise.o:    linenoise.c linenoise.h
 

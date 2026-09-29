@@ -8,8 +8,13 @@
 
 #include "qwasar_http.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdarg.h>
+#include <sys/socket.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -460,5 +465,232 @@ bool read_request(conn *c, str *carry, http_req *r, str *body) {
     memmove(carry->p, carry->p + consumed, carry->len - consumed);
     carry->len -= consumed;
     carry->p[carry->len] = 0;
+    return true;
+}
+
+/* ---- the client side ---------------------------------------------------------- */
+
+char *b64_encode(const unsigned char *src, size_t n) {
+    static const char tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *out = malloc((n + 2) / 3 * 4 + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        const uint32_t a = src[i], b = i + 1 < n ? src[i + 1] : 0, d = i + 2 < n ? src[i + 2] : 0;
+        const uint32_t v = (a << 16) | (b << 8) | d;
+        out[o++] = tab[(v >> 18) & 63];
+        out[o++] = tab[(v >> 12) & 63];
+        out[o++] = i + 1 < n ? tab[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < n ? tab[v & 63] : '=';
+    }
+    out[o] = 0;
+    return out;
+}
+
+int http_connect(const char *host, int port) {
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char service[16];
+    snprintf(service, sizeof service, "%d", port);
+    if (getaddrinfo(host, service, &hints, &res) != 0) return -1;
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd >= 0) {
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    }
+    return fd;
+}
+
+bool http_send_request(conn *c, const char *method, const char *path, const char *host,
+                       const char *bearer, const char *extra, const char *body, size_t len) {
+    str h = { 0 };
+    str_printf(&h, "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n", method, path, host);
+    if (bearer && *bearer) str_printf(&h, "Authorization: Bearer %s\r\n", bearer);
+    if (extra) str_puts(&h, extra);
+    if (body) str_printf(&h, "Content-Type: application/json\r\nContent-Length: %zu\r\n", len);
+    str_puts(&h, "\r\n");
+    bool ok = conn_write(c, h.p, h.len);
+    if (ok && body && len) ok = conn_write(c, body, len);
+    str_free(&h);
+    return ok;
+}
+
+bool http_read_response(conn *c, str *carry, http_resp *r) {
+    memset(r, 0, sizeof *r);
+    r->close = true;
+    const char *hend = NULL;
+    for (;;) {
+        if (carry->len && (hend = strstr(carry->p, "\r\n\r\n"))) break;
+        if (carry->len > (1u << 20)) return false;
+        char buf[8192];
+        ssize_t n = read(c->fd, buf, sizeof buf);
+        if (n <= 0) { if (n < 0 && errno == EINTR) continue; return false; }
+        if (!str_add(carry, buf, (size_t)n)) return false;
+    }
+    const size_t head_len = (size_t)(hend - carry->p) + 4;
+    if (sscanf(carry->p, "HTTP/1.%*d %d", &r->status) != 1) return false;
+    const char *end = carry->p + head_len;
+    const char *p = memchr(carry->p, '\n', head_len);
+    while (p && p + 1 < end) {
+        const char *line = p + 1;
+        const char *nl = memchr(line, '\n', (size_t)(end - line));
+        if (!nl) break;
+        size_t len = (size_t)(nl - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len == 0) break;
+        if (len > 15 && !strncasecmp(line, "Content-Length:", 15)) {
+            r->content_length = (size_t)strtoul(line + 15, NULL, 10);
+            r->close = false;
+        } else if (len > 13 && !strncasecmp(line, "Content-Type:", 13)) {
+            size_t i = 13;
+            while (i < len && line[i] == ' ') i++;
+            size_t k = 0;
+            while (i < len && k + 1 < sizeof r->ctype) r->ctype[k++] = line[i++];
+            r->ctype[k] = 0;
+        } else if (len > 18 && !strncasecmp(line, "Transfer-Encoding:", 18)) {
+            for (size_t i = 18; i + 7 <= len; i++)
+                if (!strncasecmp(line + i, "chunked", 7)) { r->chunked = true; r->close = false; break; }
+        }
+        p = nl;
+    }
+    memmove(carry->p, carry->p + head_len, carry->len - head_len);
+    carry->len -= head_len;
+    carry->p[carry->len] = 0;
+    return true;
+}
+
+bool http_read_body(conn *c, str *carry, const http_resp *r, str *body) {
+    if (r->chunked) {
+        size_t end = 0;
+        if (!read_chunked(c, carry, 0, body, &end)) return false;
+        return true;
+    }
+    if (!r->close) {
+        if (!carry_fill(c, carry, r->content_length)) return false;
+        return str_add(body, carry->p, r->content_length);
+    }
+    /* No framing: the body is everything to EOF. */
+    str_add(body, carry->p, carry->len);
+    char buf[8192];
+    for (;;) {
+        ssize_t n = read(c->fd, buf, sizeof buf);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return true;
+        str_add(body, buf, (size_t)n);
+    }
+}
+
+bool http_call(const char *host, int port, const char *bearer, const char *method,
+               const char *path, const char *body, http_resp *r, str *out) {
+    conn c = { .fd = http_connect(host, port) };
+    if (c.fd < 0) return false;
+    str carry = { 0 };
+    bool ok = http_send_request(&c, method, path, host, bearer, NULL, body, body ? strlen(body) : 0)
+           && http_read_response(&c, &carry, r)
+           && http_read_body(&c, &carry, r, out);
+    str_free(&carry);
+    close(c.fd);
+    return ok;
+}
+
+/* ---- server-sent events, decoded incrementally --------------------------------- */
+
+void sse_reader_init(sse_reader *rd, bool chunked) {
+    memset(rd, 0, sizeof *rd);
+    rd->chunked = chunked;
+}
+
+void sse_reader_free(sse_reader *rd) {
+    str_free(&rd->raw);
+    str_free(&rd->text);
+}
+
+/* Undoes chunked framing from `raw` into `text`, as far as the bytes go. */
+static void dechunk(sse_reader *rd) {
+    size_t pos = 0;
+    for (;;) {
+        if (rd->remaining > 0) {
+            const size_t have = rd->raw.len - pos;
+            const size_t take = have < rd->remaining ? have : rd->remaining;
+            str_add(&rd->text, rd->raw.p + pos, take);
+            pos += take;
+            rd->remaining -= take;
+            if (rd->remaining > 0) break;
+        }
+        /* The CRLF that ends a chunk -- which the server writes separately
+         * from the data, so a read may well stop between the two -- and any
+         * blank line before the next size. */
+        while (pos < rd->raw.len && (rd->raw.p[pos] == '\r' || rd->raw.p[pos] == '\n')) pos++;
+        const char *nl = memchr(rd->raw.p + pos, '\n', rd->raw.len - pos);
+        if (!nl) break;
+        char *stop = NULL;
+        const unsigned long long sz = strtoull(rd->raw.p + pos, &stop, 16);
+        if (stop == rd->raw.p + pos) { rd->ended = true; break; }   /* not a chunk line */
+        pos = (size_t)(nl - rd->raw.p) + 1;
+        if (sz == 0) { rd->ended = true; break; }
+        rd->remaining = (size_t)sz;
+    }
+    /* A chunk's data may straddle reads: keep what was not consumed.  A
+     * partial size line is kept too, whole. */
+    if (rd->remaining > 0 || pos > 0) {
+        memmove(rd->raw.p, rd->raw.p + pos, rd->raw.len - pos);
+        rd->raw.len -= pos;
+        if (rd->raw.p) rd->raw.p[rd->raw.len] = 0;
+    }
+}
+
+bool sse_reader_feed(sse_reader *rd, const char *bytes, size_t n) {
+    if (!rd->chunked) return str_add(&rd->text, bytes, n);
+    if (!str_add(&rd->raw, bytes, n)) return false;
+    dechunk(rd);
+    return true;
+}
+
+bool sse_reader_next(sse_reader *rd, const char **id, const char **event, const char **data) {
+    static str s_id, s_event, s_data;
+    /* An event ends at a blank line. */
+    const char *p = rd->text.p;
+    if (!p) return false;
+    const char *end = strstr(p, "\n\n");
+    if (!end) return false;
+    s_id.len = s_event.len = s_data.len = 0;
+    const char *line = p;
+    while (line < end + 1) {
+        const char *nl = memchr(line, '\n', (size_t)(end + 1 - line));
+        if (!nl) break;
+        size_t len = (size_t)(nl - line);
+        if (len > 3 && !strncmp(line, "id:", 3)) {
+            const char *v = line + 3; size_t vl = len - 3;
+            if (vl && *v == ' ') { v++; vl--; }
+            str_add(&s_id, v, vl);
+        } else if (len > 6 && !strncmp(line, "event:", 6)) {
+            const char *v = line + 6; size_t vl = len - 6;
+            if (vl && *v == ' ') { v++; vl--; }
+            str_add(&s_event, v, vl);
+        } else if (len >= 5 && !strncmp(line, "data:", 5)) {
+            const char *v = line + 5; size_t vl = len - 5;
+            if (vl && *v == ' ') { v++; vl--; }
+            if (s_data.len) str_add(&s_data, "\n", 1);
+            str_add(&s_data, v, vl);
+        }
+        line = nl + 1;
+    }
+    const size_t consumed = (size_t)(end + 2 - p);
+    memmove(rd->text.p, rd->text.p + consumed, rd->text.len - consumed);
+    rd->text.len -= consumed;
+    rd->text.p[rd->text.len] = 0;
+    str_add(&s_id, "", 0); str_add(&s_event, "", 0); str_add(&s_data, "", 0);
+    *id = s_id.p; *event = s_event.p; *data = s_data.p;
     return true;
 }

@@ -355,6 +355,35 @@ the engine to be free: `make test-api` with `QWASAR_TEST_MODEL` at a real
 folder (which runs the tool-call test), and a Goose session on the compat
 endpoint at the speed it had.
 
+### 3.1 M2, built -- 2026-09-29
+
+`qwasar_http.c` gained its client half -- connect, request, response, an SSE
+reader that undoes chunked framing incrementally so the agent polls its own
+keyboard between events -- and `qwasar_agent.c` was rewritten around it.
+The tools, confirmations, TUI presentation and REPL are as they were; the
+engine, tokenizer, session, generation and MTP code are gone, and the agent
+links `qwasar_toolcall.o`, `qwasar_json.o`, `qwasar_http.o` and the TUI
+only: 172 KB, no Metal.  `--server`, `--token`, `--resume <id|last>`,
+`--temperature` arrived; `-c`, `--mtp`, `--mtp-depth`, `--no-cache` went
+with the engine.  Ctrl-C is a `cancel` on a second connection; the stream is
+read to its `done`.  Sessions carry `metadata {client, cwd, title}` so
+`/sessions` and `--resume last` find this directory's own.  A one-shot run
+parks its session on the way out.
+
+Autostart as planned: no listener on a loopback port plus a resolvable model
+(`-m`, `$QWASAR_MODEL`, `./qwasar-model`, `qwasar-model` beside the binary)
+starts `qwasar-server` from beside the binary with `--exit-on-eof` on a pipe
+the agent holds; the log goes to `$TMPDIR/qwasar-server-<port>.log`.
+
+Tests (in `tests/test_session_api.py`, on the toy): a one-shot task against
+the suite's server leaves one parked session for its directory, `--resume
+last` grows it; no server and no model is refused with the reason; a server
+the agent starts serves the task and is gone once the agent is.  The toy's
+tokenizer now trains 142 merges on the template's and the agent's own text
+(`tools/toy_tokenizer.py`), which is what fits the agent's 3.3K-token prefix
+in the toy's 4K window.  **The M2 gate's interactive run on the real model
+waits for the engine to be free**, as M1's does.
+
 ## 6. Working beside the engine
 
 Another agent owns the engine and the server today. This plan touches the

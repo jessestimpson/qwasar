@@ -1,22 +1,30 @@
-/* qwasar-agent -- an agentic loop on the qwasar engine.
+/* qwasar-agent -- an agentic loop on qwasar-server's Session API.
  *
- * The conversation is append-only, which is not a simplification but a
- * requirement: 48 of this model's 64 layers carry recurrent state with no
- * per-position history, so a session can be extended but never rewound (see
- * qwasar.h).  An agent loop happens to be a natural fit -- every turn appends,
- * nothing edits history -- so each step feeds back exactly the tokens the model
- * just produced plus the rendered tool result, and the KV cache and recurrent
- * state carry forward untouched.  Re-rendering the whole conversation each turn
- * would be both slower and, for the recurrent half, wrong.
+ * The tools, the confirmations and the terminal are here; the model is not.
+ * The agent opens a session on the server (API.md) -- its system prompt and
+ * tools become the session's prefix, fixed for its life -- and from then on
+ * sends only what is new: a user turn, or the results of the calls the model
+ * asked for.  The server owns the conversation's state and says how warm it
+ * is; the agent shows what the server streams: prefill progress, reasoning,
+ * the answer, the calls.
+ *
+ * No server, no problem: when nothing answers on the port and a model can be
+ * found, the agent starts qwasar-server itself, holding a pipe on its stdin
+ * so the server goes when the agent does (the menu bar's lifeline, reused).
  *
  * Tools that only read run unattended.  Tools that write to the filesystem or
  * run commands ask first, unless --yes. */
 
-#include "qwasar.h"
+#include "qwasar_http.h"
+#include "qwasar_json.h"
 #include "qwasar_toolcall.h"
 #include "qwasar_tui.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,10 +39,11 @@
 
 /* ---- tool definitions ------------------------------------------------------
  *
- * One JSON object per tool, embedded verbatim in the system turn.  The edit
- * description spells out the match rule because that rule is the tool's whole
- * contract: the model has to know that quoting too little will be rejected as
- * ambiguous rather than applied somewhere arbitrary. */
+ * One JSON object per tool, sent to the server at open and rendered by it
+ * into the system turn.  The edit description spells out the match rule
+ * because that rule is the tool's whole contract: the model has to know that
+ * quoting too little will be rejected as ambiguous rather than applied
+ * somewhere arbitrary. */
 static const char *const AGENT_TOOLS[] = {
 "{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": "
 "\"Read a file and return its exact contents, with no line numbers or other "
@@ -62,55 +71,25 @@ static const char *const AGENT_TOOLS[] = {
 "[\"path\", \"old\", \"new\"]}}}",
 
 "{\"type\": \"function\", \"function\": {\"name\": \"list\", \"description\": "
-"\"List the entries of a directory.\", \"parameters\": {\"type\": \"object\", "
-"\"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory "
-"path; defaults to the working directory.\"}}, \"required\": []}}}",
+"\"List a directory (ls -lA).\", \"parameters\": {\"type\": \"object\", "
+"\"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory; "
+"defaults to the current one.\"}}, \"required\": []}}}",
 
 "{\"type\": \"function\", \"function\": {\"name\": \"grep\", \"description\": "
-"\"Search files recursively for a regular expression and return matching lines "
-"with their file and line number.\", \"parameters\": {\"type\": \"object\", "
-"\"properties\": {\"pattern\": {\"type\": \"string\", \"description\": \"Extended "
-"regular expression.\"}, \"path\": {\"type\": \"string\", \"description\": \"File "
-"or directory to search; defaults to the working directory.\"}}, \"required\": "
-"[\"pattern\"]}}}",
+"\"Search files recursively for an extended regular expression (grep -rnE). "
+"Returns matching lines with file names and line numbers.\", \"parameters\": "
+"{\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\", "
+"\"description\": \"The regular expression.\"}, \"path\": {\"type\": \"string\", "
+"\"description\": \"File or directory to search; defaults to the current "
+"directory.\"}}, \"required\": [\"pattern\"]}}}",
 
 "{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"description\": "
-"\"Run a shell command and return its combined output and exit status.\", "
-"\"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": "
-"\"string\", \"description\": \"Command to run via /bin/sh.\"}}, \"required\": "
-"[\"command\"]}}}",
+"\"Run a shell command and return its combined output and exit status. The user "
+"is asked to approve each command first.\", \"parameters\": {\"type\": \"object\", "
+"\"properties\": {\"command\": {\"type\": \"string\", \"description\": \"The "
+"command line.\"}}, \"required\": [\"command\"]}}}",
 };
-#define AGENT_N_TOOLS ((int32_t)(sizeof AGENT_TOOLS / sizeof *AGENT_TOOLS))
-
-/* ---- growable text --------------------------------------------------------- */
-
-typedef struct { char *p; size_t len, cap; } str;
-
-static bool str_add(str *s, const char *data, size_t n) {
-    if (s->len + n + 1 > s->cap) {
-        size_t cap = s->cap ? s->cap * 2 : 4096;
-        while (cap < s->len + n + 1) cap *= 2;
-        char *p = realloc(s->p, cap);
-        if (!p) return false;
-        s->p = p;
-        s->cap = cap;
-    }
-    memcpy(s->p + s->len, data, n);
-    s->len += n;
-    s->p[s->len] = 0;
-    return true;
-}
-static bool str_puts(str *s, const char *t) { return str_add(s, t, strlen(t)); }
-static void str_free(str *s) { free(s->p); s->p = NULL; s->len = s->cap = 0; }
-
-static void str_printf(str *s, const char *fmt, ...) {
-    char buf[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    if (n > 0) str_add(s, buf, (size_t)n < sizeof buf ? (size_t)n : sizeof buf - 1);
-}
+#define AGENT_N_TOOLS ((int)(sizeof AGENT_TOOLS / sizeof *AGENT_TOOLS))
 
 /* ---- subprocess ------------------------------------------------------------
  *
@@ -152,21 +131,19 @@ static bool run_capture(char *const argv[], str *out, int *status) {
 /* ---- tools ----------------------------------------------------------------- */
 
 typedef struct {
-    bool yes;          /* skip confirmations */
-    bool show_think;
-    int  max_steps;
-    int  max_tokens;
-    int  mtp_depth;    /* 0 = decode serially */
+    bool    yes;          /* skip confirmations */
+    bool    show_think;
+    int     max_steps;
+    int32_t max_tokens;   /* per step; the server caps it to the window's room */
+    float   temperature;  /* < 0: the model's own defaults */
 } agent_cfg;
 
-/* Mutating tools ask before acting.  A refusal is reported back to the model as
- * a tool result rather than aborting, so it can choose something else. */
-/* Asking mid-turn has to go through the same output path as everything else,
- * or the question lands on top of the pinned footer.  The reply is read with
- * the line editor for the same reason -- as a question, not a prompt change,
- * so the footer goes back to what it showed once it is answered. */
 static qw_tui *g_tui;
 
+/* Mutating tools ask before acting.  A refusal is reported back to the model as
+ * a tool result rather than aborting, so it can choose something else.  The
+ * question goes through the TUI's own ask, so it lands above the footer and
+ * a message typed ahead is not mistaken for the answer. */
 static bool confirm(const agent_cfg *cfg, const char *what, const char *detail) {
     if (cfg->yes) return true;
     const bool tty = tui_is_tty(g_tui);
@@ -242,8 +219,6 @@ static void tool_edit(const qw_tool_call *c, const agent_cfg *cfg, str *result) 
     str_free(&content);
 
     if (st != QW_EDIT_OK) {
-        /* Told plainly, with the count, so the model knows whether to quote
-         * more context or to go and look at the file again. */
         str_printf(result, "error: %s (%d matches). Nothing was changed. %s",
                    qw_edit_status_text(st), matches,
                    st == QW_EDIT_AMBIGUOUS
@@ -318,87 +293,53 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-/* ---- prefill progress ------------------------------------------------------
- *
- * Prompt processing is the one stretch of a turn with nothing to look at, and
- * on a long conversation it is the longest.  The rate is written into the
- * unfilled part of the bar, so the line stays one width whether or not there is
- * a number to show yet -- a trick worth stealing from ds4-agent. */
+/* ---- the agent ---------------------------------------------------------------- */
 
-#define AGENT_BAR_WIDTH 28
-
-/* Below this the prompt is processed faster than the eye can follow, and a bar
- * that appears and vanishes is worse than no bar.  A tool result is usually a
- * few dozen tokens; a conversation being reloaded is thousands. */
-#define AGENT_BAR_MIN_TOKENS 128
-
-/* ---- generation ------------------------------------------------------------ */
+/* A call the server reported, with what running it produced. */
+typedef struct {
+    char        id[24];
+    qw_tool_call call;      /* strings owned here */
+    str         result;
+} pending_call;
 
 typedef struct {
-    str      text;      /* everything after </think> */
-    str      think;
-    int32_t *tokens;    /* what the model produced, to feed straight back */
-    int32_t  n_tokens;
-    bool     hit_eos;
-    /* Why the turn ended, which the caller has to be able to tell apart: a
-     * finished answer and a truncated one look identical otherwise. */
-    bool     hit_budget;
-    bool     in_reasoning;   /* still inside <think> when it ended */
-    int32_t  n_think;        /* tokens spent reasoning, which are not printed */
-    bool     has_call;
-} turn;
+    char        host[256];
+    int         port;
+    const char *token;
+    agent_cfg   cfg;
+    const char *effort;
+    char       *guidance;
+    qw_tui     *tui;
 
-static void turn_free(turn *t) {
-    str_free(&t->text);
-    str_free(&t->think);
-    free(t->tokens);
-    memset(t, 0, sizeof *t);
-}
+    char        session[32];      /* the open session's id, or "" */
+    int32_t     prefix_tokens;
+    char        model_name[64];
 
-static bool turn_push(turn *t, int32_t id) {
-    int32_t *v = realloc(t->tokens, (size_t)(t->n_tokens + 1) * sizeof *v);
-    if (!v) return false;
-    t->tokens = v;
-    t->tokens[t->n_tokens++] = id;
-    return true;
-}
+    /* Footer state, from the server's events. */
+    int32_t     ctx_used, ctx_max;
+    double      turn_started;
+    int32_t     turn_tokens;
+    double      tps;
+    double      prefill_started;
+    int32_t     think_tokens;
 
-static int32_t argmax(const float *v, int32_t n) {
-    int32_t best = 0;
-    for (int32_t i = 1; i < n; i++) if (v[i] > v[best]) best = i;
-    return best;
-}
+    /* An attachment waiting for the next turn: base64, with its type. */
+    char       *att_b64;
+    char        att_type[32];
+    bool        att_video;
 
-/* Runs one assistant turn to completion: to a finished tool call, to
- * end-of-turn, or to the token budget. */
-typedef struct {
-    qwasar_engine       *e;
-    qwasar_tokenizer    *tok;
-    qwasar_session      *s;
-    qwasar_chat_options  chat;
-    agent_cfg            cfg;
-    const char          *guidance;
-    bool                 no_cache;
+    /* The step in flight. */
+    pending_call calls[QW_MAX_CALLS];
+    int          n_calls;
+    char         stop[24];
+    int32_t      generated;
+    bool         interrupted;
+    bool         think_open;      /* a dim reasoning run is on screen */
 
-    qw_tui              *tui;
-    /* Footer state.  Kept here rather than recomputed at each call site so the
-     * status line reads the same whatever produced it. */
-    int32_t              ctx_max;
-    double               turn_started;
-    int32_t              turn_tokens;
-    int64_t              spec_rounds, spec_tokens;
-
-    /* An image waiting to be attached to the next turn.  Encoded when it is
-     * named rather than when it is used, because the prompt has to say how
-     * many <|image_pad|> tokens it needs and that is a property of the patch
-     * grid.  Consumed by the first eval of the turn and not by the tool-result
-     * evals that follow it. */
-    qwasar_image_input   img;
-    int32_t              n_img_rows;
-    bool                 img_is_video;
-    /* Only the prefill start time is kept; the rate is derived from it. */
-    double               prefill_started;
-    bool                 interrupted;
+    /* A server this agent started, and the pipe that ends it. */
+    pid_t       server_pid;
+    int         lifeline;
+    char        server_log[512];
 } agent;
 
 /* Renders token counts the way a person reads them. */
@@ -414,48 +355,51 @@ static void fmt_tokens(char *out, size_t cap, int32_t n) {
 static void status_set(agent *a, const char *what) {
     if (!a->tui) return;
     char used[24], total[24];
-    fmt_tokens(used, sizeof used, a->s ? qwasar_session_n_past(a->s) : 0);
+    fmt_tokens(used, sizeof used, a->ctx_used);
     fmt_tokens(total, sizeof total, a->ctx_max);
-
-    if (a->turn_tokens > 0) {
-        double dt = now_sec() - a->turn_started;
-        double tps = dt > 0.0 ? (double)a->turn_tokens / dt : 0.0;
+    if (a->turn_tokens > 0)
         tui_status(a->tui, "ctx %s/%s  ·  %s %d tokens  ·  %.1f t/s",
-                   used, total, what, a->turn_tokens, tps);
-    } else {
+                   used, total, what, a->turn_tokens, a->tps);
+    else
         tui_status(a->tui, "ctx %s/%s  ·  %s", used, total, what);
-    }
+    tui_tick(a->tui);
 }
 
-static void progress_cb(void *ud, int32_t done, int32_t total) {
-    agent *a = ud;
+/* ---- prefill progress ------------------------------------------------------
+ *
+ * Prompt processing is the one stretch of a turn with nothing to look at, and
+ * on a long conversation it is the longest.  The server reports it over the
+ * whole of what it is evaluating; the rate is written into the unfilled part
+ * of the bar, so the line stays one width whether or not there is a number
+ * to show yet -- a trick worth stealing from ds4-agent. */
+
+#define AGENT_BAR_WIDTH 28
+/* Below this the prompt is processed faster than the eye can follow, and a
+ * bar that appears and vanishes is worse than no bar. */
+#define AGENT_BAR_MIN_TOKENS 128
+
+static void show_prefill(agent *a, int32_t done, int32_t total) {
     if (!a->tui || total < AGENT_BAR_MIN_TOKENS) return;
-    if (done == 0) { a->prefill_started = now_sec(); return; }
-
+    if (a->prefill_started == 0) a->prefill_started = now_sec();
     const double elapsed = now_sec() - a->prefill_started;
-    const double tps = elapsed > 0.0 ? (double)done / elapsed : 0.0;
+    const double tps = elapsed > 0.0 && done > 0 ? (double)done / elapsed : 0.0;
 
-    /* The rate is written into the unfilled run of the bar rather than after
-     * it, so the footer keeps one width whether or not there is a number yet. */
     char rate[24] = "";
     if (tps > 0.0) snprintf(rate, sizeof rate, " %.0f t/s ", tps);
     size_t rate_len = strlen(rate);
-
-    const int filled = (int)(((long long)done * AGENT_BAR_WIDTH) / total);
-    /* Near the end the bar overruns the rate; a clipped "17]" is worse than a
-     * bar that simply finishes, so drop the number once it no longer fits. */
+    const int filled = (int)(((long long)done * AGENT_BAR_WIDTH) / (total > 0 ? total : 1));
     if (rate_len + (size_t)filled > AGENT_BAR_WIDTH) rate_len = 0;
     char bar[AGENT_BAR_WIDTH * 4 + 1];
     size_t pos = 0;
     for (int i = 0; i < AGENT_BAR_WIDTH; i++) {
-        if (i < filled) { memcpy(bar + pos, "\u25b6", 3); pos += 3; }
+        if (i < filled) { memcpy(bar + pos, "▶", 3); pos += 3; }
         else if (rate_len && (size_t)(i - filled) < rate_len) bar[pos++] = rate[i - filled];
-        else { memcpy(bar + pos, "\u00b7", 2); pos += 2; }
+        else { memcpy(bar + pos, "·", 2); pos += 2; }
     }
     bar[pos] = 0;
 
     char used[24], total_s[24];
-    fmt_tokens(used, sizeof used, a->s ? qwasar_session_n_past(a->s) : 0);
+    fmt_tokens(used, sizeof used, a->ctx_used);
     fmt_tokens(total_s, sizeof total_s, a->ctx_max);
     tui_status(a->tui, "ctx %s/%s  ·  prefill [%s] %d/%d %.0f%%",
                used, total_s, bar, done, total,
@@ -463,216 +407,183 @@ static void progress_cb(void *ud, int32_t done, int32_t total) {
     tui_tick(a->tui);
 }
 
+/* ---- talking to the server ------------------------------------------------------- */
 
-/* Evaluates a prompt, using a disk checkpoint for whatever prefix it already
- * covers, and leaves a checkpoint at the system turn.
- *
- * The system prefix is the one span that is byte-identical on every run, and at
- * ~900 tokens it is most of a cold start.  Whole conversations are not saved
- * automatically: a checkpoint carries the recurrent state, which is ~149 MB
- * regardless of length, so saving every turn would fill the budget with
- * near-duplicates.  /save exists for when a conversation is worth keeping. */
-static int32_t agent_prefill(agent *a, const int32_t *tokens, int32_t n,
-                             char *err, size_t errcap) {
-    /* Where the system turn ends inside this prompt.  Rendered here rather than
-     * cached at startup because /effort rewrites the system turn, so a value
-     * captured earlier can describe a prompt that no longer exists -- and one
-     * that is longer than the current prompt makes the caller's suffix length
-     * negative. */
-    int32_t sys_n = 0;
-    {
-        qwasar_message sys = { "system", a->guidance, NULL, NULL, 0, false };
-        qwasar_chat_options only = a->chat;
-        only.add_generation_prompt = false;
-        char serr[256];
-        int32_t *p = qwasar_apply_chat_template(a->tok, &sys, 1, &only, &sys_n,
-                                                serr, sizeof serr);
-        free(p);
-        if (!p) sys_n = 0;
+/* One request with a JSON answer.  False when the server could not be
+ * reached; otherwise `status` is the server's and `doc` holds the body when
+ * it parsed (the caller frees it either way). */
+static bool api(agent *a, const char *method, const char *path, const char *body,
+                int *status, qj_doc *doc) {
+    http_resp r;
+    str out = { 0 };
+    memset(doc, 0, sizeof *doc);
+    if (!http_call(a->host, a->port, a->token, method, path, body, &r, &out)) {
+        str_free(&out);
+        return false;
     }
-    if (sys_n > n) sys_n = n;
-
-    int32_t covered = 0;
-    if (!a->no_cache) {
-        double t0 = now_sec();
-        covered = qwasar_session_restore(a->s, a->e, tokens, n);
-        if (covered > 0)
-            tui_printf(a->tui, "  \x1b[2m[restored %d tokens from cache in %.2fs]\x1b[0m\n",
-                       covered, now_sec() - t0);
-    }
-
-    /* Stop at the system boundary so a checkpoint can be left there, then
-     * continue.  Same total work either way. */
-    if (covered < sys_n) {
-        if (!qwasar_session_eval(a->s, tokens + covered, sys_n - covered, err, errcap))
-            return -1;
-        covered = sys_n;
-        if (!a->no_cache) {
-            char serr[256];
-            if (qwasar_session_save(a->s, a->e, serr, sizeof serr))
-                tui_printf(a->tui, "  \x1b[2m[cached %d-token system prefix]\x1b[0m\n", sys_n);
-        }
-    }
-    return covered > n ? n : covered;
-}
-
-static bool agent_open_session(agent *a, char *err, size_t errcap) {
-    if (a->s) qwasar_session_free(a->s);
-    a->s = qwasar_session_new(a->e, err, errcap);
-    if (!a->s) return false;
-    /* The callback reads the whole agent -- the tui, the session, the context
-     * limit -- so the whole agent is what it gets.  Handing it a sub-object
-     * compiles either way through the void *, and misreads the struct. */
-    qwasar_session_set_progress(a->s, progress_cb, a);
+    *status = r.status;
+    if (out.len) qj_parse(doc, out.p, out.len);
+    str_free(&out);
     return true;
 }
 
-/* What ended the consumption of one token. */
-typedef enum { TAKE_GO, TAKE_EOS, TAKE_CALL, TAKE_OOM } take_result;
-
-/* Accumulates one generated token into the turn and shows it.
- *
- * Factored out because the speculative path settles several tokens in a single
- * pass and every one of them has to be treated exactly as a serially decoded
- * one would be -- the whole guarantee is that speculation changes nothing but
- * the number of forward passes. */
-static take_result take_token(agent *a, turn *out, int32_t next,
-                              bool *reasoning, bool *in_call,
-                              int32_t think_close, int32_t call_open) {
-    if (qwasar_is_eos(a->e, next)) { out->hit_eos = true; return TAKE_EOS; }
-    if (!turn_push(out, next)) return TAKE_OOM;
-    a->turn_tokens++;
-    if (*reasoning) out->n_think++;
-
-    size_t len = 0;
-    bool special = false;
-    const char *bytes = qwasar_token_bytes(a->tok, next, &len, &special);
-
-    if (next == think_close) {
-        *reasoning = false;
-        if (a->cfg.show_think) tui_puts(a->tui, "\x1b[0m\n");
-    } else if (bytes && len) {
-        /* The call itself is markup, not prose.  It is still accumulated for
-         * the parser, but echoing it would bury any narration the model wrote
-         * first -- and it is told it may narrate before a call. */
-        if (!*reasoning && next == call_open) *in_call = true;
-        str_add(*reasoning ? &out->think : &out->text, bytes, len);
-        if (!special && !*in_call && (!*reasoning || a->cfg.show_think)) {
-            if (*reasoning && tui_is_tty(a->tui) && out->think.len == len)
-                tui_puts(a->tui, "\x1b[2m");
-            tui_out(a->tui, bytes, len);
-        }
-    }
-
-    status_set(a, *reasoning ? "thinking" : (*in_call ? "calling" : "writing"));
-    tui_tick(a->tui);
-
-    if (!*reasoning && qw_tool_call_complete(out->text.p ? out->text.p : "",
-                                             out->text.len)) {
-        out->has_call = true;
-        return TAKE_CALL;
-    }
-    return TAKE_GO;
+static void api_error(agent *a, const char *what, int status, const qj_doc *doc) {
+    const char *msg = qj_str(doc, qj_get(doc, qj_get(doc, qj_root(doc), "error"), "message"));
+    tui_printf(a->tui, "  %s: %s (HTTP %d)\n", what, msg ? msg : "no reason given", status);
 }
 
-static bool generate(agent *a, const int32_t *prompt, int32_t n_prompt,
-                     turn *out, char *err, size_t errcap) {
-    memset(out, 0, sizeof *out);
+static bool server_up(agent *a) {
+    int status = 0;
+    qj_doc d;
+    const bool ok = api(a, "GET", "/health", NULL, &status, &d) && status == 200;
+    qj_free(&d);
+    return ok;
+}
 
-    status_set(a, "prefill");
-    const float *logits;
-    if (a->n_img_rows > 0) {
-        logits = qwasar_session_eval_images(a->s, prompt, n_prompt, &a->img, 1,
-                                            err, errcap);
-        /* One turn's worth: the tool results that follow are text. */
-        qwasar_image_release(&a->img);
-        a->n_img_rows = 0;
-    } else {
-        logits = qwasar_session_eval(a->s, prompt, n_prompt, err, errcap);
+/* Where this binary is, for the server beside it. */
+static void self_dir(char *out, size_t cap) {
+    char path[1024];
+    uint32_t n = sizeof path;
+    if (_NSGetExecutablePath(path, &n) != 0) { snprintf(out, cap, "."); return; }
+    char *real = realpath(path, NULL);
+    snprintf(out, cap, "%s", real ? real : path);
+    free(real);
+    char *slash = strrchr(out, '/');
+    if (slash) *slash = 0; else snprintf(out, cap, ".");
+}
+
+static bool is_model_dir(const char *p) {
+    char cfg[1200];
+    snprintf(cfg, sizeof cfg, "%s/config.json", p);
+    return access(cfg, R_OK) == 0;
+}
+
+/* The model, when the agent has to start a server: -m, $QWASAR_MODEL, a
+ * qwasar-model link in the working directory or beside the binary. */
+static const char *resolve_model(const char *given, char *buf, size_t cap) {
+    if (given && is_model_dir(given)) return given;
+    const char *env = getenv("QWASAR_MODEL");
+    if (env && *env && is_model_dir(env)) return env;
+    if (is_model_dir("./qwasar-model")) return "./qwasar-model";
+    char dir[1024];
+    self_dir(dir, sizeof dir);
+    snprintf(buf, cap, "%s/qwasar-model", dir);
+    return is_model_dir(buf) ? buf : NULL;
+}
+
+/* Starts qwasar-server on our port with a lifeline: a pipe on its stdin
+ * that closes when this process ends, however it ends, so the server does
+ * not outlive the agent that started it.  Waits for the model to load. */
+static bool server_start(agent *a, const char *model) {
+    char dir[1024], bin[1100];
+    self_dir(dir, sizeof dir);
+    snprintf(bin, sizeof bin, "%s/qwasar-server", dir);
+    if (access(bin, X_OK) != 0) snprintf(bin, sizeof bin, "qwasar-server");   /* PATH */
+
+    const char *tmp = getenv("TMPDIR");
+    snprintf(a->server_log, sizeof a->server_log, "%s/qwasar-server-%d.log",
+             tmp && *tmp ? tmp : "/tmp", a->port);
+    int fds[2];
+    if (pipe(fds) != 0) return false;
+    int log = open(a->server_log, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    char port[16];
+    snprintf(port, sizeof port, "%d", a->port);
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); if (log >= 0) close(log); return false; }
+    if (pid == 0) {
+        close(fds[1]);
+        dup2(fds[0], STDIN_FILENO);
+        close(fds[0]);
+        if (log >= 0) { dup2(log, STDOUT_FILENO); dup2(log, STDERR_FILENO); close(log); }
+        char *argv[] = { bin, "-m", (char *)model, "--port", port, "--exit-on-eof", "-v", NULL };
+        execvp(bin, argv);
+        _exit(127);
     }
-    if (!logits) return false;
+    close(fds[0]);
+    if (log >= 0) close(log);
+    a->server_pid = pid;
+    a->lifeline = fds[1];
 
-    const int32_t vocab = qwasar_vocab_size(a->e);
-    const int32_t think_close = qwasar_token_id(a->tok, "</think>");
-    const int32_t call_open   = qwasar_token_id(a->tok, "<tool_call>");
-    bool reasoning = true;
-    bool in_call = false;
-
-    a->turn_started = now_sec();
-    a->turn_tokens = 0;
-    a->interrupted = false;
-
-    const bool spec = a->cfg.mtp_depth != 0 && qwasar_session_has_mtp(a->s);
-    int32_t next = argmax(logits, vocab);
-    int i = 0;
-
-    while (i < a->cfg.max_tokens) {
-        if (tui_interrupted(a->tui)) {
-            a->interrupted = true;
-            tui_newline(a->tui);
-            tui_puts(a->tui, "  [interrupted]\n");
-            break;
+    tui_printf(a->tui, "\x1b[2mstarting qwasar-server on port %d with %s  ·  log %s\x1b[0m\n",
+               a->port, model, a->server_log);
+    const double t0 = now_sec();
+    for (;;) {
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) == pid) {
+            tui_printf(a->tui, "  qwasar-server exited (status %d); see %s\n",
+                       WIFEXITED(st) ? WEXITSTATUS(st) : -1, a->server_log);
+            a->server_pid = 0;
+            return false;
         }
-
-        take_result r = take_token(a, out, next, &reasoning, &in_call,
-                                   think_close, call_open);
-        i++;
-        if (r == TAKE_OOM) { snprintf(err, errcap, "out of memory"); return false; }
-        if (r != TAKE_GO) break;
-
-        if (spec) {
-            /* One pass settles the whole drafted block.  The last committed
-             * token takes the place `next` had: it is the one this round leaves
-             * undecided, exactly as an ordinary step would. */
-            int32_t blk[1 + QWASAR_MAX_DRAFT], got[1 + QWASAR_MAX_DRAFT];
-            blk[0] = next;
-            const int32_t want = a->cfg.mtp_depth > 0
-                               ? a->cfg.mtp_depth
-                               : qwasar_session_draft_depth(a->s);
-            if (want == 0) {
-                /* Not worth a round here; take the cheaper plain step. */
-                logits = qwasar_session_eval(a->s, &next, 1, err, errcap);
-                if (!logits) return false;
-                next = argmax(logits, vocab);
-                continue;
-            }
-            int32_t nd = qwasar_session_draft(a->s, next, blk + 1, want, err, errcap);
-            if (nd < 0) return false;
-            int32_t nc = qwasar_session_verify(a->s, blk, nd + 1, got, err, errcap);
-            if (nc < 0) return false;
-            a->spec_rounds++;
-            a->spec_tokens += nc;
-
-            bool stop = false;
-            for (int32_t t = 0; t + 1 < nc && i < a->cfg.max_tokens; t++) {
-                r = take_token(a, out, got[t], &reasoning, &in_call,
-                               think_close, call_open);
-                i++;
-                if (r == TAKE_OOM) { snprintf(err, errcap, "out of memory"); return false; }
-                if (r != TAKE_GO) { stop = true; break; }
-            }
-            if (stop) break;
-            next = got[nc - 1];
-            continue;
+        if (server_up(a)) {
+            tui_printf(a->tui, "\x1b[2mserver ready in %.1fs; it stops when this agent does\x1b[0m\n",
+                       now_sec() - t0);
+            return true;
         }
-
-        logits = qwasar_session_eval(a->s, &next, 1, err, errcap);
-        if (!logits) return false;
-        next = argmax(logits, vocab);
+        if (now_sec() - t0 > 600) { tui_puts(a->tui, "  the server did not come up in ten minutes\n"); return false; }
+        tui_status(a->tui, "loading the model  ·  %.0fs", now_sec() - t0);
+        tui_tick(a->tui);
+        usleep(250 * 1000);
     }
+}
 
-    /* Reaching the bound is the one way this loop ends with nothing to show for
-     * it, so it is recorded rather than inferred from an empty answer. */
-    out->hit_budget  = (i >= a->cfg.max_tokens);
-    out->in_reasoning = reasoning;
-    if (tui_is_tty(a->tui)) tui_puts(a->tui, "\x1b[0m");
+/* Reads what the server is, for the footer and the banner. */
+static bool server_info(agent *a) {
+    int status = 0;
+    qj_doc d;
+    if (!api(a, "GET", "/v1/server", NULL, &status, &d) || status != 200) { qj_free(&d); return false; }
+    const qj_node *root = qj_root(&d);
+    a->ctx_max = (int32_t)qj_int_or(&d, root, "context", 0);
+    qj_str_copy(&d, root, "model.name", a->model_name, sizeof a->model_name);
+    qj_free(&d);
     return true;
 }
 
-/* ---- session ---------------------------------------------------------------- */
+/* Opens a session: the guidance and the tools become its prefix. */
+static bool open_session(agent *a, const char *title) {
+    str b = { 0 };
+    str_puts(&b, "{\"system\": ");
+    str_jsons(&b, a->guidance);
+    str_puts(&b, ", \"tools\": [");
+    for (int i = 0; i < AGENT_N_TOOLS; i++) {
+        if (i) str_puts(&b, ", ");
+        str_puts(&b, AGENT_TOOLS[i]);
+    }
+    char cwd[1024];
+    if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
+    str_printf(&b, "], \"thinking\": true, \"effort\": \"%s\", \"metadata\": {\"client\": \"qwasar-agent\", \"cwd\": ",
+               a->effort);
+    str_jsons(&b, cwd);
+    str_puts(&b, ", \"title\": ");
+    str_jsons(&b, title ? title : "");
+    str_puts(&b, "}}");
+    int status = 0;
+    qj_doc d;
+    const bool reached = api(a, "POST", "/v1/sessions", b.p, &status, &d);
+    str_free(&b);
+    if (!reached) { qj_free(&d); tui_puts(a->tui, "  the server went away\n"); return false; }
+    if (status != 201) { api_error(a, "cannot open a session", status, &d); qj_free(&d); return false; }
+    qj_str_copy(&d, qj_root(&d), "id", a->session, sizeof a->session);
+    a->prefix_tokens = (int32_t)qj_int_or(&d, qj_root(&d), "prefix_tokens", 0);
+    a->ctx_used = 0;
+    qj_free(&d);
+    return true;
+}
 
-/* Runs one task to completion: generate, and while the model asks for a tool,
- * run it and hand the result back.  `prompt` is consumed. */
+/* Parks the session: keeps it warm on disk, frees the server's live slot. */
+static void park_session(agent *a) {
+    if (!a->session[0]) return;
+    char path[96];
+    snprintf(path, sizeof path, "/v1/sessions/%s/park", a->session);
+    int status = 0;
+    qj_doc d;
+    api(a, "POST", path, "{}", &status, &d);
+    qj_free(&d);
+}
+
+/* ---- showing calls ------------------------------------------------------------- */
+
 /* Tool calls are the part of a transcript a person scans for, so they get a
  * marker column and colour rather than being another paragraph of prose.  Long
  * values are elided on one line; the tool output that follows is what matters. */
@@ -682,8 +593,6 @@ static void show_tool_call(agent *a, const qw_tool_call *c) {
     for (int j = 0; j < c->n_params; j++) {
         const char *v = c->params[j].value;
         size_t vl = strlen(v);
-        /* A file body would swamp the line; its first line is enough to
-         * recognise, and the edit either lands or reports why. */
         size_t show = vl;
         const char *nl = memchr(v, '\n', vl);
         if (nl) show = (size_t)(nl - v);
@@ -695,12 +604,11 @@ static void show_tool_call(agent *a, const qw_tool_call *c) {
     tui_puts(a->tui, "\n");
 }
 
-/* A few dimmed lines, not the whole payload: a 200-line file read would
- * otherwise push the conversation off the screen, and the model has the full
- * text regardless. */
 #define TOOL_RESULT_LINES 3
 #define TOOL_RESULT_COLS  72
 
+/* A few dimmed lines, not the whole payload: the model has the full text
+ * regardless. */
 static void show_tool_result(agent *a, const str *result) {
     const char *p = result->p ? result->p : "";
     size_t n = result->len;
@@ -725,145 +633,396 @@ static void show_tool_result(agent *a, const str *result) {
     }
 }
 
-static bool agent_run(agent *a, int32_t *prompt, int32_t n_prompt,
-                      char *err, size_t errcap) {
-    int step = 0;
-    for (;;) {
-        turn t;
-        if (!generate(a, prompt, n_prompt, &t, err, errcap)) {
-            free(prompt);
-            return false;
-        }
-        free(prompt);
-        prompt = NULL;
+/* ---- one step ------------------------------------------------------------------- */
 
-        if (!t.has_call || a->interrupted) {
-            tui_newline(a->tui);
-            /* A turn cut off by the token budget used to end exactly like a
-             * finished one: no message, and -- when the budget ran out inside
-             * the reasoning block -- no output at all, because reasoning is not
-             * printed.  From the outside that is generation stopping for no
-             * reason, which is precisely what it looked like. */
-            if (t.hit_budget) {
-                if (t.in_reasoning)
-                    tui_printf(a->tui, "  [stopped at the %d-token budget while still "
-                               "reasoning, so there is no answer to show; raise it with "
-                               "-n, or use /effort low]\n", a->cfg.max_tokens);
-                else
-                    tui_printf(a->tui, "  [stopped at the %d-token budget, %d of them "
-                               "reasoning; raise it with -n]\n",
-                               a->cfg.max_tokens, t.n_think);
+static void calls_free(agent *a) {
+    for (int i = 0; i < a->n_calls; i++) {
+        pending_call *p = &a->calls[i];
+        free(p->call.name);
+        for (int j = 0; j < p->call.n_params; j++) { free(p->call.params[j].key); free(p->call.params[j].value); }
+        str_free(&p->result);
+    }
+    a->n_calls = 0;
+}
+
+static char *dupn(const char *s, size_t n) {
+    char *p = malloc(n + 1);
+    if (p) { memcpy(p, s, n); p[n] = 0; }
+    return p;
+}
+
+/* A tool_call event into the pending list: arguments come as JSON, and the
+ * tools take strings, so a non-string value is its JSON text. */
+static void take_call(agent *a, const qj_doc *d) {
+    if (a->n_calls >= QW_MAX_CALLS) return;
+    pending_call *p = &a->calls[a->n_calls];
+    memset(p, 0, sizeof *p);
+    const qj_node *root = qj_root(d);
+    qj_str_copy(d, root, "id", p->id, sizeof p->id);
+    const char *name = qj_str(d, qj_get(d, root, "name"));
+    p->call.name = dupn(name ? name : "", name ? strlen(name) : 0);
+    const qj_node *args = qj_get(d, root, "arguments");
+    for (const qj_node *m = qj_first(d, args); m && p->call.n_params < QW_MAX_PARAMS; m = qj_next(d, m)) {
+        qw_tool_param *prm = &p->call.params[p->call.n_params++];
+        prm->key = dupn(d->text + m->key_off, m->key_len);
+        if (m->type == QJ_STRING) prm->value = dupn(d->text + m->u.str.off, m->u.str.len);
+        else { str v = { 0 }; str_node(&v, d, m); prm->value = v.p ? v.p : dupn("", 0); }
+    }
+    a->n_calls++;
+}
+
+/* One event, shown. */
+static void on_event(agent *a, const char *event, const char *data) {
+    qj_doc d;
+    if (!qj_parse(&d, data, strlen(data))) { qj_free(&d); return; }
+    const qj_node *root = qj_root(&d);
+    const bool tty = tui_is_tty(a->tui);
+
+    if (!strcmp(event, "queued")) {
+        char s[48];
+        snprintf(s, sizeof s, "queued, position %lld", (long long)qj_int_or(&d, root, "position", 0));
+        status_set(a, s);
+    } else if (!strcmp(event, "resume")) {
+        const int32_t restored = (int32_t)qj_int_or(&d, root, "restored", 0);
+        char from[16] = "";
+        qj_str_copy(&d, root, "from", from, sizeof from);
+        if (!strcmp(from, "checkpoint"))
+            tui_printf(a->tui, "  \x1b[2m[restored %d tokens from a checkpoint]\x1b[0m\n", restored);
+        else if (!strcmp(from, "cold") && restored == 0 && a->ctx_used > 0)
+            tui_printf(a->tui, "  \x1b[2m[re-evaluating %d tokens: no checkpoint covered this session]\x1b[0m\n",
+                       (int32_t)qj_int_or(&d, root, "prefill", 0));
+        a->prefill_started = 0;
+        status_set(a, "prefill");
+    } else if (!strcmp(event, "prefill")) {
+        show_prefill(a, (int32_t)qj_int_or(&d, root, "done", 0), (int32_t)qj_int_or(&d, root, "total", 0));
+    } else if (!strcmp(event, "context")) {
+        a->ctx_used = (int32_t)qj_int_or(&d, root, "used", a->ctx_used);
+    } else if (!strcmp(event, "reasoning")) {
+        a->think_tokens += (int32_t)qj_int_or(&d, root, "tokens", 0);
+        a->turn_tokens = a->generated + a->think_tokens;
+        if (a->cfg.show_think) {
+            const char *t = qj_str(&d, qj_get(&d, root, "text"));
+            if (t) {
+                if (tty && !a->think_open) { tui_puts(a->tui, "\x1b[2m"); a->think_open = true; }
+                tui_puts(a->tui, t);
             }
-            turn_free(&t);
-            status_set(a, a->interrupted ? "interrupted"
-                                         : (t.hit_budget ? "truncated" : "done"));
-            return true;
         }
+        status_set(a, "thinking");
+    } else if (!strcmp(event, "text")) {
+        if (a->think_open) { tui_puts(a->tui, "\x1b[0m\n"); a->think_open = false; }
+        const char *t = qj_str(&d, qj_get(&d, root, "text"));
+        if (t) tui_puts(a->tui, t);
+        status_set(a, "writing");
+    } else if (!strcmp(event, "decode")) {
+        a->generated = (int32_t)qj_int_or(&d, root, "generated", a->generated);
+        a->tps = qj_num_or(&d, root, "tokens_per_second", a->tps);
+        a->turn_tokens = a->generated;
+    } else if (!strcmp(event, "call_progress")) {
+        char name[64] = "";
+        qj_str_copy(&d, root, "name", name, sizeof name);
+        char s[96];
+        snprintf(s, sizeof s, "calling %s", name[0] ? name : "…");
+        if (a->think_open) { tui_puts(a->tui, "\x1b[0m\n"); a->think_open = false; }
+        status_set(a, s);
+    } else if (!strcmp(event, "tool_call")) {
+        if (a->think_open) { tui_puts(a->tui, "\x1b[0m\n"); a->think_open = false; }
+        take_call(a, &d);
+    } else if (!strcmp(event, "done")) {
+        if (a->think_open) { tui_puts(a->tui, "\x1b[0m\n"); a->think_open = false; }
+        qj_str_copy(&d, root, "stop", a->stop, sizeof a->stop);
+        a->generated = (int32_t)qj_int_or(&d, root, "usage.generated", a->generated);
+        a->think_tokens = (int32_t)qj_int_or(&d, root, "usage.reasoning", a->think_tokens);
+        a->ctx_used = (int32_t)qj_int_or(&d, root, "context.used", a->ctx_used);
+        const double ds = qj_num_or(&d, root, "timing.decode_seconds", 0);
+        if (ds > 0) a->tps = a->generated / ds;
+        a->turn_tokens = a->generated;
+    } else if (!strcmp(event, "error")) {
+        if (a->think_open) { tui_puts(a->tui, "\x1b[0m\n"); a->think_open = false; }
+        const char *m = qj_str(&d, qj_get(&d, root, "message"));
+        tui_newline(a->tui);
+        tui_printf(a->tui, "  server error: %s\n", m ? m : "?");
+        snprintf(a->stop, sizeof a->stop, "error");
+    }
+    qj_free(&d);
+}
 
-        qw_tool_calls calls;
-        char perr[256] = "";
-        int n = qw_tool_parse(t.text.p ? t.text.p : "", &calls, perr, sizeof perr);
+static void cancel_step(agent *a) {
+    char path[96];
+    snprintf(path, sizeof path, "/v1/sessions/%s/cancel", a->session);
+    int status = 0;
+    qj_doc d;
+    api(a, "POST", path, "{}", &status, &d);
+    qj_free(&d);
+}
 
-        str result = { 0 };
-        if (n < 0) {
-            str_printf(&result, "error: %s. Re-issue the call in the required format.", perr);
-        } else if (n == 0) {
-            str_puts(&result, "error: no tool call was found.");
-        } else {
-            for (int i = 0; i < n; i++) {
-                tui_newline(a->tui);
-                show_tool_call(a, &calls.calls[i]);
-                status_set(a, calls.calls[i].name);
-                tui_tick(a->tui);
-                if (i) str_puts(&result, "\n");
-                dispatch(&calls.calls[i], &a->cfg, &result);
-                show_tool_result(a, &result);
-            }
+/* Runs one step -- a turn or a continue -- and reads its stream to the end,
+ * watching the keyboard between events so ctrl-C becomes a cancel.  On
+ * return a->stop says how it ended and a->calls holds any calls. */
+static bool run_step(agent *a, const char *verb, const char *body) {
+    calls_free(a);
+    a->stop[0] = 0;
+    a->generated = 0;
+    a->think_tokens = 0;
+    a->turn_tokens = 0;
+    a->tps = 0;
+    a->think_open = false;
+    a->turn_started = now_sec();
+
+    char path[96];
+    snprintf(path, sizeof path, "/v1/sessions/%s/%s", a->session, verb);
+    conn c = { .fd = http_connect(a->host, a->port) };
+    if (c.fd < 0) { tui_puts(a->tui, "  the server went away\n"); return false; }
+    str carry = { 0 };
+    http_resp r;
+    if (!http_send_request(&c, "POST", path, a->host, a->token, NULL, body, strlen(body))
+        || !http_read_response(&c, &carry, &r)) {
+        tui_puts(a->tui, "  the server went away\n");
+        close(c.fd); str_free(&carry);
+        return false;
+    }
+    if (strncmp(r.ctype, "text/event-stream", 17)) {
+        /* A refusal, as a status with a reason. */
+        str out = { 0 };
+        http_read_body(&c, &carry, &r, &out);
+        qj_doc d;
+        memset(&d, 0, sizeof d);
+        if (out.len) qj_parse(&d, out.p, out.len);
+        api_error(a, "the step was refused", r.status, &d);
+        qj_free(&d);
+        str_free(&out); str_free(&carry); close(c.fd);
+        return false;
+    }
+
+    sse_reader rd;
+    sse_reader_init(&rd, r.chunked);
+    if (carry.len) sse_reader_feed(&rd, carry.p, carry.len);
+    str_free(&carry);
+    bool cancelled = false;
+    bool done = false;
+    while (!done) {
+        const char *id, *event, *data;
+        while (!done && sse_reader_next(&rd, &id, &event, &data)) {
+            on_event(a, event, data);
+            if (!strcmp(event, "done") || !strcmp(event, "error")) done = true;
         }
-        qw_tool_calls_free(&calls);
-        turn_free(&t);
+        if (done || rd.ended) break;
 
-        if (++step >= a->cfg.max_steps) {
-            tui_printf(a->tui, "  [stopped after %d tool calls]\n", step);
-            str_free(&result);
-            return true;
+        struct pollfd fds[2] = { { c.fd, POLLIN, 0 }, { STDIN_FILENO, POLLIN, 0 } };
+        const int nfds = tui_is_tty(a->tui) ? 2 : 1;
+        const int pr = poll(fds, (nfds_t)nfds, 200);
+        if (pr < 0 && errno != EINTR) break;
+        if (nfds == 2 && (fds[1].revents & POLLIN)) tui_tick(a->tui);
+        if (!cancelled && tui_interrupted(a->tui)) {
+            cancelled = true;
+            a->interrupted = true;
+            cancel_step(a);
+            status_set(a, "stopping");
         }
-
-        prompt = qwasar_render_tool_result(a->tok, result.p ? result.p : "",
-                                           &a->chat, &n_prompt);
-        str_free(&result);
-        if (!prompt) {
-            snprintf(err, errcap, "cannot render the tool result");
-            return false;
+        if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+            char buf[16384];
+            const ssize_t n = read(c.fd, buf, sizeof buf);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            sse_reader_feed(&rd, buf, (size_t)n);
         }
     }
+    /* Anything that completed with the last bytes. */
+    const char *id, *event, *data;
+    while (!done && sse_reader_next(&rd, &id, &event, &data)) {
+        on_event(a, event, data);
+        if (!strcmp(event, "done") || !strcmp(event, "error")) done = true;
+    }
+    sse_reader_free(&rd);
+    close(c.fd);
+    if (!done) {
+        tui_newline(a->tui);
+        tui_puts(a->tui, "  the stream ended without a result\n");
+        return false;
+    }
+    return strcmp(a->stop, "error") != 0;
+}
+
+/* The sampling and budget every step carries. */
+static void step_options(agent *a, str *b) {
+    str_printf(b, "\"max_tokens\": %d", a->cfg.max_tokens);
+    if (a->cfg.temperature >= 0) str_printf(b, ", \"sampling\": {\"temperature\": %.3f}", (double)a->cfg.temperature);
+}
+
+/* Runs one task to completion: a turn, and while the model asks for tools,
+ * run them and hand the results back. */
+static bool agent_run(agent *a, const char *text) {
+    str b = { 0 };
+    str_puts(&b, "{\"text\": ");
+    str_jsons(&b, text);
+    if (a->att_b64) {
+        str_printf(&b, ", \"images\": [{\"kind\": \"%s\", \"media_type\": \"%s\", \"data\": \"%s\"}]",
+                   a->att_video ? "video" : "image", a->att_type, a->att_b64);
+        free(a->att_b64);
+        a->att_b64 = NULL;
+    }
+    str_puts(&b, ", ");
+    step_options(a, &b);
+    str_puts(&b, "}");
+    a->interrupted = false;
+    bool ok = run_step(a, "turn", b.p);
+    str_free(&b);
+
+    int step = 0;
+    while (ok && !strcmp(a->stop, "tool_calls")) {
+        str res = { 0 };
+        str_puts(&res, "{\"results\": [");
+        for (int i = 0; i < a->n_calls; i++) {
+            pending_call *p = &a->calls[i];
+            tui_newline(a->tui);
+            show_tool_call(a, &p->call);
+            status_set(a, p->call.name);
+            dispatch(&p->call, &a->cfg, &p->result);
+            show_tool_result(a, &p->result);
+            if (i) str_puts(&res, ", ");
+            str_printf(&res, "{\"id\": \"%s\", \"content\": ", p->id);
+            str_jsons(&res, p->result.p ? p->result.p : "");
+            str_puts(&res, "}");
+        }
+        str_puts(&res, "], ");
+        step_options(a, &res);
+        str_puts(&res, "}");
+        if (++step >= a->cfg.max_steps) {
+            tui_printf(a->tui, "  [stopped after %d tool calls]\n", step);
+            str_free(&res);
+            calls_free(a);
+            return true;
+        }
+        ok = run_step(a, "continue", res.p);
+        str_free(&res);
+    }
+    calls_free(a);
+    tui_newline(a->tui);
+    if (!ok) return false;
+
+    if (!strcmp(a->stop, "cancelled") || a->interrupted) {
+        tui_puts(a->tui, "  [interrupted]\n");
+    } else if (!strcmp(a->stop, "length")) {
+        if (a->generated > 0 && a->think_tokens >= a->generated)
+            tui_printf(a->tui, "  [stopped at the %d-token budget while still reasoning, so there is "
+                       "no answer to show; raise it with -n, or use /effort low]\n", a->cfg.max_tokens);
+        else
+            tui_printf(a->tui, "  [stopped at the %d-token budget, %d of them reasoning; raise it with -n]\n",
+                       a->cfg.max_tokens, a->think_tokens);
+    } else if (!strcmp(a->stop, "context_full")) {
+        tui_puts(a->tui, "  [the context is full; /new starts over]\n");
+    }
+    status_set(a, a->interrupted ? "interrupted" : !strcmp(a->stop, "length") ? "truncated" : "done");
+    return true;
+}
+
+/* ---- attachments ------------------------------------------------------------------ */
+
+static const char *media_type(const char *path, bool video) {
+    const char *dot = strrchr(path, '.');
+    const char *ext = dot ? dot + 1 : "";
+    if (video) return !strcasecmp(ext, "mov") ? "video/quicktime" : "video/mp4";
+    if (!strcasecmp(ext, "png")) return "image/png";
+    if (!strcasecmp(ext, "gif")) return "image/gif";
+    if (!strcasecmp(ext, "bmp")) return "image/bmp";
+    return "image/jpeg";
+}
+
+static bool attach(agent *a, const char *path, bool video) {
+    str bytes = { 0 };
+    FILE *f = fopen(path, "rb");
+    if (!f) { tui_printf(a->tui, "  cannot read %s: %s\n", path, strerror(errno)); return false; }
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) str_add(&bytes, buf, n);
+    fclose(f);
+    free(a->att_b64);
+    a->att_b64 = b64_encode((const unsigned char *)bytes.p, bytes.len);
+    snprintf(a->att_type, sizeof a->att_type, "%s", media_type(path, video));
+    a->att_video = video;
+    tui_printf(a->tui, "  %s (%zu bytes) goes with your next message\n", video ? "video" : "image", bytes.len);
+    str_free(&bytes);
+    return a->att_b64 != NULL;
 }
 
 /* ---- repl ------------------------------------------------------------------- */
 
 static void repl_help(agent *a) {
     tui_puts(a->tui,"  /help            this message\n"
-           "  /new             start a fresh conversation\n"
+           "  /new             start a fresh conversation (this one is parked)\n"
+           "  /sessions        this directory's conversations on the server\n"
            "  /image <path>    attach an image to the next message\n"
-           "  /video <path>    attach a video, sampled at 2 fps\n"
-           "  /effort <level>  xhigh, medium or low\n"
+           "  /video <path>    attach a video\n"
+           "  /effort <level>  xhigh, medium or low: a new conversation at that effort\n"
            "  /think           show or hide the reasoning block\n"
            "  /yes             toggle asking before writes and commands\n"
-           "  /ctx             context and disk cache usage\n"
-           "  /save            checkpoint this conversation to disk\n"
+           "  /ctx             context used, and how warm the session is\n"
+           "  /save            park: keep the conversation warm on disk\n"
            "  /quit            leave\n");
 }
 
-/* Returns false when the command asked to quit. */
-static bool repl_command(agent *a, const char *line, bool *handled) {
-    *handled = true;
+static void show_sessions(agent *a) {
+    int status = 0;
+    qj_doc d;
+    if (!api(a, "GET", "/v1/sessions", NULL, &status, &d) || status != 200) {
+        tui_puts(a->tui, "  cannot list sessions\n"); qj_free(&d); return;
+    }
+    char cwd[1024];
+    if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
+    int shown = 0;
+    for (const qj_node *s = qj_first(&d, qj_get(&d, qj_root(&d), "sessions")); s; s = qj_next(&d, s)) {
+        char client[32] = "", scwd[1024] = "", title[64] = "", id[32] = "", warm[8] = "", state[24] = "";
+        qj_str_copy(&d, s, "metadata.client", client, sizeof client);
+        qj_str_copy(&d, s, "metadata.cwd", scwd, sizeof scwd);
+        if (strcmp(client, "qwasar-agent") || strcmp(scwd, cwd)) continue;
+        qj_str_copy(&d, s, "metadata.title", title, sizeof title);
+        qj_str_copy(&d, s, "id", id, sizeof id);
+        qj_str_copy(&d, s, "warmth.state", warm, sizeof warm);
+        qj_str_copy(&d, s, "state", state, sizeof state);
+        tui_printf(a->tui, "  %s%s  %6lld tokens  %-5s %s%s\n",
+                   !strcmp(id, a->session) ? "* " : "  ", id,
+                   (long long)qj_int_or(&d, s, "tokens", 0), warm,
+                   title[0] ? title : "(untitled)", strcmp(state, "idle") ? "  [awaiting tools]" : "");
+        shown++;
+    }
+    if (!shown) tui_puts(a->tui, "  no conversations for this directory\n");
+    else tui_puts(a->tui, "  resume one with: qwasar-agent --resume <id>\n");
+    qj_free(&d);
+}
+
+static void show_ctx(agent *a) {
+    char path[96];
+    snprintf(path, sizeof path, "/v1/sessions/%s", a->session);
+    int status = 0;
+    qj_doc d;
+    if (!api(a, "GET", path, NULL, &status, &d) || status != 200) { qj_free(&d); return; }
+    const qj_node *r = qj_root(&d);
+    char warm[8] = "";
+    qj_str_copy(&d, r, "warmth.state", warm, sizeof warm);
+    tui_printf(a->tui, "  %lld of %lld tokens used  ·  session %s is %s%s\n",
+               (long long)qj_int_or(&d, r, "tokens", 0), (long long)qj_int_or(&d, r, "context", 0),
+               a->session, warm, !strcmp(warm, "live") ? " on the server" : " on disk");
+    qj_free(&d);
+}
+
+/* Returns false when the command asked to quit; *reopen when a new session
+ * is wanted. */
+static bool repl_command(agent *a, const char *line, bool *reopen) {
+    *reopen = false;
     if (!strcmp(line, "/quit") || !strcmp(line, "/exit")) return false;
     if (!strcmp(line, "/help")) { repl_help(a); return true; }
-    if (!strcmp(line, "/ctx")) {
-        uint64_t bytes = 0;
-        int entries = 0;
-        qwasar_kv_cache_stats(&bytes, &entries);
-        tui_printf(a->tui, "  %d tokens used  ·  disk cache %d entries, %.1f GB\n",
-                   qwasar_session_n_past(a->s), entries, (double)bytes / 1e9);
-        return true;
-    }
+    if (!strcmp(line, "/ctx")) { show_ctx(a); return true; }
+    if (!strcmp(line, "/sessions")) { show_sessions(a); return true; }
     if (!strcmp(line, "/save")) {
-        char serr[256];
-        if (qwasar_session_save(a->s, a->e, serr, sizeof serr))
-            tui_printf(a->tui, "  saved %d tokens\n", qwasar_session_n_past(a->s));
-        else
-            tui_printf(a->tui, "  not saved: %s\n", serr);
+        park_session(a);
+        tui_printf(a->tui, "  parked %s; it resumes from disk\n", a->session);
         return true;
     }
     if (!strncmp(line, "/image", 6) || !strncmp(line, "/video", 6)) {
         const bool as_video = line[1] == 'v';
         const char *path = line + 6;
         while (*path == ' ') path++;
-        if (!*path) {
-            tui_printf(a->tui, "  usage: %s <path>\n", as_video ? "/video" : "/image");
-            return true;
-        }
-        /* Attaching costs a tower pass now rather than at send time, because
-         * the message cannot be rendered until the token count is known. */
-        qwasar_image_release(&a->img);
-        a->n_img_rows = 0;
-        a->img_is_video = false;
-        status_set(a, "looking");
-        tui_tick(a->tui);
-        char ierr[256];
-        const bool ok = as_video
-            ? qwasar_video_encode(a->e, path, &a->img, ierr, sizeof ierr)
-            : qwasar_image_encode(a->e, path, &a->img, ierr, sizeof ierr);
-        if (!ok) {
-            tui_printf(a->tui, "  %s\n", ierr);
-        } else {
-            a->n_img_rows = a->img.n_rows;
-            a->img_is_video = as_video;
-            tui_printf(a->tui, "  %dx%d%s -> %d tokens; it goes with your next message\n",
-                       a->img.src_w, a->img.src_h,
-                       a->img.grid_t > 1 ? ", multiple frames" : "", a->img.n_rows);
-        }
-        status_set(a, "ready");
+        if (!*path) tui_printf(a->tui, "  usage: %s <path>\n", as_video ? "/video" : "/image");
+        else attach(a, path, as_video);
         return true;
     }
     if (!strcmp(line, "/think")) {
@@ -881,43 +1040,44 @@ static bool repl_command(agent *a, const char *line, bool *handled) {
         const char *lvl = line + 7;
         while (*lvl == ' ') lvl++;
         if (!strcmp(lvl, "xhigh") || !strcmp(lvl, "medium") || !strcmp(lvl, "low")) {
-            a->chat.reasoning_effort = !strcmp(lvl, "low")    ? "low"
-                                     : !strcmp(lvl, "medium") ? "medium" : "xhigh";
-            /* The effort instruction lives in the system turn, which is already
-             * in the cache; it only takes effect on a fresh conversation. */
-            tui_printf(a->tui, "  effort will be %s from the next /new\n", a->chat.reasoning_effort);
+            /* Effort is part of the prefix, so it is a new session. */
+            a->effort = !strcmp(lvl, "low") ? "low" : !strcmp(lvl, "medium") ? "medium" : "xhigh";
+            *reopen = true;
         } else {
             tui_printf(a->tui, "  effort must be xhigh, medium or low\n");
         }
         return true;
     }
-    if (!strcmp(line, "/new")) { *handled = false; return true; }   /* caller resets */
+    if (!strcmp(line, "/new")) { *reopen = true; return true; }
     tui_printf(a->tui, "  unknown command; try /help\n");
     return true;
 }
 
 static void usage(FILE *out) {
     fprintf(out,
-        "qwasar-agent -- an agentic loop on Qwen3.8\n"
+        "qwasar-agent -- an agentic loop on qwasar-server\n"
         "\n"
-        "usage: qwasar-agent [-m <model-dir>] [options] [task...]\n"
+        "usage: qwasar-agent [options] [task...]\n"
         "\n"
         "With a task it runs once and exits.  With no task it opens a REPL.\n"
+        "Talks to qwasar-server's Session API; if nothing is listening it starts\n"
+        "a server itself, which stops when the agent does.\n"
         "\n"
-        "  -m, --model <dir>    model directory; default ./qwasar-model\n"
+        "      --server <url>   the server (default $QWASAR_SERVER or http://127.0.0.1:8080)\n"
+        "      --token <t>      its bearer token, if it needs one\n"
+        "  -m, --model <dir>    model directory, for a server this agent starts\n"
+        "      --resume <id>    continue a conversation (/sessions lists them; `last`\n"
+        "                       is this directory's most recent)\n"
         "  -C, --chdir <dir>    work in this directory\n"
-        "  -c, --context <n>    context size in tokens (default 32768)\n"
         "  -y, --yes            do not ask before writing files or running commands\n"
         "  -i, --interactive    open the REPL after running the task\n"
         "      --steps <n>      maximum tool calls per task (default 24)\n"
-        "  -n, --predict <n>    maximum tokens per turn (default 8192)\n"
+        "  -n, --predict <n>    maximum tokens per step (default 8192)\n"
+        "      --temperature <t> sampling temperature (default: the model's; 0 is greedy)\n"
         "      --image <path>   an image for the first turn (jpeg, png, bmp, gif)\n"
-        "      --video <path>   a video for the first turn, sampled at 2 fps\n"
-        "      --mtp <dir>      draft head; speculative decoding, about 1.4x\n"
-        "      --mtp-depth <n>  drafts per round; default adapts, 0 disables\n"
+        "      --video <path>   a video for the first turn\n"
         "      --effort <lvl>   reasoning effort: xhigh (default), medium, low\n"
         "      --show-think     print the reasoning block\n"
-        "      --no-cache       do not use or write disk checkpoints\n"
         "  -h, --help           this message\n"
         "\n"
         "Tools: read, write, edit, list, grep, bash.  Reading runs unattended;\n"
@@ -926,74 +1086,115 @@ static void usage(FILE *out) {
         "prompt as project guidance.\n");
 }
 
-static bool resolve_model(qwasar_options *opts, const char *prog) {
-    if (opts->model_path) return true;
-    opts->model_path = qwasar_default_model_path();
-    if (opts->model_path) return true;
-    fprintf(stderr,
-        "%s: no model given and none found.\n"
-        "\n"
-        "Download it once:\n"
-        "    ./download_model.sh model\n"
-        "\n"
-        "or point at an existing copy with -m <dir>, or set QWASAR_MODEL.\n", prog);
-    return false;
+static bool parse_server(agent *a, const char *url) {
+    const char *p = url;
+    if (!strncmp(p, "http://", 7)) p += 7;
+    else if (!strncmp(p, "https://", 8)) { fprintf(stderr, "qwasar-agent: https is not supported\n"); return false; }
+    const char *colon = strrchr(p, ':');
+    const char *slash = strchr(p, '/');
+    size_t hl = colon ? (size_t)(colon - p) : slash ? (size_t)(slash - p) : strlen(p);
+    if (hl == 0 || hl >= sizeof a->host) return false;
+    memcpy(a->host, p, hl);
+    a->host[hl] = 0;
+    if (!strcmp(a->host, "localhost")) snprintf(a->host, sizeof a->host, "127.0.0.1");
+    a->port = colon ? atoi(colon + 1) : 80;
+    return a->port > 0;
+}
+
+/* The most recent of this directory's sessions, for --resume last. */
+static bool resume_last(agent *a) {
+    int status = 0;
+    qj_doc d;
+    if (!api(a, "GET", "/v1/sessions", NULL, &status, &d) || status != 200) { qj_free(&d); return false; }
+    char cwd[1024];
+    if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
+    bool found = false;
+    for (const qj_node *s = qj_first(&d, qj_get(&d, qj_root(&d), "sessions")); s && !found; s = qj_next(&d, s)) {
+        char client[32] = "", scwd[1024] = "";
+        qj_str_copy(&d, s, "metadata.client", client, sizeof client);
+        qj_str_copy(&d, s, "metadata.cwd", scwd, sizeof scwd);
+        if (strcmp(client, "qwasar-agent") || strcmp(scwd, cwd)) continue;
+        qj_str_copy(&d, s, "id", a->session, sizeof a->session);
+        a->ctx_used = (int32_t)qj_int_or(&d, s, "tokens", 0);
+        found = true;
+    }
+    qj_free(&d);
+    return found;
 }
 
 int main(int argc, char **argv) {
-    qwasar_options opts = { 0 };
-    const char *image_path = NULL;
-    agent a = { 0 };
-    /* The turn budget bounds a runaway generation; it is not meant to bound
-     * ordinary work, and the two failure modes are not symmetric.  Too high
-     * wastes time on a turn ctrl-C can stop; too low silently truncates the
-     * answer, and at the default xhigh effort most of the budget goes to a
-     * reasoning block the user never sees, so the truncation arrives with only
-     * a few dozen visible tokens on screen.  8192 leaves several turns inside
-     * the 32K context. */
-    a.cfg = (agent_cfg){ .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 8192, .mtp_depth = -1 };
-    const char *effort = "xhigh";
-    const char *workdir = NULL;
-    bool interactive = false;
+    agent a;
+    memset(&a, 0, sizeof a);
+    /* The step budget bounds a runaway generation; it is not meant to bound
+     * ordinary work.  8192 leaves several turns inside a 32K context; the
+     * server caps it to the room the window has. */
+    a.cfg = (agent_cfg){ .yes = false, .show_think = false, .max_steps = 24, .max_tokens = 8192,
+                         .temperature = -1 };
+    a.effort = "xhigh";
+    a.lifeline = -1;
+    const char *server = getenv("QWASAR_SERVER");
+    const char *model = NULL, *workdir = NULL, *image_path = NULL, *resume = NULL;
+    bool image_is_video = false, interactive = false;
     str task = { 0 };
 
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
-        if ((!strcmp(arg, "-m") || !strcmp(arg, "--model")) && i + 1 < argc) opts.model_path = argv[++i];
+        if ((!strcmp(arg, "-m") || !strcmp(arg, "--model")) && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(arg, "--server") && i + 1 < argc) server = argv[++i];
+        else if (!strcmp(arg, "--token") && i + 1 < argc) a.token = argv[++i];
+        else if (!strcmp(arg, "--resume") && i + 1 < argc) resume = argv[++i];
         else if ((!strcmp(arg, "-C") || !strcmp(arg, "--chdir")) && i + 1 < argc) workdir = argv[++i];
-        else if ((!strcmp(arg, "-c") || !strcmp(arg, "--context")) && i + 1 < argc) opts.context_size = atoi(argv[++i]);
         else if (!strcmp(arg, "-y") || !strcmp(arg, "--yes")) a.cfg.yes = true;
         else if (!strcmp(arg, "-i") || !strcmp(arg, "--interactive")) interactive = true;
         else if (!strcmp(arg, "--image") && i + 1 < argc) image_path = argv[++i];
-        else if (!strcmp(arg, "--video") && i + 1 < argc) { image_path = argv[++i]; a.img_is_video = true; }
-        else if (!strcmp(arg, "--mtp") && i + 1 < argc) opts.mtp_path = argv[++i];
-        else if (!strcmp(arg, "--mtp-depth") && i + 1 < argc) a.cfg.mtp_depth = atoi(argv[++i]);
+        else if (!strcmp(arg, "--video") && i + 1 < argc) { image_path = argv[++i]; image_is_video = true; }
         else if (!strcmp(arg, "--steps") && i + 1 < argc) a.cfg.max_steps = atoi(argv[++i]);
         else if ((!strcmp(arg, "-n") || !strcmp(arg, "--predict")) && i + 1 < argc) a.cfg.max_tokens = atoi(argv[++i]);
-        else if (!strcmp(arg, "--effort") && i + 1 < argc) effort = argv[++i];
+        else if (!strcmp(arg, "--temperature") && i + 1 < argc) a.cfg.temperature = (float)atof(argv[++i]);
+        else if (!strcmp(arg, "--effort") && i + 1 < argc) a.effort = argv[++i];
         else if (!strcmp(arg, "--show-think")) a.cfg.show_think = true;
-        else if (!strcmp(arg, "--no-cache")) a.no_cache = true;
         else if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) { usage(stdout); return 0; }
         else if (arg[0] == '-') { fprintf(stderr, "qwasar-agent: unknown argument '%s'\n\n", arg); usage(stderr); return 2; }
         else { if (task.len) str_puts(&task, " "); str_puts(&task, arg); }
     }
-
-    if (!resolve_model(&opts, "qwasar-agent")) return 2;
+    if (strcmp(a.effort, "xhigh") && strcmp(a.effort, "medium") && strcmp(a.effort, "low")) {
+        fprintf(stderr, "qwasar-agent: effort must be xhigh, medium or low\n");
+        return 2;
+    }
+    if (!parse_server(&a, server ? server : "http://127.0.0.1:8080")) {
+        fprintf(stderr, "qwasar-agent: bad --server url\n");
+        return 2;
+    }
     if (workdir && chdir(workdir) != 0) {
         fprintf(stderr, "qwasar-agent: cannot enter %s: %s\n", workdir, strerror(errno));
         return 1;
     }
     if (!task.len) interactive = true;
+    signal(SIGPIPE, SIG_IGN);
 
     a.tui = tui_new();
     g_tui = a.tui;
 
-    char err[512] = "";
-    double t0 = now_sec();
-    a.e = qwasar_engine_load(&opts, err, sizeof err);
-    if (!a.e) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
-    a.tok = qwasar_tokenizer_load(opts.model_path, err, sizeof err);
-    if (!a.tok) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
+    /* A server, ours if there is none. */
+    if (!server_up(&a)) {
+        const bool local = !strcmp(a.host, "127.0.0.1");
+        char mbuf[1200];
+        const char *m = local ? resolve_model(model, mbuf, sizeof mbuf) : NULL;
+        if (!local || !m) {
+            fprintf(stderr, "qwasar-agent: nothing is listening at http://%s:%d%s\n", a.host, a.port,
+                    local ? ", and no model was found to start a server with.\n"
+                            "Start the Qwasar app, or pass -m <model-dir> (or set QWASAR_MODEL)"
+                          : "");
+            tui_free(a.tui);
+            return 1;
+        }
+        if (!server_start(&a, m)) { tui_free(a.tui); return 1; }
+    }
+    if (!server_info(&a)) {
+        fprintf(stderr, "qwasar-agent: the server at http://%s:%d does not speak the Session API\n", a.host, a.port);
+        tui_free(a.tui);
+        return 1;
+    }
 
     str guidance = { 0 };
     str_puts(&guidance,
@@ -1006,72 +1207,44 @@ int main(int argc, char **argv) {
         str_add(&guidance, agentmd.p, agentmd.len);
     }
     str_free(&agentmd);
-
-    a.ctx_max = opts.context_size > 0 ? opts.context_size : 32768;
-
-    a.chat = (qwasar_chat_options){
-        .enable_thinking = true,
-        .reasoning_effort = effort,
-        .add_generation_prompt = true,
-        .tools = AGENT_TOOLS,
-        .n_tools = AGENT_N_TOOLS,
-    };
     a.guidance = guidance.p;
 
-    if (!agent_open_session(&a, err, sizeof err)) {
-        fprintf(stderr, "qwasar-agent: %s\n", err);
+    if (resume) {
+        if (!strcmp(resume, "last")) {
+            if (!resume_last(&a)) { fprintf(stderr, "qwasar-agent: no conversation to resume here\n"); tui_free(a.tui); return 1; }
+        } else {
+            snprintf(a.session, sizeof a.session, "%s", resume);
+        }
+        char path[96];
+        snprintf(path, sizeof path, "/v1/sessions/%s", a.session);
+        int status = 0;
+        qj_doc d;
+        if (!api(&a, "GET", path, NULL, &status, &d) || status != 200) {
+            fprintf(stderr, "qwasar-agent: no session %s on the server\n", a.session);
+            qj_free(&d); tui_free(a.tui); return 1;
+        }
+        a.ctx_used = (int32_t)qj_int_or(&d, qj_root(&d), "tokens", 0);
+        char warm[8] = "";
+        qj_str_copy(&d, qj_root(&d), "warmth.state", warm, sizeof warm);
+        qj_free(&d);
+        tui_printf(a.tui, "\x1b[2mresuming %s: %d tokens, %s\x1b[0m\n", a.session, a.ctx_used, warm);
+    } else if (!open_session(&a, task.len ? task.p : NULL)) {
+        tui_free(a.tui);
         return 1;
     }
-    if (image_path) {
-        const bool ok = a.img_is_video
-            ? qwasar_video_encode(a.e, image_path, &a.img, err, sizeof err)
-            : qwasar_image_encode(a.e, image_path, &a.img, err, sizeof err);
-        if (!ok) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
-        a.n_img_rows = a.img.n_rows;
-        tui_printf(a.tui, "\x1b[2m%s %dx%d%s -> %d patches -> %d tokens\x1b[0m\n",
-                   a.img_is_video ? "video" : "image", a.img.src_w, a.img.src_h,
-                   a.img.grid_t > 1 ? " (multiple frames)" : "",
-                   a.img.n_patches, a.img.n_rows);
-    }
+    if (image_path && !attach(&a, image_path, image_is_video)) { tui_free(a.tui); return 1; }
 
-    /* Speculation is silent about what it does to the output -- nothing -- but
-     * it is not silent about being on, because it changes the memory footprint
-     * and the shape of a stall. */
-    const bool spec_on = a.cfg.mtp_depth > 0 && qwasar_session_has_mtp(a.s);
-    if (opts.mtp_path && !spec_on)
-        tui_printf(a.tui, "\x1b[2mmtp head loaded but drafting is off\x1b[0m\n");
-    tui_printf(a.tui, "\x1b[2mloaded in %.1fs  ·  %d tools  ·  %s%s\x1b[0m\n",
-               now_sec() - t0, AGENT_N_TOOLS,
-               a.cfg.yes ? "not asking before writes" : "asking before writes",
-               spec_on ? "  ·  drafting ahead" : "");
+    tui_printf(a.tui, "\x1b[2m%s  ·  %d tools  ·  %d-token prefix  ·  %s\x1b[0m\n",
+               a.model_name[0] ? a.model_name : "connected", AGENT_N_TOOLS, a.prefix_tokens,
+               a.cfg.yes ? "not asking before writes" : "asking before writes");
 
-    bool fresh = true;   /* the next turn must render the system prompt */
     int rc = 0;
-
-
-    /* One-shot task, if given. */
-    if (task.len) {
-        qwasar_message msgs[2] = {
-            { "system", a.guidance, NULL, NULL, 0, false },
-            { "user",   task.p,     NULL, NULL, a.n_img_rows, a.img_is_video },
-        };
-        int32_t n = 0;
-        int32_t *p = qwasar_apply_chat_template(a.tok, msgs, 2, &a.chat, &n, err, sizeof err);
-        if (!p) { fprintf(stderr, "qwasar-agent: %s\n", err); return 1; }
-        int32_t covered = agent_prefill(&a, p, n, err, sizeof err);
-        if (covered < 0) { fprintf(stderr, "qwasar-agent: %s\n", err); free(p); return 1; }
-        memmove(p, p + covered, (size_t)(n - covered) * sizeof *p);
-        n -= covered;
-        fresh = false;
-        if (!agent_run(&a, p, n, err, sizeof err)) {
-            fprintf(stderr, "qwasar-agent: %s\n", err);
-            rc = 1;
-        }
-    }
+    if (task.len && !agent_run(&a, task.p)) rc = 1;
 
     if (interactive && rc == 0) {
         static const char *const COMMANDS[] = {
-            "/help", "/new", "/effort ", "/think", "/yes", "/ctx", "/save", "/quit", NULL
+            "/help", "/new", "/sessions", "/effort ", "/think", "/yes", "/ctx", "/save",
+            "/image ", "/video ", "/quit", NULL
         };
         tui_set_commands(COMMANDS);
 
@@ -1082,13 +1255,11 @@ int main(int argc, char **argv) {
             tui_history_load(a.tui, hist);
         }
 
-        if (tui_is_tty(a.tui)) {
-            tui_printf(a.tui, "\n\x1b[1mqwasar-agent\x1b[0m  \x1b[2m%s  ·  "
-                              "/help for commands  ·  ctrl-C interrupts\x1b[0m\n\n",
-                       AGENT_N_TOOLS == 6 ? "6 tools" : "tools");
-        } else {
+        if (tui_is_tty(a.tui))
+            tui_printf(a.tui, "\n\x1b[1mqwasar-agent\x1b[0m  \x1b[2m%d tools  ·  "
+                              "/help for commands  ·  ctrl-C interrupts\x1b[0m\n\n", AGENT_N_TOOLS);
+        else
             tui_puts(a.tui, "\nqwasar-agent. /help for commands, /quit to leave.\n\n");
-        }
 
         for (;;) {
             a.turn_tokens = 0;
@@ -1100,61 +1271,32 @@ int main(int argc, char **argv) {
             if (hist[0]) tui_history_save(a.tui, hist);
 
             if (line[0] == '/') {
-                bool handled = true;
-                bool keep = repl_command(&a, line, &handled);
-                if (!keep) { free(line); break; }
-                if (handled) { free(line); continue; }
-                if (!agent_open_session(&a, err, sizeof err)) {
-                    tui_printf(a.tui, "  %s\n", err);
-                    free(line);
-                    rc = 1;
-                    break;
-                }
-                fresh = true;
-                tui_puts(a.tui, "  new conversation\n");
+                bool reopen = false;
+                const bool keep = repl_command(&a, line, &reopen);
                 free(line);
+                if (!keep) break;
+                if (reopen) {
+                    park_session(&a);
+                    if (!open_session(&a, NULL)) { rc = 1; break; }
+                    tui_printf(a.tui, "  new conversation at effort %s\n", a.effort);
+                }
                 continue;
             }
-
-            int32_t n = 0;
-            int32_t *p;
-            if (fresh) {
-                qwasar_message msgs2[2] = {
-                    { "system", a.guidance, NULL, NULL, 0, false },
-                    { "user",   line,       NULL, NULL, a.n_img_rows, a.img_is_video },
-                };
-                p = qwasar_apply_chat_template(a.tok, msgs2, 2, &a.chat, &n, err, sizeof err);
-                if (p) {
-                    int32_t covered = agent_prefill(&a, p, n, err, sizeof err);
-                    if (covered < 0) { free(p); p = NULL; }
-                    else { memmove(p, p + covered, (size_t)(n - covered) * sizeof *p);
-                           n -= covered; }
-                }
-                fresh = false;
-            } else {
-                p = qwasar_render_user_turn(a.tok, line, a.n_img_rows, a.img_is_video,
-                                            &a.chat, &n);
-                if (!p) snprintf(err, sizeof err, "cannot render the turn");
-            }
+            const bool ok = agent_run(&a, line);
             free(line);
-            if (!p) { tui_printf(a.tui, "  %s\n", err); rc = 1; break; }
-
-            if (!agent_run(&a, p, n, err, sizeof err)) {
-                /* Running out of context ends a long conversation; it is not a
-                 * crash, and /new carries on from there. */
-                tui_printf(a.tui, "  %s\n", err);
-                if (strstr(err, "context exhausted"))
-                    tui_puts(a.tui, "  use /new to start over\n");
-                else { rc = 1; break; }
+            if (!ok) {
+                if (!server_up(&a)) { tui_puts(a.tui, "  the server is gone\n"); rc = 1; break; }
             }
         }
     }
 
+    park_session(&a);
     tui_free(a.tui);
     str_free(&task);
     str_free(&guidance);
-    qwasar_session_free(a.s);
-    qwasar_tokenizer_free(a.tok);
-    qwasar_engine_free(a.e);
+    free(a.att_b64);
+    /* A server we started goes with us: closing the lifeline is enough, and
+     * it checkpoints on the way out. */
+    if (a.lifeline >= 0) close(a.lifeline);
     return rc;
 }
