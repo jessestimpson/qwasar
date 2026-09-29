@@ -144,6 +144,24 @@ final class AppState {
     // remembered from history, because the LRU evicts and an indicator that
     // reflected the past would turn eviction into a mystery slowdown.
     var warmTokens: [UUID: Int] = [:]
+    /// What the server says about each record's session -- warmth, resume
+    /// estimate, checkpoint size -- keyed by the record, refreshed with
+    /// warmTokens.
+    var serverSessions: [UUID: SessionInfo] = [:]
+
+    // Disk (M4).  The server keeps a checkpoint per parked session and never
+    // spends one on its own; the budget is the app's, and so is the choice.
+    /// Bytes the records' checkpoints use, as last reported.
+    var sessionsDiskBytes: UInt64 {
+        serverSessions.values.reduce(0) { $0 + ($1.checkpoint_bytes ?? 0) }
+    }
+    /// Set once, the first time the server reports free space: a quarter of
+    /// it (spec 4.4).  Changeable in the disk sheet.
+    var diskBudgetBytes: UInt64 = UInt64(UserDefaults.standard.double(forKey: "diskBudgetBytes")) {
+        didSet { UserDefaults.standard.set(Double(diskBudgetBytes), forKey: "diskBudgetBytes") }
+    }
+    var overDiskBudget: Bool { diskBudgetBytes > 0 && sessionsDiskBytes > diskBudgetBytes }
+    var showingDiskSheet = false
     private var delegationMailbox: DelegationMailbox?
     /// Set while the app is quitting and the guests are being flushed.
     var shuttingDown = false
@@ -298,6 +316,9 @@ final class AppState {
                     guard let client else { return }
                     do {
                         serverInfo = try await client.serverInfo()
+                        if diskBudgetBytes == 0, let d = serverInfo?.disk, d.free_bytes > 0 {
+                            diskBudgetBytes = (d.free_bytes + d.sessions_bytes) / 4
+                        }
                         if case .generating = phase {} else { phase = .ready }
                         engineNote = nil
                         select(selectedSessionID)
@@ -880,6 +901,16 @@ final class AppState {
             // own prompt as its prefix (spec 4.1 -- the executor states the
             // environment, the project its preferences).
             var sid = sessions[sidx].serverSessionID
+            if sid == nil, sessions[sidx].tokenCount > 0 {
+                // A conversation from before the server owned sessions: its
+                // tokens were never the server's, so a new server session
+                // would start from nothing under a transcript that shows
+                // everything -- the model silently forgetting.  Readable,
+                // and closed (PLAN-qwasar.md §7, question 4).
+                phase = .ready
+                engineNote = "this session is from before the server; it can be read but not continued -- start a new one"
+                return
+            }
             if sid == nil {
                 phase = .opening
                 do {
@@ -1146,16 +1177,39 @@ final class AppState {
     /// indicator claims only what the store just verified -- the server
     /// probes its checkpoints on every describe).
     func refreshWarm() {
-        guard let client else { warmTokens = [:]; return }
+        guard let client else { warmTokens = [:]; serverSessions = [:]; return }
         let byServer = Dictionary(uniqueKeysWithValues:
             sessions.compactMap { r in r.serverSessionID.map { ($0, r.id) } })
         Task {
             guard let list = try? await client.list() else { return }
             var fresh: [UUID: Int] = [:]
+            var infos: [UUID: SessionInfo] = [:]
             for info in list {
-                if let rid = byServer[info.id] { fresh[rid] = info.warmth.covered }
+                if let rid = byServer[info.id] {
+                    fresh[rid] = info.warmth.covered
+                    infos[rid] = info
+                }
             }
             warmTokens = fresh
+            serverSessions = infos
+        }
+    }
+
+    /// Gives a session's disk back (M4): its checkpoint goes, the
+    /// conversation stays, and opening it again re-evaluates it.  The user's
+    /// choice, never the app's or the server's.
+    func dropCheckpoint(_ id: UUID) {
+        guard let sid = sessions.first(where: { $0.id == id })?.serverSessionID,
+              turnSessionID != id, let client else { return }
+        Task {
+            do {
+                let freed = try await client.dropCheckpoint(sid)
+                engineNote = String(format: "freed %.1f GB; the session is kept and rebuilds when opened",
+                                    Double(freed) / 1e9)
+            } catch {
+                engineNote = "could not drop the checkpoint: \(error)"
+            }
+            refreshWarm()
         }
     }
 

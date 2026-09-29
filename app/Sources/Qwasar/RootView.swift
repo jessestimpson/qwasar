@@ -130,11 +130,17 @@ struct Sidebar: View {
                 Section {
                     ForEach(state.sessions(in: project)) { s in
                         SessionRow(session: s, isLive: state.liveSessionID == s.id,
-                                   warm: state.warmTokens[s.id])
+                                   info: state.serverSessions[s.id])
                             .tag(s.id)
                             .contextMenu {
                                 if state.liveSessionID == s.id {
                                     Button("Park Session") { state.park(s.id) }
+                                }
+                                if let b = state.serverSessions[s.id]?.checkpoint_bytes, b > 0,
+                                   state.turnSessionID != s.id {
+                                    Button("Drop Checkpoint (\(formatBytes(b)))") { state.dropCheckpoint(s.id) }
+                                        .help("Frees its disk. The conversation is kept; opening it "
+                                              + "again re-evaluates it.")
                                 }
                                 Button("Delete Session", role: .destructive) {
                                     state.deleteSession(s.id)
@@ -179,12 +185,28 @@ struct Sidebar: View {
         .sheet(item: $state.networkEditing) { p in
             NetworkSheet(state: state, project: p)
         }
+        .sheet(isPresented: $state.showingDiskSheet) { DiskSheet(state: state) }
         .safeAreaInset(edge: .bottom) {
-            Button {
-                state.addProject()
-            } label: {
-                Label("Add Project…", systemImage: "folder.badge.plus")
-                    .frame(maxWidth: .infinity)
+            VStack(spacing: 6) {
+                if state.overDiskBudget {
+                    // Said, never acted on: which sessions to let go cold is
+                    // the user's choice (spec 4.4, API.md 4.9).
+                    Button { state.showingDiskSheet = true } label: {
+                        Label("Parked sessions use \(formatBytes(state.sessionsDiskBytes)) of "
+                              + "your \(formatBytes(state.diskBudgetBytes)) — Manage…",
+                              systemImage: "externaldrive.badge.exclamationmark")
+                            .font(.caption)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.orange)
+                }
+                Button {
+                    state.addProject()
+                } label: {
+                    Label("Add Project…", systemImage: "folder.badge.plus")
+                        .frame(maxWidth: .infinity)
+                }
             }
             .padding(8)
         }
@@ -194,9 +216,12 @@ struct Sidebar: View {
 struct SessionRow: View {
     let session: SessionRecord
     let isLive: Bool
-    /// Tokens a checkpoint on disk covers, probed -- nil means unknown or
-    /// nothing (spec 4.4: the indicator claims only what is verified).
-    var warm: Int? = nil
+    /// What the server says about this record's session, or nil (none yet,
+    /// or the server is down).  Warm means a checkpoint the server just
+    /// verified covers the whole session (spec 4.4: the indicator claims only
+    /// what is verified), and the estimate is the server's, from its measured
+    /// read and prefill rates -- right for either model.
+    var info: SessionInfo? = nil
 
     /// Three states, each with the number that is its meaning: live holds
     /// memory; parked-warm resumes as a read; parked-cold pays a re-prefill.
@@ -207,22 +232,24 @@ struct SessionRow: View {
     }
 
     private var isWarm: Bool {
-        session.tokenCount > 0 && (warm ?? 0) >= session.tokenCount
+        guard let w = info?.warmth else { return false }
+        return w.state == "live" || (w.state == "warm" && w.covered >= (info?.tokens ?? 0))
     }
 
-    /// The size law from spec 4.4 (149.6 MB floor + 64 KB/token) over a
-    /// conservative read rate for warm; the measured ~32 tok/s prefill for
-    /// cold, credited with whatever prefix IS cached.
-    private var estimate: String? {
-        guard session.tokenCount > 0, !isLive else { return nil }
-        if isWarm {
-            let secs = max(1, Int((1.496e8 + Double(session.tokenCount) * 65536) / 7e8))
-            return "resumes in ~\(secs)s"
+    private var closedForGood: Bool { session.serverSessionID == nil && session.tokenCount > 0 }
+
+    private var detail: String? {
+        guard session.tokenCount > 0 else { return nil }
+        var parts = ["\(session.tokenCount) / \(session.contextSize) tokens"]
+        if closedForGood {
+            parts.append("read-only")
+        } else if !isLive, let s = info?.warmth.estimate_seconds {
+            let secs = Int(s.rounded())
+            let t = secs < 90 ? "~\(max(secs, 1))s" : "~\((secs + 30) / 60)m"
+            parts.append(isWarm ? "resumes in \(t)" : "rebuilds in \(t)")
         }
-        let remaining = session.tokenCount - min(warm ?? 0, session.tokenCount)
-        let secs = Int(Double(remaining) / 32.0)
-        return secs < 90 ? "rebuilds in ~\(max(secs, 5))s"
-                         : "rebuilds in ~\((secs + 30) / 60)m"
+        if let b = info?.checkpoint_bytes, b > 0 { parts.append(formatBytes(b)) }
+        return parts.joined(separator: " · ")
     }
 
     var body: some View {
@@ -232,16 +259,90 @@ struct SessionRow: View {
                 .foregroundStyle(symbol.tint)
             VStack(alignment: .leading, spacing: 1) {
                 Text(session.title).lineLimit(1)
-                if session.tokenCount > 0 {
-                    Text("\(session.tokenCount) / \(session.contextSize) tokens"
-                         + (estimate.map { " · \($0)" } ?? ""))
-                        .font(.caption2).foregroundStyle(.secondary)
+                if let detail {
+                    Text(detail).font(.caption2).foregroundStyle(.secondary)
                 }
             }
         }
-        .help(isLive ? "Live: holds its share of the working set."
-              : isWarm ? "Parked, warm: a checkpoint on disk covers the whole session."
-                       : "Parked, cold: no full checkpoint on disk; opening re-prefills.")
+        .help(closedForGood ? "From before the server owned sessions: readable, not continuable."
+              : isLive ? "Live: holds its share of the working set."
+              : isWarm ? "Parked, warm: its checkpoint on disk covers the whole session."
+                       : "Parked, cold: no checkpoint covers it; opening re-evaluates it.")
+    }
+}
+
+/// Decimal GB/MB, as the budget and the server report them.
+func formatBytes(_ b: UInt64) -> String {
+    b >= 1_000_000_000 ? String(format: "%.1f GB", Double(b) / 1e9)
+                       : String(format: "%.0f MB", Double(b) / 1e6)
+}
+
+/// The disk the parked sessions use, and the budget for it (M4).  Lists every
+/// session with a checkpoint, least recently used first, each with a Drop:
+/// the conversation is kept, it just rebuilds when opened.  Nothing here
+/// happens without a click.
+struct DiskSheet: View {
+    @Bindable var state: AppState
+    @State private var budgetGB: Double = 0
+
+    private var rows: [(SessionRecord, SessionInfo)] {
+        state.sessions.compactMap { r in
+            guard let i = state.serverSessions[r.id], (i.checkpoint_bytes ?? 0) > 0 else { return nil }
+            return (r, i)
+        }
+        .sorted { ($0.1.last_step?.at ?? 0) < ($1.1.last_step?.at ?? 0) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Session checkpoints").font(.headline)
+            Text("A parked session keeps its state on disk so it resumes in seconds. "
+                 + "Dropping a checkpoint frees that space; the conversation is kept, and "
+                 + "opening it again re-evaluates it. Nothing is dropped unless you do it here.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Text("Using \(formatBytes(state.sessionsDiskBytes))")
+                    .foregroundStyle(state.overDiskBudget ? .orange : .primary)
+                Spacer()
+                Text("Budget")
+                TextField("GB", value: $budgetGB, format: .number.precision(.fractionLength(0)))
+                    .frame(width: 60).textFieldStyle(.roundedBorder)
+                Text("GB")
+            }
+            .font(.callout)
+            List {
+                ForEach(rows, id: \.0.id) { r, i in
+                    HStack {
+                        VStack(alignment: .leading) {
+                            Text(r.title).lineLimit(1)
+                            Text("\(i.tokens) tokens" + (i.last_step.map {
+                                " · last used " + Date(timeIntervalSince1970: TimeInterval($0.at))
+                                    .formatted(.relative(presentation: .named)) } ?? ""))
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Text(formatBytes(i.checkpoint_bytes ?? 0)).monospacedDigit()
+                        Button("Drop") { state.dropCheckpoint(r.id) }
+                            .disabled(state.turnSessionID == r.id)
+                    }
+                }
+            }
+            .frame(minHeight: 180)
+            HStack {
+                Spacer()
+                Button("Done") {
+                    if budgetGB > 0 { state.diskBudgetBytes = UInt64(budgetGB * 1e9) }
+                    state.showingDiskSheet = false
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 520)
+        .onAppear {
+            budgetGB = (Double(state.diskBudgetBytes) / 1e9).rounded()
+            state.refreshWarm()
+        }
     }
 }
 

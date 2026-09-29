@@ -86,6 +86,8 @@ final class QwasarAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "About Qwasar", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Session Checkpoints…", action: #selector(showDisk), keyEquivalent: "").target = self
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Set Delegation API Key…", action: #selector(setAPIKey), keyEquivalent: "").target = self
         appMenu.addItem(withTitle: "Remove Delegation API Key", action: #selector(removeAPIKey), keyEquivalent: "").target = self
         appMenu.addItem(.separator())
@@ -125,4 +127,5 @@ final class QwasarAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     @objc private func newProject() { openAgent(); state.addProject() }
     @objc private func setAPIKey() { openAgent(); state.showingAPIKeySheet = true }
     @objc private func removeAPIKey() { state.removeAPIKey() }
+    @objc private func showDisk() { openAgent(); state.showingDiskSheet = true }
 }

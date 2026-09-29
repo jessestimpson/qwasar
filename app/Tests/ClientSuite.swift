@@ -53,6 +53,15 @@ enum ClientSuite {
         } else {
             f += TestMain.check(false, "done decodes")
         }
+        // M4's fields decode, and their absence (an older server) does too.
+        let withDisk = #"{"id": "s_1", "tokens": 18335, "context": 262144, "prefix_tokens": 2214, "steps": 3, "state": "idle", "warmth": {"state": "warm", "covered": 18335, "estimate_seconds": 2.1}, "model": "qwen3.8-flash-next", "checkpoint_bytes": 719000000}"#
+        let without = #"{"id": "s_2", "tokens": 10, "context": 4096, "prefix_tokens": 5, "steps": 0, "state": "idle", "warmth": {"state": "cold", "covered": 0}, "model": "qwen3.8-27b"}"#
+        let a = try? JSONDecoder().decode(SessionInfo.self, from: Data(withDisk.utf8))
+        let b = try? JSONDecoder().decode(SessionInfo.self, from: Data(without.utf8))
+        f += TestMain.check(a?.checkpoint_bytes == 719_000_000 && a?.warmth.estimate_seconds == 2.1,
+                            "a session's checkpoint size decodes")
+        f += TestMain.check(b != nil && b?.checkpoint_bytes == nil, "a session without one decodes too")
+
         // A blank line with nothing pending is not an event.
         var q = SSEParser()
         f += TestMain.check(q.feed(line: "") == nil && q.feed(line: "event: x") == nil && q.feed(line: "") == nil,

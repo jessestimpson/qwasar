@@ -56,6 +56,13 @@ public struct ServerInfo: Decodable, Sendable {
     public var capabilities: [String: Bool]
     public var sessions: Counts
     public var state_dir: String
+    public struct Disk: Decodable, Sendable {
+        public var sessions_bytes: UInt64
+        public var cache_bytes: UInt64
+        public var free_bytes: UInt64
+    }
+    /// Absent from a server older than M4.
+    public var disk: Disk?
 
     /// The profile's arithmetic, as the toolbar's help shows it.
     public var summary: String {
@@ -93,6 +100,8 @@ public struct SessionInfo: Decodable, Sendable {
     public var model_mismatch: Bool?
     public var metadata: [String: String]?
     public var last_step: LastStep?
+    /// The session's own checkpoint on disk; absent from a server before M4.
+    public var checkpoint_bytes: UInt64?
 }
 
 public struct OpenedSession: Decodable, Sendable {
@@ -333,6 +342,12 @@ public final class QwasarClient: Sendable {
     public func park(_ id: String) async throws -> Warmth {
         struct P: Decodable { var warmth: Warmth }
         return try await call("POST", "v1/sessions/\(id)/park", body: [String: Any](), as: P.self).warmth
+    }
+
+    /// Gives the session's disk back: it becomes cold, its conversation kept.
+    public func dropCheckpoint(_ id: String) async throws -> UInt64 {
+        struct D: Decodable { var freed_bytes: UInt64 }
+        return try await call("DELETE", "v1/sessions/\(id)/checkpoint", as: D.self).freed_bytes
     }
 
     public func delete(_ id: String) async throws {
