@@ -427,6 +427,47 @@ And one oddity recorded, not explained: under the sandbox the toy's shard
 headers summed to zero resident bytes where the real model's summed right;
 a zero now falls back to the known figure with a log line.
 
+### M4, built and gated -- 2026-09-29
+
+The engine gained `qwasar_session_save_file`, `qwasar_session_restore_file`
+and `qwasar_kv_probe_file` (§2.6); the store parks named sessions to
+`sessions/<id>/checkpoint.bin` (by request, eviction, shutdown, and on growth
+by a quarter of the conversation, at least 4K tokens) and resumes from
+whichever of that file and the shared prefix cache covers more; sessions
+report `checkpoint_bytes`, the server a `disk` block, and
+`DELETE /v1/sessions/{id}/checkpoint` drops one.  The app shows sizes, keeps a
+budget (a quarter of free space at first launch) and lets the user choose
+what to drop; nothing is dropped automatically.
+
+**The gate, on Flash-Next, M5 Max 128 GB** (262,144-token window, one live
+session; 720 KB of the repository's own source as one user turn; a private
+HOME and state directory):
+
+| | |
+|---|---|
+| first turn, cold | 192,441 tokens prefilled in 640 s (300 tok/s average, 430 at the start, 303 at the end) |
+| its checkpoint | **6.33 GB** (127 MB fixed + ~32 KB/token, as §2.3 predicts) |
+| park | 0.10 s -- the step had already written the file as its growth checkpoint, and a park over a current file writes nothing |
+| resume, same server | 192,442 restored, 19 to prefill; resume event at 5.5 s, first token at **11.1 s** |
+| shutdown | 3.0 s, rewriting 6.33 GB for the 19 new tokens (≥2.1 GB/s) |
+| restart with the shared cache deleted | warm, 192,462 of 192,462 covered, from the session's own file alone |
+| resume, new server | resume event at 8.3 s, first token at **16.4 s** |
+| drop | freed 6.33 GB; the live session stays live and is rewritten at its next park |
+
+Against 640 s to rebuild cold: **58x** in the same process, **39x** after a
+restart.  The file's page cache was likely still warm across the restart
+(written 30 s before); a cold read from disk is not measured -- `purge`
+needs root.
+
+**Two findings.**  (1) The first evaluation after a restore costs about as
+much as the restore itself: 5.5 s for 19 tokens in the same process, 8.0 s
+after the restart.  A normal 19-token step at this context is well under a
+second, so this is the unpacked state's first use on the GPU -- 6 GB of
+shared buffers faulted in -- not the attention.  Not investigated further.
+(2) The server's resume estimate said **3.2 s** where the truth was 11--16 s:
+it models the read and the uncovered prefill, not that first-use cost.  It
+should learn it from measured resumes, as it already learns the read rate.
+
 ## 6. Working beside the engine
 
 Another agent owns the engine and the server today. This plan touches the
