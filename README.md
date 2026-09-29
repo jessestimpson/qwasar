@@ -1,10 +1,11 @@
 # qwasar
 
-A small native inference engine for **Qwen3.8 27B** on macOS Metal, written in
-C (with Objective-C only where Metal requires it). It runs one model, end to
-end: weight loading, tokenizer, chat template, Metal kernels, KV and recurrent
-state, a disk cache, a coding agent, and an HTTP server — all in one tree, one
-`make`, no Python anywhere in the build or runtime.
+A small native inference engine for **Qwen3.8 27B** and **Qwen3.8
+Flash-Next** on macOS Metal, written in C (with Objective-C only where Metal
+requires it). It runs one model family, end to end: weight loading, tokenizer,
+chat template, Metal kernels, KV and recurrent state, a disk cache, a coding
+agent, and an HTTP server — all in one tree, one `make`, no Python anywhere in
+the build or runtime.
 
 ```
 $ qwasar -p "Name three prime numbers, with one sentence on why each is prime."
@@ -18,12 +19,24 @@ The project is modelled on [ds4](https://github.com/antirez/ds4) (DwarfStar4)
 and borrows its shape: a self-contained binary, abstractions built for this one
 model rather than for generality, and an agent that ships in the same repo.
 
-**Why this model?** Qwen3.8 27B is genuinely good, fits in 4-bit on a 32 GB
+**Why these models?** Qwen3.8 27B is genuinely good, fits in 4-bit on a 32 GB
 Mac, and is a hybrid recurrent/attention model — different enough from a plain
 transformer that implementing it properly beats bolting it onto a generic
-runner. And an engine small enough to hold in your head (~5,600 lines of
-C/ObjC/Metal for the engine, ~7,200 with the CLI and agent) is easier to make
-fast, and easier to read.
+runner. Flash-Next is the same family grown into a 125B mixture of experts
+with 6B active per token: the same tokenizer, template and recurrent layers,
+~80 GB resident, decoding at ~68 t/s on a 128 GB M5 Max against the 27B's ~6
+on a 32 GB M4 ([PLAN-flash-next.md](PLAN-flash-next.md)). One code path serves both, driven
+by the model's config. And an engine small enough to hold in your head is
+easier to make fast, and easier to read.
+
+| | Qwen3.8 27B | Qwen3.8 Flash-Next |
+|---|---|---|
+| Architecture | dense, 64 layers | MoE, 125B total / 6B active, 48 layers |
+| On disk (4-bit MLX) | ~16 GB | ~111 GB |
+| Held in memory | ~16 GB | ~80 GB (the engram table stays on disk) |
+| Smallest Mac | 32 GB | 128 GB |
+| Decode | ~6 t/s on an M4 (1.5x with the draft head) | ~68 t/s on an M5 Max |
+| Download | `./download_model.sh model` | `./download_model.sh flash-next` |
 
 **Status:** beta, and young. Text, images, video, the agent, the server, and
 the disk cache all work and are tested against the real model. Expect rough
@@ -44,9 +57,13 @@ cases — including wrong first answers — are recorded in `PLAN.md`.
 
 ## Requirements
 
-* An Apple Silicon Mac. Developed and measured on an M4 with 32 GB.
+* An Apple Silicon Mac. The 27B was developed and measured on an M4 with
+  32 GB; Flash-Next on an M5 Max with 128 GB.
 * Xcode command line tools — just `cc`, Foundation, and Metal.
-* ~16 GB of free RAM for the model, plus a few GB for cache and context.
+* Free memory for the model — ~16 GB for the 27B, ~80 GB for Flash-Next —
+  plus a few GB for cache and context. The engine checks before it maps
+  anything, and refuses a model that does not fit in the memory free at the
+  time rather than squeezing the machine into swap.
 
 You do **not** need the Metal Toolchain: kernels are embedded as source and
 compiled at startup. (If you have it, `make check-metal` uses it as a fast
@@ -63,22 +80,45 @@ That produces `./qwasar`, `./qwasar-agent`, and `./qwasar-server`.
 
 ## Get the weights
 
+**The 27B** — about 16 GB:
+
 ```
 ./download_model.sh model
 ```
 
-About 16 GB, resumable (re-run after an interruption), pinned to a tested
-revision. Add `--verify` to check SHA-256 digests. It links `./qwasar-model`,
-which is where every binary looks by default, so afterwards:
+It links `./qwasar-model`, which is where every binary looks by default, so
+afterwards:
 
 ```
 ./qwasar -p "Hello"
 ```
 
-**Already have the model?** qwasar reads the MLX 4-bit conversion directly — an
-LM Studio copy works as is. Point at it with `-m <dir>`, set `QWASAR_MODEL`, or
-symlink it to `./qwasar-model`. Note it must be the **4-bit MLX affine, group
-64** conversion; 8-bit or 6-bit will not load (see PLAN.md §1.2).
+**Flash-Next** — about 111 GB, and a 128 GB Mac to run it:
+
+```
+./download_model.sh flash-next             # links ./qwasar-flash-next
+./download_model.sh flash-next --default   # ... and points ./qwasar-model at it
+```
+
+Without `--default`, pass it explicitly: `./qwasar -m ./qwasar-flash-next -p
+"Hello"`, `./qwasar-server -m ./qwasar-flash-next`. On a machine with too
+little memory the script refuses before downloading (add `--force` to fetch it
+for another Mac), and it checks the disk has room first.
+
+Both are resumable (re-run after an interruption) and pinned to a tested
+revision, and only the files the engine reads are fetched. Add `--verify` to
+check SHA-256 digests. `./download_model.sh mtp-head` adds the 27B's optional
+draft head for speculative decoding (below); `all` is the 27B and its head.
+Downloads go to `./models` (`QWASAR_MODEL_DIR` moves them).
+
+**Already have a model?** qwasar reads the MLX 4-bit conversions directly — an
+LM Studio or Hugging Face copy works as is. Point at it with `-m <dir>`, set
+`QWASAR_MODEL`, or symlink it to `./qwasar-model`. It must be **4-bit MLX
+affine**: group 64 for the 27B (lmstudio-community's conversion), group 32 for
+Flash-Next (mlx-community's, whose 8-bit router gates and 4-bit engram table
+the loader handles). FP8, GGUF, BF16, or 6- and 8-bit conversions will not
+load (see PLAN.md §1.2). The engine tells the two models apart from
+`config.json`, not the folder name.
 
 `qwasar --info` prints what it found: device, shards, architecture, memory.
 
