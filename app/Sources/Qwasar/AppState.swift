@@ -956,7 +956,11 @@ final class AppState {
             var stream = client.turn(sid, text: promptText, maxTokens: budget)
             var steps = 0
             var ended = false
-            let maxSteps = 24
+            // A guard against a runaway loop, not a working limit: a long
+            // task on Flash-Next's window runs well past the 24 this was.
+            // At the cap the model is asked to sum up rather than cut off.
+            let maxSteps = 200
+            var wrappingUp = false
             // The last event heard, and how often this step's stream has had
             // to be picked up again.
             var lastEventID: String?
@@ -1030,6 +1034,14 @@ final class AppState {
                     }
                     reattaches = 0
                     switch stop {
+                    case "tool_calls" where wrappingUp:
+                        // Asked to sum up, it asked for tools instead.  They
+                        // are not run: the session is left awaiting them,
+                        // which a next message closes (API.md 4.5).
+                        apply(.note("the model asked for \(calls.count) more tool call(s) after the cap; "
+                                  + "not run -- send a message to carry on"))
+                        calls = []
+                        ended = true
                     case "tool_calls":
                         var results: [ToolResultPayload] = []
                         let executor = runner      // a let: a captured var is not sendable
@@ -1043,13 +1055,19 @@ final class AppState {
                         }
                         calls = []
                         steps += 1
-                        if steps >= maxSteps {
-                            apply(.note("stopped after \(steps) tool calls"))
+                        if steps >= maxSteps, !results.isEmpty {
+                            // The results still go -- nothing ran for
+                            // nothing -- with the request riding on the last.
+                            results[results.count - 1].content += "\n\n[Step limit: this turn has made "
+                                + "\(steps) rounds of tool calls, the most it may. Make no more tool "
+                                + "calls. Summarize what you have learned so far, what you have "
+                                + "changed, and what remains to be done, so the user can decide "
+                                + "how to continue.]"
+                            apply(.note("reached \(steps) rounds of tool calls; asking the model to summarize"))
                             stats.hitStepCap = true
-                            ended = true
-                        } else {
-                            stream = client.continueStep(sid, results: results, maxTokens: budget)
+                            wrappingUp = true
                         }
+                        stream = client.continueStep(sid, results: results, maxTokens: budget)
                     case "cancelled":
                         stats.interrupted = true; ended = true
                     case "length":
