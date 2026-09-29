@@ -34,7 +34,8 @@ help:
 	@echo "  make          build ./qwasar, ./qwasar-agent and ./qwasar-server"
 	@echo "  make libqwasar.a  static library for embedders (crucible/)"
 	@echo "  make test     build and run tests"
-	@echo "  make test-api  start ./qwasar-server and check its API against the OpenAI and Anthropic specs"
+	@echo "  make test-api  start ./qwasar-server and check its APIs: the Session API (API.md), OpenAI, Anthropic"
+	@echo "  make test-api-toy  the Session API suite on the toy fixture (seconds, no real model)"
 	@echo "  make clean    remove build outputs"
 	@echo "  make check-metal  offline kernel syntax check (needs the Metal Toolchain)"
 
@@ -44,7 +45,7 @@ qwasar: qwasar_cli.o $(CORE_OBJS)
 qwasar-agent: qwasar_agent.o qwasar_tui.o linenoise.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-qwasar-server: qwasar_server.o qwasar_http.o $(CORE_OBJS)
+qwasar-server: qwasar_server.o qwasar_api.o qwasar_sessions.o qwasar_profile.o qwasar_http.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # The engine as a static library, for embedders that are not one of the three
@@ -55,9 +56,15 @@ qwasar-server: qwasar_server.o qwasar_http.o $(CORE_OBJS)
 libqwasar.a: $(CORE_OBJS)
 	$(AR) rcs $@ $^
 
-qwasar_server.o: qwasar_server.c qwasar.h qwasar_http.h qwasar_json.h qwasar_toolcall.h
+qwasar_server.o: qwasar_server.c qwasar.h qwasar_api.h qwasar_sessions.h qwasar_http.h qwasar_json.h qwasar_toolcall.h
 
 qwasar_http.o: qwasar_http.c qwasar_http.h qwasar_json.h
+
+qwasar_sessions.o: qwasar_sessions.c qwasar_sessions.h qwasar.h qwasar_http.h qwasar_json.h qwasar_toolcall.h
+
+qwasar_profile.o: qwasar_profile.c qwasar_sessions.h qwasar_gpu.h qwasar_json.h
+
+qwasar_api.o: qwasar_api.c qwasar_api.h qwasar_sessions.h qwasar_http.h
 
 qwasar_agent.o: qwasar_agent.c qwasar.h qwasar_toolcall.h qwasar_tui.h
 qwasar_tui.o:   qwasar_tui.c qwasar_tui.h linenoise.h
@@ -177,7 +184,14 @@ test: $(TESTS)
 # is already running instead.
 test-api: qwasar-server
 	QWASAR_TEST_MODEL="$(if $(wildcard $(QWASAR_TEST_MODEL)),$(QWASAR_TEST_MODEL))" \
-		PYTHONPATH=tests python3 -m unittest -v test_openai_api test_anthropic_api
+		PYTHONPATH=tests python3 -m unittest -v test_openai_api test_anthropic_api test_session_api
+
+# The Session API alone, on the toy fixture: seconds, no real model.  Runs
+# servers of its own on a temp state directory and a temp HOME, so nothing
+# it writes reaches ~/.cache/qwasar/kv.
+test-api-toy: qwasar-server
+	QWASAR_TEST_MODEL=tests/fixtures/flashnext-tiny-q4 PYTHONPATH=tests \
+		python3 -m unittest -v test_session_api
 
 # Optional offline syntax check for the kernels.
 #

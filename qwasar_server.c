@@ -13,11 +13,16 @@
  * checkpoint when the live session has moved on to something else.  The server
  * writes those checkpoints itself: at the end of the system prompt, which every
  * conversation with that prompt and those tools shares, and at the last complete
- * turn of a long conversation (srv_eval_from). */
+ * turn of a long conversation (qwasar_sessions.c, the compat session).
+ *
+ * That anonymous session now sits beside the named ones of the Session API
+ * (API.md, qwasar_api.c), in one store with one queue and one live set. */
 
 #include "qwasar.h"
+#include "qwasar_api.h"
 #include "qwasar_http.h"
 #include "qwasar_json.h"
+#include "qwasar_sessions.h"
 #include "qwasar_toolcall.h"
 
 #include <arpa/inet.h>
@@ -43,222 +48,23 @@ static const char *model_name = "";
 
 /* ---- engine ---------------------------------------------------------------- */
 
+/* The engine, the sessions and the queue live in the store (qwasar_sessions.c);
+ * the compat front keeps only what shapes its own requests. */
 typedef struct {
-    qwasar_engine    *e;
-    qwasar_tokenizer *tok;
-    qwasar_session   *s;
-    int32_t           ctx;
-    int32_t           max_tokens;    /* output when a request names none; 0 = the context's room */
-    bool              no_cache;
-    int32_t           ckpt_n;        /* longest checkpoint the live session's prefix has */
-    /* The last prompt that could not reuse the live session (-v): where it
-     * departed from it, and the text on each side, for the request's log. */
-    int32_t           miss_at, miss_of;
-    char              miss_had[160], miss_got[160];
-    uint64_t          rng;
-    bool              verbose;
-    pthread_mutex_t   lock;          /* held for the whole of a completion */
-    int               n_conns;       /* live connections, under conns_lock */
-    pthread_mutex_t   conns_lock;
+    qw_store *st;
+    int32_t   max_tokens;    /* output when a request names none; 0 = the context's room */
+    bool      verbose;
+    int       n_conns;       /* live connections, under conns_lock */
+    pthread_mutex_t conns_lock;
 } server;
 
-/* Graceful shutdown (srv_shutdown). */
 static server     *g_srv;
 static atomic_bool g_ready;      /* the model is loaded */
-static atomic_bool g_stopping;   /* shutting down: replies end at the next token */
-
-/* The log: one timestamped line per event, on stderr -- which is the file
- * the menu bar's Open Log shows.  Request detail is behind -v. */
-static double srv_now(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec + tv.tv_usec * 1e-6;
-}
-
-static void srv_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-static void srv_log(const char *fmt, ...) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    struct tm tm;
-    localtime_r(&tv.tv_sec, &tm);
-    char when[32], line[1024];
-    strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tm);
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(line, sizeof line, fmt, ap);
-    va_end(ap);
-    fprintf(stderr, "[%s.%03d] %s\n", when, (int)(tv.tv_usec / 1000), line);
-}
+/* --token: every request but /health carries it as a bearer. */
+static const char *g_token;
 
 /* Tokens per second, 0 for no time. */
 static double srv_rate(int32_t n, double secs) { return secs > 0 ? n / secs : 0.0; }
-
-/* Tokens [from, to) as printable text for the log: control characters and
- * newlines escaped, cut to fit. */
-static void srv_token_text(server *sv, const int32_t *toks, int32_t from, int32_t to,
-                           char *out, size_t cap) {
-    size_t o = 0;
-    for (int32_t i = from < 0 ? 0 : from; i < to && o + 8 < cap; i++) {
-        size_t len = 0;
-        bool special = false;
-        const char *b = qwasar_token_bytes(sv->tok, toks[i], &len, &special);
-        for (size_t k = 0; b && k < len && o + 8 < cap; k++) {
-            const unsigned char ch = (unsigned char)b[k];
-            if (ch == '\n')      { out[o++] = '\\'; out[o++] = 'n'; }
-            else if (ch == '\t') { out[o++] = '\\'; out[o++] = 't'; }
-            else if (ch < 0x20)  o += (size_t)snprintf(out + o, cap - o, "\\x%02x", ch);
-            else                 out[o++] = (char)ch;
-        }
-    }
-    out[o] = 0;
-}
-
-/* Where the prompt is worth a disk checkpoint (srv_eval_from). */
-typedef struct {
-    int32_t sys_n;    /* end of the system prompt and tools: every conversation shares it */
-    int32_t hist_n;   /* end of the last complete turn, before the generation prompt */
-} ckpt_marks;
-
-/* A long conversation leaves a checkpoint at its last complete turn once this
- * many tokens have gone by since the last one it has, so a conversation the
- * live session was taken from -- by another client, a side request, a restart
- * -- resumes near where it was.  A Flash-Next checkpoint is ~127 MB whatever
- * its length, so not every turn. */
-#define QW_SRV_CKPT_SPAN 4096
-
-/* Evaluates tokens[from, n), stopping on the way at a checkpoint boundary
- * to write one.  Same total work either way; a boundary past the end, or
- * one already covered, is ignored. */
-static const float *srv_eval_from(server *sv, const int32_t *tokens, int32_t from, int32_t n,
-                                  const ckpt_marks *mk, char *err, size_t cap) {
-    int32_t stops[2], ns = 0;
-    if (mk && !sv->no_cache) {
-        if (mk->sys_n > from && mk->sys_n < n && mk->sys_n > sv->ckpt_n) stops[ns++] = mk->sys_n;
-        const int32_t last = ns ? stops[0] : sv->ckpt_n;
-        if (mk->hist_n > from && mk->hist_n < n && mk->hist_n - last >= QW_SRV_CKPT_SPAN)
-            stops[ns++] = mk->hist_n;
-    }
-    for (int i = 0; i < ns; i++) {
-        if (!qwasar_session_eval(sv->s, tokens + from, stops[i] - from, err, cap)) return NULL;
-        from = stops[i];
-        char serr[256];
-        struct timeval t0, t1;
-        gettimeofday(&t0, NULL);
-        const bool saved = qwasar_session_save(sv->s, sv->e, serr, sizeof serr);
-        gettimeofday(&t1, NULL);
-        if (saved) sv->ckpt_n = from;
-        if (sv->verbose) {
-            const double dt = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) * 1e-6;
-            if (saved) srv_log("  checkpoint written at %d tokens in %.2fs", from, dt);
-            else srv_log("  no checkpoint at %d tokens: %s", from, serr);
-        }
-    }
-    /* A rewind point one token short of the end: the next request in this
-     * conversation always repeats this prompt, whatever becomes of the reply
-     * -- and a retry repeats all of it, which still leaves the one token that
-     * produces the logits. */
-    if (n - from > 1) {
-        if (!qwasar_session_eval(sv->s, tokens + from, n - 1 - from, err, cap)) return NULL;
-        from = n - 1;
-    }
-    qwasar_session_mark(sv->s);
-    return qwasar_session_eval(sv->s, tokens + from, n - from, err, cap);
-}
-
-/* Evaluates `tokens`, reusing whatever the live session already covers.
- *
- * Prefix reuse is all-or-nothing here.  A KV cache could be truncated back to
- * the first divergence, but the recurrent layers keep no per-position history,
- * so a session that has evaluated one wrong token is worthless for this prompt
- * and has to be replaced. */
-static const float *srv_prefill(server *sv, const int32_t *tokens, int32_t n,
-                                const qwasar_image_input *images, int32_t n_images,
-                                const ckpt_marks *mk, int32_t *reused, const char **how,
-                                char *err, size_t cap) {
-    *reused = 0;
-    *how = "a new session";
-
-    /* Images defeat prefix reuse, and silently.  Two different pictures render
-     * to the same run of <|image_pad|> tokens, so a token-sequence match can
-     * say a prompt is a prefix of the live session when the pixels behind it
-     * were something else entirely.  Nothing downstream would notice.  A
-     * request carrying images therefore starts from a fresh session, which
-     * costs a prefill and cannot be wrong.
-     *
-     * Fixing this properly means keying the match on a digest of the image
-     * bytes as well as the tokens, which is worth doing when someone is holding
-     * a conversation about a picture. */
-    if (n_images > 0) {
-        if (sv->s) qwasar_session_free(sv->s);
-        sv->ckpt_n = 0;
-        *how = "a new session (images)";
-        sv->s = qwasar_session_new(sv->e, err, cap);
-        if (!sv->s) return NULL;
-        return qwasar_session_eval_images(sv->s, tokens, n, images, n_images, err, cap);
-    }
-
-    int32_t live = sv->s ? qwasar_session_common_prefix(sv->s, tokens, n) : 0;
-    if (live > 0 && live < n) {
-        *reused = live;
-        *how = "the live session";
-        return srv_eval_from(sv, tokens, live, n, mk, err, cap);
-    }
-    if (live == n && n > 0) {
-        /* The session is already sitting at the end of this prompt, so its last
-         * logits are the ones we want.  Re-evaluating the final token would
-         * append a duplicate instead of reproducing the step. */
-        *reused = n;
-        *how = "the live session, already at its end";
-        const float *l = qwasar_session_logits(sv->s);
-        if (l) return l;
-    }
-
-    /* The live session has moved past this prompt's shared part -- most often
-     * the reply it generated is not what came back (reasoning a client drops,
-     * a stop sequence, a retry).  Back to where the last prompt ended, if this
-     * one keeps that, rather than to disk. */
-    const int32_t back = sv->s ? qwasar_session_rewind(sv->s, tokens, n) : 0;
-    if (back > 0) {
-        *reused = back;
-        *how = "the live session, rewound to the last prompt";
-        return srv_eval_from(sv, tokens, back, n, mk, err, cap);
-    }
-
-    /* Neither: say where this prompt departs from the session, before the
-     * session goes -- the one thing that explains a client's misses. */
-    sv->miss_at = -1;
-    if (sv->s && sv->verbose) {
-        const int32_t *had = NULL;
-        int32_t n_had = 0;
-        const int32_t at = qwasar_session_divergence(sv->s, tokens, n, &had, &n_had);
-        if (had && n_had > 0) {
-            sv->miss_at = at;
-            sv->miss_of = n_had;
-            srv_token_text(sv, had, at - 6, at + 14 < n_had ? at + 14 : n_had,
-                           sv->miss_had, sizeof sv->miss_had);
-            srv_token_text(sv, tokens, at - 6, at + 14 < n ? at + 14 : n,
-                           sv->miss_got, sizeof sv->miss_got);
-        }
-    }
-
-    if (sv->s) qwasar_session_free(sv->s);
-    sv->s = qwasar_session_new(sv->e, err, cap);
-    if (!sv->s) return NULL;
-
-    /* A checkpoint is asked to cover at most n-1 tokens.  Restoring the whole
-     * prompt would leave the session with no logits and nothing left to
-     * evaluate to produce them. */
-    const double t0 = srv_now();
-    int32_t covered = sv->no_cache ? 0 : qwasar_session_restore(sv->s, sv->e, tokens, n - 1);
-    *reused = covered;
-    sv->ckpt_n = covered;
-    if (covered > 0) {
-        *how = "a disk checkpoint";
-        if (sv->verbose)
-            srv_log("  restored %d tokens from a disk checkpoint in %.2fs", covered, srv_now() - t0);
-    }
-    return srv_eval_from(sv, tokens, covered, n, mk, err, cap);
-}
 
 /* How many leading tokens of `prompt` the first `n_msgs` messages render to
  * under `opts` -- 0 unless that rendering is a proper prefix of it. */
@@ -266,299 +72,12 @@ static int32_t srv_prefix_len(server *sv, const qwasar_message *msgs, int32_t n_
                               const qwasar_chat_options *opts, const int32_t *prompt, int32_t n) {
     char err[256];
     int32_t m = 0;
-    int32_t *p = qwasar_apply_chat_template(sv->tok, msgs, n_msgs, opts, &m, err, sizeof err);
+    int32_t *p = qwasar_apply_chat_template(qw_store_tokenizer(sv->st), msgs, n_msgs, opts, &m,
+                                            err, sizeof err);
     if (!p) return 0;
     const bool ok = m > 0 && m < n && !memcmp(p, prompt, (size_t)m * sizeof *p);
     free(p);
     return ok ? m : 0;
-}
-
-typedef void (*delta_fn)(void *ud, bool reasoning, const char *s, size_t n);
-
-typedef struct {
-    str     text;
-    str     reasoning;
-    int32_t n_gen;
-    bool    hit_eos;
-    bool    hit_stop;      /* ended on one of the request's stop sequences */
-    int     stop_index;    /* which one */
-    bool    has_call;
-} genres;
-
-static void genres_free(genres *g) { str_free(&g->text); str_free(&g->reasoning); }
-
-#define QW_MAX_STOPS 16
-
-typedef enum {
-    QW_TOOLS_AUTO,         /* the model decides */
-    QW_TOOLS_NONE,         /* no call may start */
-    QW_TOOLS_FORCE,        /* the answer is a call, to `force_name` if set */
-} tool_mode;
-
-#define QW_MAX_TOOLS 32
-
-typedef struct {
-    const char *stops[QW_MAX_STOPS];
-    int         n_stops;
-    tool_mode   tools;
-    const char *force_name;
-    /* The request's tool names.  A call forced without a name has its name
-     * constrained to one of these, or the model is free to invent one. */
-    const char *names[QW_MAX_TOOLS];
-    int         n_names;
-} genopts;
-
-/* True if `p` (n bytes) could still become "NAME>\n" for one of the tools --
- * the newline included, because the tokenizer often spells ">\n" as one. */
-static bool name_prefix_ok(const char *p, size_t n, const genopts *go) {
-    for (int i = 0; i < go->n_names; i++) {
-        const size_t nl = strlen(go->names[i]);
-        if (n <= nl + 2 && !memcmp(p, go->names[i], n < nl ? n : nl)
-            && (n <= nl || p[nl] == '>')
-            && (n <= nl + 1 || p[nl + 1] == '\n'))
-            return true;
-    }
-    return false;
-}
-
-/* Bytes at the end of `p` that are the start of a UTF-8 sequence whose last
- * byte has not been generated yet.  A token can end partway through a
- * character, and those bytes cannot go into a JSON string on their own: a
- * delta carrying half an emoji is invalid UTF-8, which strict clients reject. */
-static size_t utf8_tail(const char *p, size_t n) {
-    for (size_t k = 1; k <= 4 && k <= n; k++) {
-        const unsigned char c = (unsigned char)p[n - k];
-        if ((c & 0xC0) == 0x80) continue;          /* continuation: keep looking */
-        const size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
-        return need > k ? k : 0;
-    }
-    return 0;
-}
-
-/* Longest suffix of `p` that begins some stop sequence.  Those bytes may yet
- * turn out to be the stop, and a stop sequence is never shown, so they wait. */
-static size_t stop_prefix_tail(const char *p, size_t n, const genopts *go) {
-    size_t best = 0;
-    for (int s = 0; s < go->n_stops; s++) {
-        const size_t sl = strlen(go->stops[s]);
-        for (size_t k = sl - 1; k > best; k--)
-            if (k <= n && !memcmp(p + n - k, go->stops[s], k)) { best = k; break; }
-    }
-    return best;
-}
-
-/* Earliest stop sequence in p[from..n), as an offset, or -1; *which says
- * which sequence it was. */
-static long find_stop(const char *p, size_t n, size_t from, const genopts *go, int *which) {
-    long best = -1;
-    for (int s = 0; s < go->n_stops; s++) {
-        const size_t sl = strlen(go->stops[s]);
-        for (size_t i = from; i + sl <= n && (best < 0 || (long)i < best); i++)
-            if (!memcmp(p + i, go->stops[s], sl)) { best = (long)i; *which = s; break; }
-    }
-    return best;
-}
-
-/* What one channel -- reasoning or content -- has produced, and how much of it
- * has gone out as deltas.  The gap is what is being held back. */
-typedef struct {
-    str    shown;
-    size_t sent;
-} channel;
-
-static void chan_send(channel *ch, bool reasoning, size_t upto, delta_fn fn, void *ud) {
-    if (upto <= ch->sent) return;
-    if (fn) fn(ud, reasoning, ch->shown.p + ch->sent, upto - ch->sent);
-    ch->sent = upto;
-}
-
-/* Starts the tool call the request's tool_choice insists on, by evaluating its
- * opening as though the model had written it:
- *
- *     <tool_call>\n<function=NAME>\n
- *
- * or up to "<function=" when any tool will do and the model picks the name.
- * After a reasoning block the model's own next move is "\n\n", so that goes in
- * first; with thinking off the template has already written it. */
-static const float *srv_force_call(server *sv, bool after_think, const char *name,
-                                   int32_t call_open, genres *out,
-                                   char *err, size_t cap) {
-    str tail = { 0 };
-    str_puts(&tail, "\n<function=");
-    if (name) { str_puts(&tail, name); str_puts(&tail, ">\n"); }
-
-    int32_t n_lead = 0, n_tail = 0;
-    int32_t *lead = after_think ? qwasar_encode(sv->tok, "\n\n", &n_lead) : NULL;
-    int32_t *tl = qwasar_encode(sv->tok, tail.p, &n_tail);
-    int32_t *ids = malloc(sizeof *ids * (size_t)(n_lead + 1 + n_tail));
-    const float *logits = NULL;
-    if (ids && tl) {
-        int32_t n = 0;
-        for (int32_t i = 0; i < n_lead; i++) ids[n++] = lead[i];
-        ids[n++] = call_open;
-        for (int32_t i = 0; i < n_tail; i++) ids[n++] = tl[i];
-        /* The parser sees the call from its opening tag; the lead is only
-         * whitespace between the reasoning and the call. */
-        str_puts(&out->text, "<tool_call>");
-        str_puts(&out->text, tail.p);
-        out->n_gen += n;
-        logits = qwasar_session_eval(sv->s, ids, n, err, cap);
-    } else {
-        snprintf(err, cap, "out of memory");
-    }
-    free(ids); free(lead); free(tl); str_free(&tail);
-    return logits;
-}
-
-/* One assistant turn.  Stops at end-of-turn, a stop sequence, a completed tool
- * call, or the token budget.
- *
- * Deltas are not always sent the moment a token arrives.  Content is held back
- * while its tail could still be the start of a stop sequence or of a UTF-8
- * character, and nothing after <tool_call> is content at all: the call is
- * parsed and sent whole once it is complete. */
-static bool srv_generate(server *sv, const float *logits, const qwasar_sampling *sp,
-                         int32_t max_tokens, bool thinking, const genopts *go,
-                         delta_fn on_delta, void *ud,
-                         genres *out, char *err, size_t cap) {
-    memset(out, 0, sizeof *out);
-    const int32_t vocab = qwasar_vocab_size(sv->e);
-    const int32_t think_close = qwasar_token_id(sv->tok, "</think>");
-    const int32_t call_open = qwasar_token_id(sv->tok, "<tool_call>");
-    /* The generation prompt leaves <think> open, so output starts as reasoning
-     * and the model closes it.  With thinking disabled the template writes the
-     * close itself, so the model never emits one -- and starting in reasoning
-     * mode meant every answer came back as reasoning_content with content
-     * null, which is a valid-looking response carrying nothing. */
-    bool reasoning = thinking;
-    bool in_call = false, forced = false, ok = true;
-    bool naming = false;          /* choosing the name of a forced call */
-    str name = { 0 };
-    channel rc = { 0 }, tc = { 0 };
-
-    /* tool_choice "none" is enforced by never letting <tool_call> be sampled.
-     * The tools stay in the prompt, so it is identical to an "auto" request's
-     * and prefix reuse carries across.  A large negative rather than -INFINITY
-     * because the build uses -ffast-math, which assumes no infinities. */
-    float *masked = NULL;
-    if ((go->tools == QW_TOOLS_NONE && call_open >= 0)
-        || (go->tools == QW_TOOLS_FORCE && !go->force_name)) {
-        masked = malloc(sizeof *masked * (size_t)vocab);
-        if (!masked) { snprintf(err, cap, "out of memory"); return false; }
-    }
-
-    for (int32_t i = 0; i < max_tokens; i++) {
-        if (go->tools == QW_TOOLS_FORCE && !reasoning && !forced) {
-            forced = in_call = true;
-            logits = srv_force_call(sv, thinking, go->force_name, call_open, out, err, cap);
-            if (!logits) { ok = false; break; }
-            naming = !go->force_name;
-        }
-        const float *lp = logits;
-        if (go->tools == QW_TOOLS_NONE && masked) {
-            memcpy(masked, logits, sizeof *masked * (size_t)vocab);
-            masked[call_open] = -1e30f;
-            lp = masked;
-        } else if (naming) {
-            /* Only tokens that keep the name on the way to a real tool's can
-             * be sampled.  A scan of the vocabulary per token, for the few
-             * tokens a name takes. */
-            memcpy(masked, logits, sizeof *masked * (size_t)vocab);
-            char buf[256];
-            memcpy(buf, name.p ? name.p : "", name.len);
-            for (int32_t t = 0; t < vocab; t++) {
-                size_t tl = 0;
-                bool sp_tok = false;
-                const char *tb = qwasar_token_bytes(sv->tok, t, &tl, &sp_tok);
-                if (sp_tok || !tb || !tl || name.len + tl > sizeof buf) { masked[t] = -1e30f; continue; }
-                memcpy(buf + name.len, tb, tl);
-                if (!name_prefix_ok(buf, name.len + tl, go)) masked[t] = -1e30f;
-            }
-            lp = masked;
-        }
-        /* Shutting down (srv_shutdown): the reply ends here, as if cut by
-         * its budget, so the engine is free for the checkpoint. */
-        if (atomic_load(&g_stopping)) break;
-        int32_t next = qwasar_sample(lp, vocab, sp, &sv->rng);
-        if (qwasar_is_eos(sv->e, next)) { out->hit_eos = true; break; }
-        out->n_gen++;
-
-        size_t len = 0;
-        bool special = false;
-        const char *bytes = qwasar_token_bytes(sv->tok, next, &len, &special);
-
-        if (naming && bytes && len) {
-            str_add(&name, bytes, len);
-            if (memchr(name.p, '>', name.len)) naming = false;
-        }
-
-        if (next == think_close) {
-            reasoning = false;
-            chan_send(&rc, true, rc.shown.len, on_delta, ud);
-        } else if (bytes && len) {
-            str_add(reasoning ? &out->reasoning : &out->text, bytes, len);
-            if (next == call_open) {
-                /* Whatever preceded the call is final now; the call itself is
-                 * never content. */
-                in_call = true;
-                chan_send(&tc, false, tc.shown.len, on_delta, ud);
-            }
-            /* Control tokens are structure, not content: they belong in the
-             * accumulated text the parser sees, never in a client delta. */
-            if (special) {
-                /* nothing to show */
-            } else if (reasoning) {
-                str_add(&rc.shown, bytes, len);
-                chan_send(&rc, true, rc.shown.len - utf8_tail(rc.shown.p, rc.shown.len),
-                          on_delta, ud);
-            } else if (!in_call) {
-                str_add(&tc.shown, bytes, len);
-                const long at = find_stop(tc.shown.p, tc.shown.len, tc.sent, go,
-                                          &out->stop_index);
-                if (at >= 0) {
-                    /* The stop sequence and everything after it are dropped,
-                     * from the deltas and from the final text alike. */
-                    chan_send(&tc, false, (size_t)at, on_delta, ud);
-                    out->text.len = 0;
-                    str_add(&out->text, tc.shown.p, (size_t)at);
-                    out->hit_stop = true;
-                    break;
-                }
-                size_t hold = stop_prefix_tail(tc.shown.p, tc.shown.len, go);
-                const size_t u = utf8_tail(tc.shown.p, tc.shown.len);
-                if (u > hold) hold = u;
-                chan_send(&tc, false, tc.shown.len - hold, on_delta, ud);
-            }
-        }
-
-        if (!reasoning && next != call_open && go->tools != QW_TOOLS_NONE
-            && qw_tool_call_complete(out->text.p ? out->text.p : "", out->text.len)) {
-            out->has_call = true;
-            break;
-        }
-
-        logits = qwasar_session_eval(sv->s, &next, 1, err, cap);
-        if (!logits) { ok = false; break; }
-    }
-
-    if (ok) {
-        /* A held-back tail is sent now that nothing can complete it -- except
-         * half a character, which the budget cut off and which is dropped from
-         * the final text too. */
-        chan_send(&rc, true, rc.shown.len - utf8_tail(rc.shown.p, rc.shown.len), on_delta, ud);
-        if (!in_call && !out->hit_stop)
-            chan_send(&tc, false, tc.shown.len - utf8_tail(tc.shown.p, tc.shown.len),
-                      on_delta, ud);
-        out->text.len -= utf8_tail(out->text.p, out->text.len);
-        out->reasoning.len -= utf8_tail(out->reasoning.p, out->reasoning.len);
-        if (out->text.p) out->text.p[out->text.len] = 0;
-        if (out->reasoning.p) out->reasoning.p[out->reasoning.len] = 0;
-    }
-    free(masked);
-    str_free(&name);
-    str_free(&rc.shown);
-    str_free(&tc.shown);
-    return ok;
 }
 
 /* ---- request shapes -------------------------------------------------------- */
@@ -679,9 +198,9 @@ static int32_t content_images(server *sv, request *r, const qj_doc *d,
         unsigned char *raw = b64_decode(data, len, &raw_len);
         if (!raw) { snprintf(err, cap, "out of memory"); return -1; }
         const bool ok = video
-            ? qwasar_video_encode_memory(sv->e, raw, raw_len, ext,
+            ? qwasar_video_encode_memory(qw_store_engine(sv->st), raw, raw_len, ext,
                                          &r->images[r->n_images], err, cap)
-            : qwasar_image_encode_memory(sv->e, raw, raw_len,
+            : qwasar_image_encode_memory(qw_store_engine(sv->st), raw, raw_len,
                                          &r->images[r->n_images], err, cap);
         free(raw);
         if (!ok) return -1;
@@ -937,9 +456,9 @@ static int32_t read_max_tokens(const qj_doc *d, const qj_node *root, int32_t dfl
 }
 
 /* The request options both APIs define beyond sampling -- stop sequences and
- * tool choice -- with the storage the genopts pointers refer to. */
+ * tool choice -- with the storage the qw_genopts pointers refer to. */
 typedef struct {
-    genopts go;
+    qw_genopts go;
     char    stop_store[QW_MAX_STOPS][128];
     char    name_store[128];
     char    names_store[QW_MAX_TOOLS][128];
@@ -1099,92 +618,6 @@ static bool read_openai_opts(const qj_doc *d, const qj_node *root, req_opts *o,
 
 /* ---- response building ------------------------------------------------------ */
 
-/* Whether the request's tool `tool` declares parameter `param` a string --
- * "type": "string", or a type list of only "string" and "null".  Tools come
- * in OpenAI's shape (function.parameters) or Anthropic's (input_schema). */
-static bool param_is_string(const qj_doc *d, const char *tool, const char *param) {
-    const qj_node *tools = qj_get(d, qj_root(d), "tools");
-    for (const qj_node *t = qj_first(d, tools); t; t = qj_next(d, t)) {
-        const qj_node *fn = qj_get(d, t, "function");
-        if (!fn) fn = t;
-        if (!qj_str_eq(d, qj_get(d, fn, "name"), tool)) continue;
-        const qj_node *schema = qj_get(d, fn, "parameters");
-        if (!schema) schema = qj_get(d, t, "input_schema");
-        const qj_node *props = qj_get(d, schema, "properties");
-        const size_t pl = strlen(param);
-        /* Keys compared directly: a parameter name may contain a dot, which
-         * qj_get would read as a path. */
-        for (const qj_node *m = qj_first(d, props); m; m = qj_next(d, m)) {
-            if (m->key_len != pl || memcmp(d->text + m->key_off, param, pl)) continue;
-            const qj_node *type = qj_get(d, m, "type");
-            if (qj_str_eq(d, type, "string")) return true;
-            if (type && type->type == QJ_ARRAY) {
-                bool str = false, other = false;
-                for (const qj_node *e = qj_first(d, type); e; e = qj_next(d, e)) {
-                    if (qj_str_eq(d, e, "string")) str = true;
-                    else if (!qj_str_eq(d, e, "null")) other = true;
-                }
-                return str && !other;
-            }
-            return false;
-        }
-        return false;
-    }
-    return false;
-}
-
-/* Strict JSON number syntax: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
- * -- "007" or "1." are text, however a lenient parser reads them. */
-static bool json_number_syntax(const char *v) {
-    const char *p = v;
-    if (*p == '-') p++;
-    if (*p == '0') p++;
-    else if (*p >= '1' && *p <= '9') while (*p >= '0' && *p <= '9') p++;
-    else return false;
-    if (*p == '.') { p++; if (!(*p >= '0' && *p <= '9')) return false; while (*p >= '0' && *p <= '9') p++; }
-    if (*p == 'e' || *p == 'E') {
-        p++;
-        if (*p == '+' || *p == '-') p++;
-        if (!(*p >= '0' && *p <= '9')) return false;
-        while (*p >= '0' && *p <= '9') p++;
-    }
-    return *p == 0;
-}
-
-/* Tool arguments arrive from the model as text.  A parameter its tool
- * declares a string is a string, whatever it looks like -- "42", "true", a
- * file that begins "00. ..." (which once went out as a bare number followed
- * by the rest of the file: invalid JSON).  Otherwise a value that is, whole,
- * a JSON number, boolean, object or array is emitted as JSON, so those survive
- * the round trip; anything else is a string. */
-static void emit_arg_value(str *out, const char *v, bool is_string) {
-    if (!is_string && v && *v) {
-        qj_doc probe;
-        if (qj_parse(&probe, v, strlen(v))) {
-            const qj_node *r = qj_root(&probe);
-            const bool json = (r->type == QJ_NUMBER && json_number_syntax(v))
-                           || r->type == QJ_TRUE || r->type == QJ_FALSE
-                           || r->type == QJ_OBJECT || r->type == QJ_ARRAY;
-            qj_free(&probe);
-            if (json) { str_puts(out, v); return; }
-        } else {
-            qj_free(&probe);
-        }
-    }
-    str_jsons(out, v ? v : "");
-}
-
-static void emit_args_object(str *out, const qw_tool_call *c, const qj_doc *d) {
-    str_puts(out, "{");
-    for (int i = 0; i < c->n_params; i++) {
-        if (i) str_puts(out, ", ");
-        str_jsons(out, c->params[i].key);
-        str_puts(out, ": ");
-        emit_arg_value(out, c->params[i].value, param_is_string(d, c->name, c->params[i].key));
-    }
-    str_puts(out, "}");
-}
-
 /* ---- streaming state -------------------------------------------------------- */
 
 typedef struct {
@@ -1285,7 +718,8 @@ static void on_delta(void *ud, bool reasoning, const char *s, size_t n) {
 static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthropic,
                               bool count_only) {
     const qj_node *root = qj_root(d);
-    const double t_start = srv_now();
+    const double t_start = qw_now();
+    qw_sess *cs = qw_store_compat(sv->st);
 
     request req;
     memset(&req, 0, sizeof req);
@@ -1319,7 +753,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
 
     qwasar_sampling sp;
     read_sampling(&sp, d, root);
-    sv->rng = sp.seed ? sp.seed : (uint64_t)time(NULL) * 6364136223846793005ull + 1;
+    qw_store_seed(sv->st, sp.seed);
 
     int32_t max_tokens = read_max_tokens(d, root, sv->max_tokens);
     const qj_node *stream_n = qj_get(d, root, "stream");
@@ -1350,7 +784,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
 
     char err[512] = "";
     int32_t n_prompt = 0;
-    int32_t *prompt = qwasar_apply_chat_template(sv->tok, req.msgs, req.n, &chat,
+    int32_t *prompt = qwasar_apply_chat_template(qw_store_tokenizer(sv->st), req.msgs, req.n, &chat,
                                                  &n_prompt, err, sizeof err);
     if (!prompt) { req_free(&req); http_error(c, 400, "Bad Request", err); return; }
 
@@ -1366,10 +800,10 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
     /* Output fits in what the context has left: past it the cache has no row
      * for the next token, and generation would fail partway through a
      * response rather than end it with a length stop. */
-    const int32_t room = sv->ctx - n_prompt;
+    const int32_t room = qw_store_ctx(sv->st) - n_prompt;
     if (max_tokens <= 0 || max_tokens > room) max_tokens = room;
 
-    if (n_prompt >= sv->ctx) {
+    if (n_prompt >= qw_store_ctx(sv->st)) {
         free(prompt);
         req_free(&req);
         http_error(c, 400, "Bad Request", "prompt exceeds the server's context size");
@@ -1380,8 +814,8 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
      * messages (with the tools, which the template puts there), and as far as
      * the last complete turn.  Used only where the rendering really is a
      * prefix of the prompt. */
-    ckpt_marks marks = { 0, 0 };
-    if (!sv->no_cache && req.n_images == 0) {
+    qw_ckpt_marks marks = { 0, 0 };
+    if (!qw_store_no_cache(sv->st) && req.n_images == 0) {
         qwasar_chat_options upto = chat;
         upto.add_generation_prompt = false;
         upto.continue_final_message = false;
@@ -1392,7 +826,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
     }
 
     if (sv->verbose)
-        srv_log("  %s request: %d message%s, %d tool%s, thinking %s, %s",
+        qw_log("  %s request: %d message%s, %d tool%s, thinking %s, %s",
                 anthropic ? "Anthropic" : "OpenAI", req.n, req.n == 1 ? "" : "s",
                 req.n_tools, req.n_tools == 1 ? "" : "s", thinking ? "on" : "off",
                 stream ? "streaming" : "not streaming");
@@ -1403,11 +837,13 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
      * tokens, but its image rows are what the prefill scatters in, so freeing
      * it here -- which is where it used to happen -- released them one call
      * before they were read. */
-    const double t_prefill = srv_now();
-    sv->miss_at = -1;
-    const float *logits = srv_prefill(sv, prompt, n_prompt, req.images, req.n_images,
-                                      &marks, &reused, &how, err, sizeof err);
-    if (sv->verbose && sv->miss_at >= 0) {
+    const double t_prefill = qw_now();
+    const float *logits = qw_compat_prefill(sv->st, cs, prompt, n_prompt, req.images, req.n_images,
+                                            &marks, &reused, &how, err, sizeof err);
+    int32_t miss_at = -1, miss_of = 0;
+    const char *miss_had = "", *miss_got = "";
+    qw_compat_last_miss(sv->st, &miss_at, &miss_of, &miss_had, &miss_got);
+    if (sv->verbose && miss_at >= 0) {
         /* Which message the departure falls in: the first whose rendering
          * reaches past it. */
         int32_t msg = -1;
@@ -1417,9 +853,9 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
         for (int32_t k = 1; k <= req.n && msg < 0; k++) {
             char e2[64];
             int32_t m = 0;
-            int32_t *p = qwasar_apply_chat_template(sv->tok, req.msgs, k, &upto, &m, e2, sizeof e2);
+            int32_t *p = qwasar_apply_chat_template(qw_store_tokenizer(sv->st), req.msgs, k, &upto, &m, e2, sizeof e2);
             free(p);
-            if (p && m > sv->miss_at) msg = k - 1;
+            if (p && m > miss_at) msg = k - 1;
         }
         char where[96];
         if (msg >= 0)
@@ -1427,16 +863,16 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
                      req.msgs[msg].role ? req.msgs[msg].role : "?");
         else
             snprintf(where, sizeof where, "after the last message");
-        srv_log("  cannot reuse the live session (%d tokens): this prompt departs from it "
-                "at token %d, in %s", sv->miss_of, sv->miss_at, where);
-        srv_log("    session had: ...%s...", sv->miss_had);
-        srv_log("    prompt has:  ...%s...", sv->miss_got);
+        qw_log("  cannot reuse the live session (%d tokens): this prompt departs from it "
+                "at token %d, in %s", miss_of, miss_at, where);
+        qw_log("    session had: ...%s...", miss_had);
+        qw_log("    prompt has:  ...%s...", miss_got);
     }
     req_free(&req);
     free(prompt);
-    const double prefill_s = srv_now() - t_prefill;
+    const double prefill_s = qw_now() - t_prefill;
     if (!logits) {
-        srv_log("  prefill failed: %s", err);
+        qw_log("  prefill failed: %s", err);
         http_error(c, 500, "Internal Server Error", err);
         return;
     }
@@ -1446,10 +882,10 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
         char rate[32] = "";
         if (fresh >= 16) snprintf(rate, sizeof rate, " (%.0f tok/s)", srv_rate(fresh, prefill_s));
         if (reused > 0)
-            srv_log("  prompt %d tokens: %d reused from %s, %d prefilled in %.2fs%s",
+            qw_log("  prompt %d tokens: %d reused from %s, %d prefilled in %.2fs%s",
                     n_prompt, reused, how, fresh, prefill_s, rate);
         else
-            srv_log("  prompt %d tokens: prefilled in %.2fs%s, from %s",
+            qw_log("  prompt %d tokens: prefilled in %.2fs%s, from %s",
                     n_prompt, prefill_s, rate, how);
     }
 
@@ -1481,21 +917,21 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
         }
     }
 
-    genres g;
+    qw_genres g;
     /* A prefilled turn already has its reasoning block closed, so the
      * continuation starts in the answer. */
-    const double t_decode = srv_now();
-    bool ok = srv_generate(sv, logits, &sp, max_tokens, thinking && !prefill, &oo.go,
-                           stream ? on_delta : NULL, &st, &g, err, sizeof err);
-    const double decode_s = srv_now() - t_decode;
+    const double t_decode = qw_now();
+    bool ok = qw_generate(sv->st, cs, logits, &sp, max_tokens, thinking && !prefill, &oo.go,
+                          stream ? on_delta : NULL, NULL, &st, NULL, &g, err, sizeof err);
+    const double decode_s = qw_now() - t_decode;
     if (sv->verbose || !ok) {
         const char *why = !ok ? "failed" : g.has_call ? "a tool call"
                         : g.hit_stop ? "a stop sequence" : g.hit_eos ? "end of turn"
-                        : atomic_load(&g_stopping) ? "shutdown" : "the output limit";
-        srv_log("  reply %d tokens in %.2fs (%.1f tok/s), ended by %s%s%s; "
+                        : qw_store_stopping() ? "shutdown" : "the output limit";
+        qw_log("  reply %d tokens in %.2fs (%.1f tok/s), ended by %s%s%s; "
                 "first token after %.2fs, request %.2fs",
                 g.n_gen, decode_s, srv_rate(g.n_gen, decode_s), why,
-                ok ? "" : ": ", ok ? "" : err, t_decode - t_start, srv_now() - t_start);
+                ok ? "" : ": ", ok ? "" : err, t_decode - t_start, qw_now() - t_start);
     }
     if (!ok) {
         if (!stream) {
@@ -1517,7 +953,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
             str_free(&b);
             sse_end(c);
         }
-        genres_free(&g);
+        qw_genres_free(&g);
         return;
     }
 
@@ -1559,7 +995,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
                 str_free(&b);
 
                 str args = { 0 };
-                emit_args_object(&args, &calls.calls[i], d);
+                qw_args_json(&args, &calls.calls[i], d);
                 str db = { 0 };
                 str_printf(&db, "{\"type\": \"content_block_delta\", \"index\": %d, "
                                 "\"delta\": {\"type\": \"input_json_delta\", "
@@ -1588,7 +1024,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
                 char tid[64];
                 gen_id(tid, sizeof tid, "call_");
                 str args = { 0 };
-                emit_args_object(&args, &calls.calls[i], d);
+                qw_args_json(&args, &calls.calls[i], d);
                 str b = { 0 };
                 str_printf(&b, "{\"id\": \"%s\", \"object\": \"chat.completion.chunk\", "
                                "\"created\": %ld, \"model\": \"%s\", \"choices\": [{\"index\": 0, "
@@ -1629,7 +1065,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
         }
         sse_end(c);
         qw_tool_calls_free(&calls);
-        genres_free(&g);
+        qw_genres_free(&g);
         str_free(&stop_seq);
         return;
     }
@@ -1660,7 +1096,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
             str_printf(&b, "{\"type\": \"tool_use\", \"id\": \"%s\", \"name\": ", tid);
             str_jsons(&b, calls.calls[i].name);
             str_puts(&b, ", \"input\": ");
-            emit_args_object(&b, &calls.calls[i], d);
+            qw_args_json(&b, &calls.calls[i], d);
             str_puts(&b, "}");
             first = false;
         }
@@ -1684,7 +1120,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
                 char tid[64];
                 gen_id(tid, sizeof tid, "call_");
                 str args = { 0 };
-                emit_args_object(&args, &calls.calls[i], d);
+                qw_args_json(&args, &calls.calls[i], d);
                 if (i) str_puts(&b, ", ");
                 str_printf(&b, "{\"id\": \"%s\", \"type\": \"function\", \"function\": "
                                "{\"name\": ", tid);
@@ -1705,7 +1141,7 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
     str_free(&b);
     str_free(&stop_seq);
     qw_tool_calls_free(&calls);
-    genres_free(&g);
+    qw_genres_free(&g);
 }
 
 static time_t started_at;     /* a model's `created`, which should not move */
@@ -1745,7 +1181,7 @@ static void serve(server *sv, conn *c) {
         str body = { 0 };
         if (!read_request(c, &carry, &r, &body)) { str_free(&body); break; }
 
-        if (sv->verbose && strcmp(r.path, "/health")) srv_log("%s %s", r.method, r.path);
+        if (sv->verbose && strcmp(r.path, "/health")) qw_log("%s %s", r.method, r.path);
         /* Errors take the shape of the API being spoken: the Messages API's
          * paths are Anthropic's, and elsewhere an anthropic-version header
          * says so -- except on OpenAI's own completions path. */
@@ -1755,6 +1191,9 @@ static void serve(server *sv, conn *c) {
 
         if (r.too_large) {
             http_error(c, 413, "Payload Too Large", "request body is too large");
+        } else if (g_token && strcmp(r.path, "/health") && strcmp(r.method, "OPTIONS")
+                   && strcmp(r.bearer, g_token)) {
+            http_error(c, 401, "Unauthorized", "this server needs Authorization: Bearer <token>");
         } else if (!strcmp(r.method, "OPTIONS")) {
             http_send(c, 204, "No Content", "text/plain", "", 0);
         } else if (!strcmp(r.method, "GET")
@@ -1766,6 +1205,8 @@ static void serve(server *sv, conn *c) {
         } else if (!strcmp(r.method, "GET") && !strncmp(r.path, "/v1/models/", 11)) {
             if (!strcmp(r.path + 11, model_id)) handle_models(c, true, r.anthropic);
             else http_error_at(c, 404, "Not Found", "no such model", "model", "model_not_found");
+        } else if (qw_api_handle(sv->st, c, &r, &body)) {
+            /* the Session API answered */
         } else if (!strcmp(r.method, "POST")
                    && (!strcmp(r.path, "/v1/chat/completions")
                        || !strcmp(r.path, "/v1/messages")
@@ -1773,13 +1214,15 @@ static void serve(server *sv, conn *c) {
             qj_doc d;
             if (!qj_parse(&d, body.p ? body.p : "", body.len)) {
                 http_error(c, 400, "Bad Request", d.err);
+            } else if (!strcmp(r.path, "/v1/messages/count_tokens")) {
+                handle_completion(sv, c, &d, messages_api, true);
             } else {
-                /* The engine holds one session, so completions take turns.
-                 * Everything else answers without waiting for them. */
-                pthread_mutex_lock(&sv->lock);
-                handle_completion(sv, c, &d, messages_api,
-                                  !strcmp(r.path, "/v1/messages/count_tokens"));
-                pthread_mutex_unlock(&sv->lock);
+                /* One step at a time on the engine: a completion waits its
+                 * turn behind whatever session holds it. */
+                qw_sess *cs = qw_store_compat(sv->st);
+                qw_store_acquire(sv->st, cs);
+                handle_completion(sv, c, &d, messages_api, false);
+                qw_store_release(sv->st, cs);
             }
             qj_free(&d);
         } else if (!strcmp(r.method, "POST")
@@ -1822,36 +1265,19 @@ static void *conn_main(void *arg) {
 }
 
 /* A graceful stop -- SIGTERM, SIGINT, or the supervisor closing stdin --
- * writes the live conversation to disk before exiting, so the next run
- * picks it up where it was: the reply in progress ends at its next token,
- * the session goes back to its rewind point (the end of the last prompt,
- * which the conversation's next request repeats whatever became of the
- * reply), and a checkpoint is written there.  Once only; whichever cause
- * comes first does it. */
+ * writes every live session to disk before exiting, so the next run picks
+ * them up where they were.  Once only; whichever cause comes first does it. */
 static void srv_shutdown(const char *why) {
     static atomic_flag once = ATOMIC_FLAG_INIT;
     if (atomic_flag_test_and_set(&once)) {
         for (;;) pause();                  /* the first caller exits for us all */
     }
-    atomic_store(&g_stopping, true);
-    srv_log("%s; exiting", why);
+    qw_log("%s; exiting", why);
     server *sv = g_srv;
-    if (!atomic_load(&g_ready) || !sv || sv->no_cache) _exit(0);
-
-    pthread_mutex_lock(&sv->lock);         /* no request in flight past here */
-    if (sv->s && qwasar_session_rewind_to_mark(sv->s) > 0) {
-        char err[256];
-        struct timeval t0, t1;
-        gettimeofday(&t0, NULL);
-        if (qwasar_session_save(sv->s, sv->e, err, sizeof err)) {
-            gettimeofday(&t1, NULL);
-            srv_log("saved the conversation (%d tokens) in %.2fs",
-                    qwasar_session_n_past(sv->s),
-                    (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) * 1e-6);
-        } else {
-            srv_log("conversation not saved: %s", err);
-        }
-    }
+    if (!atomic_load(&g_ready) || !sv || !sv->st) _exit(0);
+    /* Steps in flight end at their next token; every live session is
+     * checkpointed and its record written (qw_store_shutdown). */
+    qw_store_shutdown(sv->st);
     _exit(0);
 }
 
@@ -1894,14 +1320,21 @@ static void *signal_watch(void *arg) {
 
 static void usage(FILE *out) {
     fprintf(out,
-        "qwasar-server -- OpenAI and Anthropic compatible HTTP API for Qwen3.8\n"
+        "qwasar-server -- the Session API, and OpenAI and Anthropic compatible\n"
+        "                 endpoints, for Qwen3.8 27B and Flash-Next\n"
         "\n"
         "usage: qwasar-server [-m <model-dir>] [options]\n"
         "\n"
         "  -m, --model <dir>   model directory; default ./qwasar-model\n"
         "      --host <addr>   bind address (default 127.0.0.1)\n"
         "      --port <n>      port (default 8080)\n"
-        "      --ctx <n>       context size in tokens (default 32768)\n"
+        "      --ctx <n>       context size in tokens (default: what the machine\n"
+        "                      holds beside the weights, up to the model's window)\n"
+        "      --live <n>      sessions kept in memory at once (default: from the\n"
+        "                      same arithmetic; 1 on a 32 GB machine)\n"
+        "      --state-dir <d> where sessions live (default\n"
+        "                      ~/Library/Application Support/Qwasar; $QWASAR_STATE)\n"
+        "      --token <t>     require Authorization: Bearer <t> on every request\n"
         "      --max-tokens <n>\n"
         "                      output limit for requests that set none (default\n"
         "                      2048); 0 means whatever room the context has left.\n"
@@ -1920,10 +1353,14 @@ static void usage(FILE *out) {
         "  POST /v1/chat/completions   OpenAI, streaming and not, with tools\n"
         "  POST /v1/messages           Anthropic, streaming and not, with tools\n"
         "  POST /v1/messages/count_tokens\n"
+        "  GET  /v1/server              the Session API (API.md): the model, the\n"
+        "  POST /v1/sessions            machine, and sessions the server owns --\n"
+        "  POST /v1/sessions/{id}/turn  a prefix fixed at open, deltas only,\n"
+        "  ...                          prefill progress and warmth over SSE\n"
         "\n"
-        "One request is served at a time: the model's recurrent layers hold a\n"
-        "single session that cannot be forked. A client resending a growing\n"
-        "conversation continues from wherever that session already is.\n");
+        "One step runs on the engine at a time; sessions queue for it.  A\n"
+        "stateless client resending a growing conversation continues from\n"
+        "wherever the anonymous session already is.\n");
 }
 
 static bool resolve_model(qwasar_options *opts, const char *prog) {
@@ -1944,6 +1381,7 @@ int main(int argc, char **argv) {
     qwasar_options opts = { 0 };
     server sv = { 0 };
     sv.max_tokens = 2048;
+    qw_store_opts so = { 0 };
 
     /* Stops are taken by a thread of their own from the first moment, so one
      * that arrives during the model load exits the same way as any other. */
@@ -1967,10 +1405,13 @@ int main(int argc, char **argv) {
         if ((!strcmp(a, "-m") || !strcmp(a, "--model")) && i + 1 < argc) opts.model_path = argv[++i];
         else if (!strcmp(a, "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(a, "--port") && i + 1 < argc) port = atoi(argv[++i]);
-        else if (!strcmp(a, "--ctx") && i + 1 < argc) opts.context_size = atoi(argv[++i]);
+        else if (!strcmp(a, "--ctx") && i + 1 < argc) so.ctx = atoi(argv[++i]);
+        else if (!strcmp(a, "--live") && i + 1 < argc) so.live = atoi(argv[++i]);
+        else if (!strcmp(a, "--state-dir") && i + 1 < argc) so.state_dir = argv[++i];
+        else if (!strcmp(a, "--token") && i + 1 < argc) g_token = argv[++i];
         else if (!strcmp(a, "--max-tokens") && i + 1 < argc) sv.max_tokens = atoi(argv[++i]);
         else if (!strcmp(a, "--cors")) cors = true;
-        else if (!strcmp(a, "--no-cache")) sv.no_cache = true;
+        else if (!strcmp(a, "--no-cache")) so.no_cache = true;
         else if (!strcmp(a, "--exit-on-eof")) exit_on_eof = true;
         else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) sv.verbose = true;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
@@ -1993,15 +1434,29 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
     char err[512] = "";
-    srv_log("loading %s", opts.model_path);
-    const double t_load = srv_now();
-    sv.e = qwasar_engine_load(&opts, err, sizeof err);
-    if (!sv.e) { fprintf(stderr, "qwasar-server: %s\n", err); return 1; }
-    sv.tok = qwasar_tokenizer_load(opts.model_path, err, sizeof err);
-    if (!sv.tok) { fprintf(stderr, "qwasar-server: %s\n", err); return 1; }
-    sv.ctx = opts.context_size > 0 ? opts.context_size : 32768;
-    model_id = qwasar_model_id(sv.e);
-    model_name = qwasar_model_name(sv.e);
+    /* The profile first: context is fixed when the engine loads, and the
+     * profile is what decides it (API.md §4.1). */
+    qw_profile prof;
+    if (!qw_profile_derive(opts.model_path, 0, &prof, err, sizeof err)) {
+        fprintf(stderr, "qwasar-server: %s\n", err);
+        return 1;
+    }
+    opts.context_size = so.ctx > 0 ? so.ctx : prof.ctx;
+    opts.verbose = sv.verbose;
+    qw_log("loading %s", opts.model_path);
+    const double t_load = qw_now();
+    qwasar_engine *e = qwasar_engine_load(&opts, err, sizeof err);
+    if (!e) { fprintf(stderr, "qwasar-server: %s\n", err); return 1; }
+    qwasar_tokenizer *tok = qwasar_tokenizer_load(opts.model_path, err, sizeof err);
+    if (!tok) { fprintf(stderr, "qwasar-server: %s\n", err); return 1; }
+    /* What the engine took: the profile's context, or the override, never
+     * past the model's window (the engine caps it the same way). */
+    so.ctx = opts.context_size < prof.max_ctx ? opts.context_size : prof.max_ctx;
+    so.verbose = sv.verbose;
+    sv.st = qw_store_open(e, tok, opts.model_path, &prof, &so, err, sizeof err);
+    if (!sv.st) { fprintf(stderr, "qwasar-server: %s\n", err); return 1; }
+    model_id = qwasar_model_id(e);
+    model_name = qwasar_model_name(e);
     started_at = time(NULL);
 
     int ls = socket(AF_INET, SOCK_STREAM, 0);
@@ -2023,11 +1478,12 @@ int main(int argc, char **argv) {
     char limit[64];
     if (sv.max_tokens > 0) snprintf(limit, sizeof limit, "%d tokens unless a request sets one", sv.max_tokens);
     else snprintf(limit, sizeof limit, "whatever the context has room for");
-    srv_log("%s loaded in %.1fs; context %d tokens, output limit %s, checkpoints %s",
-            model_name, srv_now() - t_load, sv.ctx, limit, sv.no_cache ? "off" : "on");
-    srv_log("listening on http://%s:%d  (model %s)", host, port, model_id);
+    qw_log("%s loaded in %.1fs; context %d tokens, %d live session%s, output limit %s, "
+            "checkpoints %s, sessions in %s",
+            model_name, qw_now() - t_load, qw_store_ctx(sv.st), prof.live, prof.live == 1 ? "" : "s",
+            limit, so.no_cache ? "off" : "on", qw_store_state_dir(sv.st));
+    qw_log("listening on http://%s:%d  (model %s)", host, port, model_id);
 
-    pthread_mutex_init(&sv.lock, NULL);
     pthread_mutex_init(&sv.conns_lock, NULL);
     atomic_store(&g_ready, true);
     pthread_attr_t detached;
@@ -2070,9 +1526,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    qwasar_session_free(sv.s);
-    qwasar_tokenizer_free(sv.tok);
-    qwasar_engine_free(sv.e);
+    qwasar_tokenizer_free(tok);
+    qwasar_engine_free(e);
     close(ls);
     return 0;
 }

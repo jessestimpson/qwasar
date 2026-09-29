@@ -238,6 +238,17 @@ void sse_event(conn *c, const char *event, const char *json) {
     str_free(&f);
 }
 
+void sse_event_id(conn *c, const char *id, const char *event, const char *json) {
+    str f = { 0 };
+    if (id) { str_puts(&f, "id: "); str_puts(&f, id); str_puts(&f, "\n"); }
+    if (event) { str_puts(&f, "event: "); str_puts(&f, event); str_puts(&f, "\n"); }
+    str_puts(&f, "data: ");
+    str_puts(&f, json);
+    str_puts(&f, "\n\n");
+    sse_chunk(c, f.p, f.len);
+    str_free(&f);
+}
+
 void sse_end(conn *c) {
     conn_write(c, "0\r\n\r\n", 5);
     c->streaming = false;
@@ -395,6 +406,22 @@ bool read_request(conn *c, str *carry, http_req *r, str *body) {
                         r->expect_continue = true;
                         break;
                     }
+            } else if (len > 14 && !strncasecmp(line, "Authorization:", 14)) {
+                size_t i = 14;
+                while (i < len && line[i] == ' ') i++;
+                if (len - i > 7 && !strncasecmp(line + i, "Bearer ", 7)) {
+                    i += 7;
+                    size_t k = 0;
+                    while (i < len && k + 1 < sizeof r->bearer && line[i] != ' ') r->bearer[k++] = line[i++];
+                    r->bearer[k] = 0;
+                }
+            } else if (len > 14 && !strncasecmp(line, "Last-Event-ID:", 14)) {
+                size_t i = 14;
+                while (i < len && line[i] == ' ') i++;
+                size_t k = 0;
+                while (i < len && k + 1 < sizeof r->last_event_id && line[i] != ' ')
+                    r->last_event_id[k++] = line[i++];
+                r->last_event_id[k] = 0;
             } else if (len > 11 && !strncasecmp(line, "Connection:", 11)) {
                 for (size_t i = 11; i + 5 <= len; i++)
                     if (!strncasecmp(line + i, "close", 5)) { r->keep_alive = false; break; }

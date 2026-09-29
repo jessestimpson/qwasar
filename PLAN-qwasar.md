@@ -84,9 +84,10 @@ lose nothing and share the queue.
     tokens.bin                   int32 LE, the timeline; rewritten after
                                  every step (a few hundred KB at most)
     checkpoint.bin               the parked state (§2.6), when parked
-    events.jsonl                 the current and last step's events, for
-                                 reattach (bounded: two steps)
 ```
+
+The current and last step's events are kept in memory, for reattach; a
+restart ends any step, so there is nothing to reattach to across one.
 
 `state_dir` defaults to `~/Library/Application Support/Qwasar` (the merged
 app's name; a `--state-dir` flag and `QWASAR_STATE` override it, and the
@@ -322,6 +323,37 @@ made before the merge are handled as §7 question 4 decides.*
 from the engine; per-session `checkpoint.bin`; a disk budget with the
 prompt-never-delete rule from `spec/04-sessions.md`. *Gate: park and resume
 of a 200K-token Flash-Next session measured and written into this file.*
+
+### 2.7 M1, built -- 2026-09-29
+
+`qwasar_http.c` (lifted), `qwasar_sessions.c` (the store: records, token
+logs, the FIFO engine queue with `queued` positions, LRU parking through the
+hash-keyed store, resume with progress over the whole span, the generation
+loop moved from the server, the compat session on the same ladder it always
+had), `qwasar_profile.c` (the arithmetic, from the shard headers and Metal),
+`qwasar_api.c` (the endpoints and events).  `--state-dir`, `--live`,
+`--token` added; `--ctx` now overrides a derived default.
+
+`tests/test_session_api.py` runs its own servers on a temp state directory
+and a temp HOME (so the toy's checkpoints stay out of `~/.cache/qwasar/kv`).
+On `tests/fixtures/flashnext-tiny-q4`, with the tokenizer
+`tools/toy_tokenizer.py` writes for it: **17 tests, 1.4 s** -- open,
+describe, list, refusals as statuses, a cold first turn whose `prefill`
+events span the whole resume, a live second turn, the shared prefix read
+by the next session, park → warm → resume from the checkpoint, cancel,
+reattach with `Last-Event-ID` (contiguous ids), delete, `context_full`
+decided before evaluation, the compat endpoint sharing the engine, and a
+restart on the same state directory finding the session and resuming it.
+Two skip on the toy: the tool-call path (`tool_call` events, `continue`),
+which needs a model that writes a call, and the window filling under
+generation.  The OpenAI and Anthropic suites on the toy fail identically
+before and after the change (74 pass, 34 are the toy's inability to follow
+an instruction), so the moved compat path behaves as it did.
+
+**Not yet run against the real model** -- the rest of the M1 gate waits for
+the engine to be free: `make test-api` with `QWASAR_TEST_MODEL` at a real
+folder (which runs the tool-call test), and a Goose session on the compat
+endpoint at the speed it had.
 
 ## 6. Working beside the engine
 

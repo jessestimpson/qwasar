@@ -53,6 +53,8 @@ void http_error(conn *c, int status, const char *reason, const char *msg);
 void sse_begin(conn *c);
 void sse_chunk(conn *c, const char *data, size_t n);
 void sse_event(conn *c, const char *event, const char *json);
+/* The same with an `id:` line, so a client can resume with Last-Event-ID. */
+void sse_event_id(conn *c, const char *id, const char *event, const char *json);
 void sse_end(conn *c);
 
 /* ---- requests -------------------------------------------------------------- */
@@ -66,6 +68,8 @@ typedef struct {
     bool   chunked;        /* Transfer-Encoding: chunked */
     bool   expect_continue;
     bool   too_large;      /* body over QW_MAX_BODY; left unread */
+    char   bearer[128];    /* Authorization: Bearer <token>, or "" */
+    char   last_event_id[32]; /* Last-Event-ID, for a reattaching stream, or "" */
 } http_req;
 
 /* Base64 images and video make for big bodies, but not this big. */
