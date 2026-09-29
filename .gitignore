@@ -32,6 +32,9 @@ reference/
 # Crucible app build products
 libqwasar.a
 app/build/
+# the guest overlay is the user's own; only its README is ours
+app/Guest/overlay/*
+!app/Guest/overlay/README.md
 
 # Generated from vendor/highlight.js/{core.min.js,langs/} by its build.sh.
 # The pieces are vendored and reviewable; the concatenation is not committed,

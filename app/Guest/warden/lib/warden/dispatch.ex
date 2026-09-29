@@ -192,12 +192,30 @@ defmodule Warden.Dispatch do
       {"python", "/usr/bin/python3", ["--version"]}
     ]
     |> Enum.filter(fn {_, path, _} -> File.exists?(path) end)
-    |> Enum.map_join(",", fn {name, path, args} ->
+    |> Enum.map(fn {name, path, args} ->
       "#{name}@#{cmd(path, args) |> String.replace_prefix("Python ", "") |> String.replace_prefix("v", "")}"
     end)
+    |> Kernel.++(for v <- [escript_version("/usr/local/bin/rebar3")], v, do: "rebar3@#{v}")
+    |> Enum.join(",")
     |> case do
       "" -> "none"
       s -> s
+    end
+  end
+
+  # rebar3 is an escript (mkimage.sh copies the host's, from mise): its
+  # version is in its header, and reading that costs nothing where running
+  # it would start a second BEAM.
+  defp escript_version(path) do
+    case File.open(path, [:read], &IO.binread(&1, 64)) do
+      {:ok, head} when is_binary(head) ->
+        case Regex.run(~r/Rebar3 (\S+)/, head) do
+          [_, v] -> v
+          _ -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 

@@ -52,6 +52,8 @@ PACKAGES = [
     "e2fsprogs-extra",
     "erlang27",
 ]
+# More, named when the image is built: GUEST_PACKAGES="go rust" (mkimage.sh).
+EXTRA_PACKAGES = [p for p in re.split(r"[\s,]+", os.environ.get("GUEST_PACKAGES", "")) if p]
 # For the initramfs only; never lands in the rootfs.
 INITRAMFS_PACKAGES = ["busybox-static"]
 
@@ -447,6 +449,52 @@ def install_local(rootfs, guest_dir, vsock_port, warden_build):
         os.symlink("/bin/busybox", sh)
 
 
+def install_rebar3(rootfs, rebar3):
+    """The host's rebar3 escript, from mise: portable BEAM, like Elixir."""
+    dst = os.path.join(rootfs, "usr/local/bin/rebar3")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy(rebar3, dst)
+    os.chmod(dst, 0o755)
+
+
+# What an overlay may not replace: the init, the gate that keeps the user's
+# real .git out of the sandbox (spec 7.4), and the warden, which must survive
+# anything done inside the guest (spec 7.3).  A broken copy of any of these
+# is a guest that does not boot or does not protect.
+PROTECTED = ("sbin/crucible-init", "sbin/mount-work", "opt/warden",
+             "usr/local/bin/vsock_port")
+
+
+def install_overlay(rootfs, overlay):
+    """Copies `overlay` over the root filesystem as is -- files, modes,
+    symlinks -- so `overlay/usr/local/bin/tool` lands at /usr/local/bin/tool.
+    Linux binaries only, and statically linked or built against musl: the
+    guest is Alpine."""
+    added = []
+    for dirpath, dirnames, filenames in os.walk(overlay):
+        rel_dir = os.path.relpath(dirpath, overlay)
+        for name in dirnames + filenames:
+            rel = os.path.normpath(os.path.join(rel_dir, name))
+            src = os.path.join(overlay, rel)
+            if name in dirnames and not os.path.islink(src):
+                os.makedirs(os.path.join(rootfs, rel), exist_ok=True)
+                continue
+            if rel == "README.md":
+                continue                      # the folder's own instructions
+            if any(rel == p or rel.startswith(p + "/") for p in PROTECTED):
+                sys.exit(f"mkrootfs: the overlay may not replace /{rel}")
+            dst = os.path.join(rootfs, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.lexists(dst) and (os.path.islink(dst) or not os.path.isdir(dst)):
+                os.remove(dst)
+            if os.path.islink(src):
+                os.symlink(os.readlink(src), dst)
+            else:
+                shutil.copy2(src, dst)
+            added.append("/" + rel)
+    return added
+
+
 def main():
     guest_dir = os.path.dirname(os.path.abspath(__file__))
     out = os.environ.get("OUT") or os.path.join(guest_dir, "../build/guest")
@@ -475,7 +523,7 @@ def main():
         for k, v in pr.items():
             provides.setdefault(k, v)
 
-    order = resolve(PACKAGES, pkgs, provides)
+    order = resolve(PACKAGES + EXTRA_PACKAGES, pkgs, provides)
     log(f"{len(order)} packages: {' '.join(order)}")
     for name in order:
         ver = pkgs[name]["V"][0]
@@ -485,6 +533,11 @@ def main():
 
     install_elixir(cache, rootfs)
     install_local(rootfs, guest_dir, vsock_port, warden_build)
+    rebar3 = os.environ.get("REBAR3", "")
+    if rebar3:
+        install_rebar3(rootfs, rebar3)
+    overlay = os.environ.get("GUEST_OVERLAY", "")
+    overlaid = install_overlay(rootfs, overlay) if overlay and os.path.isdir(overlay) else []
 
     # busybox-static, for the initramfs only.
     bb = pkgs["busybox-static"]
@@ -510,6 +563,12 @@ def main():
     log(f"  alpine:  {open(rel).read().strip() if os.path.exists(rel) else '?'}")
     log(f"  kernel:  {os.listdir(os.path.join(rootfs, 'lib/modules'))[0]}")
     log(f"  erlang:  {pkgs['erlang27']['V'][0]},  elixir: {ELIXIR_URL.rsplit('/v', 1)[1].split('/')[0]}-otp-27")
+    if EXTRA_PACKAGES:
+        log(f"  extra:   {' '.join(EXTRA_PACKAGES)}")
+    if rebar3:
+        log(f"  rebar3:  {os.path.basename(os.path.dirname(os.path.dirname(rebar3)))} (mise)")
+    if overlaid:
+        log(f"  overlay: {len(overlaid)} file(s) from {overlay}")
     du = subprocess.run(["du", "-sh", rootfs], capture_output=True, text=True)
     log(f"  rootfs:  {du.stdout.split()[0]}")
 

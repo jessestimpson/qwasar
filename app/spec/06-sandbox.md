@@ -83,6 +83,13 @@ which is what plain `/usr/bin` paths do with less machinery. The runtimes are
 the image's, reported by `info` as `runtimes=erlang@27,elixir@...`, and adding
 a language is adding its package to `PACKAGES` in `mkrootfs.py`.
 
+Since 2026-09-29 the image takes more without editing that list:
+`GUEST_PACKAGES` names extra Alpine packages, `Guest/overlay/` (or
+`GUEST_OVERLAY`) is copied over the rootfs as is — refused if it would
+replace the init, `mount-work`, the warden or `vsock_port` — and rebar3
+comes from the host's mise (`REBAR_PIN`), since an escript is portable BEAM
+in the same way Elixir is. `info` reports it with the other runtimes.
+
 The musl constraint stands unchanged: runtimes must be Alpine packages (or
 portable bytecode, as Elixir is). Moving to a glibc base to widen the
 catalogue remains the first thing to reconsider if the agent starts wanting

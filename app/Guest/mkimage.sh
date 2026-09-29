@@ -19,8 +19,8 @@
 #   - vsock_port is cross-compiled with zig (a self-contained musl toolchain);
 #   - the ext4 image comes from mke2fs -d, which needs no root and no Linux.
 #
-# Host dependencies, checked below: python3, mise (erlang/elixir/zig pins),
-# and e2fsprogs from brew. That is the whole list.
+# Host dependencies, checked below: python3, mise (erlang/elixir/zig/rebar
+# pins), and e2fsprogs from brew. That is the whole list.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -33,6 +33,14 @@ CACHE="${CACHE:-$HERE/../build/guest-cache}"
 ERLANG_PIN="erlang@27.3.4"
 ELIXIR_PIN="elixir@1.18.4-otp-27"
 ZIG_PIN="zig@0.15.2"
+# rebar3 is an escript -- BEAM bytecode, like Elixir -- so the host's own
+# mise install runs as is on the guest's erlang27.  REBAR_PIN= leaves it out.
+REBAR_PIN="${REBAR_PIN-rebar@3.24.0}"
+# Beyond the defaults: more Alpine packages, and a folder copied over the
+# root filesystem as is.  Both are read when the image is built.
+#   GUEST_PACKAGES="go rust"   space- or comma-separated Alpine package names
+#   GUEST_OVERLAY=<dir>        default Guest/overlay, used when it exists
+GUEST_OVERLAY="${GUEST_OVERLAY-$HERE/overlay}"
 
 fail() { echo "mkimage: $*" >&2; exit 1; }
 
@@ -76,10 +84,21 @@ echo "mkimage: warden (mise: $ERLANG_PIN $ELIXIR_PIN)"
     '
 ) || fail "warden build failed"
 
+# ---- rebar3, from the host's mise --------------------------------------------
+REBAR3=""
+if [ -n "$REBAR_PIN" ]; then
+    echo "mkimage: rebar3 (mise: $REBAR_PIN)"
+    mise install "$REBAR_PIN" >/dev/null 2>&1 || fail "mise install $REBAR_PIN failed"
+    REBAR3="$(mise where "$REBAR_PIN" 2>/dev/null)/bin/rebar3"
+    head -c 32 "$REBAR3" 2>/dev/null | grep -q escript \
+        || fail "$REBAR3 is not an escript; only a portable rebar3 can go in the guest"
+fi
+
 # ---- the image itself -------------------------------------------------------
 OUT="$OUT" CACHE="$CACHE" \
     VSOCK_PORT="$CACHE/vsock_port" \
     WARDEN_EBIN="$HERE/warden/_build/prod/lib/warden" \
+    REBAR3="$REBAR3" GUEST_PACKAGES="${GUEST_PACKAGES:-}" GUEST_OVERLAY="$GUEST_OVERLAY" \
     python3 "$HERE/mkrootfs.py"
 
 echo "mkimage: done"
