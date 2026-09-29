@@ -17,10 +17,32 @@ struct MarkdownView: View {
 
     private var blocks: [MarkdownBlock] { MarkdownParser.blocks(source) }
 
+    /// Consecutive prose blocks run together into one selectable text view
+    /// (ProseText); code blocks, tables and rules stand between runs.
+    private enum Segment { case prose([MarkdownBlock]), block(MarkdownBlock) }
+
+    private var segments: [Segment] {
+        var out: [Segment] = []
+        var run: [MarkdownBlock] = []
+        for b in blocks {
+            if ProseBuilder.isProse(b.kind) { run.append(b); continue }
+            if !run.isEmpty { out.append(.prose(run)); run = [] }
+            out.append(.block(b))
+        }
+        if !run.isEmpty { out.append(.prose(run)) }
+        return out
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                row(block)
+            ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+                switch seg {
+                case .prose(let run):
+                    ProseText(text: ProseBuilder.build(run))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                case .block(let b):
+                    row(b)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
