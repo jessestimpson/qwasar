@@ -6,8 +6,9 @@
 # copied into the bundle as a helper, signed to inherit the app's sandbox.
 #
 #   make          build and sign Qwasar.app
-#   make run      build, then launch it (the menu bar item)
-#   make agent    build, then launch it with the coding agent's window open
+#   make run      build, then launch it (the menu bar item); the first run
+#                 builds the guest image too
+#   make agent    ... with the coding agent's window open
 #   make gate     the entitlement and VM probes, headless
 #   make gate-full  ... and the helper on $(MODEL), and one agent turn through it
 #   make test     the host test suite
@@ -47,7 +48,7 @@ LDLIBS    := $(FRAMEWORKS)
 ENTITLEMENTS        ?= Qwasar.entitlements
 HELPER_ENTITLEMENTS ?= Helper.entitlements
 
-.PHONY: all help run agent gate gate-full sandbox test guest clean clean-guest server
+.PHONY: all help run agent guest-once gate gate-full sandbox test guest clean clean-guest server
 
 all: $(APP)
 
@@ -64,7 +65,7 @@ help:
 	@echo "  make clean        remove build products, keeping the guest image"
 	@echo "  make clean-guest  remove the guest image too"
 	@echo ""
-	@echo "First run:  make guest && make run"
+	@echo "To start:   make run   (the first run builds the guest image too)"
 
 # The server, from the parent tree, with the same deployment floor as the
 # Swift so the bundle honours the minimum it claims.
@@ -116,11 +117,18 @@ $(APP): $(BIN) server Resources/Info.plist $(ENTITLEMENTS) $(HELPER_ENTITLEMENTS
 	@codesign -d --entitlements - $(APP) 2>&1 | sed 's/^/  /'
 	@echo "built $(APP)"
 
-run: $(APP)
+# The guest image first when there is none: without it the bundle is built
+# with read-only host tools, which is never what a first `make run` meant.
+run: guest-once
+	@$(MAKE) --no-print-directory $(APP)
 	open $(APP)
 
-agent: $(APP)
+agent: guest-once
+	@$(MAKE) --no-print-directory $(APP)
 	open $(APP) --args --agent
+
+guest-once:
+	@[ -f $(BUILD)/guest/disk.img ] || $(MAKE) --no-print-directory guest
 
 gate: $(APP)
 	@$(BIN) --gate || true

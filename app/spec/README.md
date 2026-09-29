@@ -1,6 +1,7 @@
-# The Crucible spec
+# The Qwasar.app spec
 
-The design of Crucible, one topic per file, numbered so that section
+The design of the coding agent's window of Qwasar.app — called Crucible when
+most of this was written, and still so named below — one topic per file, numbered so that section
 references stay stable: a citation like `PLAN.md 2.2` or `§7.3` in code
 comments resolves to the file whose name carries that number (`02-…` §2.2,
 `07-…` §7.3). The numbering has one deliberate gap — §9 was the eta
