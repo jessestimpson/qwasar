@@ -384,6 +384,49 @@ tokenizer now trains 142 merges on the template's and the agent's own text
 in the toy's 4K window.  **The M2 gate's interactive run on the real model
 waits for the engine to be free**, as M1's does.
 
+### 4.5 M3, built -- 2026-09-29
+
+`git mv crucible app`; the menu bar app's four files moved in; the modules
+are `Qwasar` and `QwasarKit`.  Deleted, not ported: `EngineHost`, `Session`,
+`Bridge`, `Tokenizer`, `ChatTemplate`, `MemoryProfile`, `ModelFamily`, the
+`CQwasar` module map, the C tool-call parser and UTF-8 assembler (the server
+guarantees whole characters), and the golden, prefix, tool-parser and UTF-8
+suites.  Added: `QwasarClient` (the API, URLSession, ~400 lines, with a pure
+`SSEParser` and event decoder that `ClientSuite` pins), `Events.swift` (the
+`SessionEvent` the window already consumed, `TurnStats`, `ReasoningEffort`,
+unchanged so old transcripts decode), `ServerController` (from the menu bar,
+now taking its model and state directory from the app), `StatusItem` (the
+menu bar item, plus **Open Coding Agent**), `QwasarApp` (an AppKit delegate:
+status item, main menu, the window on demand -- `.accessory` until a window
+opens, `.regular` while one is), `Gate` (the gates against the helper).
+`AppState.send()` opens the record's server session once -- the executor's
+environment description and the project's prompt as its prefix, which the
+old app never composed -- then `turn`, runs each `tool_call` off the main
+actor, `continue`s.  The server keeps its sessions in the app's own store
+under `server/`, beside the app's records.
+
+**The sandbox question (§4.2) is answered: App Sandbox stays.** The helper
+carries `com.apple.security.inherit`; the app gained `network.server`.
+`make gate-full` on Flash-Next, in the signed sandboxed bundle: the helper
+listened after 23 s and reported the right profile (79.52 GB resident, 262K,
+1 live); the guest booted in 0.49 s; a session opened with a 2,193-token
+prefix; the model called `list` and `bash` in the guest and answered;
+`describe` said idle, live.  On the toy the same path runs in 1 s, and its
+ten-tool prefix (5,240 toy tokens) does not fit the toy's window -- the
+real model is the gate.
+
+Two things are for an interactive run: the model-folder grant through the
+panel (the gate uses a static path exception; the shipping path is a
+bookmark the helper inherits, the same mechanism), and the project folder
+mounted into the guest (`/work` was empty in the gate, whose read-only
+exception cannot be shared read-write; a panel grant is).  One bug the gate
+found and fixed on the way: `URLSession.AsyncBytes.lines` does not deliver
+empty lines, and an empty line is what ends an SSE event, so the first
+Swift stream heard nothing; lines are split from the bytes directly now.
+And one oddity recorded, not explained: under the sandbox the toy's shard
+headers summed to zero resident bytes where the real model's summed right;
+a zero now falls back to the known figure with a log line.
+
 ## 6. Working beside the engine
 
 Another agent owns the engine and the server today. This plan touches the
@@ -409,8 +452,8 @@ toy question (§7) decides whether the API suite can run before then.
 2. **Toys on Metal.** May the API suite run against a toy fixture while the
    real model is in use by the other agent? It is a few MB of weights and
    seconds of GPU, but it is the GPU.
-3. **App Sandbox or not** (§4.2) -- to be decided at the M3 gate by what the
-   inheriting helper can do, unless there is a preference now.
+3. **App Sandbox or not** (§4.2) -- decided at the M3 gate: kept.  The
+   inheriting helper loads the real model inside the sandbox (§4.5).
 4. **Old Crucible sessions.** The app's existing sessions have tokens and
    transcripts but no server session. Options: (a) re-send each old
    session's history as its first `turn` when it is next used -- a one-time

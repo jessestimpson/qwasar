@@ -125,8 +125,14 @@ bool qw_profile_derive(const char *model_path, uint64_t working_set, qw_profile 
     p->fixed = flash ? 1100000000ull : 351ull * 1024 * 1024;
     p->reserve = 0.85;
 
-    if (!resident_bytes(model_path, &p->weights))
+    /* Zero is a failed read, not a weightless model: under a sandbox a
+     * header may be unreadable in ways open() does not report.  The known
+     * figures stand in, and the log says so. */
+    if (!resident_bytes(model_path, &p->weights) || p->weights == 0) {
         p->weights = flash ? 79520000000ull : 16020000000ull;
+        fprintf(stderr, "qwasar: could not read the shard headers under %s; assuming %.1f GB resident\n",
+                model_path, p->weights / 1e9);
+    }
 
     size_t len = sizeof p->physical;
     if (sysctlbyname("hw.memsize", &p->physical, &len, NULL, 0) != 0) p->physical = 0;

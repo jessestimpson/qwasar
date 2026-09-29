@@ -428,8 +428,9 @@ static bool api(agent *a, const char *method, const char *path, const char *body
 }
 
 static void api_error(agent *a, const char *what, int status, const qj_doc *doc) {
-    const char *msg = qj_str(doc, qj_get(doc, qj_get(doc, qj_root(doc), "error"), "message"));
+    char *msg = qj_strdup(doc, qj_get(doc, qj_get(doc, qj_root(doc), "error"), "message"));
     tui_printf(a->tui, "  %s: %s (HTTP %d)\n", what, msg ? msg : "no reason given", status);
+    free(msg);
 }
 
 static bool server_up(agent *a) {
@@ -659,8 +660,8 @@ static void take_call(agent *a, const qj_doc *d) {
     memset(p, 0, sizeof *p);
     const qj_node *root = qj_root(d);
     qj_str_copy(d, root, "id", p->id, sizeof p->id);
-    const char *name = qj_str(d, qj_get(d, root, "name"));
-    p->call.name = dupn(name ? name : "", name ? strlen(name) : 0);
+    p->call.name = qj_strdup(d, qj_get(d, root, "name"));
+    if (!p->call.name) p->call.name = dupn("", 0);
     const qj_node *args = qj_get(d, root, "arguments");
     for (const qj_node *m = qj_first(d, args); m && p->call.n_params < QW_MAX_PARAMS; m = qj_next(d, m)) {
         qw_tool_param *prm = &p->call.params[p->call.n_params++];
@@ -701,17 +702,18 @@ static void on_event(agent *a, const char *event, const char *data) {
         a->think_tokens += (int32_t)qj_int_or(&d, root, "tokens", 0);
         a->turn_tokens = a->generated + a->think_tokens;
         if (a->cfg.show_think) {
-            const char *t = qj_str(&d, qj_get(&d, root, "text"));
+            char *t = qj_strdup(&d, qj_get(&d, root, "text"));
             if (t) {
                 if (tty && !a->think_open) { tui_puts(a->tui, "\x1b[2m"); a->think_open = true; }
                 tui_puts(a->tui, t);
+                free(t);
             }
         }
         status_set(a, "thinking");
     } else if (!strcmp(event, "text")) {
         if (a->think_open) { tui_puts(a->tui, "\x1b[0m\n"); a->think_open = false; }
-        const char *t = qj_str(&d, qj_get(&d, root, "text"));
-        if (t) tui_puts(a->tui, t);
+        char *t = qj_strdup(&d, qj_get(&d, root, "text"));
+        if (t) { tui_puts(a->tui, t); free(t); }
         status_set(a, "writing");
     } else if (!strcmp(event, "decode")) {
         a->generated = (int32_t)qj_int_or(&d, root, "generated", a->generated);
@@ -738,9 +740,10 @@ static void on_event(agent *a, const char *event, const char *data) {
         a->turn_tokens = a->generated;
     } else if (!strcmp(event, "error")) {
         if (a->think_open) { tui_puts(a->tui, "\x1b[0m\n"); a->think_open = false; }
-        const char *m = qj_str(&d, qj_get(&d, root, "message"));
+        char *m = qj_strdup(&d, qj_get(&d, root, "message"));
         tui_newline(a->tui);
         tui_printf(a->tui, "  server error: %s\n", m ? m : "?");
+        free(m);
         snprintf(a->stop, sizeof a->stop, "error");
     }
     qj_free(&d);

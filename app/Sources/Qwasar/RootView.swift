@@ -1,0 +1,309 @@
+// RootView.swift -- the coding agent's window.
+//
+// Spec 5.1: NavigationSplitView, the shape every macOS user already knows.
+// Sidebar of projects and their sessions; the transcript in the middle; the
+// composer pinned below it.  Hosted in an NSWindow by QwasarApp.swift.
+
+import SwiftUI
+import QwasarKit
+
+struct RootView: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        VStack(spacing: 0) {
+            NavigationSplitView {
+                Sidebar(state: state)
+                    .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+            } detail: {
+                if state.selectedSession != nil {
+                    SessionView(state: state)
+                } else {
+                    EmptyPane(state: state)
+                }
+            }
+            .toolbar { StatusToolbar(state: state) }
+            .sheet(isPresented: $state.showingAPIKeySheet) { APIKeySheet(state: state) }
+
+            // Spans the window, not the detail pane: what the engine is doing
+            // is a property of the application, and there is only ever one
+            // session doing it (PLAN.md 2.1).
+            StatusFooter(state: state)
+        }
+        .animation(.easeInOut(duration: 0.15), value: state.prefillTotal > 0)
+    }
+}
+
+// MARK: - Delegation API key (spec §15.4)
+
+struct APIKeySheet: View {
+    @Bindable var state: AppState
+    @State private var key = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Delegation API key").font(.headline)
+            Text("An OpenRouter (or OpenAI-compatible) key. It is stored in "
+                 + "the macOS Keychain and attached to requests by the app "
+                 + "alone — no model, tool, or config session can read it.")
+                .font(.caption).foregroundStyle(.secondary)
+            SecureField("sk-or-…", text: $key)
+                .textFieldStyle(.roundedBorder)
+            Text("Delegation also needs models granted: in a Crucible Config "
+                 + "session, `config_set` the `delegate_models` key at the "
+                 + "layer you want.")
+                .font(.caption2).foregroundStyle(.tertiary)
+            HStack {
+                Spacer()
+                Button("Cancel") { state.showingAPIKeySheet = false }
+                Button("Save") {
+                    state.setAPIKey(key)
+                    state.showingAPIKeySheet = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 420)
+    }
+}
+
+// MARK: - Network allowlist
+
+/// The one place network gets granted (PLAN.md 8.3): a person, per project,
+/// host by host. Nothing the model does can open this sheet or grow the list.
+struct NetworkSheet: View {
+    @Bindable var state: AppState
+    let project: Project
+    @State private var text = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Network access — \(project.name)").font(.headline)
+            Text("One host per line (e.g. hexdocs.pm, *.github.io). Empty means "
+                 + "network OFF, which is the default. `fetch` is HTTPS GET only, "
+                 + "run by the app under this list — the sandbox itself still has "
+                 + "no network device.")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("Plainly: with any host granted, a prompt injection in a file "
+                 + "the model reads could encode project contents into request "
+                 + "URLs to that host. Leave this empty for confidential work.")
+                .font(.caption).foregroundStyle(.orange)
+            TextEditor(text: $text)
+                .font(.body.monospaced())
+                .frame(minHeight: 120)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(.quaternary))
+            Text("Applies when a session is next opened; changing the tool "
+                 + "surface re-prefills that session once.")
+                .font(.caption2).foregroundStyle(.tertiary)
+            HStack {
+                Spacer()
+                Button("Cancel") { state.networkEditing = nil }
+                Button("Save") {
+                    let hosts = text.split(whereSeparator: \.isNewline)
+                        .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+                        .filter { !$0.isEmpty }
+                    state.setNetworkAllowlist(project, hosts: hosts)
+                    state.networkEditing = nil
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 440)
+        .onAppear { text = (project.overlay.networkAllowlist ?? []).joined(separator: "\n") }
+    }
+}
+
+// MARK: - Sidebar
+
+struct Sidebar: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        List(selection: Binding(
+            get: { state.selectedSessionID },
+            set: { state.select($0) }
+        )) {
+            ForEach(state.projects) { project in
+                Section {
+                    ForEach(state.sessions(in: project)) { s in
+                        SessionRow(session: s, isLive: state.liveSessionID == s.id,
+                                   warm: state.warmTokens[s.id])
+                            .tag(s.id)
+                            .contextMenu {
+                                if state.liveSessionID == s.id {
+                                    Button("Park Session") { state.park(s.id) }
+                                }
+                                Button("Delete Session", role: .destructive) {
+                                    state.deleteSession(s.id)
+                                }
+                            }
+                    }
+                    Button {
+                        state.newSession(in: project)
+                    } label: {
+                        Label("New Session", systemImage: "plus").font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                } header: {
+                    HStack {
+                        Text(project.name)
+                        Spacer()
+                        if project.isConfig {
+                            Image(systemName: "gearshape")
+                                .foregroundStyle(.secondary)
+                                .help("Built in. Sessions here manage Crucible's "
+                                      + "configuration with host-side tools — no "
+                                      + "folder, no sandbox.")
+                        } else if project.resolvedRoot == nil {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                                .help("This folder is no longer reachable. Re-add the project.")
+                        }
+                    }
+                    .contextMenu {
+                        if !project.isConfig {
+                            Button("Network…") { state.networkEditing = project }
+                            Button("Remove Project", role: .destructive) {
+                                state.removeProject(project)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .sheet(item: $state.networkEditing) { p in
+            NetworkSheet(state: state, project: p)
+        }
+        .safeAreaInset(edge: .bottom) {
+            Button {
+                state.addProject()
+            } label: {
+                Label("Add Project…", systemImage: "folder.badge.plus")
+                    .frame(maxWidth: .infinity)
+            }
+            .padding(8)
+        }
+    }
+}
+
+struct SessionRow: View {
+    let session: SessionRecord
+    let isLive: Bool
+    /// Tokens a checkpoint on disk covers, probed -- nil means unknown or
+    /// nothing (spec 4.4: the indicator claims only what is verified).
+    var warm: Int? = nil
+
+    /// Three states, each with the number that is its meaning: live holds
+    /// memory; parked-warm resumes as a read; parked-cold pays a re-prefill.
+    private var symbol: (name: String, tint: Color) {
+        if isLive { return ("circle.fill", Color.accentColor) }
+        if isWarm { return ("circle.lefthalf.filled", Color.accentColor.opacity(0.7)) }
+        return ("circle", Color.secondary)
+    }
+
+    private var isWarm: Bool {
+        session.tokenCount > 0 && (warm ?? 0) >= session.tokenCount
+    }
+
+    /// The size law from spec 4.4 (149.6 MB floor + 64 KB/token) over a
+    /// conservative read rate for warm; the measured ~32 tok/s prefill for
+    /// cold, credited with whatever prefix IS cached.
+    private var estimate: String? {
+        guard session.tokenCount > 0, !isLive else { return nil }
+        if isWarm {
+            let secs = max(1, Int((1.496e8 + Double(session.tokenCount) * 65536) / 7e8))
+            return "resumes in ~\(secs)s"
+        }
+        let remaining = session.tokenCount - min(warm ?? 0, session.tokenCount)
+        let secs = Int(Double(remaining) / 32.0)
+        return secs < 90 ? "rebuilds in ~\(max(secs, 5))s"
+                         : "rebuilds in ~\((secs + 30) / 60)m"
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: symbol.name)
+                .font(.system(size: 7))
+                .foregroundStyle(symbol.tint)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(session.title).lineLimit(1)
+                if session.tokenCount > 0 {
+                    Text("\(session.tokenCount) / \(session.contextSize) tokens"
+                         + (estimate.map { " · \($0)" } ?? ""))
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .help(isLive ? "Live: holds its share of the working set."
+              : isWarm ? "Parked, warm: a checkpoint on disk covers the whole session."
+                       : "Parked, cold: no full checkpoint on disk; opening re-prefills.")
+    }
+}
+
+// MARK: - Empty state
+
+struct EmptyPane: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "square.stack.3d.up")
+                .font(.system(size: 40)).foregroundStyle(.tertiary)
+            if state.projects.isEmpty {
+                Text("Add a project to begin.").font(.title3)
+                Text("A project is a folder. Sessions can read inside it and nowhere else.")
+                    .font(.callout).foregroundStyle(.secondary)
+                Button("Add Project…") { state.addProject() }
+            } else {
+                Text("Select or create a session.").foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Toolbar
+
+struct StatusToolbar: ToolbarContent {
+    @Bindable var state: AppState
+
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .status) {
+            HStack(spacing: 10) {
+                switch state.phase {
+                case .serverDown(let why):
+                    if state.modelPath == nil {
+                        Button("Choose Model…") { state.chooseModel() }
+                    } else {
+                        Label(why, systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Button("Start Server") { state.startServer() }
+                    }
+                case .loading(let what):
+                    ProgressView().controlSize(.small)
+                    Text(what).font(.caption).foregroundStyle(.secondary)
+                case .opening:
+                    ProgressView().controlSize(.small)
+                    Text("resuming session").font(.caption).foregroundStyle(.secondary)
+                case .failed(let m):
+                    Label(m, systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.red).lineLimit(1)
+                case .ready, .generating:
+                    if let n = state.engineNote {
+                        Label(n, systemImage: "info.circle")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    } else if let i = state.serverInfo {
+                        Text("\(i.model.name) · \(i.context) ctx · \(i.live_sessions) live")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .help(i.summary)
+                    }
+                }
+            }
+        }
+    }
+}

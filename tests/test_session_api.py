@@ -352,7 +352,10 @@ class Steps(unittest.TestCase):
         whatever the model would have done -- deterministic where the test
         above depends on the model running to the end of the window."""
         sid = SRV.open()
-        status, ev = SRV.stream("POST", f"/v1/sessions/{sid}/turn", {"text": "x " * 3000, "max_tokens": 8})
+        # More tokens than the window whatever the tokenizer makes of "x ":
+        # one token each on the real one, two on the toy's.
+        ctx = SRV.request("GET", "/v1/server")[2]["context"]
+        status, ev = SRV.stream("POST", f"/v1/sessions/{sid}/turn", {"text": "x " * (ctx + 64), "max_tokens": 8})
         self.assertEqual(status, 200)
         self.assertEqual([e[1] for e in ev][-1], "done")
         self.assertEqual(ev[-1][2]["stop"], "context_full", ev[-1])
@@ -468,7 +471,7 @@ class ToolCalls(unittest.TestCase):
         status, ev2 = SRV.stream("POST", f"/v1/sessions/{sid}/continue",
                                  {"results": [{"id": c["id"], "content": "hello world\n"} for c in calls],
                                   "max_tokens": 256})
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 200, ev2)
         self.assertEqual(ev2[0][2]["from"], "live")
         self.assertIn(ev2[-1][2]["stop"], ("end_turn", "tool_calls", "length"))
 

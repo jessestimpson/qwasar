@@ -197,13 +197,15 @@ Anthropic specs (Python standard library only; `QWASAR_SERVER_URL` targets a
 running one). With the `openai` or `anthropic` package installed, the official
 clients are exercised too.
 
-### In the menu bar
+### The app
 
-`menubar/` builds **Qwasar Server.app**, which runs the server and shows in the
-menu bar whether its port is open:
+`app/` builds **Qwasar.app**: a menu bar item that runs the server and shows
+whether its port is open, and the coding agent's window (**Open Coding
+Agent** in its menu), which talks to that server over the Session API and
+runs the agent's tools in a VM — see [app/README.md](app/README.md).
 
 ```
-cd menubar && make run        # or: make install, to copy it to /Applications
+cd app && make guest && make run
 ```
 
 The icon is read from the socket itself, probed once a second, rather than

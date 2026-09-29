@@ -25,6 +25,11 @@ void str_json(str *s, const char *t, size_t n);
 void str_jsons(str *s, const char *t);
 /* Re-serialises a parsed node as JSON. */
 void str_node(str *s, const qj_doc *d, const qj_node *n);
+/* A NUL-terminated copy of a string node, or NULL for anything else.
+ * qj_str() points into the document and is NOT terminated -- the parser
+ * unescapes in place and leaves the closing quote behind -- so a node used
+ * as a C string goes through this.  Caller frees. */
+char *qj_strdup(const qj_doc *d, const qj_node *n);
 
 /* ---- a connection ---------------------------------------------------------- */
 

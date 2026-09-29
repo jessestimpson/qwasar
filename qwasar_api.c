@@ -91,7 +91,7 @@ static void handle_server(qw_store *st, conn *c) {
 static void handle_open(qw_store *st, conn *c, const qj_doc *d) {
     const qj_node *root = qj_root(d);
     if (!root || root->type != QJ_OBJECT) { api_error(c, 400, "bad_request", "the body must be a JSON object"); return; }
-    const char *system = qj_str(d, qj_get(d, root, "system"));
+    char *system = qj_strdup(d, qj_get(d, root, "system"));
     const qj_node *tools = qj_get(d, root, "tools");
     if (tools && tools->type != QJ_ARRAY) { api_error(c, 400, "bad_request", "tools must be an array"); return; }
     const int32_t n_tools = (int32_t)qj_count(tools);
@@ -118,6 +118,7 @@ static void handle_open(qw_store *st, conn *c, const qj_doc *d) {
                                        thinking, effort, meta.p, err, sizeof err);
     for (int32_t i = 0; i < k; i++) str_free(&tool_text[i]);
     str_free(&meta);
+    free(system);
     if (!s) { api_error(c, 400, "bad_request", err); return; }
 
     qw_sess_info i;
@@ -163,7 +164,8 @@ static void handle_turn(qw_store *st, qw_sess *s, conn *c, const qj_doc *d) {
     if (!root || root->type != QJ_OBJECT) { api_error(c, 400, "bad_request", "the body must be a JSON object"); return; }
     qw_turn t;
     memset(&t, 0, sizeof t);
-    t.text = qj_str(d, qj_get(d, root, "text"));
+    char *text = qj_strdup(d, qj_get(d, root, "text"));
+    t.text = text;
     read_sampling(d, root, &t.sampling);
     t.max_tokens = (int32_t)qj_int_or(d, root, "max_tokens", 0);
 
@@ -200,6 +202,7 @@ static void handle_turn(qw_store *st, qw_sess *s, conn *c, const qj_doc *d) {
     }
 out:
     for (int32_t i = 0; i < n_att; i++) free(raw[i]);
+    free(text);
 }
 
 static void handle_continue(qw_store *st, qw_sess *s, conn *c, const qj_doc *d) {
@@ -208,15 +211,19 @@ static void handle_continue(qw_store *st, qw_sess *s, conn *c, const qj_doc *d) 
     const qj_node *results = qj_get(d, root, "results");
     if (!results || results->type != QJ_ARRAY) { api_error(c, 400, "bad_request", "results must be an array"); return; }
     qw_tool_result rs[QW_MAX_CALLS];
+    char *owned[QW_MAX_CALLS * 2] = { 0 };
     int n = 0;
-    for (const qj_node *r = qj_first(d, results); r; r = qj_next(d, r)) {
-        if (n >= QW_MAX_CALLS) { api_error(c, 400, "bad_request", "too many results"); return; }
-        rs[n].id = qj_str(d, qj_get(d, r, "id"));
-        rs[n].content = qj_str(d, qj_get(d, r, "content"));
-        if (!rs[n].id) { api_error(c, 400, "bad_request", "each result needs the call's id"); return; }
-        if (!rs[n].content) rs[n].content = "";
+    bool bad = false;
+    for (const qj_node *r = qj_first(d, results); r && !bad; r = qj_next(d, r)) {
+        if (n >= QW_MAX_CALLS) { api_error(c, 400, "bad_request", "too many results"); bad = true; break; }
+        owned[2 * n] = qj_strdup(d, qj_get(d, r, "id"));
+        owned[2 * n + 1] = qj_strdup(d, qj_get(d, r, "content"));
+        rs[n].id = owned[2 * n];
+        rs[n].content = owned[2 * n + 1] ? owned[2 * n + 1] : "";
+        if (!rs[n].id) { api_error(c, 400, "bad_request", "each result needs the call's id"); bad = true; break; }
         n++;
     }
+    if (bad) { for (int i = 0; i < 2 * QW_MAX_CALLS; i++) free(owned[i]); return; }
     qwasar_sampling sp;
     read_sampling(d, root, &sp);
     const int32_t max_tokens = (int32_t)qj_int_or(d, root, "max_tokens", 0);
@@ -227,6 +234,7 @@ static void handle_continue(qw_store *st, qw_sess *s, conn *c, const qj_doc *d) 
     if (!qw_sess_continue(st, s, rs, n, &sp, max_tokens, emit_sse, &k, &status, err, sizeof err))
         api_error(c, status, status == 409 ? "conflict" : "bad_request", err);
     sink_close(&k);
+    for (int i = 0; i < 2 * QW_MAX_CALLS; i++) free(owned[i]);
 }
 
 /* ---- routing ---------------------------------------------------------------------- */

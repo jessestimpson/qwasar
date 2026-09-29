@@ -32,7 +32,7 @@ all: qwasar qwasar-agent qwasar-server
 help:
 	@echo "qwasar build targets:"
 	@echo "  make          build ./qwasar, ./qwasar-agent and ./qwasar-server"
-	@echo "  make libqwasar.a  static library for embedders (crucible/)"
+	@echo "  make libqwasar.a  static library for embedders"
 	@echo "  make test     build and run tests"
 	@echo "  make test-api  start ./qwasar-server and check its APIs: the Session API (API.md), OpenAI, Anthropic"
 	@echo "  make test-api-toy  the Session API suite on the toy fixture (seconds, no real model)"
@@ -51,7 +51,7 @@ qwasar-server: qwasar_server.o qwasar_api.o qwasar_sessions.o qwasar_profile.o q
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 # The engine as a static library, for embedders that are not one of the three
-# front ends -- currently the Crucible macOS app under crucible/, which links it
+# front ends -- currently the Qwasar app under app/ used to link it; it now talks to the server
 # into an .app and calls qwasar.h from Swift.  Deliberately CORE_OBJS only: the
 # CLI, agent, server, TUI and linenoise objects are front ends, and an embedder
 # pulling one in has made a mistake rather than found a dependency.

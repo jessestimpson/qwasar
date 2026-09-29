@@ -432,7 +432,7 @@ static qw_sess *sess_load(qw_store *st, const char *id) {
     snprintf(s->id, sizeof s->id, "%s", id);
     s->created = qj_int_or(&d, root, "created", 0);
     qj_str_copy(&d, root, "model_id", s->model_id, sizeof s->model_id);
-    s->system = xstrdup(qj_str(&d, qj_get(&d, root, "system")));
+    s->system = qj_strdup(&d, qj_get(&d, root, "system"));
     if (!s->system) s->system = xstrdup("");
     s->thinking = qj_bool_or(&d, root, "thinking", true);
     if (!qj_str_copy(&d, root, "effort", s->effort, sizeof s->effort)) snprintf(s->effort, sizeof s->effort, "xhigh");

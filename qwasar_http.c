@@ -468,6 +468,15 @@ bool read_request(conn *c, str *carry, http_req *r, str *body) {
     return true;
 }
 
+char *qj_strdup(const qj_doc *d, const qj_node *n) {
+    if (!n || n->type != QJ_STRING) return NULL;
+    char *p = malloc((size_t)n->u.str.len + 1);
+    if (!p) return NULL;
+    memcpy(p, d->text + n->u.str.off, n->u.str.len);
+    p[n->u.str.len] = 0;
+    return p;
+}
+
 /* ---- the client side ---------------------------------------------------------- */
 
 char *b64_encode(const unsigned char *src, size_t n) {

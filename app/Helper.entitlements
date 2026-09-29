@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- qwasar-server, as the app's helper (PLAN-qwasar.md 4.2).  A child
+         with `inherit` runs inside its parent's sandbox, including the
+         extensions the parent holds: the model folder the user granted
+         once, which the server mmaps.  It listens on loopback, which is the
+         app's network.server entitlement, inherited with the rest. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <key>com.apple.security.inherit</key>
+    <true/>
+</dict>
+</plist>

@@ -30,21 +30,20 @@ reference/
 
 # Crucible app build products
 libqwasar.a
-crucible/build/
+app/build/
 
 # Generated from vendor/highlight.js/{core.min.js,langs/} by its build.sh.
 # The pieces are vendored and reviewable; the concatenation is not committed,
 # for the same reason qwasar_metal_src.inc is not.
-crucible/vendor/highlight.js/highlight.bundle.js
+app/vendor/highlight.js/highlight.bundle.js
 
 # Elixir build artefacts. The guest image is built in Docker, which fetches
 # deps itself; these only appear when the warden suites are run on the host.
 # mix.lock is NOT ignored -- it pins what Docker resolves.
-crucible/Guest/warden/_build/
-crucible/Guest/warden/deps/
+app/Guest/warden/_build/
+app/Guest/warden/deps/
 
 # Menu bar app build products
-menubar/build/
 
 # Flash-Next dev tooling: the oracle venv and the regenerable toy fixtures
 tools/venv/
