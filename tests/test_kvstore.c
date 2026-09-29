@@ -112,6 +112,85 @@ static void check_rewind(qwasar_engine *e, int32_t vocab) {
     free(q); free(gen); free(bad); free(ref);
 }
 
+/* Explicit-path checkpoints (qwasar_session_save_file / _restore_file /
+ * qwasar_kv_probe_file), as the server's store parks a session: a file the
+ * caller names, in no cache, with no floor and no eviction.  Held to the same
+ * bar as the cache: a restored session continues bit-identically, and
+ * anything that is not exactly a prefix of this session is refused. */
+static void check_files(qwasar_engine *e, int32_t vocab, const char *home) {
+#define TOK(x) ((int32_t)((x) % vocab))
+    char err[512], path[1024];
+    snprintf(path, sizeof path, "%s/parked.qwkv", home);
+    uint64_t cache_before = 0;
+    int entries_before = 0;
+    qwasar_kv_cache_stats(&cache_before, &entries_before);
+
+    const int32_t n = 300, probe = TOK(777);
+    int32_t *tok = malloc((size_t)(n + 1) * sizeof *tok);
+    for (int32_t i = 0; i < n; i++) tok[i] = TOK(3000 + (i * 104729) % 50000);
+    tok[n] = probe;
+
+    qwasar_session *a = qwasar_session_new(e, err, sizeof err);
+    CHECK(a && qwasar_session_eval(a, tok, n, err, sizeof err), "eval: %s", err);
+    CHECK(qwasar_session_save_file(a, e, path, err, sizeof err), "save_file: %s", err);
+    const float *la = qwasar_session_eval(a, &probe, 1, err, sizeof err);
+    float *ref = malloc((size_t)vocab * sizeof *ref);
+    if (la) memcpy(ref, la, (size_t)vocab * sizeof *ref);
+
+    uint64_t cache_after = 0;
+    int entries_after = 0;
+    qwasar_kv_cache_stats(&cache_after, &entries_after);
+    CHECK(entries_after == entries_before && cache_after == cache_before,
+          "save_file touched the cache (%d -> %d entries)", entries_before, entries_after);
+    struct stat st;
+    CHECK(stat(path, &st) == 0, "no file at %s", path);
+
+    /* The probe predicts the restore; a restored session continues exactly. */
+    CHECK(qwasar_kv_probe_file(e, path, tok, n + 1) == n, "probe_file did not cover the prefix");
+    qwasar_session *b = qwasar_session_new(e, err, sizeof err);
+    CHECK(qwasar_session_restore_file(b, e, path, tok, n + 1) == n, "restore_file did not restore %d", n);
+    CHECK(qwasar_session_n_past(b) == n, "restored n_past %d", qwasar_session_n_past(b));
+    const float *lb = qwasar_session_eval(b, &probe, 1, err, sizeof err);
+    CHECK(lb != NULL, "eval after restore_file: %s", err);
+    if (lb && la) {
+        const double d = rel_l2(lb, ref, (size_t)vocab);
+        CHECK(d == 0.0, "logits differ after restore_file: rel l2 %.3g", d);
+        printf("  explicit-path checkpoint: %.0f MB, continuation rel l2 %.1e\n",
+               (double)st.st_size / 1e6, d);
+    }
+
+    /* Refusals: a different prefix, a shorter history, a session that is not
+     * fresh, a missing file, a truncated file. */
+    int32_t *alt = malloc((size_t)n * sizeof *alt);
+    memcpy(alt, tok, (size_t)n * sizeof *alt);
+    alt[n - 1] = TOK(alt[n - 1] + 1);
+    qwasar_session *c = qwasar_session_new(e, err, sizeof err);
+    CHECK(qwasar_session_restore_file(c, e, path, alt, n) == 0, "restored a different prefix");
+    CHECK(qwasar_kv_probe_file(e, path, alt, n) == 0, "probed a different prefix");
+    CHECK(qwasar_session_restore_file(c, e, path, tok, n - 1) == 0, "restored into a shorter history");
+    CHECK(qwasar_session_n_past(c) == 0, "a refused restore touched the session");
+    CHECK(qwasar_session_restore_file(b, e, path, tok, n + 1) == 0, "restored into a session that is not fresh");
+    char missing[1100];
+    snprintf(missing, sizeof missing, "%s/nothing-here.qwkv", home);
+    CHECK(qwasar_session_restore_file(c, e, missing, tok, n) == 0, "restored a missing file");
+    if (truncate(path, (off_t)(st.st_size / 2)) == 0)
+        CHECK(qwasar_session_restore_file(c, e, path, tok, n) == 0, "restored a truncated file");
+
+    /* No floor: a session far under the cache's 256-token minimum parks. */
+    const int32_t m = 40;
+    qwasar_session *s = qwasar_session_new(e, err, sizeof err);
+    CHECK(s && qwasar_session_eval(s, tok, m, err, sizeof err), "eval short: %s", err);
+    CHECK(qwasar_session_save_file(s, e, path, err, sizeof err), "save_file short: %s", err);
+    qwasar_session *r = qwasar_session_new(e, err, sizeof err);
+    CHECK(qwasar_session_restore_file(r, e, path, tok, n) == m, "short restore did not cover %d", m);
+
+    unlink(path);
+    qwasar_session_free(a); qwasar_session_free(b); qwasar_session_free(c);
+    qwasar_session_free(s); qwasar_session_free(r);
+    free(tok); free(alt); free(ref);
+#undef TOK
+}
+
 /* The whole round trip against one model, in a private HOME. */
 static int check_model(const char *model) {
     printf("== %s\n", model);
@@ -233,6 +312,7 @@ static int check_model(const char *model) {
     }
 
     check_rewind(e, vocab);
+    check_files(e, vocab, home);
 
     free(prompt); free(longer); free(altered); free(ref);
     qwasar_session_free(a);

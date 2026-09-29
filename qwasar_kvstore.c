@@ -189,23 +189,20 @@ static void qw_kv_evict(const char *dir, uint64_t budget) {
 
 /* ---- save ------------------------------------------------------------------- */
 
-bool qwasar_session_save(qwasar_session *s, const qwasar_engine *e,
-                         char *err, size_t errcap) {
+/* Writes the session to `path` (a temporary and a rename, so a checkpoint is
+ * either complete or absent -- a half-written one would restore silently
+ * corrupt state) and returns its header.  No floor, no eviction: those are
+ * the LRU store's policy, not the format's. */
+static bool qw_kv_write(qwasar_session *s, const qwasar_engine *e, const char *path,
+                        qw_kv_header *out, char *err, size_t errcap) {
     int32_t n = 0;
     const int32_t *tokens = qw_session_history(s, &n);
-    if (!tokens || n < QW_KV_MIN_TOKENS) {
-        snprintf(err, errcap, "nothing worth saving (%d tokens, minimum %d)",
-                 n, QW_KV_MIN_TOKENS);
+    if (!tokens || n <= 0) {
+        snprintf(err, errcap, "the session has evaluated nothing");
         return false;
     }
     if (n != qwasar_session_n_past(s)) {
         snprintf(err, errcap, "session history and cache position disagree");
-        return false;
-    }
-
-    char dir[1024];
-    if (!qw_kv_dir(dir, sizeof dir)) {
-        snprintf(err, errcap, "cannot create the cache directory");
         return false;
     }
 
@@ -231,12 +228,8 @@ bool qwasar_session_save(qwasar_session *s, const qwasar_engine *e,
         return false;
     }
 
-    char path[1200], tmp[1264];
-    snprintf(path, sizeof path, "%s/%016llx.qwkv", dir, (unsigned long long)h.token_hash);
+    char tmp[1300];
     snprintf(tmp, sizeof tmp, "%s.tmp%d", path, (int)getpid());
-
-    /* Written to a temporary and renamed, so a checkpoint is either complete or
-     * absent -- a half-written one would restore silently corrupt state. */
     FILE *f = fopen(tmp, "wb");
     if (!f) {
         free(payload);
@@ -254,9 +247,39 @@ bool qwasar_session_save(qwasar_session *s, const qwasar_engine *e,
         snprintf(err, errcap, "cannot write %s: %s", path, strerror(errno));
         return false;
     }
+    if (out) *out = h;
+    return true;
+}
+
+bool qwasar_session_save(qwasar_session *s, const qwasar_engine *e,
+                         char *err, size_t errcap) {
+    int32_t n = 0;
+    const int32_t *tokens = qw_session_history(s, &n);
+    if (!tokens || n < QW_KV_MIN_TOKENS) {
+        snprintf(err, errcap, "nothing worth saving (%d tokens, minimum %d)",
+                 n, QW_KV_MIN_TOKENS);
+        return false;
+    }
+
+    char dir[1024];
+    if (!qw_kv_dir(dir, sizeof dir)) {
+        snprintf(err, errcap, "cannot create the cache directory");
+        return false;
+    }
+    const uint64_t hash = qw_fnv64(tokens, (size_t)n * sizeof *tokens,
+                                   qw_model_id(qwasar_engine_config(e)));
+    char path[1200];
+    snprintf(path, sizeof path, "%s/%016llx.qwkv", dir, (unsigned long long)hash);
+    if (!qw_kv_write(s, e, path, NULL, err, errcap)) return false;
 
     qw_kv_evict(dir, QW_KV_DEFAULT_BUDGET);
     return true;
+}
+
+bool qwasar_session_save_file(qwasar_session *s, const qwasar_engine *e,
+                              const char *path, char *err, size_t errcap) {
+    if (!path || !*path) { snprintf(err, errcap, "no path"); return false; }
+    return qw_kv_write(s, e, path, NULL, err, errcap);
 }
 
 /* ---- restore ---------------------------------------------------------------- */
@@ -300,6 +323,21 @@ static int32_t qw_kv_try(const char *path, const qw_kv_header *want,
     *out = h;
     *out_f = f;
     return (int32_t)h.n_tokens;
+}
+
+/* Validates `path` against `want` and `tokens` (qw_kv_try) and unpacks it into
+ * `s`.  Returns the tokens covered, or 0 with the session untouched. */
+static int32_t qw_kv_load(qwasar_session *s, const char *path, const qw_kv_header *want,
+                          const int32_t *tokens, int32_t n, qw_kv_header *h) {
+    FILE *f = NULL;
+    const int32_t got = qw_kv_try(path, want, tokens, n, h, &f);
+    if (got <= 0 || !f) { if (f) fclose(f); return 0; }
+    void *payload = malloc(h->payload_bytes);
+    bool ok = payload && fread(payload, 1, h->payload_bytes, f) == h->payload_bytes;
+    fclose(f);
+    if (ok) ok = qw_session_unpack(s, payload, h->payload_bytes, tokens, got);
+    free(payload);
+    return ok ? got : 0;
 }
 
 /* How many leading tokens of `tokens` a checkpoint on disk covers, without
@@ -376,18 +414,7 @@ int32_t qwasar_session_restore(qwasar_session *s, const qwasar_engine *e,
     if (best_n == 0) return 0;
 
     qw_kv_header h;
-    FILE *f = NULL;
-    if (qw_kv_try(best_path, &want, tokens, n, &h, &f) != best_n || !f) {
-        if (f) fclose(f);
-        return 0;
-    }
-
-    void *payload = malloc(h.payload_bytes);
-    bool ok = payload && fread(payload, 1, h.payload_bytes, f) == h.payload_bytes;
-    fclose(f);
-    if (ok) ok = qw_session_unpack(s, payload, h.payload_bytes, tokens, best_n);
-    free(payload);
-    if (!ok) return 0;
+    if (qw_kv_load(s, best_path, &want, tokens, n, &h) != best_n) return 0;
 
     /* Record the hit in place; the header is fixed-size and at offset zero. */
     FILE *up = fopen(best_path, "r+b");
@@ -398,6 +425,32 @@ int32_t qwasar_session_restore(qwasar_session *s, const qwasar_engine *e,
         fclose(up);
     }
     return best_n;
+}
+
+/* The header a checkpoint of this engine must carry. */
+static void qw_kv_want(const qwasar_engine *e, qw_kv_header *want) {
+    memset(want, 0, sizeof *want);
+    want->model_id = qw_model_id(qwasar_engine_config(e));
+    qw_fill_dims(qwasar_engine_config(e), qwasar_engine_shape(e), want->dims);
+}
+
+int32_t qwasar_session_restore_file(qwasar_session *s, const qwasar_engine *e,
+                                    const char *path, const int32_t *tokens, int32_t n) {
+    if (!path || !tokens || n <= 0 || qwasar_session_n_past(s) != 0) return 0;
+    qw_kv_header want, h;
+    qw_kv_want(e, &want);
+    return qw_kv_load(s, path, &want, tokens, n, &h);
+}
+
+int32_t qwasar_kv_probe_file(const qwasar_engine *e, const char *path,
+                             const int32_t *tokens, int32_t n) {
+    if (!path || !tokens || n <= 0) return 0;
+    qw_kv_header want, h;
+    qw_kv_want(e, &want);
+    FILE *f = NULL;
+    const int32_t got = qw_kv_try(path, &want, tokens, n, &h, &f);
+    if (f) fclose(f);
+    return got;
 }
 
 void qwasar_kv_cache_stats(uint64_t *bytes, int *entries) {

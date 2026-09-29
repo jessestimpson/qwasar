@@ -374,6 +374,24 @@ int32_t qwasar_session_restore(qwasar_session *s, const qwasar_engine *e,
                                const int32_t *tokens, int32_t n);
 void    qwasar_kv_cache_stats(uint64_t *bytes, int *entries);
 
+/* Explicit-path checkpoints, for a caller that owns the file's lifetime --
+ * the server's session store parking a session.  The same format, header
+ * check and stored-token comparison as the cache above; what differs is that
+ * the caller names the file and deletes it.  No eviction and no minimum
+ * length: a parked session's state is the caller's to keep, and at a large
+ * context it is bigger than the whole cache's budget.
+ *
+ * save_file writes atomically (a temporary and a rename).  restore_file fills
+ * a *fresh* session from `path` when the file's tokens are a prefix of
+ * `tokens`, returning how many it covered, else 0 and the session untouched.
+ * probe_file is restore_file's check without the load. */
+bool    qwasar_session_save_file(qwasar_session *s, const qwasar_engine *e,
+                                 const char *path, char *err, size_t errcap);
+int32_t qwasar_session_restore_file(qwasar_session *s, const qwasar_engine *e,
+                                    const char *path, const int32_t *tokens, int32_t n);
+int32_t qwasar_kv_probe_file(const qwasar_engine *e, const char *path,
+                             const int32_t *tokens, int32_t n);
+
 /* How many leading tokens of `tokens` a checkpoint on disk covers RIGHT NOW,
  * without loading it: qwasar_session_restore's own scan and validation, minus
  * the unpack.  For a UI that claims "resumes from checkpoint" only when the
