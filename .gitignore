@@ -1,8 +1,8 @@
 # build outputs
-qwasar
-qwasar-agent
-qwasar-server
-qwasar-bench
+/qwasar
+/qwasar-agent
+/qwasar-server
+/qwasar-bench
 *.o
 *.dSYM/
 tools/bin2c
