@@ -424,20 +424,31 @@ class Steps(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(STATE, "sessions", sid)))
 
     def test_turn_while_running_is_409(self):
-        sid = SRV.open()
-        got = []
-        t = threading.Thread(target=lambda: got.append(
-            SRV.stream("POST", f"/v1/sessions/{sid}/turn", {"text": "go", "max_tokens": 0})))
-        t.start()
-        for _ in range(200):
-            if SRV.request("GET", f"/v1/sessions/{sid}")[2]["state"] in ("running", "queued"):
-                break
-            time.sleep(0.02)
-        status, _, r = SRV.request("POST", f"/v1/sessions/{sid}/turn", {"text": "again"})
-        SRV.request("POST", f"/v1/sessions/{sid}/cancel")
-        t.join(60)
-        self.assertEqual(status, 409, r)
-
+        # On a toy a whole step takes about a second, so the step can end
+        # between seeing it run and sending the second turn -- and then 200
+        # is the right answer (the server refuses a turn only while a step is
+        # queued or running).  So: a few fresh attempts, and at least one must
+        # land while the first step runs and be refused.
+        statuses = []
+        for _ in range(5):
+            sid = SRV.open()
+            got = []
+            t = threading.Thread(target=lambda: got.append(
+                SRV.stream("POST", f"/v1/sessions/{sid}/turn", {"text": "go", "max_tokens": 0})))
+            t.start()
+            for _ in range(200):
+                if SRV.request("GET", f"/v1/sessions/{sid}")[2]["state"] in ("running", "queued"):
+                    break
+                time.sleep(0.01)
+            status, _, r = SRV.request("POST", f"/v1/sessions/{sid}/turn", {"text": "again", "max_tokens": 4})
+            SRV.request("POST", f"/v1/sessions/{sid}/cancel")
+            t.join(60)
+            statuses.append(status)
+            self.assertIn(status, (409, 200), r)
+            if status == 409:
+                self.assertEqual(r["error"]["code"], "conflict")
+                return
+        self.fail(f"never caught a step running: {statuses}")
 
 class Compat(unittest.TestCase):
     def test_completions_share_the_engine(self):
@@ -526,7 +537,13 @@ class Agent(unittest.TestCase):
     def test_refuses_without_a_server_or_model(self):
         env = dict(os.environ, HOME=HOME)
         env.pop("QWASAR_MODEL", None)
-        p = subprocess.run([AGENT, "--server", f"http://127.0.0.1:{free_port()}", "hi"], cwd=HOME, env=env,
+        # A copy of the binary in a directory of its own: the agent also
+        # looks for a qwasar-model link beside itself, and a checkout that
+        # has run download_model.sh has one -- the test would then start a
+        # real server on the real model instead of testing the refusal.
+        lone = os.path.join(tempfile.mkdtemp(prefix="lone-agent-", dir=HOME), "qwasar-agent")
+        shutil.copy2(AGENT, lone)
+        p = subprocess.run([lone, "--server", f"http://127.0.0.1:{free_port()}", "hi"], cwd=HOME, env=env,
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
         self.assertEqual(p.returncode, 1)
         self.assertIn("nothing is listening", p.stdout.decode(errors="replace"))

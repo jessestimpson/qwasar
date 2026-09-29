@@ -135,12 +135,21 @@ static void handle_open(qw_store *st, conn *c, const qj_doc *d) {
 
 /* The stream is begun by its first event, not before the step is admitted:
  * a refusal is an ordinary HTTP status (API.md §3), not an event. */
-typedef struct { conn *c; bool begun; } sse_sink;
+typedef struct { conn *c; bool begun; bool lost; } sse_sink;
 
 static bool emit_sse(void *ud, const char *id, const char *event, const char *json) {
     sse_sink *k = ud;
     if (!k->begun) { sse_begin(k->c); k->begun = true; }
     sse_event_id(k->c, id, event, json);
+    /* Logged whether or not -v: a client that stops hearing a step is the
+     * one failure it cannot report itself.  The step goes on regardless, and
+     * its events stay buffered for GET .../events with Last-Event-ID. */
+    if (k->c->dead && !k->lost) {
+        k->lost = true;
+        qw_log("  the stream to the client was lost at event %s (%s): %s; "
+               "the step continues, and its events can be reattached",
+               id ? id : "?", event, k->c->err ? strerror(k->c->err) : "peer closed");
+    }
     return !k->c->dead;
 }
 
@@ -195,7 +204,7 @@ static void handle_turn(qw_store *st, qw_sess *s, conn *c, const qj_doc *d) {
     {
         int status = 400;
         char err[512] = "";
-        sse_sink k = { c, false };
+        sse_sink k = { c, false, false };
         if (!qw_sess_turn(st, s, &t, emit_sse, &k, &status, err, sizeof err))
             api_error(c, status, status == 409 ? "conflict" : "bad_request", err);
         sink_close(&k);
@@ -230,7 +239,7 @@ static void handle_continue(qw_store *st, qw_sess *s, conn *c, const qj_doc *d) 
 
     int status = 400;
     char err[512] = "";
-    sse_sink k = { c, false };
+    sse_sink k = { c, false, false };
     if (!qw_sess_continue(st, s, rs, n, &sp, max_tokens, emit_sse, &k, &status, err, sizeof err))
         api_error(c, status, status == 409 ? "conflict" : "bad_request", err);
     sink_close(&k);
@@ -308,7 +317,7 @@ bool qw_api_handle(qw_store *st, conn *c, const http_req *r, const str *body) {
 
     const bool post = !strcmp(r->method, "POST");
     if (!strcmp(verb, "events") && !strcmp(r->method, "GET")) {
-        sse_sink k = { c, false };
+        sse_sink k = { c, false, false };
         if (!qw_sess_reattach(st, s, r->last_event_id[0] ? r->last_event_id : NULL, emit_sse, &k))
             api_error(c, 404, "not_found", "no step to reattach to");
         sink_close(&k);

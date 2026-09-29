@@ -39,6 +39,7 @@ typedef struct {
     bool  streaming;   /* headers already sent, body is chunked */
     bool  dead;        /* the peer went away */
     bool  anthropic;   /* errors in Anthropic's envelope rather than OpenAI's */
+    int   err;         /* errno of the write that found the peer gone, or 0 */
 } conn;
 
 bool conn_write(conn *c, const char *data, size_t n);

@@ -131,6 +131,7 @@ bool conn_write(conn *c, const char *data, size_t n) {
         ssize_t w = write(c->fd, data, n);
         if (w <= 0) {
             if (errno == EINTR) continue;
+            c->err = w < 0 ? errno : EPIPE;
             c->dead = true;
             return false;
         }
