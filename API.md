@@ -113,6 +113,7 @@ POST   /v1/sessions/{id}/continue      tool results              -> stream
 GET    /v1/sessions/{id}/events        reattach to the step in flight -> stream
 POST   /v1/sessions/{id}/cancel        end the step at the next token
 POST   /v1/sessions/{id}/park          free the live slot, keep it warm
+DELETE /v1/sessions/{id}/checkpoint    give its disk back; it becomes cold, not gone
 DELETE /v1/sessions/{id}               forget it, state and log
 ```
 
@@ -135,7 +136,8 @@ What a client needs before opening anything.
   "capabilities": {"reasoning": true, "images": true, "video": true,
                    "speculation": false, "rewind": false, "fork": false},
   "sessions": {"total": 7, "live": 1, "queued": 0},
-  "state_dir": "/Users/…/Library/Application Support/Qwasar"
+  "state_dir": "/Users/…/Library/Application Support/Qwasar",
+  "disk": {"sessions_bytes": 7312000000, "cache_bytes": 412000000, "free_bytes": 812000000000}
 }
 ```
 
@@ -189,6 +191,7 @@ the same for every session of a project at a given effort.
  "tokens": 18335, "context": 262144, "prefix_tokens": 2214,
  "state": "idle",
  "warmth": {"state": "warm", "covered": 18335, "estimate_seconds": 2.1},
+ "checkpoint_bytes": 719000000,
  "last_step": {"stop": "tool_calls", "at": 1790000420,
                "pending_calls": [{"id": "c_1", "name": "read"}]}}
 ```
@@ -267,7 +270,17 @@ live slot freed; `describe` then reports `warm`. The one verb a user should
 ever see about the cache; everything else the server does on its own (§6).
 `200` with the new warmth, or `409` while a step is running.
 
-### 4.9 `DELETE /v1/sessions/{id}`
+### 4.9 `DELETE /v1/sessions/{id}/checkpoint`
+
+Deletes the session's own checkpoint and answers `{"freed_bytes": n}`. A
+parked session becomes `cold`: its timeline is intact, and the next step
+re-prefills whatever the shared prefix cache does not cover. A live session
+is unaffected until it is next parked, which writes the checkpoint again.
+`409` while a step runs. This is how a client gives disk back without losing
+a conversation; `checkpoint_bytes` on each session and `/v1/server`'s `disk`
+are what it decides by. The server never does this on its own.
+
+### 4.10 `DELETE /v1/sessions/{id}`
 
 Removes the session, its token log, its checkpoint and its events. `204`.
 The shared prefix checkpoint is not the session's and stays.
@@ -371,9 +384,14 @@ What a conforming server does with warmth, stated so a client can rely on it.
   near where it was rather than from the prefix.
 - **The token log is written after every step**, so a session survives a
   server restart at worst `cold`, never lost.
-- **Disk is budgeted.** Shared prefixes live in an LRU store; per-session
-  checkpoints belong to their session and go with it. A session whose
-  checkpoint was lost to the budget is `cold`, not gone.
+- **Disk is the client's to budget, and the server never spends a session's
+  state behind its back.** Shared prefixes live in an LRU store with a
+  budget of its own. A session's checkpoint is a file of its own, written
+  when it is parked (by request, by eviction from the live set, at shutdown)
+  and as a long conversation grows (each time it has grown by a quarter,
+  at least 4K tokens); nothing evicts it, and it goes when the session is
+  deleted or its checkpoint dropped (§4.9). A resume reads whichever of the
+  two covers more.
 
 ## 7. Two flows
 

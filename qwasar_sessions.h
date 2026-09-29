@@ -126,6 +126,7 @@ typedef struct {
     qw_sess_state   state;
     qw_warmth       warmth;
     int32_t         covered;       /* tokens the warmth covers */
+    uint64_t        checkpoint_bytes; /* the session's own checkpoint on disk, or 0 */
     double          estimate_s;    /* to resume: a read, or a re-prefill */
     const char     *last_stop;     /* NULL before the first step */
     int64_t         last_at;
@@ -196,6 +197,16 @@ bool qw_sess_cancel(qw_store *st, qw_sess *s);
 /* Checkpoints and frees the live handle.  False with `err` while a step
  * runs or when nothing could be written (the session is then cold). */
 bool qw_sess_park(qw_store *st, qw_sess *s, char *err, size_t errcap);
+/* Deletes the session's own checkpoint: a parked session becomes cold (its
+ * tokens stay, and a resume re-prefills what the shared cache does not
+ * cover); a live one is rewritten at its next park.  The one way disk used
+ * by sessions is given back short of deleting them, and never done by the
+ * server on its own.  False while a step runs. */
+bool qw_sess_drop_checkpoint(qw_store *st, qw_sess *s, uint64_t *freed, char *err, size_t errcap);
+/* Bytes in session checkpoints, in the shared prefix cache, and free on the
+ * volume that holds the state directory. */
+void qw_store_disk(qw_store *st, uint64_t *sessions_bytes, uint64_t *cache_bytes,
+                   uint64_t *free_bytes);
 /* Removes the session and everything on disk that is its own. */
 bool qw_store_delete(qw_store *st, qw_sess *s, char *err, size_t errcap);
 

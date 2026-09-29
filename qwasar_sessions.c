@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
@@ -84,6 +85,10 @@ struct qw_sess {
     qwasar_session *h;          /* live handle, or NULL */
     double   last_used;
     int32_t  ckpt_n;            /* tokens covered by the last checkpoint this run wrote */
+    /* Tokens the session's OWN checkpoint file covers, as far as this run
+     * knows -- kept apart from ckpt_n, which the shared cache can satisfy:
+     * a session whose state is only in the cache is one eviction from cold. */
+    int32_t  own_n;
     bool     compat;
 
     /* The step in flight: its events, for the connection and for reattach. */
@@ -202,6 +207,35 @@ static bool tokens_append(qw_sess *s, const int32_t *t, int32_t n) {
 
 static void sess_dir(const qw_store *st, const qw_sess *s, char *out, size_t cap) {
     snprintf(out, cap, "%s/sessions/%s", st->dir, s->id);
+}
+
+/* The session's own checkpoint: written when it is parked -- by request, by
+ * eviction, at shutdown -- and on a long conversation's growth; read on
+ * resume.  The session's to keep: nothing evicts it, and it goes when the
+ * session does or when its checkpoint is dropped (qw_sess_drop_checkpoint). */
+static void sess_ckpt_path(const qw_store *st, const qw_sess *s, char *out, size_t cap) {
+    snprintf(out, cap, "%s/sessions/%s/checkpoint.bin", st->dir, s->id);
+}
+
+static uint64_t file_bytes(const char *path) {
+    struct stat stt;
+    return stat(path, &stt) == 0 ? (uint64_t)stt.st_size : 0;
+}
+
+/* Writes the session's own checkpoint from its live handle. */
+static bool sess_save_own(qw_store *st, qw_sess *s, const char *why) {
+    char path[1400], dir[1300], err[256];
+    sess_dir(st, s, dir, sizeof dir);
+    if (!mkdir_p(dir)) return false;
+    sess_ckpt_path(st, s, path, sizeof path);
+    const double t0 = qw_now();
+    const bool saved = qwasar_session_save_file(s->h, st->e, path, err, sizeof err);
+    if (saved) s->ckpt_n = s->own_n = qwasar_session_n_past(s->h);
+    if (st->verbose || !saved)
+        qw_log("  %s: checkpoint (%s) at %d tokens, %.0f MB in %.2fs%s%s", s->id, why,
+               qwasar_session_n_past(s->h), file_bytes(path) / 1e6, qw_now() - t0,
+               saved ? "" : " -- NOT SAVED: ", saved ? "" : err);
+    return saved;
 }
 
 /* Writes `data` to `path` through a temporary, so a crash leaves the old
@@ -723,10 +757,16 @@ void qw_store_release(qw_store *st, qw_sess *s) { (void)s; engine_release(st); }
 static bool park_locked(qw_store *st, qw_sess *s, const char *why) {
     if (!s->h) return false;
     bool saved = false;
-    if (!st->no_cache) {
+    if (!st->no_cache && !s->compat) {
+        /* A named session parks to its own file, whatever its length: the
+         * state is the session's, and the shared cache's 6 GB budget would
+         * evict it -- or, at a large context, could not hold it at all. */
+        saved = s->own_n == qwasar_session_n_past(s->h) || sess_save_own(st, s, why);
+    } else if (!st->no_cache) {
         /* The compat session's next prompt repeats the last one but not
-         * necessarily the reply: its checkpoint is taken at the rewind point. */
-        if (s->compat) qwasar_session_rewind_to_mark(s->h);
+         * necessarily the reply: its checkpoint is taken at the rewind point,
+         * in the shared cache, since nothing owns an anonymous session. */
+        qwasar_session_rewind_to_mark(s->h);
         if (qwasar_session_n_past(s->h) >= 256) {
             char err[256];
             const double t0 = qw_now();
@@ -1285,8 +1325,22 @@ static bool resume(qw_store *st, qw_sess *s, int32_t n_new,
     const int32_t seq_n = s->n_tokens ? s->n_tokens : prefix_n;
     int32_t covered = 0;
     const double t0 = qw_now();
-    if (!st->no_cache && seq_n > 0)
-        covered = qwasar_session_restore(s->h, st->e, seq, seq_n);
+    if (!st->no_cache && seq_n > 0) {
+        /* Its own checkpoint, or the shared cache (which holds the prefix
+         * every session of it shares) -- whichever covers more.  Both are
+         * probed before either is read: a fresh handle takes one restore. */
+        char own[1400];
+        sess_ckpt_path(st, s, own, sizeof own);
+        const int32_t by_file = qwasar_kv_probe_file(st->e, own, seq, seq_n);
+        const int32_t by_cache = qwasar_kv_probe(st->e, seq, seq_n);
+        if (by_file >= by_cache && by_file > 0) {
+            covered = qwasar_session_restore_file(s->h, st->e, own, seq, seq_n);
+            s->own_n = covered;
+        } else if (by_cache > 0) {
+            covered = qwasar_session_restore(s->h, st->e, seq, seq_n);
+            s->own_n = by_file;
+        }
+    }
     const double dt = qw_now() - t0;
     if (covered > 0 && dt > 0) {
         const double bytes = 150e6 + (double)covered * (double)st->prof.kv_per_token;
@@ -1463,15 +1517,15 @@ static bool run_step(qw_store *st, qw_sess *s, int32_t *fresh, int32_t n_fresh,
         else stop = "length";
     }
 
-    /* A long conversation leaves a checkpoint every ~4K tokens past its last
-     * one, so a crash or an eviction costs at most that much re-prefill. */
-    if (ok && !st->no_cache && s->n_tokens - s->ckpt_n >= 4096) {
-        char e2[256];
-        const double t0 = qw_now();
-        if (qwasar_session_save(s->h, st->e, e2, sizeof e2)) {
-            s->ckpt_n = s->n_tokens;
-            if (st->verbose) qw_log("  %s: checkpoint at %d tokens in %.2fs", s->id, s->n_tokens, qw_now() - t0);
-        }
+    /* A long conversation leaves a checkpoint in its own file as it grows,
+     * so a crash costs a bounded re-prefill.  Spaced by a quarter of the
+     * conversation (at least 4K tokens) rather than every 4K: the file is
+     * rewritten whole, and at 200K tokens it is gigabytes -- a crash then
+     * costs at most a fifth of the conversation, and the writes stay few. */
+    if (ok && !st->no_cache) {
+        const int32_t grown = s->n_tokens - s->own_n;
+        const int32_t span = s->own_n / 4 > 4096 ? s->own_n / 4 : 4096;
+        if (grown >= span) sess_save_own(st, s, "growth");
     }
 
     pthread_mutex_lock(&st->lock);
@@ -1716,12 +1770,50 @@ bool qw_store_delete(qw_store *st, qw_sess *s, char *err, size_t errcap) {
     char dir[1300], path[1400];
     sess_dir(st, s, dir, sizeof dir);
     snprintf(path, sizeof path, "%s/tokens.bin", dir); unlink(path);
+    snprintf(path, sizeof path, "%s/checkpoint.bin", dir); unlink(path);
     snprintf(path, sizeof path, "%s/record.json", dir); unlink(path);
     rmdir(dir);
     /* The struct itself is kept: a list or describe on another thread may
      * still be reading it, and a session is a few hundred bytes plus its
      * token log.  Out of the list, it is unreachable from any request. */
     return true;
+}
+
+bool qw_sess_drop_checkpoint(qw_store *st, qw_sess *s, uint64_t *freed, char *err, size_t errcap) {
+    pthread_mutex_lock(&st->lock);
+    const bool busy = s->state == QW_SESS_QUEUED || s->state == QW_SESS_RUNNING;
+    pthread_mutex_unlock(&st->lock);
+    if (busy) { snprintf(err, errcap, "a step is running"); return false; }
+    char path[1400];
+    sess_ckpt_path(st, s, path, sizeof path);
+    *freed = file_bytes(path);
+    if (*freed && unlink(path) != 0) {
+        snprintf(err, errcap, "cannot remove %s: %s", path, strerror(errno));
+        return false;
+    }
+    /* A live session's state is in memory still; the next park writes it
+     * again.  A parked one is cold now -- its tokens are all still here. */
+    s->own_n = 0;
+    if (s->h) s->ckpt_n = 0;
+    if (st->verbose) qw_log("  %s: checkpoint dropped, %.0f MB freed", s->id, *freed / 1e6);
+    return true;
+}
+
+void qw_store_disk(qw_store *st, uint64_t *sessions_bytes, uint64_t *cache_bytes,
+                   uint64_t *free_bytes) {
+    uint64_t total = 0;
+    pthread_mutex_lock(&st->lock);
+    for (int i = 0; i < st->n_sess; i++) {
+        char path[1400];
+        sess_ckpt_path(st, st->sess[i], path, sizeof path);
+        total += file_bytes(path);
+    }
+    pthread_mutex_unlock(&st->lock);
+    *sessions_bytes = total;
+    int entries = 0;
+    qwasar_kv_cache_stats(cache_bytes, &entries);
+    struct statfs fs;
+    *free_bytes = statfs(st->dir, &fs) == 0 ? (uint64_t)fs.f_bavail * fs.f_bsize : 0;
 }
 
 void qw_sess_info_get(qw_store *st, qw_sess *s, qw_sess_info *out) {
@@ -1745,13 +1837,22 @@ void qw_sess_info_get(qw_store *st, qw_sess *s, qw_sess_info *out) {
     pthread_mutex_unlock(&st->lock);
 
     if (live) {
+        char own[1400];
+        sess_ckpt_path(st, s, own, sizeof own);
+        out->checkpoint_bytes = file_bytes(own);
         out->warmth = QW_WARMTH_LIVE;
         out->covered = s->n_tokens;
         return;
     }
     int32_t covered = 0;
-    if (!st->no_cache && s->n_tokens > 0)
-        covered = qwasar_kv_probe(st->e, s->tokens, s->n_tokens);
+    char own[1400];
+    sess_ckpt_path(st, s, own, sizeof own);
+    out->checkpoint_bytes = file_bytes(own);
+    if (!st->no_cache && s->n_tokens > 0) {
+        const int32_t by_file = qwasar_kv_probe_file(st->e, own, s->tokens, s->n_tokens);
+        const int32_t by_cache = qwasar_kv_probe(st->e, s->tokens, s->n_tokens);
+        covered = by_file > by_cache ? by_file : by_cache;
+    }
     out->covered = covered;
     out->warmth = covered > 0 ? QW_WARMTH_WARM : QW_WARMTH_COLD;
     const double read_s = covered > 0
@@ -1915,7 +2016,7 @@ void qw_store_shutdown(qw_store *st) {
         for (int i = 0; i < st->n_sess; i++) {
             qw_sess *s = st->sess[i];
             if (!s->h) continue;
-            if (s->n_tokens - s->ckpt_n > 0) park_locked(st, s, "shutdown");
+            if (s->n_tokens - s->own_n > 0) park_locked(st, s, "shutdown");
             else { qwasar_session_free(s->h); s->h = NULL; }
             char err[256];
             sess_persist(st, s, err, sizeof err);

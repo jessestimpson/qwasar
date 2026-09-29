@@ -450,6 +450,86 @@ class Steps(unittest.TestCase):
                 return
         self.fail(f"never caught a step running: {statuses}")
 
+class Parking(unittest.TestCase):
+    """M4: a session parks to a checkpoint of its own (sessions/<id>/
+    checkpoint.bin), which nothing evicts -- not the shared prefix cache,
+    whose budget a large session would overflow."""
+
+    def own(self, sid):
+        return os.path.join(STATE, "sessions", sid, "checkpoint.bin")
+
+    def wipe_shared_cache(self):
+        shutil.rmtree(os.path.join(HOME, ".cache", "qwasar", "kv"), ignore_errors=True)
+
+    def test_park_writes_its_own_file_and_resumes_from_it(self):
+        sid = SRV.open()
+        SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="park me"))
+        n = SRV.request("GET", f"/v1/sessions/{sid}")[2]["tokens"]
+        status, _, r = SRV.request("POST", f"/v1/sessions/{sid}/park")
+        self.assertEqual(status, 200, r)
+        self.assertTrue(os.path.exists(self.own(sid)), "no checkpoint.bin after park")
+        size = os.path.getsize(self.own(sid))
+        d = SRV.request("GET", f"/v1/sessions/{sid}")[2]
+        self.assertEqual(d["checkpoint_bytes"], size)
+        self.assertEqual(d["warmth"], {**d["warmth"], "state": "warm", "covered": n})
+        # The shared cache gone -- as its LRU would do to a big session --
+        # the session is still warm, and resumes from its own file.
+        self.wipe_shared_cache()
+        d = SRV.request("GET", f"/v1/sessions/{sid}")[2]
+        self.assertEqual(d["warmth"]["state"], "warm", d)
+        self.assertEqual(d["warmth"]["covered"], n)
+        status, ev = SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="back"))
+        resume = ev[0][2]
+        self.assertEqual((resume["from"], resume["restored"]), ("checkpoint", n), resume)
+
+    def test_drop_checkpoint_makes_it_cold_not_gone(self):
+        sid = SRV.open()
+        SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="drop me"))
+        n = SRV.request("GET", f"/v1/sessions/{sid}")[2]["tokens"]
+        SRV.request("POST", f"/v1/sessions/{sid}/park")
+        size = os.path.getsize(self.own(sid))
+        status, _, r = SRV.request("DELETE", f"/v1/sessions/{sid}/checkpoint")
+        self.assertEqual(status, 200, r)
+        self.assertEqual(r["freed_bytes"], size)
+        self.assertFalse(os.path.exists(self.own(sid)))
+        self.wipe_shared_cache()
+        d = SRV.request("GET", f"/v1/sessions/{sid}")[2]
+        self.assertEqual((d["warmth"]["state"], d["tokens"], d["checkpoint_bytes"]), ("cold", n, 0), d)
+        # Cold means a re-prefill, not a loss: the next turn evaluates the
+        # whole timeline and continues it.
+        status, ev = SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="still there?"))
+        resume = ev[0][2]
+        self.assertEqual(resume["from"], "cold", resume)
+        self.assertGreater(resume["prefill"], n)
+        self.assertEqual(ev[-1][1], "done")
+        self.assertGreater(SRV.request("GET", f"/v1/sessions/{sid}")[2]["tokens"], n)
+        # Dropping an absent checkpoint frees nothing and is not an error.
+        status, _, r = SRV.request("DELETE", f"/v1/sessions/{sid}/checkpoint")
+        self.assertEqual((status, r.get("freed_bytes")), (200, 0), r)
+
+    def test_disk_accounting(self):
+        sid = SRV.open()
+        SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="count me"))
+        SRV.request("POST", f"/v1/sessions/{sid}/park")
+        disk = SRV.request("GET", "/v1/server")[2]["disk"]
+        on_disk = sum(os.path.getsize(os.path.join(STATE, "sessions", d, "checkpoint.bin"))
+                      for d in os.listdir(os.path.join(STATE, "sessions"))
+                      if os.path.exists(os.path.join(STATE, "sessions", d, "checkpoint.bin")))
+        self.assertEqual(disk["sessions_bytes"], on_disk)
+        self.assertGreater(disk["free_bytes"], 0)
+        self.assertIn("cache_bytes", disk)
+        listed = {s["id"]: s["checkpoint_bytes"] for s in SRV.request("GET", "/v1/sessions")[2]["sessions"]}
+        self.assertEqual(listed[sid], os.path.getsize(self.own(sid)))
+
+    def test_delete_removes_the_checkpoint(self):
+        sid = SRV.open()
+        SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="x"))
+        SRV.request("POST", f"/v1/sessions/{sid}/park")
+        self.assertTrue(os.path.exists(self.own(sid)))
+        self.assertEqual(SRV.request("DELETE", f"/v1/sessions/{sid}")[0], 204)
+        self.assertFalse(os.path.exists(os.path.join(STATE, "sessions", sid)))
+
+
 class Compat(unittest.TestCase):
     def test_completions_share_the_engine(self):
         sid = SRV.open()
@@ -575,16 +655,19 @@ class Restart(unittest.TestCase):
         SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="remember this"))
         n = SRV.request("GET", f"/v1/sessions/{sid}")[2]["tokens"]
         SRV.stop()                      # SIGTERM: the live session is checkpointed on the way out
+        self.assertTrue(os.path.exists(os.path.join(STATE, "sessions", sid, "checkpoint.bin")),
+                        "shutdown did not write the session's own checkpoint")
+        shutil.rmtree(os.path.join(HOME, ".cache", "qwasar", "kv"), ignore_errors=True)
         second = Server(STATE, HOME)
         try:
             status, _, d = second.request("GET", f"/v1/sessions/{sid}")
             self.assertEqual(status, 200)
             self.assertEqual(d["tokens"], n)
             self.assertEqual(d["metadata"]["title"], "survivor")
-            self.assertIn(d["warmth"]["state"], ("warm", "cold"))
+            self.assertEqual(d["warmth"]["state"], "warm", d)
             status, ev = second.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="still here?"))
             resume = ev[0][2]
-            self.assertIn(resume["from"], ("checkpoint", "cold"))
+            self.assertEqual((resume["from"], resume["restored"]), ("checkpoint", n), resume)
             # What was read plus what was prefilled covers the old timeline
             # and the new turn; nothing the timeline held was skipped.
             self.assertLessEqual(resume["restored"], n)

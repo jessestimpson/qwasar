@@ -43,6 +43,7 @@ static void info_json(str *b, const qw_sess_info *i) {
                qw_sess_state_name(i->state), qw_warmth_name(i->warmth), i->covered);
     if (i->warmth != QW_WARMTH_LIVE) str_printf(b, ", \"estimate_seconds\": %.1f", i->estimate_s);
     str_puts(b, "}");
+    str_printf(b, ", \"checkpoint_bytes\": %llu", (unsigned long long)i->checkpoint_bytes);
     if (i->last_stop) {
         str_printf(b, ", \"last_step\": {\"stop\": \"%s\", \"at\": %lld, \"pending_calls\": [",
                    i->last_stop, (long long)i->last_at);
@@ -81,7 +82,10 @@ static void handle_server(qw_store *st, conn *c) {
                    "\"sessions\": {\"total\": %d, \"live\": %d, \"queued\": %d}, \"state_dir\": ",
                vision ? "true" : "false", vision ? "true" : "false", total, live, queued);
     str_jsons(&b, qw_store_state_dir(st));
-    str_puts(&b, "}");
+    uint64_t sb = 0, cb = 0, fb = 0;
+    qw_store_disk(st, &sb, &cb, &fb);
+    str_printf(&b, ", \"disk\": {\"sessions_bytes\": %llu, \"cache_bytes\": %llu, \"free_bytes\": %llu}}",
+               (unsigned long long)sb, (unsigned long long)cb, (unsigned long long)fb);
     api_json(c, 200, &b);
     str_free(&b);
 }
@@ -316,6 +320,19 @@ bool qw_api_handle(qw_store *st, conn *c, const http_req *r, const str *body) {
     }
 
     const bool post = !strcmp(r->method, "POST");
+    if (!strcmp(verb, "checkpoint") && !strcmp(r->method, "DELETE")) {
+        uint64_t freed = 0;
+        char err[256];
+        if (!qw_sess_drop_checkpoint(st, s, &freed, err, sizeof err)) {
+            api_error(c, strstr(err, "running") ? 409 : 500, strstr(err, "running") ? "conflict" : "server_error", err);
+            return true;
+        }
+        str b = { 0 };
+        str_printf(&b, "{\"freed_bytes\": %llu}", (unsigned long long)freed);
+        api_json(c, 200, &b);
+        str_free(&b);
+        return true;
+    }
     if (!strcmp(verb, "events") && !strcmp(r->method, "GET")) {
         sse_sink k = { c, false, false };
         if (!qw_sess_reattach(st, s, r->last_event_id[0] ? r->last_event_id : NULL, emit_sse, &k))
@@ -359,6 +376,6 @@ bool qw_api_handle(qw_store *st, conn *c, const http_req *r, const str *body) {
         qj_free(&d);
         return true;
     }
-    api_error(c, 404, "not_found", "no such verb; turn, continue, events, cancel, park");
+    api_error(c, 404, "not_found", "no such verb; turn, continue, events, cancel, park, checkpoint");
     return true;
 }
