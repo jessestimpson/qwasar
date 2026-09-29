@@ -133,6 +133,9 @@ struct qw_store {
     waiter  *head, *tail;
     bool     busy;
     qw_sess *holder;
+    /* The handle of the session last parked, kept for the next to take:
+     * see handle_put.  The engine holder's, like every handle. */
+    qwasar_session *spare;
 
     uint64_t rng;
     /* Measured rates, for resume estimates. */
@@ -751,7 +754,32 @@ void qw_store_release(qw_store *st, qw_sess *s) { (void)s; engine_release(st); }
  *
  * Caller holds the engine: nothing else touches a handle meanwhile. */
 
-/* Writes the session's checkpoint and frees its handle.  Returns whether a
+/* A handle leaving the live set is kept, not freed, for the next session
+ * to take.  A new handle's memory is committed on first write -- by the CPU
+ * on a restore, and again by the GPU on the first step that reads it -- and
+ * at a long context that is seconds, twice; a reset handle's pages are
+ * already both.  One spare at most, and only ever made by a handle leaving
+ * the live set and spent by the next one joining it, so live handles and
+ * the spare together stay within live_max. */
+static void handle_put(qw_store *st, qwasar_session *h) {
+    if (!h) return;
+    if (st->spare) qwasar_session_free(st->spare);
+    st->spare = h;
+}
+
+static qwasar_session *handle_take(qw_store *st, char *err, size_t errcap) {
+    qwasar_session *h = st->spare;
+    st->spare = NULL;
+    if (h) {
+        char why[256];
+        if (qwasar_session_reset(h, why, sizeof why)) return h;
+        qw_log("  a kept handle did not reset (%s); allocating a new one", why);
+        qwasar_session_free(h);
+    }
+    return qwasar_session_new(st->e, err, errcap);
+}
+
+/* Writes the session's checkpoint and gives up its handle.  Returns whether a
  * checkpoint now covers it (else it is cold, which for a session under the
  * store's floor of 256 tokens is cheap and expected). */
 static bool park_locked(qw_store *st, qw_sess *s, const char *why) {
@@ -778,7 +806,7 @@ static bool park_locked(qw_store *st, qw_sess *s, const char *why) {
             if (saved) s->ckpt_n = qwasar_session_n_past(s->h);
         }
     }
-    qwasar_session_free(s->h);
+    handle_put(st, s->h);
     s->h = NULL;
     return saved;
 }
@@ -1316,7 +1344,7 @@ static bool resume(qw_store *st, qw_sess *s, int32_t n_new,
         return true;
     }
     admit(st, s);
-    s->h = qwasar_session_new(st->e, err, errcap);
+    s->h = handle_take(st, err, errcap);
     if (!s->h) return false;
     qwasar_session_set_progress(s->h, progress_cb, s);
     s->ckpt_n = 0;
@@ -1763,7 +1791,7 @@ bool qw_store_delete(qw_store *st, qw_sess *s, char *err, size_t errcap) {
     pthread_mutex_unlock(&st->lock);
     if (s->h) {
         engine_acquire(st, s, false);
-        qwasar_session_free(s->h);
+        handle_put(st, s->h);
         s->h = NULL;
         engine_release(st);
     }
@@ -1928,12 +1956,12 @@ const float *qw_compat_prefill(qw_store *st, qw_sess *s, const int32_t *tokens, 
     /* Images defeat prefix reuse, and silently: two pictures render to the
      * same run of placeholder tokens.  A request carrying them starts fresh. */
     if (n_images > 0) {
-        if (s->h) qwasar_session_free(s->h);
+        handle_put(st, s->h);
         s->h = NULL;
         s->ckpt_n = 0;
         admit(st, s);
         *how = "a new session (images)";
-        s->h = qwasar_session_new(st->e, err, cap);
+        s->h = handle_take(st, err, cap);
         if (!s->h) return NULL;
         return qwasar_session_eval_images(s->h, tokens, n, images, n_images, err, cap);
     }
@@ -1971,10 +1999,10 @@ const float *qw_compat_prefill(qw_store *st, qw_sess *s, const int32_t *tokens, 
         }
     }
 
-    if (s->h) qwasar_session_free(s->h);
+    handle_put(st, s->h);
     s->h = NULL;
     admit(st, s);
-    s->h = qwasar_session_new(st->e, err, cap);
+    s->h = handle_take(st, err, cap);
     if (!s->h) return NULL;
 
     /* A checkpoint covers at most n-1 tokens, so there is a token left to
@@ -2023,5 +2051,7 @@ void qw_store_shutdown(qw_store *st) {
         }
         if (st->compat->h) park_locked(st, st->compat, "shutdown");
     }
+    qwasar_session_free(st->spare);
+    st->spare = NULL;
     engine_release(st);
 }

@@ -463,7 +463,14 @@ needs root.
 much as the restore itself: 5.5 s for 19 tokens in the same process, 8.0 s
 after the restart.  A normal 19-token step at this context is well under a
 second, so this is the unpacked state's first use on the GPU -- 6 GB of
-shared buffers faulted in -- not the attention.  Not investigated further.
+shared buffers faulted in -- not the attention.  Since measured
+(`QWASAR_TEST_RESTORE_TIMING` in tests/test_kvstore, 131K tokens, 4.35 GB):
+into a new session the restore took 1.1--7.4 s and its first step 1.5--8.2 s,
+varying run to run; into a reset session (`qwasar_session_reset`, which keeps
+a session's memory) 1.9 s and 0.22 s, steady, against 0.13 s for a normal
+step.  The server now keeps the last parked handle and resets it for the
+next resume.  Still open: the first resume after a restart, which has no
+handle to reuse; and the restore's read through a temporary buffer.
 (2) The server's resume estimate said **3.2 s** where the truth was 11--16 s:
 it models the read and the uncovered prefill, not that first-use cost.  It
 should learn it from measured resumes, as it already learns the read rate.
