@@ -203,6 +203,105 @@ defmodule Warden.Tools do
 
   def shell(_), do: {:error, "args", "shell requires a command"}
 
+  # ---- primitives for the host's tools ---------------------------------------
+  #
+  # Read, Write, Edit, Glob and Grep are written once, on the host, over a
+  # backend: the user's own filesystem for a session on their Mac, these three
+  # for a sandboxed one -- so the two behave identically, and the guest keeps
+  # only what must run inside it.  Confinement to /work is here as for every
+  # other op.
+
+  @raw_default 4 * 1024 * 1024
+
+  @doc "The file's first `max_bytes`, after a line with its full size."
+  @spec read_raw(map()) :: reply
+  def read_raw(%{"path" => path} = args) do
+    max = int_arg(args["max_bytes"], @raw_default)
+
+    with {:ok, full} <- safe(path) do
+      cond do
+        File.dir?(full) ->
+          {:error, "isdir", "#{path} is a directory"}
+
+        true ->
+          size = file_size(full)
+
+          case File.open(full, [:read, :binary], &IO.binread(&1, max)) do
+            {:ok, :eof} ->
+              {:ok, "#{size}\n"}
+
+            {:ok, data} when is_binary(data) ->
+              if String.contains?(data, <<0>>),
+                do: {:error, "binary", "#{path} is a binary file"},
+                else: {:ok, "#{size}\n" <> String.replace_invalid(data)}
+
+            {:error, reason} ->
+              {:error, "io", "cannot read #{path}: #{:file.format_error(reason)}"}
+          end
+      end
+    end
+  end
+
+  def read_raw(_), do: {:error, "args", "read_raw requires a path"}
+
+  @doc "`file <size>`, `dir`, or `missing`."
+  @spec stat(map()) :: reply
+  def stat(%{"path" => path}) do
+    with {:ok, full} <- safe(path, must_exist: false) do
+      cond do
+        File.dir?(full) -> {:ok, "dir"}
+        File.exists?(full) -> {:ok, "file #{file_size(full)}"}
+        true -> {:ok, "missing"}
+      end
+    end
+  end
+
+  def stat(_), do: {:error, "args", "stat requires a path"}
+
+  @doc """
+  `sh -c command` in /work: the exit status on the first line, then the
+  combined output -- at most `max_bytes` of it, collected as it arrives, so a
+  command that prints without end cannot exhaust the guest.
+  """
+  @spec exec(map()) :: reply
+  def exec(%{"command" => command} = args) do
+    timeout = int_arg(args["timeout_ms"], @shell_timeout_ms)
+    max = int_arg(args["max_bytes"], @raw_default)
+
+    task =
+      Task.async(fn ->
+        System.cmd("/bin/sh", ["-c", command],
+          cd: @root,
+          stderr_to_stdout: true,
+          into: %Warden.CappedOutput{max: max},
+          env: [{"PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"}]
+        )
+      end)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {out, status}} ->
+        {:ok, "#{status}\n" <> String.replace_invalid(Warden.CappedOutput.text(out))}
+
+      nil ->
+        {:error, "timeout", "the command ran for #{div(timeout, 1000)}s and was killed"}
+    end
+  rescue
+    e -> {:error, "shell", Exception.message(e)}
+  end
+
+  def exec(_), do: {:error, "args", "exec requires a command"}
+
+  defp int_arg(v, _default) when is_integer(v) and v > 0, do: v
+
+  defp int_arg(v, default) when is_binary(v) do
+    case Integer.parse(v) do
+      {n, ""} when n > 0 -> n
+      _ -> default
+    end
+  end
+
+  defp int_arg(_, default), do: default
+
   # ---- confinement ---------------------------------------------------------
 
   # The guest-side half of a rule the host also enforces (PLAN.md 7.4 step 8).

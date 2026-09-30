@@ -48,6 +48,14 @@ defmodule Warden.Dispatch do
   def run(%{"op" => "bash", "args" => args}), do: Warden.Tools.shell(args)
   def run(%{"op" => "shell", "args" => args}), do: Warden.Tools.shell(args)
 
+  # Primitives for the host's tools, which are written once over them.
+  def run(%{"op" => "read_raw", "args" => args}), do: Warden.Tools.read_raw(args)
+  def run(%{"op" => "stat", "args" => args}), do: Warden.Tools.stat(args)
+  def run(%{"op" => "exec", "args" => args}), do: Warden.Tools.exec(args)
+  def run(%{"op" => "read_raw"}), do: Warden.Tools.read_raw(%{})
+  def run(%{"op" => "stat"}), do: Warden.Tools.stat(%{})
+  def run(%{"op" => "exec"}), do: Warden.Tools.exec(%{})
+
   # Called with no arguments at all.
   #
   # Without these the op falls through to the catch-all and the model is told

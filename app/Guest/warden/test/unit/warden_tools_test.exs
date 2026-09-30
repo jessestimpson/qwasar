@@ -129,4 +129,28 @@ defmodule Warden.ToolsTest do
       assert out |> String.split("\n") |> Enum.at(0) == "a line of text that is quite long indeed"
     end
   end
+
+  describe "primitives for the host's tools" do
+    test "read_raw returns the size, then the bytes, up to max_bytes" do
+      assert {:ok, "14\none\ntwo\nthree\n"} = Warden.Tools.read_raw(%{"path" => "hello.txt"})
+      assert {:ok, "14\none"} = Warden.Tools.read_raw(%{"path" => "hello.txt", "max_bytes" => 3})
+    end
+
+    test "read_raw is confined, and refuses a binary" do
+      assert {:error, "path", _} = Warden.Tools.read_raw(%{"path" => "/tmp/outside/secret.txt"})
+      File.write!(Path.join(@root, "sub/b.bin"), <<1, 0, 2>>)
+      assert {:error, "binary", _} = Warden.Tools.read_raw(%{"path" => "sub/b.bin"})
+    end
+
+    test "stat" do
+      assert {:ok, "file 14"} = Warden.Tools.stat(%{"path" => "hello.txt"})
+      assert {:ok, "dir"} = Warden.Tools.stat(%{"path" => "sub"})
+      assert {:ok, "missing"} = Warden.Tools.stat(%{"path" => "nope.txt"})
+    end
+
+    test "exec: status line, then output, in /work" do
+      assert {:ok, "3\n/work\n"} = Warden.Tools.exec(%{"command" => "pwd; exit 3"})
+      assert {:error, "timeout", _} = Warden.Tools.exec(%{"command" => "sleep 5", "timeout_ms" => 200})
+    end
+  end
 end
