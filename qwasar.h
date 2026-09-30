@@ -129,6 +129,12 @@ int32_t *qwasar_apply_chat_template(const qwasar_tokenizer *t,
  * Caller frees. */
 int32_t *qwasar_render_tool_result(const qwasar_tokenizer *t, const char *result,
                                    const qwasar_chat_options *opts, int32_t *out_n);
+/* Several results from one step, in the order the calls were made: one user
+ * turn, each result in its own <tool_response> block -- the template's
+ * rendering of consecutive tool messages.  n >= 1. */
+int32_t *qwasar_render_tool_results(const qwasar_tokenizer *t, const char *const *results,
+                                    int32_t n, const qwasar_chat_options *opts,
+                                    int32_t *out_n);
 int32_t *qwasar_render_user_turn(const qwasar_tokenizer *t, const char *text,
                                  int32_t n_image_tokens, bool is_video,
                                  const qwasar_chat_options *opts, int32_t *out_n);

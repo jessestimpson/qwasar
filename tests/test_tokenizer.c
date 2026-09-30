@@ -80,6 +80,39 @@ int main(int argc, char **argv) {
     CHECK(qwasar_token_id(t, "<think>")      == 248068, "<think> id");
     CHECK(qwasar_token_id(t, "</think>")     == 248069, "</think> id");
 
+    /* Tool results after a step, as the template renders consecutive tool
+     * messages: one user turn, each result in its own <tool_response>. */
+    {
+        const char *res[] = { "README.md\nMakefile", "edited a.c" };
+        qwasar_chat_options o = { .enable_thinking = true, .add_generation_prompt = true };
+        int32_t nr = 0;
+        int32_t *ids = qwasar_render_tool_results(t, res, 2, &o, &nr);
+        char text[512] = "";
+        size_t at = 0;
+        for (int32_t i = 0; ids && i < nr && at < sizeof text - 64; i++) {
+            size_t len = 0;
+            const char *b = qwasar_token_bytes(t, ids[i], &len, NULL);
+            if (b && at + len < sizeof text) { memcpy(text + at, b, len); at += len; text[at] = 0; }
+        }
+        const char *want =
+            "<|im_end|>\n<|im_start|>user\n<tool_response>\nREADME.md\nMakefile\n</tool_response>"
+            "\n<tool_response>\nedited a.c\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n";
+        CHECK(ids && !strcmp(text, want), "two tool results render as two <tool_response> blocks:\n%s", text);
+        free(ids);
+        int32_t n1 = 0;
+        int32_t *one = qwasar_render_tool_result(t, "x", &o, &n1);
+        text[0] = 0; at = 0;
+        for (int32_t i = 0; one && i < n1; i++) {
+            size_t len = 0;
+            const char *b = qwasar_token_bytes(t, one[i], &len, NULL);
+            if (b && at + len < sizeof text) { memcpy(text + at, b, len); at += len; text[at] = 0; }
+        }
+        CHECK(one && !strcmp(text, "<|im_end|>\n<|im_start|>user\n<tool_response>\nx\n</tool_response>"
+                                   "<|im_end|>\n<|im_start|>assistant\n<think>\n"),
+              "one tool result renders as before:\n%s", text);
+        free(one);
+    }
+
     int n_cases = 0, n_ok = 0;
     const qj_node *cases = qj_get(&d, qj_root(&d), "cases");
     for (const qj_node *c = qj_first(&d, cases); c; c = qj_next(&d, c)) {

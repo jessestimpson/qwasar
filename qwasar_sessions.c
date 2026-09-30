@@ -1696,7 +1696,8 @@ bool qw_sess_continue(qw_store *st, qw_sess *s, const qw_tool_result *results, i
         snprintf(err, errcap, "%d result%s for %d pending call%s", n, n == 1 ? "" : "s",
                  s->n_pending, s->n_pending == 1 ? "" : "s");
     }
-    str joined = { 0 };
+    const char **each = adm ? calloc((size_t)(n > 0 ? n : 1), sizeof *each) : NULL;
+    if (adm && !each) { adm = false; *status = 500; snprintf(err, errcap, "out of memory"); }
     for (int i = 0; adm && i < n; i++) {
         if (strcmp(results[i].id, s->pending[i].id)) {
             adm = false;
@@ -1705,17 +1706,19 @@ bool qw_sess_continue(qw_store *st, qw_sess *s, const qw_tool_result *results, i
                      i + 1, results[i].id, s->pending[i].id);
             break;
         }
-        if (i) str_puts(&joined, "\n");
-        str_puts(&joined, results[i].content ? results[i].content : "");
+        each[i] = results[i].content ? results[i].content : "";
     }
     pthread_mutex_unlock(&st->lock);
-    if (!adm) { str_free(&joined); return false; }
+    if (!adm) { free(each); return false; }
 
+    /* One <tool_response> per result, as the chat template renders
+     * consecutive tool messages; joining them into one block is a shape the
+     * model was never trained on. */
     qwasar_chat_options o;
     chat_opts(s, &o);
     int32_t n_fresh = 0;
-    int32_t *fresh = qwasar_render_tool_result(st->tok, joined.p ? joined.p : "", &o, &n_fresh);
-    str_free(&joined);
+    int32_t *fresh = qwasar_render_tool_results(st->tok, each, n, &o, &n_fresh);
+    free(each);
     if (!fresh) { snprintf(err, errcap, "cannot render the tool result"); return false; }
     run_step(st, s, fresh, n_fresh, NULL, 0, NULL, 0, sp, max_tokens, emit, ud);
     return true;

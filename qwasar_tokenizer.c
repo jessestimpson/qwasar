@@ -1002,23 +1002,35 @@ static bool qw_chat_init(qw_chat *c, const qwasar_tokenizer *t, char *err, size_
 
 int32_t *qwasar_render_tool_result(const qwasar_tokenizer *t, const char *result,
                                    const qwasar_chat_options *opts, int32_t *out_n) {
+    return qwasar_render_tool_results(t, &result, 1, opts, out_n);
+}
+
+int32_t *qwasar_render_tool_results(const qwasar_tokenizer *t, const char *const *results,
+                                    int32_t n, const qwasar_chat_options *opts,
+                                    int32_t *out_n) {
     char err[128];
     qw_chat c;
     *out_n = 0;
-    if (!qw_chat_init(&c, t, err, sizeof err)) return NULL;
+    if (n < 1 || !qw_chat_init(&c, t, err, sizeof err)) return NULL;
     if (c.tr_open < 0 || c.tr_close < 0) return NULL;
 
     /* Close the assistant turn the model left open when it stopped at
-     * </tool_call>, then deliver the result as a user turn. */
+     * </tool_call>, then deliver the results as one user turn -- each in
+     * its own <tool_response>, as the template renders consecutive tool
+     * messages: "user" then, per result, "\n<tool_response>\n" result
+     * "\n</tool_response>". */
     qw_put_id(&c, c.im_end);
     qw_put_str(&c, "\n");
     qw_put_id(&c, c.im_start);
-    qw_put_str(&c, "user\n");
-    qw_put_id(&c, c.tr_open);
-    qw_put_str(&c, "\n");
-    qw_put_str(&c, result);
-    qw_put_str(&c, "\n");
-    qw_put_id(&c, c.tr_close);
+    qw_put_str(&c, "user");
+    for (int32_t i = 0; i < n; i++) {
+        qw_put_str(&c, "\n");
+        qw_put_id(&c, c.tr_open);
+        qw_put_str(&c, "\n");
+        qw_put_str(&c, results[i] ? results[i] : "");
+        qw_put_str(&c, "\n");
+        qw_put_id(&c, c.tr_close);
+    }
     qw_put_id(&c, c.im_end);
     qw_put_str(&c, "\n");
     qw_put_generation_prompt(&c, opts);
