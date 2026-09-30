@@ -246,7 +246,7 @@ public struct DelegateToolRunner: ToolExecuting {
         }
         guard let key = keyProvider() else {
             return "error: no API key is set. The user can add one via "
-                 + "Crucible ▸ Set Delegation API Key…"
+                 + "Qwasar ▸ Set Delegation API Key…"
         }
         guard policy.isEnabled else { return "error: the delegation budget is exhausted" }
 

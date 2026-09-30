@@ -50,7 +50,7 @@ struct ConfigToolRunner: ToolExecuting {
 
         Keys: \(SandboxKey.allCases.map { "\($0.rawValue) — \($0.doc)" }.joined(separator: "; ")).
 
-        Two things you cannot do, and what to tell the user instead: the delegation API key is entered by the user through the app menu — Crucible ▸ Set Delegation API Key… — and lands in the macOS Keychain; you can report whether one is set (config_show shows it) but never read or write it. Delegation needs both that key AND delegate_models granted at some layer, which IS yours to set.
+        Two things you cannot do, and what to tell the user instead: the delegation API key is entered by the user through the app menu — Qwasar ▸ Set Delegation API Key… — and lands in the macOS Keychain; you can report whether one is set (config_show shows it) but never read or write it. Delegation needs both that key AND delegate_models granted at some layer, which IS yours to set.
 
         Start with config_show. Change only what the user asked for, and say what changed at which layer.
         """
