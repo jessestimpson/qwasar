@@ -3,7 +3,7 @@
 #
 # No .xcodeproj: swiftc and a hand-assembled bundle, readable as a text file.
 # The app links no engine.  qwasar-server is built by the parent tree and
-# copied into the bundle as a helper, signed to inherit the app's sandbox.
+# copied into the bundle as a helper.
 #
 #   make          build and sign Qwasar.app
 #   make run      build, then launch it (the menu bar item); the first run
@@ -11,6 +11,7 @@
 #   make agent    ... with the coding agent's window open
 #   make gate     the entitlement and VM probes, headless
 #   make gate-full  ... and the helper on $(MODEL), and one agent turn through it
+#                   (tools on this Mac; SANDBOXED=1 for the VM)
 #   make test     the host test suite
 #   make guest    the guest image (native macOS build; no Docker)
 #   make clean
@@ -42,9 +43,9 @@ FRAMEWORKS := -framework Foundation -framework Virtualization -framework SwiftUI
               -framework ServiceManagement
 LDLIBS    := $(FRAMEWORKS)
 
-# The entitlements the shipping app carries, and the helper's.  If the M3
-# gate finds the helper cannot inherit the model-folder grant, both become
-# Hardened-Runtime-only files here and nothing else changes (PLAN-qwasar.md 4.2).
+# The entitlements the shipping app carries, and the helper's.  Neither is
+# App Sandboxed: a session's host tools run as the user, which a sandbox
+# would forbid; the per-session VM is the isolation (Qwasar.entitlements).
 ENTITLEMENTS        ?= Qwasar.entitlements
 HELPER_ENTITLEMENTS ?= Helper.entitlements
 
@@ -117,8 +118,9 @@ $(APP): $(BIN) server Resources/Info.plist $(ENTITLEMENTS) $(HELPER_ENTITLEMENTS
 	@codesign -d --entitlements - $(APP) 2>&1 | sed 's/^/  /'
 	@echo "built $(APP)"
 
-# The guest image first when there is none: without it the bundle is built
-# with read-only host tools, which is never what a first `make run` meant.
+# The guest image first when there is none -- sandboxed sessions need it --
+# but not at the price of the app: without mise or e2fsprogs the build says
+# so and carries on, and sandboxed sessions are read-only until `make guest`.
 run: guest-once
 	@$(MAKE) --no-print-directory $(APP)
 	open $(APP)
@@ -128,7 +130,8 @@ agent: guest-once
 	open $(APP) --args --agent
 
 guest-once:
-	@[ -f $(BUILD)/guest/disk.img ] || $(MAKE) --no-print-directory guest
+	@[ -f $(BUILD)/guest/disk.img ] || $(MAKE) --no-print-directory guest \
+	  || echo "  warning: no guest image; sandboxed sessions will be read-only (see 'make guest')"
 
 gate: $(APP)
 	@$(BIN) --gate || true
@@ -143,7 +146,7 @@ gate-full: $(APP)
 	codesign --force --sign - --entitlements Qwasar.gate.entitlements \
 	         --options runtime --timestamp=none $(APP)
 	@$(BIN) --gate --model "$(MODEL)" --prompt "$(PROMPT)" --root "$(abspath $(ROOT_DIR))" \
-	        --guest "$(abspath $(BUILD)/guest)" $(EXTRA) || true
+	        --guest "$(abspath $(BUILD)/guest)" $(if $(SANDBOXED),--sandboxed) $(EXTRA) || true
 	@echo "re-signing with the shipping entitlements"
 	@codesign --force --sign - --entitlements $(ENTITLEMENTS) \
 	          --options runtime --timestamp=none $(APP) 2>/dev/null

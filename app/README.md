@@ -3,8 +3,9 @@
 One macOS app with two faces: a menu bar item that runs
 [`qwasar-server`](../README.md) and shows whether its port is up, and — when
 asked — the coding agent's window, which talks to that server over the
-[Session API](../API.md) and runs the agent's tools inside a
-Virtualization.framework guest with no network device. It was Crucible and
+[Session API](../API.md) and runs the agent's tools on your Mac — or, for a
+session you create sandboxed, inside a Virtualization.framework guest with
+no network device. It was Crucible and
 the Qwasar Server menu bar app; the two merged when the server grew an API
 built for this ([PLAN-qwasar.md](../PLAN-qwasar.md)). A few names inside
 still say Crucible — the built-in config project, the skill behaviour, the
@@ -19,16 +20,18 @@ cd app && make run
 ```
 
 That builds `qwasar-server` in the parent tree, the app around it, and —
-the first time — the Linux guest image the tools run in; then it opens
-`build/Qwasar.app`. The guest build takes a couple of minutes and caches
-its downloads; later runs skip it. `make agent` does the same and opens the
-coding agent's window straight away.
+the first time — the Linux guest image that sandboxed sessions run their
+tools in; then it opens `build/Qwasar.app`. The guest build takes a couple
+of minutes and caches its downloads; later runs skip it. If its
+prerequisites are missing the build says so and carries on: the app works,
+and sandboxed sessions are read-only until `make guest` succeeds. `make
+agent` does the same and opens the coding agent's window straight away.
 
 | | |
 |---|---|
 | Machine | Apple silicon. The 27B runs on an M4 with 32 GB; Flash-Next needs ~80 GB resident, so a 128 GB machine |
 | macOS | 14.0 minimum; developed on 26 |
-| Build | Xcode command line tools, `python3`, [mise](https://mise.jdx.dev) (erlang/elixir/zig pins), `brew install e2fsprogs` |
+| Build | Xcode command line tools; for sandboxed sessions, also `python3`, [mise](https://mise.jdx.dev) (erlang/elixir/zig pins) and `brew install e2fsprogs` |
 | Model | Qwen3.8 27B or Qwen3.8 Flash-Next, 4-bit MLX — the folders `../download_model.sh` fetches; not bundled |
 | Disk | ~530 MB for the guest image, plus the app, plus session checkpoints (a budget you set) |
 
@@ -48,11 +51,14 @@ On first launch:
    remembered once granted, so the menu bar's **Model** submenu switches
    between them by restarting the server.
 2. **Open Coding Agent** (⌘N), then **Add Project…** at the foot of the
-   sidebar. That folder is the only thing a session can see.
-3. Type, and **⌘↵**.
+   sidebar. A session is created in it; **New Session** makes more, and its
+   arrow offers **New Sandboxed Session**.
+3. Type, and **⌘↵**. Return sends; Shift-Return is a new line.
 
-The session header should say **`sandboxed · booted in 0.6s`**. If it says
-*read-only*, the guest image was not staged — run `make guest`, then `make`.
+The session header says where its tools run: **`on this Mac · zsh
+environment`**, or for a sandboxed session **`sandboxed · booted in 0.6s`**.
+A sandboxed session that says *read-only* has no guest image — run `make
+guest`, then `make`.
 
 The menu bar item reads the server's state from its socket, probed once a
 second: a **plain Q** is listening, a **pulsing amber dot** is loading the
@@ -112,13 +118,23 @@ The cost of this is the working set: one session is live at a time on a
 parks the live one to disk (a checkpoint write) and resumes the other (a
 read) — seconds, shown as they happen, rather than a re-prefill.
 
-### 2. The tools run in a VM with no network
+### 2. You choose where the tools run, per session
 
-A coding agent reads files it did not write — READMEs, issues, dependencies —
-and any of them can carry instructions aimed at the model. The app assumes
-some will, and limits what a hijacked model could do:
+A **New Session** runs its tools directly on your Mac: `Read`, `Write`,
+`Edit`, `Glob`, `Grep`, `Bash` and `TodoWrite`, as you, in the project folder, with your
+login shell's environment — the app starts your shell as a login shell once
+per project, the way Terminal would, and takes its PATH and variables, so
+Homebrew, mise, cargo and the project's own pinned toolchain are all there.
+Relative paths are the project's; absolute paths work too. Nothing is
+confined, which is the point: it is the fast, familiar mode for your own
+code. The session is told so, and told not to do anything destructive or
+irreversible you did not ask for — but that is an instruction, not a wall.
 
-* **The tools run in a Linux VM, one per session, with no network device
+A **New Sandboxed Session** is the wall. A coding agent reads files it did
+not write — READMEs, issues, dependencies — and any of them can carry
+instructions aimed at the model. For work where that matters:
+
+* **Its tools run in a Linux VM, one per session, with no network device
   at all** — an absence, not a firewall rule. The app is built without the
   entitlement that would let a VM have one, so even a misconfigured guest
   cannot get one.
@@ -132,35 +148,63 @@ some will, and limits what a hijacked model could do:
   the sandbox works normally (log, blame, diff, even private commits) while
   your hooks, config and history sit behind the mount.
 * **Network is opt-in, per project, and never touches the guest.**
-  Right-click a project → **Network…** to allow specific hosts; the model
-  then gets a `fetch` tool — HTTPS GET only, size-capped, logged in the
-  transcript — that the *app* runs under that list. Stated plainly, because
-  it is the one real trade: with any host allowed, code execution is still
-  sandboxed, but *confidentiality* is not — a prompt injection could encode
-  project contents into a request URL to an allowed host. The default is
-  off, and for confidential work it should stay off.
-* **The app itself is sandboxed** (App Sandbox): it and its server see only
-  the folders you chose in an open panel.
+  Right-click a project → **Network…** to allow specific hosts; a sandboxed
+  session then gets a `fetch` tool — HTTPS GET only, size-capped, logged in
+  the transcript — that the *app* runs under that list. With any host
+  allowed, code execution is still sandboxed, but *confidentiality* is not:
+  a prompt injection could encode project contents into a request URL to an
+  allowed host. The default is off.
 
-So a successful prompt injection degrades from *arbitrary code execution on
-your laptop* to *bad uncommitted edits in one folder, in plain sight of your
-own `git status`*. The cost is that the model cannot install packages or
-reach the internet from its shell; what it needs beyond the guest's
-toolchain, it asks for or writes itself.
+In a sandboxed session a successful prompt injection degrades from
+*arbitrary code execution on your laptop* to *bad uncommitted edits in one
+folder, in plain sight of your own `git status`*. The cost is the guest's
+toolchain instead of yours ([Adding tools to the sandbox](#adding-tools-to-the-sandbox))
+and no internet from its shell. The choice is fixed when the session is
+created — the tools are part of the session's prefix — and a sandboxed
+session is marked with a box in the sidebar.
 
-### 3. A small tool surface the model extends itself
+The app itself is not App Sandboxed: everything a sandboxed app starts
+inherits its sandbox, which would leave a host session unable to reach your
+files or your toolchains. The isolation that matters is the VM's.
 
-Eleven tools, fixed: `read`, `write`, `edit`, `list`, `grep`, `bash`,
-`elixir`, `define`, `skills`, `invoke`, and `fetch` when a project allows
+### 3. A tool surface the model can extend
+
+A sandboxed session has the same seven — the same code, run over the
+guest's primitives, so they behave identically — plus `elixir`,
+`define`, `skills` and `invoke` — and `fetch` when the project allows
 hosts. `define` compiles an Elixir module into a live BEAM node in the
 guest; one that implements the skill behaviour becomes a **skill**,
 callable through `invoke`, owned by the project and replayed into every
-session of it. Why: generation is by far the slowest thing the model does,
-and a skill that searches, checks or transforms files does in one call what
-would otherwise be hundreds of generated tokens and several round trips.
-The VM is what makes it safe to let the model write and run its own code.
+sandboxed session of it. Why: generation is by far the slowest thing the
+model does, and a skill that searches, checks or transforms files does in
+one call what would otherwise be hundreds of generated tokens and several
+round trips. The VM is what makes it safe to let the model write and run
+its own code, so skills are a sandboxed session's; a session on your Mac has
+your whole toolchain instead.
 
-### 4. The model's own defaults, and turns that end cleanly
+### 4. Aligned with how the model was trained, and turns that end cleanly
+
+Qwen3.8 Flash-Next's agentic results are reported in the Claude Code harness
+(its model card), and its chat template fixes the format of tool calls and
+results. The app follows both, rather than a format of its own:
+
+* **The tools are named and shaped as in that harness**: `Read` with
+  numbered lines and `offset`/`limit`; `Edit` with `old_string`,
+  `new_string` and `replace_all`, matching an exact substring once; `Grep`
+  with ripgrep syntax and an `output_mode`; `Glob`; `Bash` with a
+  `timeout`; `TodoWrite` for a task list. Results may be 64 KB on
+  Flash-Next (8 KB on the 27B, whose prefill is ten times slower).
+* **The system prompt has the harness's shape**: an environment block
+  (working directory, git branch, platform, date), how to work (read before
+  changing, match the project, verify, summarize), then the project's own
+  `AGENTS.md`, `CLAUDE.md` or `QWEN.md` if it keeps one.
+* **Tool results are rendered as the template renders them** — each in its
+  own `<tool_response>`, several to a turn — and the app's own interjections
+  are marked as `<system-reminder>`s.
+* **Effort defaults to xhigh on Flash-Next**, with 64K tokens a step: its
+  card says lower effort in agent work costs more in retries than it saves.
+  The 27B stays at medium.
+
 
 * Sampling is the model's own generation config (temperature 1.0, top-k 20,
   top-p 0.95) — Qwen's guidance for thinking models, which loop under
@@ -209,9 +253,9 @@ downloads cannot either.
   (~465 tok/s prefill on short prompts). The 27B's ceiling is a memory
   bandwidth identity, not an efficiency problem. At 32 KB of cache per
   token Flash-Next gets the full 262K window, and each step may generate up
-  to 32K tokens against the 27B's 4K.
-* **A pause before the first token, once per project.** The system turn is
-  ~2,300 tokens (the tool schemas render into it), so a project's first
+  to 64K tokens at xhigh (32K otherwise) against the 27B's 4K.
+* **A pause before the first token, once per project and day.** The system
+  turn is a few thousand tokens (the tool schemas render into it), so a project's first
   session spends a while reading its own prompt. The server then keeps it,
   and every later session in that project starts from it.
 * **A lot of reasoning.** A turn where the model wrote itself a tool ran

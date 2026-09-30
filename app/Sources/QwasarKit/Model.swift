@@ -122,12 +122,10 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
     /// The project's own instructions. NOT a description of the environment --
     /// that is the executor's to state (see `ToolExecuting.environmentDescription`),
     /// because it is a fact about what is running rather than a preference.
-    public static let defaultSystem = """
-        Investigate before answering: read the code rather than guessing at it, \
-        and quote what you found. Prefer a small, verifiable change to a large \
-        speculative one, and say plainly when something is not what it looked \
-        like.
-        """
+    /// Empty: how to work is the harness's (SystemPrompt), and a project's
+    /// own guidance is added under it when the user writes some -- or when
+    /// the project keeps an AGENTS.md, CLAUDE.md or QWEN.md.
+    public static let defaultSystem = ""
 
     /// What the default said until M4, when the tools had been writable for two
     /// milestones and this had not been updated. Recognised so that a project
@@ -167,6 +165,17 @@ public enum SessionState: String, Codable, Sendable {
     case live, closed, archived
 }
 
+/// Where a session's tools run, chosen when it is created and fixed after:
+/// the tool surface and the environment description are part of the prefix,
+/// and they differ between the two.
+public enum ToolPlacement: String, Codable, Sendable {
+    /// Directly on the user's Mac, with their shell environment
+    /// (HostToolRunner).  The default.
+    case host
+    /// In a Linux VM with no network device (SandboxToolRunner).  Opt-in.
+    case sandbox
+}
+
 public struct SessionRecord: Codable, Identifiable, Sendable {
     public var id: UUID
     public var projectID: UUID
@@ -203,14 +212,20 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
     /// and kept for the record's life.  nil for a record from before the
     /// server owned sessions: readable, and closed (PLAN-qwasar.md §7).
     public var serverSessionID: String?
+    /// Where this session's tools run.  Optional only so a record without it
+    /// decodes, as host.
+    public var tools: ToolPlacement?
 
     public var effort: ReasoningEffort { storedEffort ?? .medium }
+    public var placement: ToolPlacement { tools ?? .host }
+    public var isSandboxed: Bool { placement == .sandbox }
 
     public init(id: UUID = UUID(), projectID: UUID, title: String = "New session",
                 workingSubpath: String = "", createdAt: Date = Date(),
                 state: SessionState = .closed, contextSize: Int32,
                 tokenCount: Int = 0, ancestorID: UUID? = nil, successorID: UUID? = nil,
-                storedEffort: ReasoningEffort? = nil, sandbox: SandboxOverlay? = nil) {
+                storedEffort: ReasoningEffort? = nil, sandbox: SandboxOverlay? = nil,
+                tools: ToolPlacement = .host) {
         self.id = id
         self.projectID = projectID
         self.title = title
@@ -223,6 +238,7 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
         self.successorID = successorID
         self.storedEffort = storedEffort
         self.sandbox = sandbox
+        self.tools = tools
     }
 }
 

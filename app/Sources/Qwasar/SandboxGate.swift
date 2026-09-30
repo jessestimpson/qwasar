@@ -202,7 +202,7 @@ enum SandboxGate {
             }
             if !recovered { print("  workspace DID NOT recover"); failures += 1 }
 
-            // Every advertised tool must be dispatchable.
+            // Every op the host calls must be dispatchable.
             //
             // Two bugs of this exact shape reached a real model before this
             // check existed: the schema said `bash` while the guest op was
@@ -212,16 +212,42 @@ enum SandboxGate {
             // model is told it has and cannot call is worse than no tool.
             print("  every advertised tool is dispatchable:")
             var missing: [String] = []
-            for name in ToolSurface.names.sorted() {
+            for name in ToolSurface.wardenOps.sorted() {
                 let probe = try await channel.send(op: name, timeout: 20)
                 if probe.kind == "unknown_op" { missing.append(name) }
             }
             if missing.isEmpty {
-                print("      all \(ToolSurface.names.count) reach a handler")
+                print("      all \(ToolSurface.wardenOps.count) reach a handler")
             } else {
                 print("      NOT DISPATCHABLE: \(missing.joined(separator: ", "))")
                 failures += 1
             }
+
+            // The core tools as the model calls them: ToolKit over the
+            // warden's primitives, the same code a session on the Mac runs.
+            print("  the core tools, through the guest:")
+            let kit = SandboxToolRunner(channel: channel, resultCap: 4096)
+            func tool(_ name: String, _ args: [String: String]) async -> String {
+                await Task.detached { kit.run(ToolCall(name: name, arguments: args)) }.value
+            }
+            func expect(_ what: String, _ got: String, _ ok: Bool) {
+                print("      \(ok ? "ok  " : "FAIL") \(what) → \(got.prefix(80).replacingOccurrences(of: "\n", with: "⏎"))")
+                if !ok { failures += 1 }
+            }
+            var got = await tool("Write", ["file_path": "kit/probe.txt", "content": "alpha\nbeta\n"])
+            expect("Write", got, got == "wrote 11 bytes (2 lines) to kit/probe.txt")
+            got = await tool("Read", ["file_path": "/work/kit/probe.txt"])
+            expect("Read numbers lines", got, got == "     1\talpha\n     2\tbeta\n")
+            got = await tool("Edit", ["file_path": "kit/probe.txt", "old_string": "et", "new_string": "ET"])
+            expect("Edit, substring", got, got == "edited kit/probe.txt")
+            got = await tool("Grep", ["pattern": "b\\w+a", "path": "kit", "output_mode": "content"])
+            expect("Grep, ripgrep syntax", got, got.contains("kit/probe.txt:2:bETa"))
+            got = await tool("Glob", ["pattern": "kit/**/*.txt"])
+            expect("Glob", got, got == "kit/probe.txt")
+            got = await tool("Bash", ["command": "rm -r kit && echo gone; exit 4"])
+            expect("Bash", got, got == "[exit 4]\ngone\n")
+            got = await tool("Read", ["file_path": "/etc/hostname"])
+            expect("a path outside /work is refused", got, got.hasPrefix("error:") && got.contains("escapes"))
 
             // Self-modification (PLAN.md 7.2): the agent writes a tool,
             // hot-loads it, and calls it — with no restart and no change to the

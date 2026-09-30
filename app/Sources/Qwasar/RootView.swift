@@ -147,13 +147,34 @@ struct Sidebar: View {
                                 }
                             }
                     }
-                    Button {
-                        state.newSession(in: project)
-                    } label: {
-                        Label("New Session", systemImage: "plus").font(.caption)
+                    if project.isConfig {
+                        Button {
+                            state.newSession(in: project)
+                        } label: {
+                            Label("New Session", systemImage: "plus").font(.caption)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                    } else {
+                        // Click for a session on this Mac; the arrow offers a
+                        // sandboxed one.  Which it is cannot change later.
+                        Menu {
+                            Button("New Session") { state.newSession(in: project) }
+                            Button("New Sandboxed Session") {
+                                state.newSession(in: project, sandboxed: true)
+                            }
+                        } label: {
+                            Label("New Session", systemImage: "plus").font(.caption)
+                        } primaryAction: {
+                            state.newSession(in: project)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .foregroundStyle(.secondary)
+                        .help("A new session whose tools run on this Mac, with your shell "
+                              + "environment. From the arrow: one whose tools run in a VM "
+                              + "with no network, seeing only this folder.")
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
                 } header: {
                     HStack {
                         Text(project.name)
@@ -258,7 +279,14 @@ struct SessionRow: View {
                 .font(.system(size: 7))
                 .foregroundStyle(symbol.tint)
             VStack(alignment: .leading, spacing: 1) {
-                Text(session.title).lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(session.title).lineLimit(1)
+                    if session.isSandboxed {
+                        Image(systemName: "shippingbox")
+                            .font(.caption2).foregroundStyle(.secondary)
+                            .help("Sandboxed: its tools run in a VM with no network.")
+                    }
+                }
                 if let detail {
                     Text(detail).font(.caption2).foregroundStyle(.secondary)
                 }

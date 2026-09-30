@@ -29,6 +29,13 @@ struct ProseText: NSViewRepresentable {
         tv.textContainer?.widthTracksTextView = true
         tv.isVerticallyResizable = false
         tv.isHorizontallyResizable = false
+        // macOS 14 stopped clipping views to their bounds by default.  A
+        // height that is ever short -- a measurement at one width, a
+        // placement at another -- then paints the rest of the text over
+        // whatever is laid out below: the code card after it, in the report
+        // that found this.  Clipped, the worst case is a cut line, never two
+        // texts on top of each other.
+        tv.clipsToBounds = true
         tv.linkTextAttributes = [.foregroundColor: NSColor.linkColor,
                                  .underlineStyle: NSUnderlineStyle.single.rawValue,
                                  .cursor: NSCursor.pointingHand]
@@ -41,12 +48,49 @@ struct ProseText: NSViewRepresentable {
         if let ts = tv.textStorage, !ts.isEqual(to: text) { ts.setAttributedString(text) }
     }
 
+    /// The height at the proposed width, measured off to the side.
+    ///
+    /// It used to measure by resizing the view's own text container, which
+    /// SwiftUI then resized again when it placed the view -- so the height it
+    /// laid out by was whichever width it had asked about last, not the width
+    /// the text was drawn at.  SwiftUI asks about several (including none at
+    /// all), and a transcript that is not lazy asks more often.  Measuring
+    /// the text itself, per width, leaves the view's own layout alone.
     func sizeThatFits(_ proposal: ProposedViewSize, nsView tv: NSTextView, context: Context) -> CGSize? {
-        guard let lm = tv.layoutManager, let tc = tv.textContainer else { return nil }
         let w = proposal.width.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 600
-        tc.containerSize = NSSize(width: w, height: .greatestFiniteMagnitude)
+        // Every row of a transcript is asked on every layout pass; a row's
+        // height changes only with its text or its width, so it is measured
+        // once per pair.
+        let c = context.coordinator
+        if c.text === text || c.text?.isEqual(to: text) == true, let h = c.heights[w] {
+            return CGSize(width: w, height: h)
+        }
+        if !(c.text === text || c.text?.isEqual(to: text) == true) {
+            c.text = text
+            c.heights = [:]
+        }
+        let h = Self.height(of: text, width: w)
+        c.heights[w] = h
+        return CGSize(width: w, height: h)
+    }
+
+    final class Coordinator {
+        var text: NSAttributedString?
+        var heights: [CGFloat: CGFloat] = [:]
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// TextKit 1, as the view itself lays out: same storage, same padding.
+    static func height(of text: NSAttributedString, width: CGFloat) -> CGFloat {
+        let storage = NSTextStorage(attributedString: text)
+        let lm = NSLayoutManager()
+        let tc = NSTextContainer(size: NSSize(width: width, height: .greatestFiniteMagnitude))
+        tc.lineFragmentPadding = 0
+        lm.addTextContainer(tc)
+        storage.addLayoutManager(lm)
         lm.ensureLayout(for: tc)
-        return CGSize(width: w, height: ceil(lm.usedRect(for: tc).height))
+        return ceil(lm.usedRect(for: tc).height)
     }
 }
 

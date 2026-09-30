@@ -140,16 +140,51 @@ final class FollowerView: NSView {
             pinned = distanceFromBottom() <= slack
             if was != pinned { log(pinned ? "user scrolled to the end: following" : "user scrolled up: holding") }
         } else if pinned {
-            toBottom()
+            follow()
         }
     }
 
-    /// The content or the viewport changed size.  Follow if pinned; otherwise
-    /// leave the clip where it is, which on a top-anchored document keeps what
-    /// is on screen exactly where it was.
+    /// The content or the viewport changed size.  Follow if pinned -- once,
+    /// after this layout pass, however many changes it made; otherwise leave
+    /// the clip where it is, which on a top-anchored document keeps what is on
+    /// screen exactly where it was.
     private func contentChanged() {
-        if pinned { toBottom() }
         snapshot()
+        guard pinned, !followScheduled else { return }
+        followScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.followScheduled = false
+            if self.pinned { self.follow() }
+        }
+    }
+
+    // A follow that makes the content change size makes another follow, and
+    // if the two never agree -- a layout that settles differently for every
+    // scroll position -- that is a loop with no input to end it.  More than
+    // this many follows in a second and following pauses briefly, then snaps
+    // once: the view ends at the bottom and the main thread is let go.
+    private var followScheduled = false
+    private var recentFollows: [Date] = []
+    private var pausedUntil = Date.distantPast
+    private let maxFollowsPerSecond = 30
+
+    private func follow() {
+        let now = Date()
+        if now < pausedUntil { return }
+        recentFollows = recentFollows.filter { now.timeIntervalSince($0) < 1 }
+        recentFollows.append(now)
+        if recentFollows.count > maxFollowsPerSecond {
+            log("following \(recentFollows.count) times a second; pausing")
+            recentFollows = []
+            pausedUntil = now.addingTimeInterval(0.5)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
+                guard let self, self.pinned else { return }
+                self.toBottom()
+            }
+            return
+        }
+        toBottom()
     }
 
     private func distanceFromBottom() -> CGFloat {

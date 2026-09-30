@@ -34,16 +34,6 @@ public protocol ToolExecuting: Sendable {
     var environmentDescription: String { get }
 }
 
-extension ToolRunner: ToolExecuting {
-    public var schemas: [String] { ToolSurface.readOnlySchemas }
-
-    public var environmentDescription: String {
-        """
-        You are working directly against the user's own files, with READ-ONLY access. You can read files, list directories, and search with regular expressions. You cannot write, edit, or run commands, and there is no sandbox: investigate and explain, and describe any change you would make rather than attempting it.
-        """
-    }
-}
-
 public struct SandboxToolRunner: ToolExecuting {
     let channel: VsockChannel
     /// Per-call ceiling. Generous next to the tools' own timeouts, because a
@@ -51,31 +41,35 @@ public struct SandboxToolRunner: ToolExecuting {
     /// `bash`, which the warden kills on its own and reports.
     let timeout: Int
 
-    public init(channel: VsockChannel, timeout: Int = 180) {
+    /// The core tools, over the guest's primitives: the same code a session
+    /// on the Mac runs, so the two cannot drift.
+    let kit: ToolKit
+
+    public init(channel: VsockChannel, timeout: Int = 180,
+                resultCap: Int = ToolKit.resultCap(flashNext: true)) {
         self.channel = channel
         self.timeout = timeout
+        self.kit = ToolKit(backend: GuestBackend(channel: channel), resultCap: resultCap,
+                           defaultTimeoutMS: 120_000)
     }
 
-    public var schemas: [String] { ToolSurface.guestSchemas }
+    public var schemas: [String] { ToolSurface.sandboxSchemas }
 
     public var environmentDescription: String {
         """
-        You are working inside a sandbox: a virtual machine with no network. /work IS the user's real project directory, mounted read-write: every edit you make lands in their working tree immediately, and they may be editing files right beside you. Nothing else of their machine is reachable from here.
+        # Where you are working
 
-        Work directly. Make the change, then verify it by reading the file back or running a command. Do not ask permission to edit a file or run something -- editing the working tree is exactly what you are here for.
+        Your tools run inside a sandbox: a Linux virtual machine with no network. /work IS the user's real project directory, mounted read-write: every edit you make lands in their working tree immediately, and they may be editing files right beside you. Nothing else of their machine is reachable. Paths are relative to /work, or absolute under it. The toolchain is the VM's (git, ripgrep, node, python3, Erlang/OTP 27, Elixir, rebar3), not the user's; there is no internet, so nothing can be installed.
 
-        Version control is the user's, not yours: they review your edits with their own tools and commit what they accept. Do not commit, branch, stage, or otherwise operate git -- your job is the files themselves.
-
-        You can also extend yourself: `define` compiles and hot-loads an Elixir module, and one implementing the Crucible.Skill behaviour becomes a SKILL -- invokable through `invoke`, listed by `skills`, and owned by the project, so every session here has it. Worth doing for something you will need repeatedly; not worth it for one-off work, since writing a module costs far more than doing the task by hand.
-
-        Paths are relative to the project root.
+        You can also extend yourself: `define` compiles and hot-loads an Elixir module, and one implementing the Crucible.Skill behaviour becomes a SKILL -- invokable through `invoke`, listed by `skills`, and owned by the project, so every sandboxed session here has it. Worth doing for something you will need repeatedly; not worth it for one-off work.
         """
     }
 
     public func run(_ call: ToolCall) -> String {
-        guard ToolSurface.names.contains(call.name) else {
+        if ToolSurface.coreNames.contains(call.name) { return kit.run(call) }
+        guard ToolSurface.guestNames.contains(call.name) else {
             return "error: no such tool: \(call.name). Available: "
-                 + ToolSurface.names.sorted().joined(separator: ", ")
+                 + (ToolSurface.coreNames.union(ToolSurface.guestNames)).sorted().joined(separator: ", ")
         }
 
         var args: [String: GuestValue] = [:]

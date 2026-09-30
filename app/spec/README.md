@@ -29,6 +29,18 @@ invariants live in §10.
 House rule, carried over from when this was one file: design decisions carry
 their measurements, and a measurement that contradicts an assumption wins.
 
+**Since 2026-09-30 the tool surface is Claude Code's** — Read, Write, Edit,
+Glob, Grep, Bash, TodoWrite, written once in `ToolKit` over a host or guest
+backend — and the system prompt is built by `SystemPrompt`, to match the
+harness Qwen3.8 Flash-Next's agentic results were measured in. §7.1's frozen
+C-agent surface is history.
+
+**Since 2026-09-30 the sandbox is a per-session choice.** A new session's
+tools run on the user's Mac (`HostToolRunner`, with their login shell's
+environment); a sandboxed one's run in the guest as described below. The
+app is no longer App Sandboxed (§8's threat model applies to sandboxed
+sessions). See [`../README.md`](../README.md#2-you-choose-where-the-tools-run-per-session).
+
 **Since 2026-09-29 the engine is out of process.** The app runs
 `qwasar-server` as a helper and talks to it over the Session API
 ([`../../API.md`](../../API.md)); the renovation that did this, and what moved

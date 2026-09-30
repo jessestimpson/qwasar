@@ -373,7 +373,7 @@ final class AppState {
         // Also shown here: a dotfiles repository, ~/.config, or anything under
         // a hidden directory is a perfectly ordinary thing to want to work on.
         panel.showsHiddenFiles = true
-        panel.message = "Choose a project directory. Sessions can read inside it and nowhere else."
+        panel.message = "Choose a project directory. Sessions start in it; a sandboxed session can see nothing else."
         panel.prompt = "Add Project"
         guard panel.runModal() == .OK, let u = panel.url else { return }
         let resolved = u.resolvingSymlinksInPath()
@@ -475,15 +475,18 @@ final class AppState {
         // the session's own vsock channel when the guest is up, the read-only
         // host tools when it is not, network per the same resolved policy.
         var inner: ToolExecuting
-        if let channel = sandboxes?.channel(for: rec.id) {
+        if !rec.isSandboxed, let root = root(of: rec) {
+            inner = HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root),
+                                   timeout: settings.toolTimeoutSeconds, resultCap: resultCap)
+        } else if let channel = sandboxes?.channel(for: rec.id) {
             inner = SandboxToolRunner(channel: channel,
-                                      timeout: settings.toolTimeoutSeconds)
+                                      timeout: settings.toolTimeoutSeconds, resultCap: resultCap)
         } else if let root = root(of: rec) {
-            inner = ToolRunner(root: root)
+            inner = ToolRunner(root: root, resultCap: resultCap)
         } else {
             return
         }
-        if !settings.networkAllowlist.isEmpty {
+        if rec.isSandboxed, !settings.networkAllowlist.isEmpty {
             inner = NetworkToolRunner(inner: inner,
                                       policy: NetworkPolicy(allowlist: settings.networkAllowlist,
                                                             maxResponseBytes: settings.fetchMaxKB * 1024))
@@ -654,9 +657,26 @@ final class AppState {
 
     // MARK: Sessions
 
-    func newSession(in p: Project) {
+    /// Bytes a tool result may put in front of the model: what its prefill
+    /// rate makes worth sending (ToolKit).
+    var resultCap: Int { ToolKit.resultCap(flashNext: activeFamily == .flashNext) }
+
+    /// What a new session in `p` starts at: the project's choice if it made
+    /// one, else the model's.  Flash-Next's card is plain that lower effort in
+    /// agent work costs more than it saves -- "insufficient analysis, more
+    /// failures, and repeated retries" -- so it gets its template's default,
+    /// xhigh.  The 27B, at ~6 tokens a second, stays at medium.
+    func defaultEffort(for p: Project) -> ReasoningEffort {
+        p.defaultEffort ?? (activeFamily == .flashNext ? .xhigh : .medium)
+    }
+
+    /// A new session in `p`.  Its tools run on this Mac unless `sandboxed`,
+    /// and which is fixed for its life: the tool surface is part of the
+    /// session's prefix.
+    func newSession(in p: Project, sandboxed: Bool = false) {
         let r = SessionRecord(projectID: p.id, contextSize: Int32(serverInfo?.context ?? 0),
-                              storedEffort: p.effort)
+                              storedEffort: defaultEffort(for: p),
+                              tools: sandboxed ? .sandbox : .host)
         sessions.insert(r, at: 0)
         store?.save(r)
         select(r.id)
@@ -817,11 +837,14 @@ final class AppState {
             if switching { phase = .opening; prefillDone = 0; prefillTotal = 0 }
 
             var runner: ToolExecuting = ToolRunner(root: root ?? URL(fileURLWithPath: "/"))
+            // Whether the tools run in the guest, for the prompt's environment.
+            var toolsInGuest = false
             do {
-                // The tools run in the guest when there is one. Without an
-                // image the session still works, read-only, against the real
-                // tree -- and the header says which world it is in, because
-                // "can this change my files" is not a detail to leave implicit.
+                // A session's tools run on this Mac, or -- when it was created
+                // sandboxed -- in the guest.  A sandboxed session with no
+                // guest still works, read-only, against the real tree; the
+                // header says which world it is in, because "can this change
+                // my files" is not a detail to leave implicit.
                 if p.isConfig {
                     // The config project (PLAN.md 8.5): host-side config
                     // tools, no folder, no VM, no network wrapper.
@@ -835,14 +858,25 @@ final class AppState {
                     let settings = SandboxSettings.resolve(global: globalSandbox,
                                                            project: p.overlay,
                                                            session: rec.sandbox)
-                    runner = ToolRunner(root: root)
-                    if let sandboxes, sandboxes.isAvailable {
+                    runner = ToolRunner(root: root, resultCap: resultCap)
+                    if !rec.isSandboxed {
+                        // On this Mac, with the user's own shell environment,
+                        // resolved in the project (a login shell can take a
+                        // second or two, so off the main actor).
+                        let env = await Task.detached { ShellEnvironment.resolve(in: root) }.value
+                        runner = HostToolRunner(root: root, environment: env,
+                                                timeout: settings.toolTimeoutSeconds,
+                                                resultCap: resultCap)
+                        sandboxStatus = "on this Mac · \(URL(fileURLWithPath: ShellEnvironment.loginShell).lastPathComponent) environment"
+                    } else if let sandboxes, sandboxes.isAvailable {
                         do {
                             let ready = try await sandboxes.start(session: rec.id,
                                                                   projectRoot: root,
                                                                   settings: settings)
                             runner = SandboxToolRunner(channel: ready.channel,
-                                                       timeout: settings.toolTimeoutSeconds)
+                                                       timeout: settings.toolTimeoutSeconds,
+                                                       resultCap: resultCap)
+                            toolsInGuest = true
                             sandboxStatus = String(format: "sandboxed · booted in %.1fs",
                                                    ready.bootSeconds)
                             // The project's tools, into this guest (spec
@@ -860,7 +894,7 @@ final class AppState {
                     // answers it itself and delegates everything else -- so
                     // the guest stays exactly as network-less as before.
                     let net = settings.networkAllowlist
-                    if !net.isEmpty {
+                    if rec.isSandboxed, !net.isEmpty {
                         runner = NetworkToolRunner(
                             inner: runner,
                             policy: NetworkPolicy(allowlist: net,
@@ -915,7 +949,11 @@ final class AppState {
                 phase = .opening
                 do {
                     let o = try await client.open(
-                        system: runner.environmentDescription + "\n\n" + p.systemPrompt,
+                        system: p.isConfig
+                            ? runner.environmentDescription + "\n\n" + p.systemPrompt
+                            : SystemPrompt.build(toolsDescription: runner.environmentDescription,
+                                                 environment: toolsInGuest ? .guest(root: root!) : .host(root: root!),
+                                                 projectRoot: root, projectPrompt: p.systemPrompt),
                         tools: runner.schemas, thinking: true, effort: rec.effort.rawValue,
                         metadata: ["client": "qwasar-app", "project": p.name,
                                    "record": rec.id.uuidString, "title": rec.title])
@@ -941,8 +979,10 @@ final class AppState {
 
             var promptText = text
             if let handoff = pendingHandoff {
-                promptText = "The user escalated to a remote model; its answer follows.\n\n"
-                           + handoff + "\n\n---\n\n" + text
+                // The harness's voice, marked as such -- the convention the
+                // model knows from the harness it was measured in.
+                promptText = "<system-reminder>\nThe user asked a remote model about this; its "
+                           + "answer follows.\n\n" + handoff + "\n</system-reminder>\n\n" + text
                 pendingHandoff = nil
                 appendItem(TranscriptItem(.note("the delegation result was attached to this message")))
             }
@@ -950,7 +990,9 @@ final class AppState {
 
             // The turn: a step, and while the model asks for tools, run them
             // here and continue.  Per-step budget by model, as before.
-            let budget = activeFamily == .flashNext ? 32_768 : 4096
+            // Flash-Next at xhigh reasons at length before it acts; its card
+            // asks for generous output room, so a step gets 64K there.
+            let budget = activeFamily == .flashNext ? (rec.effort == .xhigh ? 65_536 : 32_768) : 4096
             var stats = TurnStats()
             stats.contextLimit = contextLimit
             var stream = client.turn(sid, text: promptText, maxTokens: budget)
@@ -1058,11 +1100,11 @@ final class AppState {
                         if steps >= maxSteps, !results.isEmpty {
                             // The results still go -- nothing ran for
                             // nothing -- with the request riding on the last.
-                            results[results.count - 1].content += "\n\n[Step limit: this turn has made "
-                                + "\(steps) rounds of tool calls, the most it may. Make no more tool "
-                                + "calls. Summarize what you have learned so far, what you have "
-                                + "changed, and what remains to be done, so the user can decide "
-                                + "how to continue.]"
+                            results[results.count - 1].content += "\n\n<system-reminder>\nThis turn "
+                                + "has made \(steps) rounds of tool calls, the most it may. Make no "
+                                + "more tool calls. Summarize what you have learned so far, what you "
+                                + "have changed, and what remains to be done, so the user can decide "
+                                + "how to continue.\n</system-reminder>"
                             apply(.note("reached \(steps) rounds of tool calls; asking the model to summarize"))
                             stats.hitStepCap = true
                             wrappingUp = true
@@ -1317,7 +1359,66 @@ final class AppState {
         pendingItems[pendingItems.count - 1].append(s, tokens: tokens)
     }
 
+    // MARK: coalescing the stream
+    //
+    // A token arrives as up to three events -- its text, the decode rate, the
+    // context meter -- at ~60 tokens a second on Flash-Next, and each one that
+    // touched observed state was a SwiftUI transaction over the whole
+    // transcript.  So the high-rate events are buffered and applied together
+    // at most every `streamInterval`; anything else flushes the buffer first,
+    // so order is kept exactly.
+
+    private static let streamInterval: Duration = .milliseconds(50)
+    private var streamBuffer: [SessionEvent] = []
+    private var streamFlushScheduled = false
+
     private func apply(_ ev: SessionEvent) {
+        switch ev {
+        case .text, .reasoning, .rate, .context, .prefill, .toolCallProgress:
+            // Consecutive deltas of the same kind merge; for the others only
+            // the latest value matters, so a newer one replaces the older.
+            switch (streamBuffer.last, ev) {
+            case (.text(let a)?, .text(let b)):
+                streamBuffer[streamBuffer.count - 1] = .text(a + b)
+            case (.reasoning(let a, let n)?, .reasoning(let b, let m)):
+                streamBuffer[streamBuffer.count - 1] = .reasoning(a + b, tokens: n + m)
+            default:
+                if let i = streamBuffer.lastIndex(where: { Self.sameGauge($0, ev) }) {
+                    streamBuffer.remove(at: i)
+                }
+                streamBuffer.append(ev)
+            }
+            if !streamFlushScheduled {
+                streamFlushScheduled = true
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: Self.streamInterval)
+                    self?.flushStream()
+                }
+            }
+        default:
+            flushStream()
+            applyNow(ev)
+        }
+    }
+
+    /// Gauges: events whose latest value supersedes the earlier ones.
+    private static func sameGauge(_ a: SessionEvent, _ b: SessionEvent) -> Bool {
+        switch (a, b) {
+        case (.rate, .rate), (.context, .context), (.prefill, .prefill),
+             (.toolCallProgress, .toolCallProgress): return true
+        default: return false
+        }
+    }
+
+    private func flushStream() {
+        streamFlushScheduled = false
+        guard !streamBuffer.isEmpty else { return }
+        let batch = streamBuffer
+        streamBuffer = []
+        for ev in batch { applyNow(ev) }
+    }
+
+    private func applyNow(_ ev: SessionEvent) {
         switch ev {
         case .prefill(let done, let total):
             // Only while there is still prompt left to read. The engine reports

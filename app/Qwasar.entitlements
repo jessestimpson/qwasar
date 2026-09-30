@@ -2,30 +2,19 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- The M0 gate is that these four coexist with a 16 GB mmap in a signed
-         bundle.  virtualization is available with an ordinary Developer ID and
-         is not one of the restricted entitlements; com.apple.vm.networking is,
-         and is deliberately absent (spec 8.1, 8.3). -->
-    <key>com.apple.security.app-sandbox</key>
-    <true/>
+    <!-- Not App Sandboxed.  A session's tools run either on this Mac, as the
+         user with their shell environment (HostToolRunner), or in a VM with
+         no network device (SandboxToolRunner) - chosen per session.  The
+         first is impossible under App Sandbox: everything a sandboxed app
+         starts inherits its sandbox, so `bash` could reach neither the
+         user's files nor their toolchains.  The isolation that matters is the
+         VM's, and it does not depend on this one.
+
+         virtualization runs that VM.  com.apple.vm.networking is deliberately
+         absent (spec 8.1, 8.3), so even a misconfigured guest cannot be given
+         a network device.  The Makefile still signs with the hardened
+         runtime. -->
     <key>com.apple.security.virtualization</key>
-    <true/>
-    <key>com.apple.security.files.user-selected.read-write</key>
-    <true/>
-    <key>com.apple.security.files.bookmarks.app-scope</key>
-    <true/>
-    <!-- Outgoing connections only, for the HOST's own egress: fetch (spec
-         8.3) and delegate (spec 15), both policy-gated in the app.  The
-         GUEST still has no network device; com.apple.vm.networking stays
-         deliberately absent, so even a misconfigured VM cannot get one.
-         Without this entitlement a sandboxed connection fails with the
-         misleading "hostname could not be found". -->
-    <key>com.apple.security.network.client</key>
-    <true/>
-    <!-- The server helper listens on 127.0.0.1 for the window, the CLI
-         agent and any client of the compat endpoints.  Loopback only by
-         its own bind address; the entitlement is what lets it listen. -->
-    <key>com.apple.security.network.server</key>
     <true/>
 </dict>
 </plist>

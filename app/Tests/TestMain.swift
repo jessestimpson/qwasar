@@ -2,6 +2,8 @@
 //
 // The suites, in order of how much they cost to run:
 //   pathguard  no I/O beyond a temp tree; the security boundary
+//   host tools a session's tools on this Mac: edit's contract, the runner, the
+//              user's shell environment (starts their login shell once)
 //   client     pure; the Session API's event stream, decoded
 //   store      persistence, including what survives a crash mid-turn
 //   markdown   blocks out of Foundation's parse; the highlighter's reconstruction
@@ -21,6 +23,7 @@ struct TestMain {
         var failures = 0
 
         print("== pathguard");  failures += PathGuardSuite.run()
+        print("== host tools"); failures += HostToolsSuite.run()
         print("== network");    failures += NetworkPolicySuite.run()
         print("== overlay");    failures += SandboxOverlaySuite.run()
         print("== delegation");  failures += EscalationSuite.run()

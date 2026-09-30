@@ -5,6 +5,7 @@
 // a determinate bar with real numbers, because a cold prompt is the longest
 // part of a turn and a spinner during it reads as a hang.
 
+import AppKit
 import SwiftUI
 import QwasarKit
 
@@ -16,7 +17,14 @@ struct SessionView: View {
             SessionHeader(state: state)
             Divider()
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
+                // Not lazy.  A LazyVStack estimates the heights of rows it
+                // has not built and corrects them as it builds them, so the
+                // content height moves whenever the view scrolls -- and
+                // following the tail is scrolling.  Estimate, scroll,
+                // correct, scroll: a hang report caught that loop pinning
+                // the main thread for 108 s with nothing arriving.  Real
+                // heights only change when content does.
+                VStack(alignment: .leading, spacing: 16) {
                     ForEach(state.transcript) { item in
                         // Only the tail item can be mid-generation, and
                         // only then is a fence possibly still open.
@@ -178,7 +186,7 @@ struct EffortControl: View {
     /// silently started somewhere else.
     private var projectDefault: ReasoningEffort? {
         guard let rec = state.selectedSession else { return nil }
-        return state.projects.first { $0.id == rec.projectID }?.effort
+        return state.projects.first { $0.id == rec.projectID }.map(state.defaultEffort(for:))
     }
 
     var body: some View {
@@ -616,9 +624,12 @@ struct ToolCard: View {
 
     private var icon: String {
         switch name {
-        case "read": return "doc.text"
-        case "list": return "folder"
-        case "grep": return "magnifyingglass"
+        case "Read": return "doc.text"
+        case "Write", "Edit": return "pencil"
+        case "Glob": return "folder"
+        case "Grep": return "magnifyingglass"
+        case "Bash": return "terminal"
+        case "TodoWrite": return "checklist"
         default:     return "wrench.and.screwdriver"
         }
     }
@@ -631,8 +642,41 @@ struct ToolCard: View {
 
 // MARK: - Composer
 
+/// Shift-Return in the composer is a new line, where Return sends.
+///
+/// The field's own newline is Option-Return; Shift-Return is what chat boxes
+/// have taught everyone.  SwiftUI's onKeyPress does not reliably see Return
+/// while a TextField's field editor has it, so this watches the window's key
+/// events instead -- only while the composer has focus -- and hands the field
+/// editor the same action Option-Return would, which inserts at the cursor.
+@MainActor
+final class ShiftReturnNewline {
+    var active = false
+    private var monitor: Any?
+
+    func install() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self, self.active,
+                  e.keyCode == 36 || e.keyCode == 76,               // Return, keypad Enter
+                  e.modifierFlags.intersection(.deviceIndependentFlagsMask) == .shift,
+                  let editor = e.window?.firstResponder as? NSTextView, editor.isFieldEditor
+            else { return e }
+            editor.insertNewlineIgnoringFieldEditor(nil)
+            return nil
+        }
+    }
+
+    func remove() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+    }
+}
+
 struct Composer: View {
     @Bindable var state: AppState
+    @FocusState private var focused: Bool
+    @State private var shiftReturn = ShiftReturnNewline()
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
@@ -642,6 +686,10 @@ struct Composer: View {
                 .padding(8)
                 .background(Color.secondary.opacity(0.08), in: .rect(cornerRadius: 8))
                 .onSubmit { state.send() }
+                .focused($focused)
+                .onChange(of: focused) { _, f in shiftReturn.active = f }
+                .onAppear { shiftReturn.install() }
+                .onDisappear { shiftReturn.remove() }
                 .disabled(state.phase == .generating)
 
             if state.phase == .generating, !state.isTurnSelected {

@@ -54,8 +54,8 @@ enum NetworkPolicySuite {
         // policy-off project never carries the schema. The composition rule,
         // pinned here so the wiring cannot silently regress.
         check("fetch schema names fetch", ToolSurface.fetchSchema.contains("\"fetch\""))
-        check("fetch is not in the frozen guest surface",
-              !ToolSurface.guestSchemas.contains(ToolSurface.fetchSchema))
+        check("fetch is not in the sandbox surface itself",
+              !ToolSurface.sandboxSchemas.contains(ToolSurface.fetchSchema))
 
         return fails
     }

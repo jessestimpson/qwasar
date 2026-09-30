@@ -9,7 +9,7 @@
 //   Qwasar --gate                              probes only
 //   Qwasar --gate --model <dir> [--prompt ..]  starts the helper on that model
 //   Qwasar --gate --server <url> [--prompt ..] uses a server that is running
-//   --root <dir> --no-sandbox --guest <dir>    as for the sandbox gate
+//   --root <dir> --sandboxed --guest <dir>     tools on this Mac, or with --sandboxed in the VM
 
 import Foundation
 import QwasarKit
@@ -74,9 +74,13 @@ enum Gate {
         print("  root: \(root.path)")
         print("  > \(prompt)\n")
 
-        var runner: ToolExecuting = ToolRunner(root: root)
+        // On this Mac by default, as a new session is; `--sandboxed` for the
+        // VM, as the "New Sandboxed Session" is.
+        var runner: ToolExecuting = HostToolRunner(root: root,
+                                                   environment: ShellEnvironment.resolve(in: root))
         var sandboxes: SandboxManager?
-        if !args.contains("--no-sandbox") {
+        if args.contains("--sandboxed") {
+            runner = ToolRunner(root: root)
             let guestDir = URL(fileURLWithPath: QwasarMain.value(of: "--guest", in: args) ?? "build/guest")
             let stateDir = FileManager.default.temporaryDirectory.appendingPathComponent("qwasar-gate-vm-\(UUID().uuidString)")
             let m = SandboxManager(guestDir: guestDir, stateDir: stateDir)
@@ -89,13 +93,19 @@ enum Gate {
             } catch {
                 print("  sandbox unavailable (\(error)); falling back to the read-only host tools")
             }
+        } else {
+            print("  tools: on this Mac, \(ShellEnvironment.loginShell) environment")
         }
         defer { if let s = sandboxes { Task { await s.stopAll() } } }
 
         let opened: OpenedSession
         do {
-            opened = try await client.open(system: runner.environmentDescription + "\n\n" + Project.defaultSystem,
-                                           tools: runner.schemas, thinking: true, effort: "low",
+            opened = try await client.open(system: SystemPrompt.build(
+                                               toolsDescription: runner.environmentDescription,
+                                               environment: runner is SandboxToolRunner ? .guest(root: root) : .host(root: root),
+                                               projectRoot: root, projectPrompt: Project.defaultSystem),
+                                           tools: runner.schemas, thinking: true,
+                                           effort: QwasarMain.value(of: "--effort", in: args) ?? "low",
                                            metadata: ["client": "gate"])
         } catch { print("  open: \(error)"); return 1 }
         print("  session \(opened.id): prefix \(opened.prefix_tokens) tokens")
@@ -104,7 +114,8 @@ enum Gate {
         var steps = 0
         var ok = false
         do {
-            while steps < 8 {
+            let maxSteps = Int(QwasarMain.value(of: "--steps", in: args) ?? "") ?? 24
+            while steps < maxSteps {
                 var calls: [(String, ToolCall)] = []
                 var stop = ""
                 var sawText = false
