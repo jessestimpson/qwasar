@@ -371,6 +371,32 @@ bool qw_api_handle(qw_store *st, conn *c, const http_req *r, const str *body) {
         str_free(&b);
         return true;
     }
+    if (!strcmp(verb, "aside")) {
+        qj_doc d;
+        if (!qj_parse(&d, body->p ? body->p : "", body->len)) {
+            api_error(c, 400, "bad_request", d.err);
+            qj_free(&d);
+            return true;
+        }
+        const qj_node *root = qj_root(&d);
+        char *text = qj_strdup(&d, qj_get(&d, root, "text"));
+        if (!text || !*text) {
+            api_error(c, 400, "bad_request", "an aside needs text");
+        } else {
+            qwasar_sampling sp;
+            read_sampling(&d, root, &sp);
+            const int32_t max_tokens = (int32_t)qj_int_or(&d, root, "max_tokens", 1024);
+            int status = 409;
+            char err[256] = "";
+            sse_sink k = { c, false, false };
+            if (!qw_sess_aside(st, s, text, max_tokens, &sp, emit_sse, &k, &status, err, sizeof err))
+                api_error(c, status, status == 409 ? "conflict" : "bad_request", err);
+            sink_close(&k);
+        }
+        free(text);
+        qj_free(&d);
+        return true;
+    }
     if (!strcmp(verb, "turn") || !strcmp(verb, "continue")) {
         qj_doc d;
         if (!qj_parse(&d, body->p ? body->p : "", body->len)) {

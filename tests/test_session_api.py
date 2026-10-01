@@ -450,6 +450,52 @@ class Steps(unittest.TestCase):
                 return
         self.fail(f"never caught a step running: {statuses}")
 
+class Aside(unittest.TestCase):
+    """An aside is a step off the record: it streams an answer, then the
+    session is rolled back to exactly where it was.  Proved the strong way --
+    two identical sessions, one given an aside between turns, take the same
+    next turn token for token."""
+
+    def text_of(self, ev):
+        return "".join(d.get("text", "") for _, name, d in ev if name == "text")
+
+    def test_aside_leaves_no_trace(self):
+        a, b = SRV.open(), SRV.open()
+        for sid in (a, b):
+            SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="tell me about the sea"))
+        before = SRV.request("GET", f"/v1/sessions/{a}")[2]
+        # b's turn may have evicted a; a fresh turn brings it back in memory.
+        SRV.stream("POST", f"/v1/sessions/{a}/turn", dict(FAST, text="and the sky"))
+        SRV.stream("POST", f"/v1/sessions/{b}/turn", dict(FAST, text="and the sky"))
+        SRV.stream("POST", f"/v1/sessions/{a}/turn", dict(FAST, text="one more"))
+        mid = SRV.request("GET", f"/v1/sessions/{a}")[2]
+        self.assertEqual(mid["warmth"]["state"], "live", mid)
+
+        status, ev = SRV.stream("POST", f"/v1/sessions/{a}/aside",
+                                {"text": "Write a one-line note.", "max_tokens": 16,
+                                 "sampling": {"temperature": 0}})
+        self.assertEqual(status, 200, ev)
+        names = [n for _, n, _ in ev]
+        self.assertEqual(names[-1], "done", names)
+        self.assertGreater(ev[-1][2]["usage"]["generated"], 0, ev[-1])
+        after = SRV.request("GET", f"/v1/sessions/{a}")[2]
+        self.assertEqual(after["tokens"], mid["tokens"], "the aside's tokens reached the timeline")
+        self.assertEqual(after["state"], "idle")
+
+        SRV.stream("POST", f"/v1/sessions/{b}/turn", dict(FAST, text="one more"))
+        _, ea = SRV.stream("POST", f"/v1/sessions/{a}/turn", dict(FAST, text="finally"))
+        _, eb = SRV.stream("POST", f"/v1/sessions/{b}/turn", dict(FAST, text="finally"))
+        self.assertEqual(self.text_of(ea), self.text_of(eb), "an aside changed what came next")
+        self.assertEqual(ea[-1][2]["context"]["used"], eb[-1][2]["context"]["used"])
+
+    def test_aside_needs_a_live_idle_session(self):
+        sid = SRV.open()
+        status, _, r = SRV.request("POST", f"/v1/sessions/{sid}/aside", {"text": "notes"})
+        self.assertEqual(status, 409, r)
+        status, _, r = SRV.request("POST", f"/v1/sessions/{sid}/aside", {})
+        self.assertEqual(status, 400, r)
+
+
 class Parking(unittest.TestCase):
     """M4: a session parks to a checkpoint of its own (sessions/<id>/
     checkpoint.bin), which nothing evicts -- not the shared prefix cache,

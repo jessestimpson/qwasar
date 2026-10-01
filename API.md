@@ -115,6 +115,7 @@ POST   /v1/sessions/{id}/cancel        end the step at the next token
 POST   /v1/sessions/{id}/park          free the live slot, keep it warm
 DELETE /v1/sessions/{id}/checkpoint    give its disk back; it becomes cold, not gone
 DELETE /v1/sessions/{id}               forget it, state and log
+POST   /v1/sessions/{id}/aside         a step off the record    -> stream
 ```
 
 The existing `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`,
@@ -294,6 +295,30 @@ are what it decides by. The server never does this on its own.
 
 Removes the session, its token log, its checkpoint and its events. `204`.
 The shared prefix checkpoint is not the session's and stays.
+
+### 4.11 `POST /v1/sessions/{id}/aside` -- a step off the record
+
+```json
+{"text": "Update your notes: …", "max_tokens": 1024, "sampling": {"temperature": 0.7}}
+```
+
+A user turn the session answers and then forgets. The server takes a rewind
+point at the end of the timeline, evaluates `text` as a user turn with
+thinking off and no tools, streams the answer as `text` events and a `done`
+(`{"stop", "usage": {"prompt", "generated"}, "seconds"}`), and rolls the
+session back to the rewind point: its timeline, token log and checkpoints
+are exactly what they were, and the next real step continues as if the
+aside had never run. For work that belongs beside a conversation rather
+than in it -- the app's running notes, written while the user reads.
+
+It runs only on an `idle` session that is `live`, only when the engine is
+free (an aside never queues), and never in a session whose timeline holds
+images (no rewind point can be taken there); otherwise `409`. A `turn`,
+`park` or `DELETE` on the session ends a running aside at its next token,
+rolls it back, and proceeds -- an aside never delays a real step by more
+than that. qwasar-specific: it rests on the engine's rewind point
+(`qwasar_session_mark`), which copies the recurrent state; a server for a
+pure-attention model would truncate its cache instead.
 
 ## 5. The event stream
 

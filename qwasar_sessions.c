@@ -102,6 +102,11 @@ struct qw_sess {
     void     *emit_ud;
     bool      peer_gone;
     atomic_bool cancel;
+    /* An aside (qw_sess_aside): a step taken off the record and rolled back.
+     * `aside` keeps its tokens out of the timeline; `aside_running` is what
+     * a real step waits on, after setting `aside_cancel` to end it. */
+    bool        aside, aside_running;
+    atomic_bool aside_cancel;
     /* Prefill progress, rebased over the whole of a resume. */
     int32_t   prog_base, prog_total;
 };
@@ -1061,7 +1066,7 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
 
         logits = qwasar_session_eval(s->h, &next, 1, err, cap);
         if (!logits) { ok = false; break; }
-        if (!s->compat) tokens_append(s, &next, 1);
+        if (!s->compat && !s->aside) tokens_append(s, &next, 1);
         if (on_token) on_token(ud, out->n_gen, in_call, out->text.p ? out->text.p : "", out->text.len);
     }
 
@@ -1265,6 +1270,12 @@ static void end_step(qw_store *st, qw_sess *s, const char *stop, bool persist) {
     }
     pthread_mutex_lock(&s->ev_lock);
     s->step_open = false;
+    /* The step's connection is gone when its handler returns: nothing may
+     * emit to it after this.  (An aside's prefill once did, through the
+     * progress callback, and wrote into a dead stack frame.) */
+    s->emit = NULL;
+    s->emit_ud = NULL;
+    s->prog_total = 0;
     pthread_cond_broadcast(&s->ev_cond);
     pthread_mutex_unlock(&s->ev_lock);
 }
@@ -1576,6 +1587,42 @@ static bool run_step(qw_store *st, qw_sess *s, int32_t *fresh, int32_t n_fresh,
     return true;
 }
 
+/* Ends an aside running on `s`, if any, and waits for it to roll back: a
+ * real step never waits behind one. */
+static void aside_preempt(qw_sess *s) {
+    pthread_mutex_lock(&s->ev_lock);
+    if (s->aside_running) {
+        atomic_store(&s->aside_cancel, true);
+        while (s->aside_running) pthread_cond_wait(&s->ev_cond, &s->ev_lock);
+    }
+    pthread_mutex_unlock(&s->ev_lock);
+}
+
+/* The engine if it is free right now; an aside never queues. */
+static bool engine_try_acquire(qw_store *st, qw_sess *s) {
+    pthread_mutex_lock(&st->qlock);
+    const bool got = !st->busy && !st->head;
+    if (got) { st->busy = true; st->holder = s; }
+    pthread_mutex_unlock(&st->qlock);
+    return got;
+}
+
+typedef struct { qw_emit_fn emit; void *ud; int seq; bool gone; } aside_sink;
+
+static void aside_delta(void *ud, bool reasoning, const char *p, size_t n) {
+    aside_sink *k = ud;
+    if (reasoning || n == 0 || k->gone) return;
+    str b = { 0 };
+    str_puts(&b, "{\"text\": ");
+    char *t = malloc(n + 1);
+    if (t) { memcpy(t, p, n); t[n] = 0; str_jsons(&b, t); free(t); }
+    str_puts(&b, "}");
+    char id[32];
+    snprintf(id, sizeof id, "aside.%d", ++k->seq);
+    if (!k->emit(k->ud, id, "text", b.p)) k->gone = true;
+    str_free(&b);
+}
+
 static void chat_opts(const qw_sess *s, qwasar_chat_options *o) {
     memset(o, 0, sizeof *o);
     o->enable_thinking = s->thinking;
@@ -1584,9 +1631,105 @@ static void chat_opts(const qw_sess *s, qwasar_chat_options *o) {
     o->n_tools = s->n_tools;
 }
 
+bool qw_sess_aside(qw_store *st, qw_sess *s, const char *text, int32_t max_tokens,
+                   const qwasar_sampling *sp, qw_emit_fn emit, void *ud,
+                   int *status, char *err, size_t errcap) {
+    *status = 409;
+    pthread_mutex_lock(&st->lock);
+    const bool idle = s->state == QW_SESS_IDLE && !strcmp(s->model_id, st->model_id) && !s->compat;
+    pthread_mutex_unlock(&st->lock);
+    if (!idle) { snprintf(err, errcap, "an aside needs an idle session"); return false; }
+
+    pthread_mutex_lock(&s->ev_lock);
+    const bool already = s->aside_running;
+    if (!already) { s->aside_running = true; atomic_store(&s->aside_cancel, false); }
+    pthread_mutex_unlock(&s->ev_lock);
+    if (already) { snprintf(err, errcap, "an aside is already running"); return false; }
+
+    bool ok = false;
+    if (!engine_try_acquire(st, s)) {
+        snprintf(err, errcap, "the engine is busy");
+        goto done;
+    }
+    /* Live only: an aside costs no resume, and needs a rewind point, which
+     * a session with images in it cannot take. */
+    if (!s->h || !qwasar_session_mark(s->h)) {
+        snprintf(err, errcap, s->h ? "this session cannot take a rewind point (it has images)"
+                                   : "the session is not in memory");
+        engine_release(st);
+        goto done;
+    }
+    {
+        const int32_t base = qwasar_session_n_past(s->h);
+        qwasar_chat_options o;
+        chat_opts(s, &o);
+        o.enable_thinking = false;            /* notes, not deliberation */
+        int32_t n = 0;
+        int32_t *ids = qwasar_render_user_turn(st->tok, text ? text : "", 0, false, &o, &n);
+        if (max_tokens <= 0) max_tokens = 1024;
+        if (!ids || base + n + max_tokens + 1 >= st->ctx) {
+            free(ids);
+            snprintf(err, errcap, ids ? "not enough room left in the window for an aside"
+                                      : "cannot render the aside");
+            engine_release(st);
+            goto done;
+        }
+        *status = 200;
+        aside_sink k = { emit, ud, 0, false };
+        /* Its prefill reports to no one: the progress callback emits into
+         * the session's step log and connection, which are not the aside's. */
+        s->prog_total = 0;
+        const double t0 = qw_now();
+        char e2[256] = "";
+        const float *logits = qwasar_session_eval(s->h, ids, n, e2, sizeof e2);
+        free(ids);
+        qw_genres g;
+        memset(&g, 0, sizeof g);
+        bool gen = false;
+        if (logits) {
+            qw_genopts go;
+            memset(&go, 0, sizeof go);
+            go.tools = QW_TOOLS_NONE;
+            s->aside = true;
+            gen = qw_generate(st, s, logits, sp, max_tokens, false, &go, aside_delta, NULL, &k,
+                              &s->aside_cancel, &g, e2, sizeof e2);
+            s->aside = false;
+        }
+        /* Back to where the session was: the rewind point is exactly the
+         * timeline's end, so nothing the aside did remains.  Should it fail
+         * to land there, the handle goes and the session resumes from disk
+         * -- never from a state with the aside in it. */
+        if (qwasar_session_rewind_to_mark(s->h) != s->n_tokens || qwasar_session_n_past(s->h) != base) {
+            qw_log("  %s: aside did not rewind cleanly; dropping the handle", s->id);
+            qwasar_session_free(s->h);
+            s->h = NULL;
+        }
+        const char *stop = !logits || !gen ? "error"
+                         : g.cancelled ? "cancelled" : (g.hit_eos || g.hit_stop) ? "end_turn" : "length";
+        str b = { 0 };
+        str_printf(&b, "{\"stop\": \"%s\", \"usage\": {\"prompt\": %d, \"generated\": %d}, "
+                       "\"seconds\": %.3f}", stop, n, g.n_gen, qw_now() - t0);
+        if (!k.gone) emit(ud, "aside.done", "done", b.p);
+        str_free(&b);
+        if (st->verbose)
+            qw_log("  %s: aside: %d tokens in, %d out in %.2fs, %s; rolled back to %d",
+                   s->id, n, g.n_gen, qw_now() - t0, stop, base);
+        qw_genres_free(&g);
+        engine_release(st);
+        ok = true;
+    }
+done:
+    pthread_mutex_lock(&s->ev_lock);
+    s->aside_running = false;
+    pthread_cond_broadcast(&s->ev_cond);
+    pthread_mutex_unlock(&s->ev_lock);
+    return ok;
+}
+
 bool qw_sess_turn(qw_store *st, qw_sess *s, const qw_turn *t,
                   qw_emit_fn emit, void *ud, int *status, char *err, size_t errcap) {
     *status = 400;
+    aside_preempt(s);
     pthread_mutex_lock(&st->lock);
     const bool adm = step_admissible(st, s, false, status, err, errcap);
     pthread_mutex_unlock(&st->lock);
@@ -1766,6 +1909,7 @@ bool qw_sess_cancel(qw_store *st, qw_sess *s) {
 }
 
 bool qw_sess_park(qw_store *st, qw_sess *s, char *err, size_t errcap) {
+    aside_preempt(s);
     pthread_mutex_lock(&st->lock);
     const bool busy = s->state == QW_SESS_QUEUED || s->state == QW_SESS_RUNNING;
     pthread_mutex_unlock(&st->lock);
@@ -1788,6 +1932,7 @@ bool qw_sess_park(qw_store *st, qw_sess *s, char *err, size_t errcap) {
 }
 
 bool qw_sess_purge(qw_store *st, qw_sess *s, char *err, size_t errcap) {
+    aside_preempt(s);
     pthread_mutex_lock(&st->lock);
     const bool busy = s->state == QW_SESS_QUEUED || s->state == QW_SESS_RUNNING;
     pthread_mutex_unlock(&st->lock);
@@ -1810,6 +1955,7 @@ bool qw_sess_purge(qw_store *st, qw_sess *s, char *err, size_t errcap) {
 }
 
 bool qw_store_delete(qw_store *st, qw_sess *s, char *err, size_t errcap) {
+    aside_preempt(s);
     pthread_mutex_lock(&st->lock);
     if (s->state == QW_SESS_QUEUED || s->state == QW_SESS_RUNNING) {
         pthread_mutex_unlock(&st->lock);

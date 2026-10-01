@@ -199,6 +199,17 @@ bool qw_sess_cancel(qw_store *st, qw_sess *s);
  * handle as the spare for the next resume.)  False with `err` while a step
  * runs or when nothing could be written (the session is then cold). */
 bool qw_sess_park(qw_store *st, qw_sess *s, char *err, size_t errcap);
+/* A step off the record: `text` as a user turn, answered with thinking off
+ * and no tools, streamed to `emit` as `text` events and a final `done` --
+ * then rolled back to the rewind point taken before it, so the session's
+ * timeline, token log and checkpoints are exactly as they were.  For the
+ * app's running notes, written while the user reads a reply.  Only on an
+ * idle session in memory, only when the engine is free (it never queues),
+ * and a turn, continue, park or delete on the session ends it at once.
+ * False with `status`/`err` when it cannot start. */
+bool qw_sess_aside(qw_store *st, qw_sess *s, const char *text, int32_t max_tokens,
+                   const qwasar_sampling *sp, qw_emit_fn emit, void *ud,
+                   int *status, char *err, size_t errcap);
 /* Frees the session's memory without writing anything: the checkpoints it
  * already has on disk stay, and its warmth is whatever they cover.  The
  * store's spare handle goes too.  False with `err` while a step runs. */
