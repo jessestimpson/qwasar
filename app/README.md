@@ -217,11 +217,16 @@ results. The app follows both, rather than a format of its own:
 
 ### Also in the box
 
-* **Configuration by conversation.** Sandbox settings layer global →
-  project → session, the most specific value winning field by field. The
-  built-in **Crucible Config** project manages them: its sessions run
-  host-side config tools with no sandbox, no shell, no file access and no
-  network — their whole reach is the configuration.
+* **Configuration by conversation.** The built-in **Qwasar Config** project
+  manages everything the menus and sheets do, by asking: the server's port,
+  its model, its context size and live sessions, starting and stopping it,
+  start at login, the checkpoint disk budget; each project's default effort
+  and guidance prompt; and the sandbox settings, which layer global →
+  project → session, the most specific value winning field by field. Its
+  sessions run host-side config tools — no shell, no file access, no
+  network; their whole reach is the configuration. A change that restarts
+  the server waits until the reply that made it is finished. The delegation
+  API key is the one setting it cannot touch: you enter that yourself.
 * **Delegation.** A session can hand a sub-task to a remote model, under a
   dollar budget, if you have set an API key (**Set Delegation API Key…**,
   stored in the Keychain) and granted models in the config. Off otherwise.

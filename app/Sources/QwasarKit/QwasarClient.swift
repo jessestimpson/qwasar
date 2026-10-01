@@ -339,9 +339,12 @@ public final class QwasarClient: Sendable {
         _ = try await data("POST", "v1/sessions/\(id)/cancel", body: [String: Any]())
     }
 
-    public func park(_ id: String) async throws -> Warmth {
+    /// Frees the live slot.  `save` false writes nothing: the memory goes,
+    /// and the session keeps only what is already on disk (API.md 4.8).
+    public func park(_ id: String, save: Bool = true) async throws -> Warmth {
         struct P: Decodable { var warmth: Warmth }
-        return try await call("POST", "v1/sessions/\(id)/park", body: [String: Any](), as: P.self).warmth
+        let body: [String: Any] = save ? [:] : ["save": false]
+        return try await call("POST", "v1/sessions/\(id)/park", body: body, as: P.self).warmth
     }
 
     /// Gives the session's disk back: it becomes cold, its conversation kept.

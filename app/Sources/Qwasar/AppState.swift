@@ -201,6 +201,13 @@ final class AppState {
         if !projects.contains(where: \.isConfig) {
             projects.append(Project.configProject())
         }
+        // The built-in project's name and prompt are the app's, not the
+        // user's: a store written by an older build is brought up to date.
+        if let i = projects.firstIndex(where: \.isConfig) {
+            let current = Project.configProject()
+            projects[i].name = current.name
+            projects[i].systemPrompt = current.systemPrompt
+        }
         migrateSystemPrompts()
         resolveProjectRoots()
         // The model folder's grant, from the last time it was chosen.  The
@@ -249,6 +256,44 @@ final class AppState {
     /// The Model menu's choice: a folder already granted for its family is
     /// used at once; any other needs one click in the panel, which is what
     /// grants it (the app cannot read a folder it was not handed).
+    /// Set when a change needs the server restarted (a config session's
+    /// port, model, context or live sessions); done when the turn in flight
+    /// ends, or at once if there is none.
+    var pendingServerRestart = false
+    /// The same, for a stop -- which a config session cannot do to itself
+    /// mid-reply either.
+    var pendingServerStop = false
+    /// Whether the server is coming up, which counts as running for a
+    /// change that needs it restarted.
+    var pendingServerStart: Bool { if case .starting = server.state { return true }; return false }
+
+    /// A new port, held until the restart: changed at once, the menu bar's
+    /// probe would watch an empty port while the old one is still answering.
+    var pendingPort: Int?
+
+    func requestServerRestart() {
+        if phase == .generating { pendingServerRestart = true } else { applyPendingPort(); restartServer() }
+    }
+
+    private func applyPendingPort() {
+        if let p = pendingPort { server.port = p; pendingPort = nil }
+    }
+
+    /// A model folder by path, without the panel -- the app is not App
+    /// Sandboxed, so naming a folder is enough to read it.  Returns an error,
+    /// or nil once the model is chosen (the restart is requested separately).
+    func setModel(path raw: String) -> String? {
+        let u = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath).resolvingSymlinksInPath()
+        guard ModelAccess.looksLikeModel(u) else { return "\(u.path) has no config.json and *.safetensors" }
+        guard let family = ModelCatalog.family(of: u.path) else {
+            return "\(u.path) is not a model the server runs (Qwen3.8 27B or Flash-Next, 4-bit MLX)"
+        }
+        guard access.store(u) else { return "could not keep a bookmark for \(u.path)" }
+        if let data = access.bookmark { ModelLibrary.remember(data, as: family) }
+        modelPath = u.path
+        return nil
+    }
+
     func useModel(path: String) {
         guard let family = ModelCatalog.family(of: path) else { chooseModel(startingAt: path); return }
         if let data = ModelLibrary.bookmark(for: family),
@@ -1148,6 +1193,17 @@ final class AppState {
             instantaneousTokensPerSecond = 0
             if case .generating = phase { phase = .ready }
             refreshWarm()
+            // A restart a config session asked for waits for that session's
+            // own reply: the server it would restart is the one answering.
+            if pendingServerStop {
+                pendingServerStop = false
+                pendingServerRestart = false
+                stopServer()
+            } else if pendingServerRestart {
+                pendingServerRestart = false
+                applyPendingPort()
+                restartServer()
+            }
         }
     }
 
@@ -1273,18 +1329,35 @@ final class AppState {
         }
     }
 
-    /// The one user verb (spec 4.4): keep it warm, free the live slot. The
-    /// checkpoint is mechanism and goes unmentioned; the VM stops too, per
-    /// the park sequence -- its disk survives and reboots on the next open.
-    func park(_ id: UUID) {
-        guard liveSessionID == id, phase != .generating else { return }
+    /// Whether the server holds `id` in memory -- by its own report, or
+    /// because it is this window's live session.
+    func isInMemory(_ id: UUID) -> Bool {
+        liveSessionID == id || serverSessions[id]?.warmth.state == "live"
+    }
+
+    /// Takes a session out of memory (spec 4.4's one user verb).  `save`
+    /// writes its checkpoint first, so the next message resumes with
+    /// nothing to re-read; without it nothing is written, the memory goes at
+    /// once, and the next message re-reads whatever the disk does not cover.
+    /// Either way the server frees the memory outright, and a sandboxed
+    /// session's VM stops -- its disk survives and reboots on the next open.
+    func unload(_ id: UUID, save: Bool = true) {
+        guard turnSessionID != id || phase != .generating else { return }
         Task {
             if let sid = sessions.first(where: { $0.id == id })?.serverSessionID, let client {
-                _ = try? await client.park(sid)
+                do {
+                    let w = try await client.park(sid, save: save)
+                    let total = sessions.first(where: { $0.id == id })?.tokenCount ?? 0
+                    engineNote = w.covered >= total
+                        ? "unloaded from memory; its checkpoint on disk covers all of it"
+                        : "unloaded from memory without saving; \(w.covered) of \(total) tokens "
+                          + "are on disk, and the rest is re-read when it is next used"
+                } catch {
+                    engineNote = "could not unload the session: \(error)"
+                }
             }
             if let sandboxes { await sandboxes.stop(session: id) }
-            liveSessionID = nil
-            sandboxStatus = nil
+            if liveSessionID == id { liveSessionID = nil; sandboxStatus = nil }
             if let i = sessions.firstIndex(where: { $0.id == id }) {
                 sessions[i].state = .closed
                 store?.save(sessions[i])
@@ -1329,7 +1402,7 @@ final class AppState {
             if selectedSessionID == rec.id { savedTranscript.append(item) }
             store?.appendTranscript(rec.id, [item])
             if liveSessionID == rec.id {
-                park(rec.id)
+                unload(rec.id)
             } else if let sandboxes {
                 await sandboxes.stop(session: rec.id)
             }

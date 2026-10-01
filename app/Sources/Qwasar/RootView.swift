@@ -49,7 +49,7 @@ struct APIKeySheet: View {
                 .font(.caption).foregroundStyle(.secondary)
             SecureField("sk-or-…", text: $key)
                 .textFieldStyle(.roundedBorder)
-            Text("Delegation also needs models granted: in a Crucible Config "
+            Text("Delegation also needs models granted: in a Qwasar Config "
                  + "session, `config_set` the `delegate_models` key at the "
                  + "layer you want.")
                 .font(.caption2).foregroundStyle(.tertiary)
@@ -133,8 +133,18 @@ struct Sidebar: View {
                                    info: state.serverSessions[s.id])
                             .tag(s.id)
                             .contextMenu {
-                                if state.liveSessionID == s.id {
-                                    Button("Park Session") { state.park(s.id) }
+                                if state.isInMemory(s.id), s.serverSessionID != nil {
+                                    // Option skips the checkpoint write:
+                                    // the memory goes at once, and the next
+                                    // message re-reads what the disk lacks.
+                                    Button("Unload from Memory") {
+                                        state.unload(s.id, save: !NSEvent.modifierFlags.contains(.option))
+                                    }
+                                    .disabled(state.turnSessionID == s.id && state.phase == .generating)
+                                    .help("Saves its checkpoint and frees its memory; the next "
+                                          + "message resumes from disk. Hold Option to free it "
+                                          + "without saving: faster now, and the turns since its "
+                                          + "last checkpoint are re-read next time.")
                                 }
                                 if let b = state.serverSessions[s.id]?.checkpoint_bytes, b > 0,
                                    state.turnSessionID != s.id {
@@ -182,9 +192,10 @@ struct Sidebar: View {
                         if project.isConfig {
                             Image(systemName: "gearshape")
                                 .foregroundStyle(.secondary)
-                                .help("Built in. Sessions here manage Crucible's "
-                                      + "configuration with host-side tools — no "
-                                      + "folder, no sandbox.")
+                                .help("Built in. Sessions here manage Qwasar's "
+                                      + "configuration -- the server, the projects, "
+                                      + "the sandbox -- with host-side tools: no "
+                                      + "folder, no shell.")
                         } else if project.resolvedRoot == nil {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .foregroundStyle(.orange)

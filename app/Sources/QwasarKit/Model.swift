@@ -108,14 +108,15 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
 
     public var isConfig: Bool { id == Project.configProjectID }
 
-    /// The built-in project whose sessions manage Crucible itself: host-side
+    /// The built-in project whose sessions manage Qwasar itself: host-side
     /// config tools, no folder, no sandbox to boot.
+    public static let configProjectName = "Qwasar Config"
     public static func configProject() -> Project {
-        Project(id: configProjectID, name: "Crucible Config", rootBookmark: Data(),
+        Project(id: configProjectID, name: configProjectName, rootBookmark: Data(),
                 systemPrompt: """
-                You manage Crucible's configuration through the config tools. \
+                You manage Qwasar's configuration through the config tools. \
                 Show the current state before changing it, change only what was \
-                asked, and state what you changed and at which layer.
+                asked, and state what you changed, where, and when it takes effect.
                 """)
     }
 

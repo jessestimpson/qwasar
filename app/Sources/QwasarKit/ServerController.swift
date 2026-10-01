@@ -64,6 +64,17 @@ public final class ServerController {
         set { UserDefaults.standard.set(newValue, forKey: "port") }
     }
 
+    /// Overrides for what the server would derive from the model and the
+    /// machine (`--ctx`, `--live`).  nil -- the default -- lets it derive.
+    public var contextOverride: Int? {
+        get { let v = UserDefaults.standard.integer(forKey: "serverContext"); return v > 0 ? v : nil }
+        set { UserDefaults.standard.set(newValue ?? 0, forKey: "serverContext") }
+    }
+    public var liveSessionsOverride: Int? {
+        get { let v = UserDefaults.standard.integer(forKey: "serverLive"); return v > 0 ? v : nil }
+        set { UserDefaults.standard.set(newValue ?? 0, forKey: "serverLive") }
+    }
+
     public var apiURL: String { "http://127.0.0.1:\(port)/v1" }
     public var baseURL: URL { URL(string: "http://127.0.0.1:\(port)/")! }
 
@@ -121,11 +132,15 @@ public final class ServerController {
 
         let p = Process()
         p.executableURL = binary
-        // The server derives its context from the model and the machine
-        // (API.md §4.1); nothing is passed for it.  --max-tokens 0 leaves a
+        // The server derives its context and live sessions from the model and
+        // the machine (API.md §4.1) unless the user set them (contextOverride,
+        // liveSessionsOverride -- the config session's server_context and
+        // server_live_sessions).  --max-tokens 0 leaves a
         // compat request's output bounded only by the window's room.
         var args = ["-m", model, "--port", String(port), "--exit-on-eof", "--max-tokens", "0", "-v"]
         if let stateDir { args += ["--state-dir", stateDir.path] }
+        if let c = contextOverride { args += ["--ctx", String(c)] }
+        if let l = liveSessionsOverride { args += ["--live", String(l)] }
         p.arguments = args
         let pipe = Pipe()
         p.standardInput = pipe
