@@ -273,6 +273,8 @@ struct SessionRow: View {
     private var detail: String? {
         guard session.tokenCount > 0 else { return nil }
         var parts = ["\(session.tokenCount) / \(session.contextSize) tokens"]
+        if session.successorID != nil { parts.insert("continued in a new session", at: 0) }
+        else if session.ancestorID != nil, session.tokenCount == 0 { parts.insert("continues an earlier session", at: 0) }
         if closedForGood {
             parts.append("read-only")
         } else if !isLive, let s = info?.warmth.estimate_seconds {
@@ -292,6 +294,7 @@ struct SessionRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
                     Text(session.title).lineLimit(1)
+                        .foregroundStyle(session.successorID != nil ? .secondary : .primary)
                     if session.isSandboxed {
                         Image(systemName: "shippingbox")
                             .font(.caption2).foregroundStyle(.secondary)

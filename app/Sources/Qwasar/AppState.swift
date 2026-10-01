@@ -1031,6 +1031,14 @@ final class AppState {
                 pendingHandoff = nil
                 appendItem(TranscriptItem(.note("the delegation result was attached to this message")))
             }
+            // A successor's first message carries its ancestor's notes.
+            if sessions[sidx].ancestorID != nil, sessions[sidx].tokenCount == 0,
+               let notes = sessions[sidx].notes, !notes.isEmpty {
+                promptText = "<system-reminder>\nThis session continues an earlier one that ran out "
+                           + "of context. Its working notes follow; treat them as what you already "
+                           + "know, and re-read files rather than trusting them where it matters."
+                           + "\n\n<notes>\n" + notes + "\n</notes>\n</system-reminder>\n\n" + promptText
+            }
             appendItem(TranscriptItem(.user(text)))
 
             // The turn: a step, and while the model asks for tools, run them
@@ -1048,6 +1056,11 @@ final class AppState {
             // At the cap the model is asked to sum up rather than cut off.
             let maxSteps = 200
             var wrappingUp = false
+            // The window's fill, as last reminded about: a long turn is told
+            // at 75% and at 90%, once each (the in-turn half of running
+            // notes -- notes are taken when a turn ends, so a turn that
+            // never ends is asked to find a place to).
+            var remindedFill = 0.0
             // The last event heard, and how often this step's stream has had
             // to be picked up again.
             var lastEventID: String?
@@ -1153,6 +1166,17 @@ final class AppState {
                             apply(.note("reached \(steps) rounds of tool calls; asking the model to summarize"))
                             stats.hitStepCap = true
                             wrappingUp = true
+                        } else if !results.isEmpty, stats.contextLimit > 0 {
+                            let fill = Double(stats.contextUsed) / Double(stats.contextLimit)
+                            if let mark = [0.9, 0.75].first(where: { fill >= $0 && remindedFill < $0 }) {
+                                remindedFill = mark
+                                results[results.count - 1].content += "\n\n<system-reminder>\nThe context "
+                                    + "window is \(Int(fill * 100))% used (\(stats.contextUsed) of "
+                                    + "\(stats.contextLimit) tokens). At the next natural milestone, stop "
+                                    + "and report to the user, so that working notes can be taken -- the "
+                                    + "work may need to continue in a fresh session.\n</system-reminder>"
+                                apply(.note("the context is \(Int(fill * 100))% full; the model was told"))
+                            }
                         }
                         stream = client.continueStep(sid, results: results, maxTokens: budget)
                     case "cancelled":
@@ -1195,6 +1219,15 @@ final class AppState {
             refreshWarm()
             // A restart a config session asked for waits for that session's
             // own reply: the server it would restart is the one answering.
+            // Notes, while the user reads: off the record, so they cost
+            // the conversation nothing.  Only after a turn that ended on its
+            // own, in a session long enough to be worth summarizing.
+            if !p.isConfig, runningNotesEnabled, !stats.interrupted, stats.contextUsed >= 4096,
+               let i = sessions.firstIndex(where: { $0.id == rec.id }),
+               (sessions[i].notesTokens ?? 0) < stats.contextUsed {
+                let id = rec.id
+                Task { await takeNotes(id) }
+            }
             if pendingServerStop {
                 pendingServerStop = false
                 pendingServerRestart = false
@@ -1327,6 +1360,140 @@ final class AppState {
             }
             refreshWarm()
         }
+    }
+
+    // MARK: Running notes and successors
+
+    /// Off by the config session's running_notes; on by default.
+    var runningNotesEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "runningNotes") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "runningNotes") }
+    }
+    /// The session whose notes are being written right now, for the header.
+    var notesInProgress: UUID?
+
+    static let notesPrompt = """
+        <system-reminder>
+        This is a note-taking step. It is not shown to the user, and it is undone afterwards: nothing you write here stays in this conversation.
+
+        Update the working notes for this session. They are what a fresh session would start from if this work had to continue elsewhere -- so they must stand on their own, for a reader who has seen nothing else. Be concrete: names, paths, commands, numbers. At most about 600 words, in this shape:
+
+        ## Goal
+        ## Decisions, and why
+        ## Tried and did not work
+        ## Current state -- files changed, what works, what does not
+        ## Next steps
+
+        Reply with the notes only, in Markdown.
+        </system-reminder>
+        """
+
+    /// Writes the session's notes in an aside: the server answers the notes
+    /// prompt with thinking off and rolls the session back, so this costs
+    /// the conversation nothing and the user's next message waits for none
+    /// of it (the server ends an aside when a real step arrives).  Returns
+    /// whether notes were written.
+    @discardableResult
+    func takeNotes(_ id: UUID) async -> Bool {
+        guard notesInProgress == nil, let client,
+              let i = sessions.firstIndex(where: { $0.id == id }),
+              let sid = sessions[i].serverSessionID else { return false }
+        notesInProgress = id
+        defer { notesInProgress = nil }
+        var text = Self.notesPrompt
+        if let old = sessions[i].notes, !old.isEmpty {
+            text += "\n\nThe current notes, to replace -- keep what is still true:\n\n<notes>\n"
+                  + old + "\n</notes>"
+        }
+        let seen = sessions[i].tokenCount
+        var out = ""
+        var stop = ""
+        do {
+            for try await se in client.aside(sid, text: text, maxTokens: 1200) {
+                switch se.event {
+                case .text(let t): out += t
+                case .done(let s, _, _, _, _, _, _, _, _, _, _, _): stop = s
+                default: break
+                }
+            }
+        } catch {
+            return false      // refused: busy, not in memory, or images -- next time
+        }
+        let notes = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard stop == "end_turn" || stop == "length", !notes.isEmpty,
+              let j = sessions.firstIndex(where: { $0.id == id }) else { return false }
+        sessions[j].notes = notes
+        sessions[j].notesAt = Date()
+        sessions[j].notesTokens = seen
+        store?.save(sessions[j])
+        return true
+    }
+
+    /// How full the selected session's window is, 0...1.
+    var contextFill: Double {
+        contextLimit > 0 ? Double(contextUsed) / Double(contextLimit) : 0
+    }
+
+    /// Whether to offer Continue in a New Session: a window 85% used, or full.
+    var offerSuccessor: Bool {
+        guard let rec = selectedSession, rec.successorID == nil,
+              let p = project(of: rec), !p.isConfig else { return false }
+        return contextFill >= 0.85 || rec.state == .archived
+            || transcript.contains { if case .contextFull = $0.kind { return true }; return false }
+    }
+
+    /// Continues `id` in a new session: brings its notes up to date when
+    /// there is room to, opens a successor in the same project with the same
+    /// placement and effort, seeded with those notes, and unloads and
+    /// archives the old one.  The successor's first message carries the
+    /// notes; the old session stays readable.
+    func continueInNewSession(_ id: UUID) {
+        guard phase != .generating, let i = sessions.firstIndex(where: { $0.id == id }),
+              let p = project(of: sessions[i]) else { return }
+        Task {
+            if (sessions[i].notesTokens ?? 0) < sessions[i].tokenCount {
+                engineNote = "writing notes for the new session…"
+                await takeNotes(id)
+            }
+            guard let k = sessions.firstIndex(where: { $0.id == id }) else { return }
+            let old = sessions[k]
+            var notes = old.notes ?? ""
+            if notes.isEmpty {
+                // No room left to write any: the last thing the model told
+                // the user is the best summary there is.
+                notes = "No working notes were taken. The model's last reply in that session was:\n\n"
+                      + (fullTranscript(of: id).last { if case .assistant = $0.kind { return true }; return false }
+                            .map { if case .assistant(let t) = $0.kind { return t }; return "" } ?? "(none)")
+            }
+            var next = SessionRecord(projectID: p.id, title: Self.successorTitle(old.title),
+                                     contextSize: Int32(serverInfo?.context ?? Int(old.contextSize)),
+                                     storedEffort: old.storedEffort ?? defaultEffort(for: p),
+                                     tools: old.placement)
+            next.ancestorID = old.id
+            next.notes = notes
+            next.notesAt = Date()
+            next.notesTokens = 0
+            sessions.insert(next, at: 0)
+            sessions[k + 1].successorID = next.id
+            sessions[k + 1].state = .archived
+            store?.save(sessions[k + 1])
+            store?.save(next)
+            if isInMemory(old.id) { unload(old.id) }
+            let opening = TranscriptItem(.note("continues “\(old.title)”: its notes go with your first "
+                                               + "message (Notes, above, shows them)"))
+            store?.appendTranscript(next.id, [opening])
+            select(next.id)
+            engineNote = nil
+        }
+    }
+
+    static func successorTitle(_ t: String) -> String {
+        if let r = t.range(of: #" \(continued( \d+)?\)$"#, options: .regularExpression) {
+            let base = String(t[..<r.lowerBound])
+            let n = Int(t[r].filter(\.isNumber)) ?? 1
+            return "\(base) (continued \(n + 1))"
+        }
+        return t + " (continued)"
     }
 
     /// Whether the server holds `id` in memory -- by its own report, or

@@ -158,8 +158,43 @@ enum Gate {
         } catch { print("\n  TURN FAILED: \(error)"); return 1 }
 
         print("\n-- describe")
-        if let d = try? await client.describe(opened.id) {
-            print("  \(d.tokens) tokens · \(d.state) · \(d.warmth.state)")
+        let before = try? await client.describe(opened.id)
+        if let d = before { print("  \(d.tokens) tokens · \(d.state) · \(d.warmth.state)") }
+
+        // --notes: the running notes the app takes after a reply -- an
+        // aside, rolled back -- then proof the session is untouched: the
+        // same token count, and a follow-up only the real context answers.
+        if ok, args.contains("--notes") {
+            print("\n-- notes (an aside, off the record)")
+            var notes = "", stop = "", t0 = Date()
+            do {
+                for try await se in client.aside(opened.id, text: AppState.notesPrompt, maxTokens: 1200) {
+                    switch se.event {
+                    case .text(let t): notes += t
+                    case .done(let s, _, let generated, _, _, _, _, _, _, _, _, _):
+                        stop = s
+                        print(String(format: "  [%@: %d tokens in %.1fs]", s, generated, Date().timeIntervalSince(t0)))
+                    default: break
+                    }
+                }
+            } catch { print("  ASIDE FAILED: \(error)"); ok = false }
+            print(notes.split(separator: "\n").map { "  | " + $0 }.joined(separator: "\n"))
+            let after = try? await client.describe(opened.id)
+            let same = after?.tokens == before?.tokens
+            print("  tokens after the aside: \(after?.tokens ?? -1) (\(same ? "unchanged" : "CHANGED"))")
+            if stop != "end_turn" || notes.isEmpty || !same { ok = false }
+
+            print("\n-- follow-up, to show the context is the real one")
+            t0 = Date()
+            var reply = ""
+            do {
+                for try await se in client.turn(opened.id, text: "In one sentence: which file did you change, and what was wrong with it?",
+                                                 temperature: 0, maxTokens: 2048) {
+                    if case .text(let t) = se.event { reply += t }
+                }
+            } catch { print("  FOLLOW-UP FAILED: \(error)"); ok = false }
+            print("  " + reply.trimmingCharacters(in: .whitespacesAndNewlines))
+            _ = t0
         }
         _ = try? await client.park(opened.id)
         print("\n  \(ok ? "GATE PASSES" : "gate incomplete")")

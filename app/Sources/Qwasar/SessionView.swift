@@ -68,6 +68,9 @@ struct SessionView: View {
                 .foregroundStyle(.secondary)
                 .background(Color.accentColor.opacity(0.06))
             }
+            if state.offerSuccessor {
+                SuccessorBanner(state: state)
+            }
             Composer(state: state)
         }
         .sheet(isPresented: $state.showingDelegateSheet) {
@@ -115,18 +118,104 @@ struct SessionHeader: View {
                           + "message reboots the sandbox (~2s) with fresh history. "
                           + "Your files and your real .git are untouched.")
                 }
+                if state.notesInProgress == s.id {
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.mini)
+                        Text("taking notes…").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .help("Writing this session's running notes while you read -- off the "
+                          + "record, so they cost the conversation nothing. Sending a message "
+                          + "stops it at once.")
+                }
+                if let notes = s.notes, !notes.isEmpty {
+                    NotesButton(notes: notes, at: s.notesAt, tokens: s.notesTokens,
+                                inherited: s.ancestorID != nil && s.tokenCount == 0)
+                }
                 if let status = state.sandboxStatus {
                     Label(status, systemImage: status.hasPrefix("sandboxed")
-                          ? "shield.lefthalf.filled" : "eye")
+                          ? "shield.lefthalf.filled" : status.hasPrefix("on this Mac") ? "laptopcomputer" : "eye")
                         .font(.caption)
                         .foregroundStyle(status.hasPrefix("sandboxed") ? .green : .secondary)
                         .help(status.hasPrefix("sandboxed")
                               ? "Tools run in a VM with no network, editing this project's working tree directly — your git shows the edits as uncommitted changes, and your real .git is shadowed out of the VM's reach. Review and commit with your own git."
-                              : "Tools can read your files but cannot change anything.")
+                              : status.hasPrefix("on this Mac")
+                                ? "Tools run directly on your Mac, as you, with your login shell's environment."
+                                : "Tools can read your files but cannot change anything.")
                 }
             }
         }
         .padding(.horizontal, 20).padding(.vertical, 10)
+    }
+}
+
+/// Offered at 85% of the window, and when it is full: continue the work in a
+/// new session, seeded with this one's notes (spec 2.4).
+struct SuccessorBanner: View {
+    @Bindable var state: AppState
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.triangle.branch")
+            Text(state.contextFill >= 1 || state.selectedSession.map { s in
+                    state.transcript.contains { if case .contextFull = $0.kind { return true }; return false }
+                 } == true
+                 ? "The context is full."
+                 : "The context is \(Int(state.contextFill * 100))% used.")
+                .font(.caption)
+            Spacer()
+            Button("Continue in a New Session") {
+                if let id = state.selectedSessionID { state.continueInNewSession(id) }
+            }
+            .disabled(state.phase == .generating || state.notesInProgress != nil)
+            .help("Brings this session's notes up to date, opens a new session seeded "
+                  + "with them, and unloads this one. It stays readable in the sidebar.")
+        }
+        .padding(.horizontal, 20).padding(.vertical, 6)
+        .foregroundStyle(.orange)
+        .background(Color.orange.opacity(0.07))
+    }
+}
+
+/// The session's running notes, in a popover: what a successor would start
+/// from, as of when they were last written.
+struct NotesButton: View {
+    let notes: String
+    let at: Date?
+    let tokens: Int?
+    let inherited: Bool
+    @State private var showing = false
+
+    var body: some View {
+        Button { showing.toggle() } label: {
+            Label("Notes", systemImage: "note.text")
+        }
+        .help(inherited ? "The notes this session was started from."
+                        : "This session's running notes -- what a new session would start from.")
+        .popover(isPresented: $showing, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(inherited ? "Carried over from the earlier session" : "Running notes")
+                        .font(.headline)
+                    Spacer()
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(notes, forType: .string)
+                    } label: { Image(systemName: "doc.on.doc") }
+                    .buttonStyle(.borderless).help("Copy")
+                }
+                if let at, !inherited {
+                    Text("written \(at.formatted(.relative(presentation: .named)))"
+                         + (tokens.map { ", covering \($0) tokens" } ?? ""))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                ScrollView {
+                    MarkdownView(source: notes)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(width: 520, height: 420)
+            }
+            .padding(14)
+        }
     }
 }
 

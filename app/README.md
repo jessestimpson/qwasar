@@ -113,6 +113,21 @@ most clients do, silently (see the warning in the
   recurrent layers cannot rewind — so there is no editing an earlier turn;
   a different past is a new session.
 
+* **Running notes, and a successor when the window fills.** A session
+  cannot be compacted in place — its recurrent layers keep no history to
+  cut — so when the window runs out the work continues in a new session.
+  To make that cheap and good, the model keeps working notes as it goes:
+  after each reply, while you read, the app has it update them in an
+  *aside* — a step the server runs and then rolls back, so the notes cost
+  the conversation nothing, and a message you send stops it at once. The
+  header's **Notes** shows them. At 85% of the window (and when it is full)
+  the app offers **Continue in a New Session**: the notes are brought up to
+  date, a successor opens in the same project, with the same placement and
+  effort, its first message carrying them, and the old session is unloaded
+  and kept, marked as continued. A long turn that never pauses is told at
+  75% and 90% to stop at the next milestone, so notes can be taken.
+  `running_notes` in the config session turns the asides off.
+
 The cost of this is the working set: one session is live at a time on a
 32 GB machine and under Flash-Next. Sending a message to another session
 parks the live one to disk (a checkpoint write) and resumes the other (a

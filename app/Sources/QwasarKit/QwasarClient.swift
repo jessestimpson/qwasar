@@ -380,6 +380,16 @@ public final class QwasarClient: Sendable {
         return stream("v1/sessions/\(id)/continue", body: body)
     }
 
+    /// A step off the record (API.md §4.11): `text` answered with thinking
+    /// off, streamed as `.text` and a `.done`, then rolled back -- the
+    /// session is left exactly as it was.  Refused (409) unless the session
+    /// is idle and in memory and the engine is free.
+    public func aside(_ id: String, text: String, maxTokens: Int = 1024,
+                      temperature: Float = 0.7) -> AsyncThrowingStream<StreamEvent, Error> {
+        stream("v1/sessions/\(id)/aside", body: ["text": text, "max_tokens": maxTokens,
+                                                 "sampling": ["temperature": temperature]])
+    }
+
     /// Reattaches to the step in flight after `lastEventID` (API.md §4.6).
     public func events(_ id: String, after lastEventID: String?) -> AsyncThrowingStream<StreamEvent, Error> {
         stream("v1/sessions/\(id)/events", body: nil, method: "GET",

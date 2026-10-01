@@ -216,6 +216,14 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
     /// Where this session's tools run.  Optional only so a record without it
     /// decodes, as host.
     public var tools: ToolPlacement?
+    /// The session's running notes: what a fresh session would start from
+    /// if this one had to continue elsewhere.  Written off the record, while
+    /// the user reads a reply (AppState.takeNotes); a successor starts with
+    /// its ancestor's.  `notesTokens` is how much of the conversation they
+    /// had seen.
+    public var notes: String?
+    public var notesAt: Date?
+    public var notesTokens: Int?
 
     public var effort: ReasoningEffort { storedEffort ?? .medium }
     public var placement: ToolPlacement { tools ?? .host }
