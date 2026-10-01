@@ -461,6 +461,29 @@ class Parking(unittest.TestCase):
     def wipe_shared_cache(self):
         shutil.rmtree(os.path.join(HOME, ".cache", "qwasar", "kv"), ignore_errors=True)
 
+    def test_park_without_saving_frees_memory_and_writes_nothing(self):
+        sid = SRV.open()
+        SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="park me first"))
+        n = SRV.request("GET", f"/v1/sessions/{sid}")[2]["tokens"]
+        self.assertEqual(SRV.request("POST", f"/v1/sessions/{sid}/park")[0], 200)
+        before = os.stat(self.own(sid))
+        # Live again, and longer than its checkpoint.
+        SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="then a little more"))
+        n2 = SRV.request("GET", f"/v1/sessions/{sid}")[2]["tokens"]
+        self.assertGreater(n2, n)
+        status, _, r = SRV.request("POST", f"/v1/sessions/{sid}/park", {"save": False})
+        self.assertEqual(status, 200, r)
+        after = os.stat(self.own(sid))
+        self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns),
+                         "a purge wrote the checkpoint")
+        self.assertNotEqual(r["warmth"]["state"], "live", r)
+        self.assertEqual(r["warmth"]["covered"], n, r)
+        # It resumes from what was on disk, and evaluates the rest.
+        status, ev = SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="back"))
+        resume = ev[0][2]
+        self.assertEqual(resume["from"], "checkpoint", resume)
+        self.assertEqual(resume["restored"], n, resume)
+
     def test_park_writes_its_own_file_and_resumes_from_it(self):
         sid = SRV.open()
         SRV.stream("POST", f"/v1/sessions/{sid}/turn", dict(FAST, text="park me"))

@@ -266,9 +266,19 @@ is removed from the queue instead. `200` with `{"cancelled": true|false}`.
 ### 4.8 `POST /v1/sessions/{id}/park`
 
 "I am done here for now." The session's state is written to disk and its
-live slot freed; `describe` then reports `warm`. The one verb a user should
+memory freed -- its live slot, and anything the server would otherwise
+keep for the next resume; `describe` then reports `warm`. (When the server
+parks a session itself, to make room in the live set, it may keep that
+memory for the next session it resumes.) The one verb a user should
 ever see about the cache; everything else the server does on its own (§6).
 `200` with the new warmth, or `409` while a step is running.
+
+`{"save": false}` frees the memory without writing anything: whatever
+checkpoints the session already has on disk stay as they are, and its
+warmth is what they cover -- `warm` if they cover all of it, else `cold`
+with `covered` saying how much a resume will restore. For a client that
+wants the memory back now and will pay a re-prefill later, rather than wait
+for a checkpoint write.
 
 ### 4.9 `DELETE /v1/sessions/{id}/checkpoint`
 

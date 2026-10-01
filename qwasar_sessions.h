@@ -194,9 +194,15 @@ bool qw_sess_reattach(qw_store *st, qw_sess *s, const char *last_id, qw_emit_fn 
 /* Ends the step in flight at its next token, or removes a queued one.
  * True if there was something to cancel. */
 bool qw_sess_cancel(qw_store *st, qw_sess *s);
-/* Checkpoints and frees the live handle.  False with `err` while a step
+/* Checkpoints the session and frees its memory -- the handle, and the
+ * store's spare.  (Eviction from the live set parks too, and keeps the
+ * handle as the spare for the next resume.)  False with `err` while a step
  * runs or when nothing could be written (the session is then cold). */
 bool qw_sess_park(qw_store *st, qw_sess *s, char *err, size_t errcap);
+/* Frees the session's memory without writing anything: the checkpoints it
+ * already has on disk stay, and its warmth is whatever they cover.  The
+ * store's spare handle goes too.  False with `err` while a step runs. */
+bool qw_sess_purge(qw_store *st, qw_sess *s, char *err, size_t errcap);
 /* Deletes the session's own checkpoint: a parked session becomes cold (its
  * tokens stay, and a resume re-prefills what the shared cache does not
  * cover); a live one is rewritten at its next park.  The one way disk used

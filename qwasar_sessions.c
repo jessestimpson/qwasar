@@ -1771,14 +1771,41 @@ bool qw_sess_park(qw_store *st, qw_sess *s, char *err, size_t errcap) {
     pthread_mutex_unlock(&st->lock);
     if (busy) { snprintf(err, errcap, "a step is running"); return false; }
     if (!s->h) return true;
-    /* The engine, briefly: a save reads the handle's buffers. */
+    /* The engine, briefly: a save reads the handle's buffers.  Asked for,
+     * a park gives the memory back: the handle park_locked keeps as the
+     * spare -- right for an eviction, whose next resume reuses it -- is
+     * freed, since a client asking to park is asking for its memory. */
     engine_acquire(st, s, false);
     const bool saved = park_locked(st, s, "parked");
+    qwasar_session_free(st->spare);
+    st->spare = NULL;
     engine_release(st);
     if (!saved && s->n_tokens >= 256 && !st->no_cache) {
         snprintf(err, errcap, "the checkpoint could not be written; the session is cold");
         return false;
     }
+    return true;
+}
+
+bool qw_sess_purge(qw_store *st, qw_sess *s, char *err, size_t errcap) {
+    pthread_mutex_lock(&st->lock);
+    const bool busy = s->state == QW_SESS_QUEUED || s->state == QW_SESS_RUNNING;
+    pthread_mutex_unlock(&st->lock);
+    if (busy) { snprintf(err, errcap, "a step is running"); return false; }
+    /* Nothing is written: what is on disk stays as it is, and the memory
+     * goes -- the handle freed rather than kept as the spare, and any spare
+     * with it, since giving memory back is the point. */
+    engine_acquire(st, s, false);
+    if (s->h) {
+        if (st->verbose)
+            qw_log("  %s purged from memory at %d tokens; %d on disk", s->id,
+                   qwasar_session_n_past(s->h), s->own_n > s->ckpt_n ? s->own_n : s->ckpt_n);
+        qwasar_session_free(s->h);
+        s->h = NULL;
+    }
+    qwasar_session_free(st->spare);
+    st->spare = NULL;
+    engine_release(st);
     return true;
 }
 

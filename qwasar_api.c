@@ -350,7 +350,14 @@ bool qw_api_handle(qw_store *st, conn *c, const http_req *r, const str *body) {
     }
     if (!strcmp(verb, "park")) {
         char err[256];
-        if (!qw_sess_park(st, s, err, sizeof err)) {
+        /* {"save": false}: free the memory, write nothing (API.md 4.8). */
+        bool save = true;
+        qj_doc pd;
+        if (body->len > 0) {
+            if (qj_parse(&pd, body->p, body->len)) save = qj_bool_or(&pd, qj_root(&pd), "save", true);
+            qj_free(&pd);
+        }
+        if (!(save ? qw_sess_park(st, s, err, sizeof err) : qw_sess_purge(st, s, err, sizeof err))) {
             api_error(c, strstr(err, "running") ? 409 : 500, strstr(err, "running") ? "conflict" : "server_error", err);
             return true;
         }
