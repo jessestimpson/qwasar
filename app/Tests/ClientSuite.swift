@@ -66,6 +66,19 @@ enum ClientSuite {
         var q = SSEParser()
         f += TestMain.check(q.feed(line: "") == nil && q.feed(line: "event: x") == nil && q.feed(line: "") == nil,
                             "no data, no event")
+        // The open body carries each tool schema byte for byte: the order
+        // the model reads its tools in is the order they are declared in.
+        if let body = try? QwasarClient.openBody(system: "s", tools: ToolSurface.coreSchemas, thinking: true,
+                                                 effort: "xhigh", metadata: ["k": "v"]) {
+            let text = String(decoding: body, as: UTF8.self)
+            f += TestMain.check(ToolSurface.coreSchemas.allSatisfy { text.contains($0.trimmingCharacters(in: .whitespacesAndNewlines)) },
+                                "tool schemas reach the server verbatim, in their declared key order")
+            let o = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+            f += TestMain.check((o?["tools"] as? [Any])?.count == ToolSurface.coreSchemas.count && o?["effort"] as? String == "xhigh",
+                                "and the body is JSON with every field")
+        } else {
+            f += TestMain.check(false, "the open body builds")
+        }
         return f
     }
 }

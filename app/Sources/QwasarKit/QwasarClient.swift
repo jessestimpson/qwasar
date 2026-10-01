@@ -278,15 +278,20 @@ public final class QwasarClient: Sendable {
 
     /// One request with a JSON answer.  A non-2xx answer is a ClientError.refused.
     private func call<T: Decodable>(_ method: String, _ path: String, body: Any? = nil,
-                                    as type: T.Type) async throws -> T {
-        let (data, resp) = try await data(method, path, body: body)
+                                    rawBody: Data? = nil, as type: T.Type) async throws -> T {
+        let (data, resp) = try await data(method, path, body: body, rawBody: rawBody)
         _ = resp
         do { return try JSONDecoder().decode(T.self, from: data) }
         catch { throw ClientError.malformed("\(path): \(error)") }
     }
 
-    private func data(_ method: String, _ path: String, body: Any? = nil) async throws -> (Data, HTTPURLResponse) {
-        let req = try request(method, path, body: body)
+    private func data(_ method: String, _ path: String, body: Any? = nil,
+                      rawBody: Data? = nil) async throws -> (Data, HTTPURLResponse) {
+        var req = try request(method, path, body: body)
+        if let rawBody {
+            req.httpBody = rawBody
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         let (data, resp): (Data, URLResponse)
         do { (data, resp) = try await session.data(for: req) }
         catch { throw ClientError.unreachable(error.localizedDescription) }
@@ -314,16 +319,31 @@ public final class QwasarClient: Sendable {
 
     public func open(system: String, tools: [String], thinking: Bool, effort: String,
                      metadata: [String: String]) async throws -> OpenedSession {
-        // Tools are JSON already; they go in as objects, not strings.
-        let toolObjects: [Any] = try tools.map { s in
-            guard let d = s.data(using: .utf8), let o = try? JSONSerialization.jsonObject(with: d) else {
+        let body = try Self.openBody(system: system, tools: tools, thinking: thinking,
+                                     effort: effort, metadata: metadata)
+        return try await call("POST", "v1/sessions", rawBody: body, as: OpenedSession.self)
+    }
+
+    /// The open request's body.  Tools are JSON already, and they go in byte
+    /// for byte: parsed and re-serialized they came out in a dictionary's
+    /// order -- "timeout" before "description", "function" before "type" --
+    /// and the server renders what it is given into the prompt, so the model
+    /// read its tools shuffled from how they are declared, and from how its
+    /// chat template shows the tools it was trained on.
+    public static func openBody(system: String, tools: [String], thinking: Bool, effort: String,
+                                metadata: [String: String]) throws -> Data {
+        for t in tools {
+            guard let d = t.data(using: .utf8), (try? JSONSerialization.jsonObject(with: d)) != nil else {
                 throw ClientError.malformed("a tool schema is not JSON")
             }
-            return o
         }
-        let body: [String: Any] = ["system": system, "tools": toolObjects, "thinking": thinking,
+        let rest: [String: Any] = ["system": system, "thinking": thinking,
                                    "effort": effort, "metadata": metadata]
-        return try await call("POST", "v1/sessions", body: body, as: OpenedSession.self)
+        var json = String(decoding: try JSONSerialization.data(withJSONObject: rest), as: UTF8.self)
+        json.removeLast()                                   // the closing brace
+        json += ", \"tools\": [" + tools.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                          .joined(separator: ", ") + "]}"
+        return Data(json.utf8)
     }
 
     public func describe(_ id: String) async throws -> SessionInfo {

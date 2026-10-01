@@ -677,21 +677,60 @@ struct ToolCard: View {
     let result: String?
 
     @State private var expanded = false
+    /// The call in full: every argument, whole, selectable.
+    @State private var showCall = false
 
     private var resultLines: [Substring] { (result ?? "").split(separator: "\n", omittingEmptySubsequences: false) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // The model's own words for what the call is for, when it gave
+            // some (Bash's `description`), are the headline: "Bash · List
+            // the project's files" reads at a glance where the command does
+            // not.  The arguments follow, quieter, on their own line.
             HStack(spacing: 8) {
                 Image(systemName: icon).foregroundStyle(.secondary).font(.caption)
                 Text(name).font(.system(.callout, design: .monospaced)).bold()
-                ForEach(arguments.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
-                    Text("\(k)=\(oneLine(v))")
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.secondary).lineLimit(1)
+                if let purpose {
+                    Text("·").foregroundStyle(.tertiary)
+                    Text(purpose).font(.callout).lineLimit(2)
+                } else if !showCall {
+                    argumentLine
+                        .contentShape(Rectangle())
+                        .onTapGesture { showCall = true }
                 }
                 Spacer()
                 if result == nil { ProgressView().controlSize(.small) }
+                if !shownArguments.isEmpty {
+                    Button { showCall.toggle() } label: {
+                        Image(systemName: showCall ? "chevron.up" : "chevron.down")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(showCall ? "Hide the call" : "Show the whole call")
+                }
+            }
+            if showCall {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(shownArguments, id: \.key) { k, v in
+                        VStack(alignment: .leading, spacing: 2) {
+                            if shownArguments.count > 1 || k != "command" {
+                                Text(k).font(.caption2).foregroundStyle(.tertiary)
+                            }
+                            Text(v)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(6)
+                                .background(Color.secondary.opacity(0.08), in: .rect(cornerRadius: 4))
+                        }
+                    }
+                }
+                .padding(.leading, 22)
+            } else if purpose != nil, !shownArguments.isEmpty {
+                argumentLine.padding(.leading, 22)
+                    .contentShape(Rectangle())
+                    .onTapGesture { showCall = true }
             }
             if let result, !result.isEmpty {
                 Text(expanded ? result : resultLines.prefix(3).joined(separator: "\n"))
@@ -709,6 +748,28 @@ struct ToolCard: View {
         }
         .padding(10)
         .background(Color.secondary.opacity(0.07), in: .rect(cornerRadius: 8))
+    }
+
+    /// What the call is for, in the model's words, if it said.
+    private var purpose: String? {
+        guard let d = arguments["description"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !d.isEmpty else { return nil }
+        return d
+    }
+
+    /// Every argument but the description, which has its own place.
+    private var shownArguments: [(key: String, value: String)] {
+        arguments.filter { $0.key != "description" }.sorted { $0.key < $1.key }
+    }
+
+    private var argumentLine: some View {
+        HStack(spacing: 8) {
+            ForEach(shownArguments, id: \.key) { k, v in
+                Text("\(k)=\(oneLine(v))")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
     }
 
     private var icon: String {
