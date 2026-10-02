@@ -286,6 +286,10 @@ typedef struct {
     /* A tool call opened inside the reasoning block -- the model skipped its
      * </think> -- and was read as the end of it. */
     bool    call_in_reasoning;
+    /* The step's first token as sampled, for the log: its probability at
+     * T=1 over the whole vocabulary, and the most likely token's. */
+    int32_t first_token, first_top;
+    float   first_p, first_top_p;
 } qw_genres;
 
 /* A delta of reasoning or content, UTF-8 complete. */

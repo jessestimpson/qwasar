@@ -13,6 +13,8 @@
 
 #include "qwasar_sessions.h"
 
+#include <math.h>
+
 #include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
@@ -153,6 +155,10 @@ struct qw_store {
 };
 
 /* ---- small helpers ----------------------------------------------------------- */
+
+static void token_text(qw_store *st, const int32_t *toks, int32_t from, int32_t to,
+                       char *out, size_t cap);
+
 
 static char *xstrdup(const char *s) {
     if (!s) return NULL;
@@ -1011,6 +1017,20 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
         if (atomic_load(&g_stopping)) break;
         if (cancel && atomic_load(cancel)) { out->cancelled = true; break; }
         int32_t next = qwasar_sample(lp, vocab, sp, &st->rng);
+        if (i == 0) {
+            /* What the first token was drawn from, for the log: a token the
+             * filters (top-k, top-p) should never have let through shows up
+             * as a probability no sampler could have produced. */
+            float mx = lp[0];
+            int32_t top = 0;
+            for (int32_t v = 1; v < vocab; v++) if (lp[v] > mx) { mx = lp[v]; top = v; }
+            double z = 0.0;
+            for (int32_t v = 0; v < vocab; v++) z += exp((double)(lp[v] - mx));
+            out->first_token = next;
+            out->first_p = (float)(exp((double)(lp[next] - mx)) / z);
+            out->first_top = top;
+            out->first_top_p = (float)(1.0 / z);
+        }
         if (qwasar_is_eos(st->e, next)) { out->hit_eos = true; break; }
         out->n_gen++;
         if (reasoning) out->n_reasoning++;
@@ -1595,6 +1615,14 @@ static bool run_step(qw_store *st, qw_sess *s, int32_t *fresh, int32_t n_fresh,
     s->last_used = qw_now();
     pthread_mutex_unlock(&st->lock);
 
+    if (ok && g.n_gen > 0 && (st->verbose || g.first_p < 1e-3f)) {
+        char a[48], b[48];
+        token_text(st, &g.first_token, 0, 1, a, sizeof a);
+        token_text(st, &g.first_top, 0, 1, b, sizeof b);
+        qw_log("  %s: step %d: first token %d '%s' p=%.4f (most likely %d '%s' p=%.4f)%s", s->id, s->step,
+               g.first_token, a, g.first_p, g.first_top, b, g.first_top_p,
+               g.first_p < 1e-3f ? " -- UNLIKELY: no top-k/top-p draw gives this; the logits or the sampler are suspect" : "");
+    }
     if (g.call_in_reasoning)
         qw_log("  %s: step %d: a tool call opened inside the reasoning block; read as its end", s->id, s->step);
     if (st->verbose)
