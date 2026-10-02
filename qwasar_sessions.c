@@ -1028,6 +1028,18 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
             reasoning = false;
             chan_send(&rc, true, rc.shown.len, on_delta, ud);
         } else if (bytes && len) {
+            /* A tool call opened while still reasoning: the model skipped its
+             * </think> and went straight to the call.  <tool_call> is not
+             * something reasoning writes, so it ends the reasoning here --
+             * what came before stays reasoning, the call is parsed and run.
+             * (Seen in a long session: the model's whole reasoning became
+             * one stray word, copied step after step without its </think>,
+             * and every call it wrote after that was lost.) */
+            if (reasoning && next == call_open && go->tools != QW_TOOLS_NONE) {
+                reasoning = false;
+                chan_send(&rc, true, rc.shown.len, on_delta, ud);
+                out->call_in_reasoning = true;
+            }
             str_add(reasoning ? &out->reasoning : &out->text, bytes, len);
             if (next == call_open) {
                 in_call = true;
@@ -1060,6 +1072,16 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
         if (!reasoning && next != call_open && go->tools != QW_TOOLS_NONE
             && qw_tool_call_complete(out->text.p ? out->text.p : "", out->text.len)) {
             out->has_call = true;
+            /* The token that completed the call -- </tool_call> -- is part of
+             * the turn as the chat template writes it ("</function>\n
+             * </tool_call><|im_end|>"), so it is evaluated and recorded like
+             * any other before the step ends.  It used not to be: the step
+             * stopped on it, the next render closed the turn, and every call
+             * in a session's context lacked its closing tag -- a shape the
+             * model never saw in training, repeated dozens of times a session. */
+            logits = qwasar_session_eval(s->h, &next, 1, err, cap);
+            if (!logits) { ok = false; break; }
+            if (!s->compat && !s->aside) tokens_append(s, &next, 1);
             if (on_token) on_token(ud, out->n_gen, in_call, out->text.p ? out->text.p : "", out->text.len);
             break;
         }
@@ -1573,6 +1595,8 @@ static bool run_step(qw_store *st, qw_sess *s, int32_t *fresh, int32_t n_fresh,
     s->last_used = qw_now();
     pthread_mutex_unlock(&st->lock);
 
+    if (g.call_in_reasoning)
+        qw_log("  %s: step %d: a tool call opened inside the reasoning block; read as its end", s->id, s->step);
     if (st->verbose)
         qw_log("  %s: step %d: %d tokens prefilled in %.2fs, %d generated in %.2fs (%.1f tok/s), %s",
                s->id, s->step, n_fresh, prefill_s, g.n_gen, decode_s,

@@ -283,6 +283,9 @@ typedef struct {
     int     stop_index;    /* which one */
     bool    has_call;
     bool    cancelled;
+    /* A tool call opened inside the reasoning block -- the model skipped its
+     * </think> -- and was read as the end of it. */
+    bool    call_in_reasoning;
 } qw_genres;
 
 /* A delta of reasoning or content, UTF-8 complete. */
