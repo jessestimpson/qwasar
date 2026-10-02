@@ -87,6 +87,10 @@ public struct ToolKit: Sendable {
         case "Grep":      return grep(call)
         case "Bash":      return bash(call)
         case "TodoWrite": return todo(call)
+        // The app answers this one with a card; reaching here means no one
+        // is there to (a headless run, a delegated remote model).
+        case UserQuestions.toolName:
+            return "error: there is no one to answer questions here. " + UserQuestions.skipped
         default:          return "error: no such tool: \(call.name)"
         }
     }

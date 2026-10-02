@@ -35,6 +35,9 @@ public enum ToolSurface {
     public static let bashSchema = #"""
     {"type": "function", "function": {"name": "Bash", "description": "Run a shell command with /bin/sh in the project directory and return its combined output and exit status. Use it to build, run tests, run git read-only commands, and use the project's own tools. Prefer Read, Edit, Write, Glob and Grep for files: they are faster and their results are exact. Commands that wait for input will hang until the timeout.", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The command to run."}, "description": {"type": "string", "description": "In a few words, what the command does."}, "timeout": {"type": "integer", "description": "Milliseconds before the command is killed. Default 120000, at most 600000."}}, "required": ["command"]}}}
     """#
+    public static let askSchema = #"""
+    {"type": "function", "function": {"name": "AskUserQuestion", "description": "Ask the user to settle a decision that is theirs to make, before you commit to it: what to build, which of several reasonable approaches, how far the change should reach, a preference the request does not state. The questions appear in the app as a card with your options as choices; the user picks, or answers in their own words, and their answers come back as the result. Ask when the request is ambiguous or underspecified and the code cannot tell you -- early, and in one call, rather than exploring every reading of the request in your reasoning. Do not ask what you can find out by reading the code or running something, and do not ask for permission to proceed with a reasonable default. Offer concrete options; put the one you recommend first and end its label with \"(Recommended)\". The user can always choose \"Other\" and write their own answer, so do not add an \"Other\" option yourself.", "parameters": {"type": "object", "properties": {"questions": {"type": "array", "description": "One to four questions.", "minItems": 1, "maxItems": 4, "items": {"type": "object", "properties": {"question": {"type": "string", "description": "The complete question, ending in a question mark."}, "header": {"type": "string", "description": "A very short label for the question, at most 12 characters, e.g. \"Approach\" or \"Scope\"."}, "options": {"type": "array", "description": "Two to four distinct choices.", "minItems": 2, "maxItems": 4, "items": {"type": "object", "properties": {"label": {"type": "string", "description": "The choice, in one to five words."}, "description": {"type": "string", "description": "What choosing it means: its trade-off or consequence."}}, "required": ["label", "description"]}}, "multiSelect": {"type": "boolean", "description": "True when more than one choice may apply; false (the default) when they are exclusive."}}, "required": ["question", "header", "options", "multiSelect"]}}}, "required": ["questions"]}}}
+    """#
     public static let todoSchema = #"""
     {"type": "function", "function": {"name": "TodoWrite", "description": "Keep a short task list for work with several steps, and update it as you go: mark an item in_progress when you start it and completed as soon as it is done. Each call replaces the whole list. Skip it for a single simple step.", "parameters": {"type": "object", "properties": {"todos": {"type": "array", "description": "The complete, updated list.", "items": {"type": "object", "properties": {"content": {"type": "string", "description": "The task, as an imperative (\"Fix the parser\")."}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}}}
     """#
@@ -64,8 +67,12 @@ public enum ToolSurface {
     /// The core surface, in order -- and the order is part of the system turn.
     public static let coreSchemas: [String] = [
         readSchema, writeSchema, editSchema, globSchema, grepSchema, bashSchema, todoSchema,
+        askSchema,
     ]
-    public static let coreNames: Set<String> = ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "TodoWrite"]
+    /// AskUserQuestion is among them, though no backend runs it: the app
+    /// answers it with a card in the transcript (UserQuestions).
+    public static let coreNames: Set<String> = ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "TodoWrite",
+                                                "AskUserQuestion"]
 
     /// A sandboxed session's: the core, then the guest's own four.
     public static let sandboxSchemas: [String] = coreSchemas + [
@@ -74,8 +81,8 @@ public enum ToolSurface {
     public static let guestNames: Set<String> = ["elixir", "define", "skills", "invoke"]
 
     /// A sandboxed session whose guest did not start: looking, not touching.
-    public static let readOnlySchemas: [String] = [readSchema, globSchema, grepSchema]
-    public static let readOnlyNames: Set<String> = ["Read", "Glob", "Grep"]
+    public static let readOnlySchemas: [String] = [readSchema, globSchema, grepSchema, askSchema]
+    public static let readOnlyNames: Set<String> = ["Read", "Glob", "Grep", "AskUserQuestion"]
 
     /// The warden ops the host calls, which the sandbox gate checks are all
     /// dispatchable: the primitives ToolKit is written over, and the guest's

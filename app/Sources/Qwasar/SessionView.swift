@@ -26,13 +26,21 @@ struct SessionView: View {
                 // heights only change when content does.
                 VStack(alignment: .leading, spacing: 16) {
                     ForEach(state.transcript) { item in
-                        // Only the tail item can be mid-generation, and
-                        // only then is a fence possibly still open.
-                        TranscriptRow(item: item,
-                                      isStreaming: state.phase == .generating
-                                                   && state.isTurnSelected
-                                                   && item.id == state.transcript.last?.id)
-                            .id(item.id)
+                        if state.isTurnSelected, let qs = state.pendingQuestions,
+                           case .tool(let name, _, nil) = item.kind, name == UserQuestions.toolName {
+                            // The model is waiting on the user: its questions,
+                            // answerable in place.
+                            QuestionCard(questions: qs) { state.answerQuestions($0) }
+                                .id(item.id)
+                        } else {
+                            // Only the tail item can be mid-generation, and
+                            // only then is a fence possibly still open.
+                            TranscriptRow(item: item,
+                                          isStreaming: state.phase == .generating
+                                                       && state.isTurnSelected
+                                                       && item.id == state.transcript.last?.id)
+                                .id(item.id)
+                        }
                     }
                     if state.isTurnSelected, let p = state.pendingCall {
                         PendingCallRow(name: p.name, keys: p.keys, tokens: p.tokens)
@@ -145,6 +153,159 @@ struct SessionHeader: View {
             }
         }
         .padding(.horizontal, 20).padding(.vertical, 10)
+    }
+}
+
+/// An Edit as `git diff` shows one: the file, then its lines removed (red,
+/// `-`), added (green, `+`) and unchanged around them.
+struct EditDiffView: View {
+    let path: String
+    let old: String
+    let new: String
+    let replaceAll: Bool
+
+    var body: some View {
+        let lines = LineDiff.diff(old: old, new: new)
+        let removed = lines.filter { if case .removed = $0 { return true }; return false }.count
+        let added = lines.filter { if case .added = $0 { return true }; return false }.count
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(path).font(.system(.caption, design: .monospaced)).bold()
+                    .lineLimit(1).truncationMode(.head).textSelection(.enabled)
+                Text("−\(removed)").font(.caption.monospacedDigit()).foregroundStyle(.red)
+                Text("+\(added)").font(.caption.monospacedDigit()).foregroundStyle(.green)
+                if replaceAll {
+                    Text("every occurrence").font(.caption2).foregroundStyle(.secondary)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.12), in: .capsule)
+                }
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    let (mark, text, tint): (String, String, Color?) = {
+                        switch line {
+                        case .same(let t):    return (" ", t, nil)
+                        case .removed(let t): return ("-", t, .red)
+                        case .added(let t):   return ("+", t, .green)
+                        }
+                    }()
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(mark).foregroundStyle(tint ?? .secondary)
+                        Text(text.isEmpty ? " " : text)
+                            .foregroundStyle(tint == nil ? Color.secondary : Color.primary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                    .font(.system(.caption, design: .monospaced))
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(tint.map { $0.opacity(0.12) } ?? Color.clear)
+                }
+            }
+            .textSelection(.enabled)
+            .clipShape(.rect(cornerRadius: 4))
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.15)))
+        }
+    }
+}
+
+/// The model's questions, answerable in place: Claude Code's question card.
+/// Each question has its header chip, its options -- radio buttons, or
+/// checkboxes when several may apply -- each with what it means, and an
+/// "Other" field for an answer of the user's own.  Skip lets the model go
+/// on with its own judgment.
+struct QuestionCard: View {
+    let questions: [UserQuestion]
+    let answer: ([String: [String]]?) -> Void
+
+    @State private var chosen: [String: Set<String>] = [:]
+    @State private var other: [String: String] = [:]
+
+    private func answered(_ q: UserQuestion) -> Bool {
+        !(chosen[q.question] ?? []).isEmpty
+            || !(other[q.question] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label(questions.count == 1 ? "The model has a question" : "The model has \(questions.count) questions",
+                  systemImage: "questionmark.bubble")
+                .font(.headline)
+            ForEach(questions) { q in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        if !q.header.isEmpty {
+                            Text(q.header).font(.caption.weight(.semibold))
+                                .padding(.horizontal, 7).padding(.vertical, 2)
+                                .background(Color.accentColor.opacity(0.15), in: .capsule)
+                        }
+                        Text(q.question).font(.callout.weight(.medium))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    ForEach(q.options, id: \.label) { o in
+                        let on = chosen[q.question]?.contains(o.label) == true
+                        Button {
+                            var set = chosen[q.question] ?? []
+                            if q.multiSelect {
+                                if on { set.remove(o.label) } else { set.insert(o.label) }
+                            } else {
+                                set = [o.label]
+                                other[q.question] = ""
+                            }
+                            chosen[q.question] = set
+                        } label: {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Image(systemName: q.multiSelect ? (on ? "checkmark.square.fill" : "square")
+                                                                : (on ? "largecircle.fill.circle" : "circle"))
+                                    .foregroundStyle(on ? Color.accentColor : .secondary)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(o.label).font(.callout)
+                                    if !o.description.isEmpty {
+                                        Text(o.description).font(.caption).foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.vertical, 5).padding(.horizontal, 8)
+                            .background(on ? Color.accentColor.opacity(0.08) : Color.clear, in: .rect(cornerRadius: 6))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    HStack(spacing: 8) {
+                        Image(systemName: "pencil").foregroundStyle(.secondary)
+                        TextField("Other…", text: Binding(
+                            get: { other[q.question] ?? "" },
+                            set: { v in
+                                other[q.question] = v
+                                if !q.multiSelect, !v.isEmpty { chosen[q.question] = [] }
+                            }))
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    .padding(.horizontal, 8)
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Skip") { answer(nil) }
+                    .help("Let the model go on with its own judgment; it states its assumptions.")
+                Button("Answer") {
+                    var out: [String: [String]] = [:]
+                    for q in questions {
+                        var a = q.options.map(\.label).filter { chosen[q.question]?.contains($0) == true }
+                        let o = (other[q.question] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !o.isEmpty { a.append(o) }
+                        out[q.question] = a
+                    }
+                    answer(out)
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!questions.allSatisfy(answered))
+            }
+        }
+        .padding(14)
+        .background(Color.accentColor.opacity(0.05), in: .rect(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.accentColor.opacity(0.35)))
     }
 }
 
@@ -710,7 +871,13 @@ struct ToolCard: View {
                     .help(showCall ? "Hide the call" : "Show the whole call")
                 }
             }
-            if showCall {
+            if showCall, name == "Edit", let old = arguments["old_string"] ?? arguments["old"],
+               let new = arguments["new_string"] ?? arguments["new"] {
+                EditDiffView(path: arguments["file_path"] ?? arguments["path"] ?? "",
+                             old: old, new: new,
+                             replaceAll: arguments["replace_all"] == "true")
+                    .padding(.leading, 22)
+            } else if showCall {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(shownArguments, id: \.key) { k, v in
                         VStack(alignment: .leading, spacing: 2) {
@@ -752,6 +919,10 @@ struct ToolCard: View {
 
     /// What the call is for, in the model's words, if it said.
     private var purpose: String? {
+        if name == UserQuestions.toolName {
+            let n = UserQuestions.parse(ToolCall(name: name, arguments: arguments)).map(\.count)
+            if case .success(let k) = n { return k == 1 ? "asked a question" : "asked \(k) questions" }
+        }
         guard let d = arguments["description"]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !d.isEmpty else { return nil }
         return d
@@ -780,6 +951,7 @@ struct ToolCard: View {
         case "Grep": return "magnifyingglass"
         case "Bash": return "terminal"
         case "TodoWrite": return "checklist"
+        case UserQuestions.toolName: return "questionmark.bubble"
         default:     return "wrench.and.screwdriver"
         }
     }

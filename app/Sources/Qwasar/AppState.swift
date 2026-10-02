@@ -1148,7 +1148,11 @@ final class AppState {
                         for (id, c) in calls {
                             // The tool runs off the main actor: a call into the
                             // guest can take seconds, and the window must not.
-                            let r = await Task.detached { @Sendable in executor.run(c) }.value
+                            // The model's questions are the user's to answer:
+                            // a card in the transcript, and the turn waits.
+                            let r = c.name == UserQuestions.toolName
+                                ? await askUser(c)
+                                : await Task.detached { @Sendable in executor.run(c) }.value
                             apply(.toolResult(name: c.name, result: r))
                             results.append(ToolResultPayload(id: id, content: r))
                             stats.toolCalls += 1
@@ -1244,6 +1248,7 @@ final class AppState {
     /// the delegation code watches.
     func interrupt() {
         cancelFlag.set()
+        if pendingQuestion != nil { answerQuestions(nil) }
         guard let rec = liveSessionID.flatMap({ id in sessions.first { $0.id == id } }),
               let sid = rec.serverSessionID, let client else { return }
         Task { try? await client.cancel(sid) }
@@ -1360,6 +1365,39 @@ final class AppState {
             }
             refreshWarm()
         }
+    }
+
+    // MARK: The model's questions (AskUserQuestion)
+
+    /// Questions waiting on the user, shown as a card in the transcript.
+    struct PendingQuestion {
+        var questions: [UserQuestion]
+        var resume: CheckedContinuation<String, Never>
+    }
+    private(set) var pendingQuestion: PendingQuestion?
+    var pendingQuestions: [UserQuestion]? { pendingQuestion?.questions }
+
+    /// Shows the questions and waits for the answer -- however long that
+    /// takes: the engine is idle meanwhile, and the user may be thinking.
+    private func askUser(_ c: ToolCall) async -> String {
+        switch UserQuestions.parse(c) {
+        case .failure(let f):
+            return "error: \(f.message)"
+        case .success(let qs):
+            NSApp.requestUserAttention(.informationalRequest)
+            return await withCheckedContinuation { k in
+                pendingQuestion = PendingQuestion(questions: qs, resume: k)
+            }
+        }
+    }
+
+    /// The card's answer: per question, the chosen labels (and any words of
+    /// the user's own); nil when the user skipped, or stopped the turn.
+    func answerQuestions(_ answers: [String: [String]]?) {
+        guard let p = pendingQuestion else { return }
+        pendingQuestion = nil
+        p.resume.resume(returning: answers.map { UserQuestions.answerText(p.questions, $0) }
+                                   ?? UserQuestions.skipped)
     }
 
     // MARK: Running notes and successors

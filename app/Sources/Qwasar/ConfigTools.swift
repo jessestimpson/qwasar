@@ -337,9 +337,9 @@ extension AppState {
         case .listening: running = "listening"
         case .starting: running = "starting"
         case .stopped: running = "stopped"
+        case .stopping: running = "stopping"
         case .portBusy: running = "port busy (another program holds it)"
         case .failed(let why): running = "failed: \(why)"
-        @unknown default: running = "\(server.state)"
         }
         let derived = serverInfo.map { "derived: \($0.context) tokens, \($0.live_sessions) live" } ?? "derived when it starts"
         let login = SMAppService.mainApp.status == .enabled

@@ -19,6 +19,8 @@ enum HostToolsSuite {
         var f = 0
         f += edits()
         f += textEdits()
+        f += questions()
+        f += diffs()
         f += runner()
         f += prompt()
         f += environment()
@@ -92,6 +94,44 @@ enum HostToolsSuite {
         return f
     }
 
+    private static func diffs() -> Int {
+        var f = 0
+        let d = LineDiff.diff(old: "a\nb\nc\n", new: "a\nB\nc\nd\n")
+        f += TestMain.check(d == [.same("a"), .removed("b"), .added("B"), .same("c"), .added("d")],
+                            "a line diff: shared lines kept, removals before additions")
+        f += TestMain.check(LineDiff.diff(old: "x", new: "") == [.removed("x")], "a deletion is all removals")
+        f += TestMain.check(LineDiff.diff(old: "", new: "y\nz") == [.added("y"), .added("z")], "an insertion is all additions")
+        let big = (0..<1000).map(String.init).joined(separator: "\n")
+        f += TestMain.check(LineDiff.diff(old: big, new: big + "\nmore").count == 2001,
+                            "past the size limit, removed then added, without stalling")
+        return f
+    }
+
+    private static func questions() -> Int {
+        var f = 0
+        func parse(_ json: String) -> Result<[UserQuestion], ToolFailure> {
+            UserQuestions.parse(ToolCall(name: "AskUserQuestion", arguments: ["questions": json]))
+        }
+        let good = #"[{"question":"Which approach?","header":"Approach and more","multiSelect":false,"options":[{"label":"A (Recommended)","description":"fast"},{"label":"B","description":"thorough"}]},{"question":"Which parts?","header":"Scope","multiSelect":true,"options":[{"label":"api","description":""},{"label":"ui"}]}]"#
+        if case .success(let qs) = parse(good) {
+            f += TestMain.check(qs.count == 2 && qs[0].options.count == 2 && qs[1].multiSelect,
+                                "AskUserQuestion: questions, options and multiSelect parse")
+            f += TestMain.check(qs[0].header == "Approach and", "a header is cut at 12 characters")
+            let text = UserQuestions.answerText(qs, ["Which approach?": ["A (Recommended)"],
+                                                     "Which parts?": ["api", "the CLI too"]])
+            f += TestMain.check(text.contains("“Which approach?” — A (Recommended)")
+                                && text.contains("“Which parts?” — api; the CLI too"),
+                                "answers, an Other included, come back per question")
+        } else {
+            f += TestMain.check(false, "AskUserQuestion parses a good call")
+        }
+        f += TestMain.check({ if case .failure = parse(#"[{"question":"Q?","options":[{"label":"only one"}]}]"#) { return true }; return false }(),
+                            "AskUserQuestion: one option is refused")
+        f += TestMain.check({ if case .failure = parse("[]") { return true }; return false }(),
+                            "AskUserQuestion: no questions is refused")
+        return f
+    }
+
     private static func runner() -> Int {
         var f = 0
         let tmp = FileManager.default.temporaryDirectory
@@ -115,7 +155,9 @@ enum HostToolsSuite {
         }
         print("  info ripgrep on PATH: \(r.kit.backend.hasRipgrep)")
 
-        f += TestMain.check(r.schemas.count == 7, "seven core tools on the host")
+        f += TestMain.check(r.schemas.count == 8, "eight core tools on the host, AskUserQuestion among them")
+        f += TestMain.check(call("AskUserQuestion", ["questions": "[]"]).hasPrefix("error: there is no one"),
+                            "with no one to answer, AskUserQuestion says so")
         f += TestMain.check(call("Write", ["file_path": "new/dir/f.txt", "content": "one\ntwo\n"])
                                 == "wrote 8 bytes (2 lines) to new/dir/f.txt", "Write creates directories and reports")
         f += TestMain.check(call("Read", ["file_path": "new/dir/f.txt"]) == "     1\tone\n     2\ttwo\n",
