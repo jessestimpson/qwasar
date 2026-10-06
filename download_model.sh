@@ -10,10 +10,13 @@
 #
 #     ./qwasar -p "Hello"
 #
-# Two models, one engine: Qwen3.8 27B (dense, ~16 GB, runs on a 32 GB Mac)
-# and Qwen3.8 Flash-Next (a 125B mixture of experts with 6B active, ~111 GB,
-# which needs a 128 GB Mac).  They share the tokenizer, the chat template and
-# the session model; the engine tells them apart by config.json.
+# Three models, one engine: Qwen3.8 27B (dense, ~16 GB, runs on a 32 GB Mac),
+# Qwen3.8 Flash-Next (a 125B mixture of experts with 6B active, ~111 GB,
+# which needs a 128 GB Mac), and Qwen3.5 9B (dense, ~6 GB, for 16 GB Macs --
+# the previous generation, but the same architecture, tokenizer and chat
+# format).  The engine tells them apart by config.json.
+#
+# Run with no arguments to have it suggest one for this Mac's memory.
 #
 # Only the files qwasar actually reads are downloaded -- config.json, the
 # safetensors index, the shards, and tokenizer.json.  The rest of each
@@ -33,6 +36,22 @@ model-00001-of-00003.safetensors
 model-00002-of-00003.safetensors
 model-00003-of-00003.safetensors"
 MODEL_GB=16
+# The 27B holds ~16 GB of weights plus its context; below this (a 24 GB Mac)
+# the engine would refuse to load it.  Memory sizes here are as Macs are sold.
+MODEL_MIN_MEM_GB=32
+
+# Qwen3.5 9B, mlx-community's 4-bit build (group 64, A_log kept in F32, which
+# the loader rounds to BF16).  ~5.5 GB of weights, ~8 GB with a 32K context.
+NINEB_REPO="mlx-community/Qwen3.5-9B-MLX-4bit"
+NINEB_REV="938d8919941c6e7efd3c7150eff7fe9d12afa631"
+NINEB_NAME="Qwen3.5-9B-MLX-4bit"
+NINEB_FILES="config.json
+model.safetensors.index.json
+tokenizer.json
+model-00001-of-00002.safetensors
+model-00002-of-00002.safetensors"
+NINEB_GB=6
+NINEB_MIN_MEM_GB=12
 
 # mlx-community's 4-bit build, made with mlx-vlm: group 32, the router and
 # shared-expert gates at 8 bits, the engram table 4-bit and mixed into the
@@ -79,7 +98,9 @@ usage() {
 qwasar model downloader
 
 Usage:
-  ./download_model.sh model      [--verify] [--token TOKEN]
+  ./download_model.sh            (suggest a model for this Mac's memory)
+  ./download_model.sh model      [--force] [--verify] [--token TOKEN]
+  ./download_model.sh 9b         [--default] [--force] [--verify] [--token TOKEN]
   ./download_model.sh flash-next [--default] [--force] [--verify] [--token TOKEN]
   ./download_model.sh mtp-head   [--verify] [--token TOKEN]
   ./download_model.sh all        [--verify] [--token TOKEN]
@@ -94,6 +115,16 @@ Targets:
 
        Repository: $MODEL_REPO
        Links ./qwasar-model, which every qwasar binary uses when -m is absent.
+
+  9b
+       Qwen3.5 9B, dense, MLX affine 4-bit, group 64.  About 6 GB on disk and
+       ~8 GB in memory with a 32K context, so it runs on a 16 GB Mac.  The
+       previous Qwen generation, but the same hybrid architecture, tokenizer
+       and chat format.  Faster than the 27B and weaker on long agent tasks.
+
+       Repository: $NINEB_REPO
+       Links ./qwasar-9b.  With --default, ./qwasar-model points at it too,
+       so the binaries use it when -m is absent.
 
   flash-next
        Qwen3.8 Flash-Next: a 125B mixture of experts with 6B active per
@@ -118,9 +149,9 @@ Targets:
        Flash-Next is its own target: it is 111 GB and needs 128 GB.
 
 Options:
-  --default      (flash-next) Also point ./qwasar-model at Flash-Next.
-  --force        (flash-next) Download even on a machine with too little
-                 memory to run it, e.g. to copy it to another Mac.
+  --default      (9b, flash-next) Also point ./qwasar-model at it.
+  --force        Download even on a machine with too little memory to run
+                 it, e.g. to copy it to another Mac.
   --verify       Check the SHA-256 of every downloaded file.  Sizes are always
                  checked; this additionally re-reads every file, so it is
                  opt-in.
@@ -137,15 +168,71 @@ this was tested against rather than whatever main has become.
 EOF
 }
 
+# Physical memory in binary GB, so a "16 GB" Mac reads 16, or 0 if unknown.
+# QWASAR_MEM_GB pretends otherwise, for trying the suggestions and refusals.
+mem_gb() {
+    if [ -n "${QWASAR_MEM_GB:-}" ]; then echo "$QWASAR_MEM_GB"; return; fi
+    b=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+    echo $((b / 1073741824))
+}
+
+# With no target: the largest model this Mac runs, and how to get it.
+suggest() {
+    mem=$(mem_gb)
+    if [ "$mem" -eq 0 ]; then
+        echo "Could not read this machine's memory size."
+        echo
+        usage
+        return
+    fi
+    echo "This Mac has $mem GB of unified memory."
+    echo
+    if [ "$mem" -ge "$FLASH_MIN_MEM_GB" ]; then
+        cat <<EOF
+Suggested: Qwen3.8 Flash-Next -- ~111 GB download, ~80 GB in memory, the
+fastest model and the one the agent is best on.
+
+    ./download_model.sh flash-next --default
+
+The 27B also runs here (./download_model.sh model), at ~16 GB.
+EOF
+    elif [ "$mem" -ge "$MODEL_MIN_MEM_GB" ]; then
+        cat <<EOF
+Suggested: Qwen3.8 27B -- ~16 GB download and in memory.
+
+    ./download_model.sh model
+
+For speed over quality, Qwen3.5 9B runs here too (./download_model.sh 9b).
+Flash-Next needs a 128 GB Mac.
+EOF
+    elif [ "$mem" -ge "$NINEB_MIN_MEM_GB" ]; then
+        cat <<EOF
+Suggested: Qwen3.5 9B -- ~6 GB download, ~8 GB in memory.
+
+    ./download_model.sh 9b --default
+
+The 27B needs a 32 GB Mac and Flash-Next a 128 GB one.
+EOF
+    else
+        cat <<EOF
+None of the models qwasar is tested with fits: the smallest, Qwen3.5 9B,
+needs ~8 GB free, which a Mac of this size does not leave beside macOS.
+(./download_model.sh 9b --force downloads it anyway.)
+EOF
+    fi
+    echo
+    echo "Every target: ./download_model.sh --help"
+}
+
 if [ $# -eq 0 ]; then
-    usage
-    exit 1
+    suggest
+    exit 0
 fi
 
 TARGET=$1
 shift
 case "$TARGET" in
-    model|flash-next|mtp-head|all) ;;
+    model|9b|flash-next|mtp-head|all) ;;
     -h|--help|help) usage; exit 0 ;;
     *)
         echo "Unknown target: $TARGET" >&2
@@ -170,8 +257,8 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-if [ "$AS_DEFAULT" -eq 1 ] && [ "$TARGET" != "flash-next" ]; then
-    echo "--default applies to flash-next only; model already links ./qwasar-model" >&2
+if [ "$AS_DEFAULT" -eq 1 ] && [ "$TARGET" != "flash-next" ] && [ "$TARGET" != "9b" ]; then
+    echo "--default applies to 9b and flash-next; model already links ./qwasar-model" >&2
     exit 1
 fi
 
@@ -180,12 +267,6 @@ if [ -z "$TOKEN" ] && [ -s "$HOME/.cache/huggingface/token" ]; then
 fi
 
 # ---- before a download that cannot be used ------------------------------------
-
-# Physical memory in GB (decimal, as the model sizes are), or 0 if unknown.
-mem_gb() {
-    b=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
-    echo $((b / 1000000000))
-}
 
 # Free space in GB where the downloads go (the nearest existing parent).
 free_gb() {
@@ -216,20 +297,29 @@ check_space() {
     fi
 }
 
-if [ "$TARGET" = "flash-next" ] && [ "$FORCE" -eq 0 ]; then
-    mem=$(mem_gb)
-    if [ "$mem" -gt 0 ] && [ "$mem" -lt "$FLASH_MIN_MEM_GB" ]; then
-        cat >&2 <<EOF
-This Mac has $mem GB of memory.  Flash-Next holds ~80 GB of weights in memory
-and the engine refuses to load it without that much free, so it needs a
-128 GB machine.  The 27B runs here:
+# Refuses a model this Mac cannot run, and says which one it can.
+too_small() {
+    what=$1; why=$2
+    echo "$why" >&2
+    echo >&2
+    suggest >&2
+    echo >&2
+    echo "To download $what anyway (for another Mac), add --force." >&2
+    exit 1
+}
 
-    ./download_model.sh model
-
-To download Flash-Next anyway (for another Mac), add --force.
-EOF
-        exit 1
-    fi
+if [ "$FORCE" -eq 0 ] && [ "$(mem_gb)" -gt 0 ]; then
+    case "$TARGET" in
+        flash-next)
+            [ "$(mem_gb)" -ge "$FLASH_MIN_MEM_GB" ] || too_small Flash-Next \
+                "Flash-Next holds ~80 GB of weights in memory, so it needs a 128 GB Mac." ;;
+        model|all)
+            [ "$(mem_gb)" -ge "$MODEL_MIN_MEM_GB" ] || too_small "the 27B" \
+                "The 27B holds ~16 GB of weights plus its context, so it needs a 32 GB Mac." ;;
+        9b)
+            [ "$(mem_gb)" -ge "$NINEB_MIN_MEM_GB" ] || too_small "the 9B" \
+                "The 9B needs ~8 GB free with a 32K context, so it needs a 16 GB Mac." ;;
+    esac
 fi
 
 # Asking the server for the expected size and digest rather than pinning them
@@ -324,6 +414,13 @@ fetch() {
 
 fetch_model() { fetch "$MODEL_REPO" "$MODEL_REV" "$MODEL_NAME" "$MODEL_FILES" qwasar-model "$MODEL_GB"; }
 fetch_mtp()   { fetch "$MTP_REPO"   "$MTP_REV"   "$MTP_NAME"   "$MTP_FILES"   qwasar-mtp   "$MTP_GB"; }
+fetch_9b() {
+    fetch "$NINEB_REPO" "$NINEB_REV" "$NINEB_NAME" "$NINEB_FILES" qwasar-9b "$NINEB_GB"
+    if [ "$AS_DEFAULT" -eq 1 ]; then
+        ln -sfn "$OUT_DIR/$NINEB_NAME" "$ROOT/qwasar-model"
+        echo "Linked ./qwasar-model -> $OUT_DIR/$NINEB_NAME"
+    fi
+}
 fetch_flash() {
     fetch "$FLASH_REPO" "$FLASH_REV" "$FLASH_NAME" "$FLASH_FILES" qwasar-flash-next "$FLASH_GB"
     if [ "$AS_DEFAULT" -eq 1 ]; then
@@ -334,6 +431,7 @@ fetch_flash() {
 
 case "$TARGET" in
     model)      fetch_model ;;
+    9b)         fetch_9b ;;
     flash-next) fetch_flash ;;
     mtp-head)   fetch_mtp ;;
     all)        fetch_model; fetch_mtp ;;
@@ -358,6 +456,18 @@ case "$TARGET" in
             echo "or make it the default: ./download_model.sh flash-next --default"
         fi
         echo "In Qwasar.app, choose models/$FLASH_NAME in the Model menu."
+        ;;
+    9b)
+        echo "Ready.  From this directory:"
+        if [ "$AS_DEFAULT" -eq 1 ]; then
+            echo "  ./qwasar -p \"Hello\""
+            echo "  ./qwasar-server"
+        else
+            echo "  ./qwasar -m ./qwasar-9b -p \"Hello\""
+            echo "  ./qwasar-server -m ./qwasar-9b"
+            echo "or make it the default: ./download_model.sh 9b --default"
+        fi
+        echo "In Qwasar.app, choose models/$NINEB_NAME in the Model menu."
         ;;
 esac
 case "$TARGET" in

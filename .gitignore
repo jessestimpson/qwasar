@@ -22,6 +22,7 @@ models/
 qwasar-model
 qwasar-mtp
 qwasar-flash-next
+qwasar-9b
 
 # reference implementations, kept locally for study and for generating
 # golden vectors; not part of this project

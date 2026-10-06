@@ -1,8 +1,8 @@
 # qwasar
 
 A small native inference engine for **Qwen3.8 27B** and **Qwen3.8
-Flash-Next** on macOS Metal, written in C (with Objective-C only where Metal
-requires it). It runs one model family, end to end: weight loading, tokenizer,
+Flash-Next** on macOS Metal — and, for 16 GB Macs, **Qwen3.5 9B** — written
+in C (with Objective-C only where Metal requires it). It runs one model family, end to end: weight loading, tokenizer,
 chat template, Metal kernels, KV and recurrent state, a disk cache, an HTTP
 server, a terminal coding agent, and a macOS app with another — all
 in one tree, no Python anywhere in the engine's build or runtime.
@@ -25,18 +25,21 @@ transformer that implementing it properly beats bolting it onto a generic
 runner. Flash-Next is the same family grown into a 125B mixture of experts
 with 6B active per token: the same tokenizer, template and recurrent layers,
 ~80 GB resident, decoding at ~68 t/s on a 128 GB M5 Max against the 27B's ~6
-on a 32 GB M4 ([PLAN-flash-next.md](PLAN-flash-next.md)). One code path serves both, driven
-by the model's config. And an engine small enough to hold in your head is
-easier to make fast, and easier to read.
+on a 32 GB M4 ([PLAN-flash-next.md](PLAN-flash-next.md)). Qwen3.5 9B is the previous
+generation at a third of the 27B's size: the same hybrid architecture,
+tokenizer and chat format, so it runs on the same engine unchanged and brings
+qwasar to Macs with 16 GB. One code path serves all three, driven by the
+model's config. And an engine small enough to hold in your head is easier to
+make fast, and easier to read.
 
-| | Qwen3.8 27B | Qwen3.8 Flash-Next |
-|---|---|---|
-| Architecture | dense, 64 layers | MoE, 125B total / 6B active, 48 layers |
-| On disk (4-bit MLX) | ~16 GB | ~111 GB |
-| Held in memory | ~16 GB | ~80 GB (the engram table stays on disk) |
-| Smallest Mac | 32 GB | 128 GB |
-| Decode | ~6 t/s on an M4 (1.5x with the draft head) | ~68 t/s on an M5 Max |
-| Download | `./download_model.sh model` | `./download_model.sh flash-next` |
+| | Qwen3.5 9B | Qwen3.8 27B | Qwen3.8 Flash-Next |
+|---|---|---|---|
+| Architecture | dense, 32 layers | dense, 64 layers | MoE, 125B total / 6B active, 48 layers |
+| On disk (4-bit MLX) | ~6 GB | ~16 GB | ~111 GB |
+| Held in memory | ~6 GB (~8 GB with a 32K context) | ~16 GB | ~80 GB (the engram table stays on disk) |
+| Smallest Mac | 16 GB | 32 GB | 128 GB |
+| Decode | ~90 t/s on an M5 Max | ~6 t/s on an M4 (1.5x with the draft head) | ~68 t/s on an M5 Max |
+| Download | `./download_model.sh 9b` | `./download_model.sh model` | `./download_model.sh flash-next` |
 
 **Status:** beta, and young. Text, images, video, the app, the agent, the
 server, and the disk cache all work and are tested against the real models.
@@ -44,9 +47,16 @@ Expect rough edges — see [What is not implemented](#what-is-not-implemented).
 
 ## Which model?
 
-Both run from the same binaries; you choose by which weights you download,
-and can keep both and switch.
+All three run from the same binaries; you choose by which weights you
+download, and can keep several and switch. Not sure? Run
+`./download_model.sh` with no arguments and it suggests one for your Mac's
+memory.
 
+* **Qwen3.5 9B (dense)** if you have a 16–24 GB Mac. Everything works — the
+  app, the agent, tools, images — and it is quick, but it is a smaller model
+  of the previous generation: weaker on long agent tasks, and on a trivial
+  prompt its reasoning can run long (the reference implementation does the
+  same). `--effort low`, or `--no-think`, keeps it brief.
 * **Qwen3.8 27B (dense)** if you have a 32–64 GB Mac. Everything works,
   including images and video, but at ~6 tokens a second a long agent task is
   something you leave running. Its context is sized to what the machine
@@ -73,14 +83,16 @@ Several such cases — including wrong first answers — are recorded in the
 ## Requirements
 
 * An Apple Silicon Mac. The 27B was developed and measured on an M4 with
-  32 GB; Flash-Next on an M5 Max with 128 GB. macOS 14 or later.
+  32 GB; Flash-Next on an M5 Max with 128 GB. The 9B is checked against the
+  reference implementation and measured on the M5 Max, but has not yet been
+  run on a 16 GB machine. macOS 14 or later.
 * Xcode command line tools — `cc`, `swiftc`, Foundation, and Metal.
 * For the app's optional sandbox, whose Linux image is built natively on
   the first run: `python3`, [mise](https://mise.jdx.dev) (it supplies
   pinned Erlang, Elixir and Zig), and `brew install e2fsprogs`. No Docker,
   no Linux. Without them the app still builds and runs.
-* Free memory for the model — ~16 GB for the 27B, ~80 GB for Flash-Next —
-  plus a few GB for cache and context. The engine checks before it maps
+* Free memory for the model — ~6 GB for the 9B, ~16 GB for the 27B, ~80 GB
+  for Flash-Next — plus a few GB for cache and context. The engine checks before it maps
   anything, and refuses a model that does not fit in the memory free at the
   time rather than squeezing the machine into swap.
 
@@ -89,6 +101,19 @@ compiled at startup. (If you have it, `make check-metal` uses it as a fast
 offline lint.)
 
 ## Get the weights
+
+**Which one fits?** With no arguments the script reads this Mac's memory and
+suggests a model, with the command to fetch it:
+
+```
+./download_model.sh
+```
+
+**The 9B** — about 6 GB, for a 16 GB Mac:
+
+```
+./download_model.sh 9b --default
+```
 
 **The 27B** — about 16 GB:
 
@@ -103,13 +128,13 @@ offline lint.)
 ```
 
 `model` links `./qwasar-model`, which is where every binary looks by default.
-`flash-next` links `./qwasar-flash-next`; with `--default` it points
-`./qwasar-model` at it too. Without `--default`, pass it explicitly
-(`-m ./qwasar-flash-next`). On a machine with too little memory the script
+`9b` links `./qwasar-9b` and `flash-next` links `./qwasar-flash-next`; with
+`--default` either points `./qwasar-model` at it too. Without `--default`,
+pass it explicitly (`-m ./qwasar-9b`, `-m ./qwasar-flash-next`). On a machine with too little memory the script
 refuses before downloading (add `--force` to fetch it for another Mac), and
 it checks the disk has room first.
 
-Both are resumable (re-run after an interruption) and pinned to a tested
+All are resumable (re-run after an interruption) and pinned to a tested
 revision, and only the files the engine reads are fetched. Add `--verify` to
 check SHA-256 digests. `./download_model.sh mtp-head` adds the 27B's optional
 draft head for speculative decoding (below); `all` is the 27B and its head.
@@ -118,11 +143,13 @@ Downloads go to `./models` (`QWASAR_MODEL_DIR` moves them).
 **Already have a model?** qwasar reads the MLX 4-bit conversions directly — an
 LM Studio or Hugging Face copy works as is. Point at it with `-m <dir>`, set
 `QWASAR_MODEL`, or symlink it to `./qwasar-model`. It must be **4-bit MLX
-affine**: group 64 for the 27B (lmstudio-community's conversion), group 32 for
-Flash-Next (mlx-community's, whose 8-bit router gates and 4-bit engram table
-the loader handles). FP8, GGUF, BF16, or 6- and 8-bit conversions will not
-load (see PLAN.md §1.2). The engine tells the two models apart from
-`config.json`, not the folder name.
+affine**: group 64 for the 27B (lmstudio-community's conversion) and the 9B
+(mlx-community's), group 32 for Flash-Next (mlx-community's, whose 8-bit
+router gates and 4-bit engram table the loader handles). FP8, GGUF, BF16, or
+6- and 8-bit conversions will not load (see PLAN.md §1.2). The engine tells
+the models apart from `config.json`, not the folder name. The other small
+Qwen3.5 models (4B, 2B, 0.8B) share the 9B's format and should load the same
+way, but are untested.
 
 ## Run it: the app
 
@@ -341,6 +368,10 @@ layers, every fourth full attention) and replaces the dense MLP with a
 mixture of experts: 125B parameters, 6B active per token, 32 KB of cache per
 token. Both consequences above hold for it too.
 
+Qwen3.5 9B is the 27B's layout at a smaller width: 32 layers, every fourth
+full attention, hidden size 4096. Its cache is 32 KB/token (1 GB at 32K) and
+its recurrent state a constant 49 MB.
+
 ---
 
 # Performance
@@ -409,6 +440,15 @@ attention grows — 192,441 tokens took 640 s, about 300 t/s — which is what
 makes the cache matter: that session parked to a 6.33 GB checkpoint and
 resumed to its first new token in 11 s, or 16 s after a server restart,
 against 640 s to rebuild it ([PLAN-qwasar.md](PLAN-qwasar.md) M4).
+
+## Qwen3.5 9B
+
+Measured on the same **M5 Max with 128 GB**: ~90 t/s decode and 200–400 t/s
+prefill on short prompts; engine load under a second. Not yet measured on a
+16 GB Mac, where the memory bandwidth — and so the decode rate — is several
+times lower. Against the mlx-lm reference its per-layer error matches the
+27B's (0.5% after the first layer), and greedy decoding agrees token for
+token until the first near-tie.
 
 ## Checkpoints
 
