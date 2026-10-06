@@ -54,6 +54,7 @@ typedef struct {
     qw_store *st;
     int32_t   max_tokens;    /* output when a request names none; 0 = the context's room */
     bool      verbose;
+    bool      no_think;      /* reasoning off unless a request turns it on */
     int       n_conns;       /* live connections, under conns_lock */
     pthread_mutex_t conns_lock;
 } server;
@@ -631,7 +632,28 @@ typedef struct {
     bool        open;
     bool        open_is_thinking;
     uint64_t    sig;              /* running hash of the open thinking block */
+    atomic_bool cancel;               /* the client left: stop generating */
 } stream_ctx;
+
+/* True once the peer has closed its end.  A non-blocking peek: EOF reads as 0,
+ * a live connection with nothing to say as EAGAIN, and bytes already waiting
+ * (a pipelined next request) as > 0 -- none of which is a departure. */
+static bool peer_gone(const conn *c) {
+    if (c->dead) return true;
+    char b;
+    const ssize_t n = recv(c->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0) return true;
+    return n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+}
+
+/* After every token: a client that hung up (a timed-out caller, a closed tab)
+ * no longer wants the reply, and the engine is better spent on whoever is
+ * queued behind it. */
+static void on_token(void *ud, int32_t n_gen, bool in_call, const char *text, size_t len) {
+    (void)n_gen; (void)in_call; (void)text; (void)len;
+    stream_ctx *st = ud;
+    if (peer_gone(st->c)) atomic_store(&st->cancel, true);
+}
 
 /* A thinking block's signature.  Anthropic's is an opaque token clients must
  * hand back unchanged; nothing here verifies one, but the field is required,
@@ -759,14 +781,17 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
     const qj_node *stream_n = qj_get(d, root, "stream");
     const bool stream = stream_n && stream_n->type == QJ_TRUE;
 
-    /* Thinking is on unless a client turns it off.  Anthropic clients express
+    /* Thinking is on unless the server was started --no-think or a client
+     * turns it off.  Anthropic clients express
      * that as thinking.type = "disabled"; OpenAI ones have no standard field,
      * so an explicit enable_thinking is honoured as an extension. */
-    bool thinking = true;
+    bool thinking = !sv->no_think;
     const qj_node *th = qj_get(d, root, "thinking");
     if (th && qj_str_eq(d, qj_get(d, th, "type"), "disabled")) thinking = false;
+    if (th && qj_str_eq(d, qj_get(d, th, "type"), "enabled")) thinking = true;
     const qj_node *et = qj_get(d, root, "enable_thinking");
     if (et && et->type == QJ_FALSE) thinking = false;
+    if (et && et->type == QJ_TRUE) thinking = true;
 
     qwasar_chat_options chat = {
         .enable_thinking = thinking,
@@ -894,6 +919,9 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
     const long created = (long)time(NULL);
 
     stream_ctx st = { .c = c, .id = id, .created = created, .anthropic = anthropic };
+    /* Waiting for the engine can outlast the caller: check before spending
+     * a decode on a reply nobody will read. */
+    atomic_init(&st.cancel, peer_gone(c));
 
     if (stream) {
         sse_begin(c);
@@ -922,16 +950,23 @@ static void handle_completion(server *sv, conn *c, const qj_doc *d, bool anthrop
      * continuation starts in the answer. */
     const double t_decode = qw_now();
     bool ok = qw_generate(sv->st, cs, logits, &sp, max_tokens, thinking && !prefill, &oo.go,
-                          stream ? on_delta : NULL, NULL, &st, NULL, &g, err, sizeof err);
+                          stream ? on_delta : NULL, on_token, &st, &st.cancel, &g, err, sizeof err);
     const double decode_s = qw_now() - t_decode;
     if (sv->verbose || !ok) {
         const char *why = !ok ? "failed" : g.has_call ? "a tool call"
                         : g.hit_stop ? "a stop sequence" : g.hit_eos ? "end of turn"
+                        : g.cancelled ? "the client disconnecting"
                         : qw_store_stopping() ? "shutdown" : "the output limit";
         qw_log("  reply %d tokens in %.2fs (%.1f tok/s), ended by %s%s%s; "
                 "first token after %.2fs, request %.2fs",
                 g.n_gen, decode_s, srv_rate(g.n_gen, decode_s), why,
                 ok ? "" : ": ", ok ? "" : err, t_decode - t_start, qw_now() - t_start);
+    }
+    if (ok && g.cancelled) {
+        /* Nobody is listening: drop the connection rather than write a reply. */
+        c->dead = true;
+        qw_genres_free(&g);
+        return;
     }
     if (!ok) {
         if (!stream) {
@@ -1344,6 +1379,7 @@ static void usage(FILE *out) {
         "      --exit-on-eof   exit when standard input closes, so a supervising\n"
         "                      app that holds the other end cannot be outlived\n"
         "  -v, --verbose       log requests\n"
+        "      --no-think      reasoning off unless a request sets enable_thinking: true\n"
         "  -h, --help          this message\n"
         "\n"
         "Endpoints:\n"
@@ -1414,6 +1450,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--no-cache")) so.no_cache = true;
         else if (!strcmp(a, "--exit-on-eof")) exit_on_eof = true;
         else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) sv.verbose = true;
+        else if (!strcmp(a, "--no-think")) sv.no_think = true;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(stdout); return 0; }
         else { fprintf(stderr, "qwasar-server: unknown argument '%s'\n\n", a); usage(stderr); return 2; }
     }
