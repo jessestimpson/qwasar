@@ -48,6 +48,10 @@
 #define QW_DRAFT_PREFIX   98304
 #endif
 #define QW_DRAFT_TAIL_LO  248044
+/* <|im_end|>, which ends every ChatML turn.  The family's generation configs
+ * list it as a stop token, but some MLX conversions ship only config.json,
+ * whose eos_token_id may name <|endoftext|> alone. */
+#define QW_TOKEN_IM_END   248046
 
 
 typedef enum {

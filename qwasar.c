@@ -839,6 +839,11 @@ static bool qw_load_config(qwasar_engine *e, char *err, size_t errcap) {
         c->eos_token_ids[c->n_eos++] = (int32_t)eos->u.num;
     }
     {
+        bool has_im_end = false;
+        for (int i = 0; i < c->n_eos; i++) has_im_end |= c->eos_token_ids[i] == QW_TOKEN_IM_END;
+        if (!has_im_end && c->n_eos < 8) c->eos_token_ids[c->n_eos++] = QW_TOKEN_IM_END;
+    }
+    {
         const qj_node *me = qj_get(&d, tc ? tc : root, "eos_token_id");
         if (me && me->type == QJ_ARRAY) me = qj_first(&d, me);
         c->model_eos = (me && me->type == QJ_NUMBER) ? (int32_t)me->u.num
@@ -1388,6 +1393,31 @@ static const qw_tensor *qw_bind_gain(qwasar_engine *e, const char *name, int64_t
     return d;
 }
 
+/* A per-head gated-delta scalar (A_log, dt_bias), BF16 [hv] as the gate
+ * kernels read it.  Most builds store both BF16, but some MLX conversions of
+ * Qwen3.5 keep A_log in F32; read as BF16 it gives a decay that is wrong from
+ * the second token on, while the first -- decaying a zero state -- is still
+ * exact.  An F32 copy is rounded to BF16 here. */
+static const qw_tensor *qw_bind_gdn_scalar(qwasar_engine *e, const char *fmt, int layer,
+                                           int64_t hv, char *err, size_t errcap) {
+    char name[300];
+    snprintf(name, sizeof name, fmt, layer);
+    const qw_tensor *t = qw_table_find(&e->tensors, name);
+    if (!t) { qw_errf(err, errcap, "layer %d: missing %s", layer, name); return NULL; }
+    if (t->ndim != 1 || t->shape[0] != hv
+        || (t->dtype != QW_DT_BF16 && t->dtype != QW_DT_F32)) {
+        qw_errf(err, errcap, "%s is not BF16 or F32 [%lld]", name, (long long)hv);
+        return NULL;
+    }
+    if (t->dtype == QW_DT_BF16) return t;
+    uint16_t *out;
+    qw_tensor *d = qw_derived_bf16(e, name, 1, hv, 0, &out);
+    if (!d) { qw_errf(err, errcap, "out of memory for %s", name); return NULL; }
+    const float *in = qw_tensor_data(t);
+    for (int64_t i = 0; i < hv; i++) out[i] = qw_f32_to_bf16_c(in[i]);
+    return d;
+}
+
 /* A small matrix the graph reads as BF16 [rows, cols]: bound as stored when
  * it is BF16, or dequantised into a BF16 copy when the checkpoint quantised
  * it -- MLX stores the router 8-bit and the injection weights 4-bit.  Both
@@ -1725,8 +1755,10 @@ static bool qw_bind_weights_qwen4(qwasar_engine *e, char *err, size_t errcap) {
             snprintf(p, sizeof p, "language_model.model.layers.%d.linear_attn.out_proj", i);
             if (!qw_bind_qlinear(e, &L->out_proj, p, s->value_dim, c->hidden_size, err, errcap)) return false;
             L->conv1d  = qw_table_findf(&e->tensors, "language_model.model.layers.%d.linear_attn.conv1d.weight", i);
-            L->A_log   = qw_table_findf(&e->tensors, "language_model.model.layers.%d.linear_attn.A_log", i);
-            L->dt_bias = qw_table_findf(&e->tensors, "language_model.model.layers.%d.linear_attn.dt_bias", i);
+            L->A_log   = qw_bind_gdn_scalar(e, "language_model.model.layers.%d.linear_attn.A_log", i,
+                                            c->linear_num_value_heads, err, errcap);
+            L->dt_bias = qw_bind_gdn_scalar(e, "language_model.model.layers.%d.linear_attn.dt_bias", i,
+                                            c->linear_num_value_heads, err, errcap);
             L->gdn_norm = qw_bind_norm(e, "language_model.model.layers.%d.linear_attn.norm.weight", i,
                                        c->linear_value_head_dim, err, errcap);
             if (!L->conv1d || !L->A_log || !L->dt_bias || !L->gdn_norm) {
@@ -1827,8 +1859,10 @@ static bool qw_bind_weights(qwasar_engine *e, char *err, size_t errcap) {
             if (!qw_bind_qlinear(e, &L->out_proj, p, s->value_dim, c->hidden_size, err, errcap)) return false;
 
             L->conv1d  = qw_table_findf(&e->tensors, "language_model.model.layers.%d.linear_attn.conv1d.weight", i);
-            L->A_log   = qw_table_findf(&e->tensors, "language_model.model.layers.%d.linear_attn.A_log", i);
-            L->dt_bias = qw_table_findf(&e->tensors, "language_model.model.layers.%d.linear_attn.dt_bias", i);
+            L->A_log   = qw_bind_gdn_scalar(e, "language_model.model.layers.%d.linear_attn.A_log", i,
+                                            c->linear_num_value_heads, err, errcap);
+            L->dt_bias = qw_bind_gdn_scalar(e, "language_model.model.layers.%d.linear_attn.dt_bias", i,
+                                            c->linear_num_value_heads, err, errcap);
             L->gdn_norm = qw_bind_norm(e,
                 "language_model.model.layers.%d.linear_attn.norm.weight", i,
                 c->linear_value_head_dim, err, errcap);
