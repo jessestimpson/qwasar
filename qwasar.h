@@ -304,11 +304,43 @@ typedef struct {
     int32_t  top_k;        /* 0 = off */
     float    top_p;        /* 1 = off */
     float    min_p;        /* 0 = off */
+    /* Subtracted from the logit of every token the reply has already produced
+     * (qwasar_presence below); 0 = off, negative = the model's default
+     * (qwasar_default_presence_penalty).  Not read by qwasar_sample: the
+     * generation loop, which knows the reply, applies it to the logits first. */
+    float    presence_penalty;
     uint64_t seed;
 } qwasar_sampling;
 
-/* The model's own generation_config: temp 1.0, top_k 20, top_p 0.95. */
+/* The model's own generation_config: temp 1.0, top_k 20, top_p 0.95, and the
+ * model's default presence penalty. */
 void    qwasar_sampling_defaults(qwasar_sampling *sp);
+
+/* The presence penalty a reply gets when the caller does not set one.  Qwen's
+ * small Qwen3.5 dense models (9B and below) loop in long reasoning without
+ * one -- the reference implementation does the same -- and their model cards
+ * recommend 1.5; the 27B and Flash-Next get 0, and their sampling is as it
+ * was. */
+float   qwasar_default_presence_penalty(const qwasar_engine *e);
+
+/* OpenAI's presence_penalty: each token the reply has produced so far has
+ * `penalty` subtracted from its logit, once, however often it appeared.
+ * Callers add only content tokens -- a control token such as <tool_call> or
+ * </think> is structure, and penalising it would make a second tool call in
+ * one reply less likely, not the prose less repetitive. */
+typedef struct {
+    float    penalty;
+    uint8_t *seen;      /* [vocab] */
+    int32_t *ids;       /* the distinct tokens seen, in order */
+    int32_t  n, vocab;
+} qwasar_presence;
+
+/* Returns false on allocation failure.  A penalty of 0 allocates nothing and
+ * makes add and apply no-ops. */
+bool    qwasar_presence_init(qwasar_presence *p, int32_t vocab, float penalty);
+void    qwasar_presence_add(qwasar_presence *p, int32_t token);
+void    qwasar_presence_apply(const qwasar_presence *p, float *logits);
+void    qwasar_presence_free(qwasar_presence *p);
 int32_t qwasar_sample(const float *logits, int32_t n, const qwasar_sampling *sp,
                       uint64_t *rng);
 

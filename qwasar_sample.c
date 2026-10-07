@@ -163,7 +163,40 @@ void qwasar_sampling_defaults(qwasar_sampling *sp) {
     sp->top_k = 20;
     sp->top_p = 0.95f;
     sp->min_p = 0.0f;
+    sp->presence_penalty = -1.0f;   /* resolved against the model by the caller */
     sp->seed = 0;
+}
+
+bool qwasar_presence_init(qwasar_presence *p, int32_t vocab, float penalty) {
+    memset(p, 0, sizeof *p);
+    p->penalty = penalty > 0.0f ? penalty : 0.0f;
+    p->vocab = vocab;
+    if (p->penalty == 0.0f) return true;
+    p->seen = calloc((size_t)vocab, 1);
+    p->ids = malloc((size_t)vocab * sizeof *p->ids);
+    if (!p->seen || !p->ids) { qwasar_presence_free(p); return false; }
+    return true;
+}
+
+void qwasar_presence_add(qwasar_presence *p, int32_t token) {
+    if (!p->seen || token < 0 || token >= p->vocab || p->seen[token]) return;
+    p->seen[token] = 1;
+    p->ids[p->n++] = token;
+}
+
+/* Only the distinct tokens seen are touched, so a reply costs as many
+ * subtractions as it has distinct tokens -- a few hundred -- not a pass over
+ * the vocabulary. */
+void qwasar_presence_apply(const qwasar_presence *p, float *logits) {
+    for (int32_t i = 0; i < p->n; i++) logits[p->ids[i]] -= p->penalty;
+}
+
+void qwasar_presence_free(qwasar_presence *p) {
+    free(p->seen);
+    free(p->ids);
+    p->seen = NULL;
+    p->ids = NULL;
+    p->n = 0;
 }
 
 int32_t qwasar_sample(const float *logits, int32_t n, const qwasar_sampling *sp,

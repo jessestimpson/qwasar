@@ -46,6 +46,9 @@ static void usage(FILE *out) {
         "      --effort <level>  reasoning effort: xhigh (default), medium, low\n"
         "      --no-think        skip the reasoning block\n"
         "      --show-think      print the reasoning block (hidden by default)\n"
+        "      --presence-penalty <x>\n"
+        "                        subtract x from each token already generated;\n"
+        "                        default 1.5 for small Qwen3.5 models, else 0\n"
         "      --tokens <ids>    comma-separated prompt token ids, instead of -p\n"
         "      --info            print the parsed architecture and exit\n"
         "  -v, --verbose         verbose loading\n"
@@ -84,6 +87,18 @@ static int32_t argmax(const float *v, int32_t n) {
     return best;
 }
 
+/* Greedy under a presence penalty: the argmax of the logits with the reply's
+ * tokens marked down.  Greedy decoding is where a small model's loops are
+ * worst -- the same continuation always wins -- so it needs the penalty more
+ * than sampling does.  `scratch` is [n]; untouched while nothing is seen. */
+static int32_t argmax_penalised(const float *v, int32_t n, const qwasar_presence *p,
+                                float *scratch) {
+    if (p->n == 0) return argmax(v, n);
+    memcpy(scratch, v, (size_t)n * sizeof *scratch);
+    qwasar_presence_apply(p, scratch);
+    return argmax(scratch, n);
+}
+
 static bool resolve_model(qwasar_options *opts, const char *prog) {
     if (opts->model_path) return true;
     opts->model_path = qwasar_default_model_path();
@@ -111,6 +126,7 @@ int main(int argc, char **argv) {
     const char *image_path = NULL;
     bool image_is_video = false;
     bool use_spec = false; /* --spec: decode speculatively rather than measure */
+    float presence = -1.0f; /* negative: the model's default */
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -143,6 +159,8 @@ int main(int argc, char **argv) {
             thinking = false;
         } else if (!strcmp(a, "--show-think")) {
             show_think = true;
+        } else if (!strcmp(a, "--presence-penalty") && i + 1 < argc) {
+            presence = (float)atof(argv[++i]);
         } else if (!strcmp(a, "--tokens") && i + 1 < argc) {
             token_spec = argv[++i];
         } else if (!strcmp(a, "--info")) {
@@ -289,6 +307,20 @@ int main(int argc, char **argv) {
      * is reasoning.  Hidden unless asked for, but always consumed. */
     bool in_reasoning = thinking && !token_spec;
 
+    /* The penalty is applied by the plain loop below.  A speculative verify
+     * accepts by the unpenalised argmax, so the two do not combine. */
+    if (presence < 0.0f) presence = qwasar_default_presence_penalty(e);
+    if (spec && presence > 0.0f) {
+        fprintf(stderr, "qwasar: --spec decodes without the presence penalty\n");
+        presence = 0.0f;
+    }
+    qwasar_presence pres;
+    float *pen_scratch = presence > 0.0f ? malloc((size_t)vocab * sizeof *pen_scratch) : NULL;
+    if (!qwasar_presence_init(&pres, vocab, presence) || (presence > 0.0f && !pen_scratch)) {
+        fprintf(stderr, "qwasar: out of memory\n");
+        return 1;
+    }
+
     int32_t next = argmax(logits, vocab);
     while (generated < n_predict) {
         if (qwasar_is_eos(e, next)) break;
@@ -319,6 +351,12 @@ int main(int argc, char **argv) {
 
         emit_token(tok, next, &in_reasoning, think_close, show_think);
         generated++;
+        {
+            size_t len = 0;
+            bool special = false;
+            qwasar_token_bytes(tok, next, &len, &special);
+            if (!special) qwasar_presence_add(&pres, next);
+        }
 
         if (spec) {
             /* Propose a block, settle all of it in one pass over the weights,
@@ -375,9 +413,11 @@ int main(int argc, char **argv) {
         logits = qwasar_session_eval(s, &next, 1, err, sizeof err);
         t_decode += now_sec() - t1;
         if (!logits) { fprintf(stderr, "\nqwasar: %s\n", err); return 1; }
-        next = argmax(logits, vocab);
+        next = argmax_penalised(logits, vocab, &pres, pen_scratch);
     }
     printf("\n");
+    qwasar_presence_free(&pres);
+    free(pen_scratch);
 
     if (spec && rounds > 0)
         fprintf(stderr, "\nmtp  %lld rounds, %.2f tokens per round, mean depth %.2f, "

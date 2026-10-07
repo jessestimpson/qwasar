@@ -215,7 +215,8 @@ session).
 {
   "text": "What does qw_edit_apply do?",
   "images": [ {"kind": "image", "media_type": "image/png", "data": "<base64>"} ],
-  "sampling": {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0, "seed": 0},
+  "sampling": {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0,
+               "presence_penalty": 0, "seed": 0},
   "max_tokens": 32768
 }
 ```
@@ -224,6 +225,10 @@ session).
 and placed in the turn; a model without the capability refuses them with
 `400`. `sampling` is per step because it does not touch the cache; absent
 fields take the model's own generation defaults, `seed` 0 means the clock.
+`presence_penalty` is subtracted once from the logit of every content token
+the step has already produced (control tokens such as `<tool_call>` are
+exempt); absent, it is 1.5 for the small Qwen3.5 models, whose reasoning
+otherwise tends to loop, and 0 for the rest.
 `max_tokens` bounds this step's generation (reasoning included); absent
 means the room the window has left.
 

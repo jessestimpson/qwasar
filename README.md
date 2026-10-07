@@ -54,9 +54,10 @@ memory.
 
 * **Qwen3.5 9B (dense)** if you have a 16–24 GB Mac. Everything works — the
   app, the agent, tools, images — and it is quick, but it is a smaller model
-  of the previous generation: weaker on long agent tasks, and on a trivial
-  prompt its reasoning can run long (the reference implementation does the
-  same). `--effort low`, or `--no-think`, keeps it brief.
+  of the previous generation: weaker on long agent tasks, and its reasoning
+  can circle on a trivial prompt (the reference implementation does the
+  same). It gets a presence penalty of 1.5 by default, as Qwen recommends,
+  which helps; `--effort low`, or `--no-think`, keeps it brief.
 * **Qwen3.8 27B (dense)** if you have a 32–64 GB Mac. Everything works,
   including images and video, but at ~6 tokens a second a long agent task is
   something you leave running. Its context is sized to what the machine
@@ -226,9 +227,10 @@ or tool results), and the server reports how warm each session is and
 streams prefill progress. Sessions live on the server, survive its restarts,
 and park to checkpoints on disk.
 
-Both compat endpoints take `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
-`max_tokens`, `stream`, and `tools`; the default sampling is the model's own
-generation config. The OpenAI one also honours `stop`, `tool_choice` (`none`,
+Both compat endpoints take `temperature`, `top_p`, `top_k`, `min_p`,
+`presence_penalty`, `seed`, `max_tokens`, `stream`, and `tools`; the default
+sampling is the model's own generation config, plus a presence penalty of 1.5
+for the 9B (0 for the others). The OpenAI one also honours `stop`, `tool_choice` (`none`,
 `auto`, `required`, or a named function), and
 `stream_options.include_usage`; `n` other than 1 is refused with a 400. The
 Anthropic one honours `stop_sequences`, `tool_choice` (`auto`, `any`,

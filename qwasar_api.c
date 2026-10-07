@@ -169,6 +169,7 @@ static void read_sampling(const qj_doc *d, const qj_node *root, qwasar_sampling 
     sp->top_k = (int32_t)qj_int_or(d, s, "top_k", sp->top_k);
     sp->top_p = (float)qj_num_or(d, s, "top_p", sp->top_p);
     sp->min_p = (float)qj_num_or(d, s, "min_p", sp->min_p);
+    sp->presence_penalty = (float)qj_num_or(d, s, "presence_penalty", sp->presence_penalty);
     sp->seed = (uint64_t)qj_int_or(d, s, "seed", 0);
 }
 

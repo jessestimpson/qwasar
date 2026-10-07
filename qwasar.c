@@ -2064,6 +2064,11 @@ int32_t qwasar_engine_context_size (const qwasar_engine *e) { return e->context_
 int32_t qwasar_engine_prefill_chunk(const qwasar_engine *e) { return e->prefill_chunk; }
 
 int32_t qwasar_vocab_size(const qwasar_engine *e) { return e->config.vocab_size; }
+
+/* "Small" is narrower than the 27B's 5120: Qwen3.5's 9B, 4B, 2B and 0.8B. */
+float qwasar_default_presence_penalty(const qwasar_engine *e) {
+    return e->config.family == QW_FAMILY_QWEN3_5 && e->config.hidden_size < 5120 ? 1.5f : 0.0f;
+}
 int32_t qwasar_n_layers  (const qwasar_engine *e) { return e->config.num_hidden_layers; }
 const char *qwasar_model_id(const qwasar_engine *e) {
     return e->config.family == QW_FAMILY_QWEN4_EXP ? "qwen3.8-flash-next" : "qwen3.8-27b";

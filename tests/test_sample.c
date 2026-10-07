@@ -289,6 +289,45 @@ static void test_rejection_law(void) {
            "filtered distribution\n");
 }
 
+/* The presence penalty: each distinct token once, however often it was seen,
+ * and a zero penalty that touches nothing and allocates nothing. */
+static void test_presence(void) {
+    const int32_t n = 5000;
+    float *v = malloc((size_t)n * sizeof *v);
+    make_logits(v, n);
+
+    qwasar_presence p;
+    CHECK(qwasar_presence_init(&p, n, 0.0f), "a zero penalty must init");
+    CHECK(!p.seen && !p.ids, "a zero penalty allocates nothing");
+    qwasar_presence_add(&p, 7);
+    qwasar_presence_apply(&p, v);
+    CHECK(v[7] == 5.0f, "a zero penalty leaves the logits alone");
+    qwasar_presence_free(&p);
+
+    CHECK(qwasar_presence_init(&p, n, 2.5f), "init");
+    qwasar_presence_add(&p, 7);
+    qwasar_presence_add(&p, 7);
+    qwasar_presence_add(&p, 3);
+    qwasar_presence_add(&p, -1);
+    qwasar_presence_add(&p, n);
+    CHECK(p.n == 2, "two distinct tokens, out-of-range ignored (n=%d)", p.n);
+    qwasar_presence_apply(&p, v);
+    CHECK(fabsf(v[7] - 2.5f) < 1e-6f, "seen twice, penalised once (%g)", v[7]);
+    CHECK(fabsf(v[3] - 1.5f) < 1e-6f, "seen once, penalised once (%g)", v[3]);
+    CHECK(v[9] == 3.0f, "unseen tokens untouched");
+
+    /* The point of it: greedy no longer repeats the mode. */
+    qwasar_sampling sp;
+    qwasar_sampling_defaults(&sp);
+    CHECK(sp.presence_penalty < 0.0f, "default defers to the model");
+    sp.temperature = 0.0f;
+    uint64_t rng = 1;
+    CHECK(qwasar_sample(v, n, &sp, &rng) == 9, "greedy moves off the penalised mode");
+    qwasar_presence_free(&p);
+    free(v);
+    printf("  presence penalty        once per distinct token, zero is a no-op\n");
+}
+
 int main(void) {
     test_greedy();
     test_top_k();
@@ -298,6 +337,7 @@ int main(void) {
     test_seed_reproducibility();
     test_edges();
     test_rejection_law();
+    test_presence();
     if (fails) { fprintf(stderr, "%d check(s) failed\n", fails); return 1; }
     printf("ok: sample\n");
     return 0;

@@ -979,11 +979,19 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
     str name = { 0 };
     channel rc = { 0 }, tc = { 0 };
 
+    qwasar_presence pres;
+    if (!qwasar_presence_init(&pres, vocab, sp->presence_penalty < 0.0f
+                                            ? qwasar_default_presence_penalty(st->e)
+                                            : sp->presence_penalty)) {
+        snprintf(err, cap, "out of memory");
+        return false;
+    }
     float *masked = NULL;
     if ((go->tools == QW_TOOLS_NONE && call_open >= 0)
-        || (go->tools == QW_TOOLS_FORCE && !go->force_name)) {
+        || (go->tools == QW_TOOLS_FORCE && !go->force_name)
+        || pres.penalty > 0.0f) {
         masked = malloc(sizeof *masked * (size_t)vocab);
-        if (!masked) { snprintf(err, cap, "out of memory"); return false; }
+        if (!masked) { qwasar_presence_free(&pres); snprintf(err, cap, "out of memory"); return false; }
     }
 
     for (int32_t i = 0; i < max_tokens; i++) {
@@ -1012,6 +1020,11 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
             }
             lp = masked;
         }
+        if (pres.n > 0) {
+            if (lp != masked) memcpy(masked, logits, sizeof *masked * (size_t)vocab);
+            qwasar_presence_apply(&pres, masked);
+            lp = masked;
+        }
         /* Shutting down, or cancelled: the reply ends here, as if cut by its
          * budget, so the engine is free. */
         if (atomic_load(&g_stopping)) break;
@@ -1038,6 +1051,7 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
         size_t len = 0;
         bool special = false;
         const char *bytes = qwasar_token_bytes(st->tok, next, &len, &special);
+        if (!special) qwasar_presence_add(&pres, next);
 
         if (naming && bytes && len) {
             str_add(&name, bytes, len);
@@ -1123,6 +1137,7 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
         if (out->reasoning.p) out->reasoning.p[out->reasoning.len] = 0;
     }
     free(masked);
+    qwasar_presence_free(&pres);
     str_free(&name);
     str_free(&rc.shown);
     str_free(&tc.shown);
