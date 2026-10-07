@@ -26,6 +26,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let portItem = NSMenuItem(title: "", action: #selector(choosePort), keyEquivalent: "")
     private let modelItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let modelMenu = NSMenu()
+    private let thinkingItem = NSMenuItem(title: "Thinking for API Clients", action: #selector(toggleThinking),
+                                          keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
     /// Loadable model folders found on disk, rescanned each time the menu opens.
     private var models: [FoundModel] = []
@@ -46,7 +48,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         statusLine.isEnabled = false
-        for i in [agentItem, copyItem, toggleItem, portItem, loginItem] { i.target = self }
+        for i in [agentItem, copyItem, toggleItem, portItem, thinkingItem, loginItem] { i.target = self }
         modelMenu.autoenablesItems = false
         modelItem.submenu = modelMenu
         menu.addItem(statusLine)
@@ -56,6 +58,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(toggleItem)
         menu.addItem(portItem)
         menu.addItem(modelItem)
+        menu.addItem(thinkingItem)
         menu.addItem(withTitle: "Open Server Log", action: #selector(openLog), keyEquivalent: "l").target = self
         menu.addItem(loginItem)
         menu.addItem(.separator())
@@ -121,6 +124,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         toggleItem.isEnabled = server.state != .stopping && (running || state.modelPath != nil)
         portItem.title = "Port: \(port)…"
         renderModels()
+        thinkingItem.state = server.apiThinking ? .on : .off
+        thinkingItem.toolTip = "Whether the OpenAI and Anthropic endpoints reason before they answer "
+                             + "when a request does not say (off starts the server with --no-think).  "
+                             + "The coding agent's own sessions are not affected.  "
+                             + (server.isRunning ? "Changing it restarts the server." : "")
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
@@ -228,6 +236,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let wasRunning = server.isRunning
         server.port = p
         if wasRunning { state.restartServer() } else { server.refresh() }
+        render()
+    }
+
+    /// The server reads it at launch, so a running one is restarted -- after
+    /// the turn in flight, if the coding agent is mid-reply.
+    @objc private func toggleThinking() {
+        let server = state.server
+        server.apiThinking.toggle()
+        if server.isRunning || state.pendingServerStart { state.requestServerRestart() }
         render()
     }
 

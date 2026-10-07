@@ -75,6 +75,15 @@ public final class ServerController {
         set { UserDefaults.standard.set(newValue ?? 0, forKey: "serverLive") }
     }
 
+    /// Whether the OpenAI and Anthropic endpoints reason by default (off is
+    /// `--no-think`; a request can still ask either way).  The app's own
+    /// sessions choose for themselves when they open, so this is for other
+    /// clients of the API only.  On unless the user turned it off.
+    public var apiThinking: Bool {
+        get { !UserDefaults.standard.bool(forKey: "serverNoThink") }
+        set { UserDefaults.standard.set(!newValue, forKey: "serverNoThink") }
+    }
+
     public var apiURL: String { "http://127.0.0.1:\(port)/v1" }
     public var baseURL: URL { URL(string: "http://127.0.0.1:\(port)/")! }
 
@@ -135,12 +144,14 @@ public final class ServerController {
         // The server derives its context and live sessions from the model and
         // the machine (API.md §4.1) unless the user set them (contextOverride,
         // liveSessionsOverride -- the config session's server_context and
-        // server_live_sessions).  --max-tokens 0 leaves a
+        // server_live_sessions), and its API clients reason unless told not
+        // to (apiThinking, the menu's Thinking for API Clients).  --max-tokens 0 leaves a
         // compat request's output bounded only by the window's room.
         var args = ["-m", model, "--port", String(port), "--exit-on-eof", "--max-tokens", "0", "-v"]
         if let stateDir { args += ["--state-dir", stateDir.path] }
         if let c = contextOverride { args += ["--ctx", String(c)] }
         if let l = liveSessionsOverride { args += ["--live", String(l)] }
+        if !apiThinking { args.append("--no-think") }
         p.arguments = args
         let pipe = Pipe()
         p.standardInput = pipe

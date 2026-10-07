@@ -64,7 +64,11 @@ The menu bar item reads the server's state from its socket, probed once a
 second: a **plain Q** is listening, a **pulsing amber dot** is loading the
 model, a **red dot** means the server failed or another program holds the
 port, a **faded Q** is stopped. Its menu has Open Coding Agent, Copy API
-URL, Start/Stop, Port…, Model…, Start at Login, Open Server Log, and Quit. The server is a helper
+URL, Start/Stop, Port…, Model…, Thinking for API Clients, Start at Login,
+Open Server Log, and Quit. **Thinking for API Clients** sets whether the
+OpenAI and Anthropic endpoints reason when a request does not say — off
+restarts the server with `--no-think`, and a request can still ask either
+way; the coding agent's own sessions choose for themselves. The server is a helper
 inside the bundle, serving this window, `qwasar-agent` in a terminal, and
 anything on the OpenAI or Anthropic endpoints at once; it runs on a pipe the
 app holds, so it cannot outlive the app, even after a crash or `kill -9`.

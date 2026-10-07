@@ -37,7 +37,7 @@ struct ConfigToolRunner: ToolExecuting {
     """#
 
     static let setSchema = #"""
-    {"type": "function", "function": {"name": "config_set", "description": "Set one configuration key. scope \"app\" is the app itself: server_port (1-65535), server_model (\"flash-next\", \"27b\", \"9b\", or a model folder's path), server_context (tokens, or \"auto\"), server_live_sessions (a number, or \"auto\"), server_running (true or false), start_at_login (true or false), checkpoint_disk_budget_gb (a number), running_notes (true or false: whether the model writes its working notes, off the record, after each reply). A server_port, server_model, server_context, server_live_sessions or server_running change restarts or stops the server -- after your reply finishes, since you are running on it. scope \"project\" (target: its name) also takes default_effort (low, medium, xhigh, or \"auto\") and system_prompt (the project's own guidance for its sessions; empty to remove). Sandbox keys apply at scope global, project or session; resolution is field-wise, session over project over global over the built-in default, and setting a value REPLACES what lower layers said for that key. They apply when a session is next opened. Sandbox keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb, delegate_models (comma-separated remote model ids, empty string for explicitly OFF), delegate_budget_usd, delegate_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
+    {"type": "function", "function": {"name": "config_set", "description": "Set one configuration key. scope \"app\" is the app itself: server_port (1-65535), server_model (\"flash-next\", \"27b\", \"9b\", or a model folder's path), server_context (tokens, or \"auto\"), server_live_sessions (a number, or \"auto\"), server_thinking (true or false: whether the OpenAI and Anthropic endpoints reason when a request does not say; this app's own sessions are unaffected), server_running (true or false), start_at_login (true or false), checkpoint_disk_budget_gb (a number), running_notes (true or false: whether the model writes its working notes, off the record, after each reply). A server_port, server_model, server_context, server_live_sessions, server_thinking or server_running change restarts or stops the server -- after your reply finishes, since you are running on it. scope \"project\" (target: its name) also takes default_effort (low, medium, xhigh, or \"auto\") and system_prompt (the project's own guidance for its sessions; empty to remove). Sandbox keys apply at scope global, project or session; resolution is field-wise, session over project over global over the built-in default, and setting a value REPLACES what lower layers said for that key. They apply when a session is next opened. Sandbox keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb, delegate_models (comma-separated remote model ids, empty string for explicitly OFF), delegate_budget_usd, delegate_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
     """#
 
     static let clearSchema = #"""
@@ -251,6 +251,11 @@ extension AppState {
             guard let n = Int(value), (1...16).contains(n) else { return "error: server_live_sessions must be 1-16, or auto" }
             server.liveSessionsOverride = n
             return restarting("server_live_sessions is \(n)")
+        case "server_thinking":
+            guard let on = bool() else { return "error: server_thinking is true or false" }
+            if on == server.apiThinking { return "ok: server_thinking is already \(on)" }
+            server.apiThinking = on
+            return restarting("server_thinking is \(on) (the OpenAI and Anthropic endpoints' default)")
         case "server_running":
             guard let on = bool() else { return "error: server_running is true or false" }
             if on {
@@ -357,6 +362,7 @@ extension AppState {
         out.append("  models set up: " + (known.isEmpty ? "none" : known.joined(separator: "; ")))
         out.append("  server_context: " + (server.contextOverride.map { "\($0) tokens" } ?? "auto (\(derived))"))
         out.append("  server_live_sessions: " + (server.liveSessionsOverride.map(String.init) ?? "auto"))
+        out.append("  server_thinking: \(server.apiThinking) (API clients' default; not this app's sessions)")
         out.append("  start_at_login: \(login)")
         out.append("  running_notes: \(runningNotesEnabled)")
         out.append("  checkpoint_disk_budget_gb: \(String(format: "%.1f", Double(diskBudgetBytes) / 1e9)) "
