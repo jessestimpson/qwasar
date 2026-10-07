@@ -79,6 +79,42 @@ enum ClientSuite {
         } else {
             f += TestMain.check(false, "the open body builds")
         }
+        f += modelCatalog()
+        return f
+    }
+
+    /// Which family a folder holds, from config.json as the engine reads it:
+    /// the 9B and the 27B share a model_type and differ in width.
+    static func modelCatalog() -> Int {
+        var f = 0
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwasar-catalog-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        func folder(_ name: String, _ config: [String: Any]) -> String {
+            let dir = root.appendingPathComponent(name)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let data = try! JSONSerialization.data(withJSONObject: config)
+            try? data.write(to: dir.appendingPathComponent("config.json"))
+            return dir.path
+        }
+        let q4 = ["bits": 4, "group_size": 64, "mode": "affine"] as [String: Any]
+        func qwen35(_ hidden: Int, _ q: [String: Any] = q4) -> [String: Any] {
+            ["model_type": "qwen3_5", "quantization": q, "text_config": ["hidden_size": hidden]]
+        }
+        f += TestMain.check(ModelCatalog.family(of: folder("9b", qwen35(4096))) == .nineB,
+                            "a qwen3_5 at width 4096 is the 9B")
+        f += TestMain.check(ModelCatalog.family(of: folder("27b", qwen35(5120))) == .dense,
+                            "a qwen3_5 at width 5120 is the 27B")
+        f += TestMain.check(ModelCatalog.family(of: folder("4b", qwen35(2560))) == nil,
+                            "an untested width is not offered")
+        f += TestMain.check(ModelCatalog.family(of: folder("9b-8bit", qwen35(4096, ["bits": 8, "group_size": 64]))) == nil,
+                            "an 8-bit 9B is refused, as the engine refuses it")
+        f += TestMain.check(ModelCatalog.family(of: folder("flash", ["model_type": "qwen4_exp",
+                                                                    "quantization": ["bits": 4, "group_size": 32]])) == .flashNext,
+                            "qwen4_exp is Flash-Next")
+        f += TestMain.check(ModelFamily(modelID: "qwen3.5-9b") == .nineB,
+                            "the server's id for the 9B maps back to it")
+        f += TestMain.check(ModelFamily.allCases.first == .nineB, "the Model menu lists smallest first")
         return f
     }
 }

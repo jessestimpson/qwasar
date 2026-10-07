@@ -29,10 +29,10 @@ agent` does the same and opens the coding agent's window straight away.
 
 | | |
 |---|---|
-| Machine | Apple silicon. The 27B runs on an M4 with 32 GB; Flash-Next needs ~80 GB resident, so a 128 GB machine |
+| Machine | Apple silicon. The 9B fits a 16 GB Mac; the 27B runs on an M4 with 32 GB; Flash-Next needs ~80 GB resident, so a 128 GB machine |
 | macOS | 14.0 minimum; developed on 26 |
 | Build | Xcode command line tools; for sandboxed sessions, also `python3`, [mise](https://mise.jdx.dev) (erlang/elixir/zig pins) and `brew install e2fsprogs` |
-| Model | Qwen3.8 27B or Qwen3.8 Flash-Next, 4-bit MLX — the folders `../download_model.sh` fetches; not bundled |
+| Model | Qwen3.5 9B, Qwen3.8 27B or Qwen3.8 Flash-Next, 4-bit MLX — the folders `../download_model.sh` fetches (run it bare for a suggestion by memory); not bundled |
 | Disk | ~530 MB for the guest image, plus the app, plus session checkpoints (a budget you set) |
 
 There is no Docker and no Linux anywhere in the build: the guest image is
@@ -43,7 +43,7 @@ portable, and `mke2fs -d` builds an ext4 image without root — see
 On first launch:
 
 1. **Choose a model** when asked — the folder holding `config.json` and the
-   safetensors shards: the 27B or Flash-Next, told apart by the config. The
+   safetensors shards: the 9B, the 27B or Flash-Next, told apart by the config. The
    server starts on it (the Q in the menu bar pulses amber while the model
    loads, ~10–25 s), and the window's toolbar then shows the model and the
    context and live-session budget the server derived for this machine
@@ -208,7 +208,8 @@ results. The app follows both, rather than a format of its own:
   `new_string` and `replace_all`, matching an exact substring once; `Grep`
   with ripgrep syntax and an `output_mode`; `Glob`; `Bash` with a
   `timeout`; `TodoWrite` for a task list. Results may be 64 KB on
-  Flash-Next (8 KB on the 27B, whose prefill is ten times slower).
+  Flash-Next (8 KB on the 27B, whose prefill is ten times slower, and on
+  the 9B, whose window on a 16 GB Mac is small).
 * **The system prompt has the harness's shape**: an environment block
   (working directory, git branch, platform, date), how to work (read before
   changing, match the project, verify, summarize), then the project's own
@@ -218,12 +219,15 @@ results. The app follows both, rather than a format of its own:
   are marked as `<system-reminder>`s.
 * **Effort defaults to xhigh on Flash-Next**, with 64K tokens a step: its
   card says lower effort in agent work costs more in retries than it saves.
-  The 27B stays at medium.
+  The 27B stays at medium, with 4K tokens a step; the 9B at medium too (its
+  own template's default) with 16K, since its reasoning alone often passes
+  4K and it runs ~15x faster.
 
 
 * Sampling is the model's own generation config (temperature 1.0, top-k 20,
   top-p 0.95) — Qwen's guidance for thinking models, which loop under
-  greedy decoding. The headless gates pin temperature 0 so runs compare.
+  greedy decoding — and on the 9B a presence penalty of 1.5, which Qwen
+  recommends for its smaller models. The headless gates pin temperature 0 so runs compare.
 * A turn runs as many rounds of tool calls as the task takes, up to 200. At
   that cap the last results are still delivered, with a request to stop and
   summarize what was learned, what changed and what remains — so a long
@@ -269,8 +273,10 @@ downloads cannot either.
 
 ## What to expect
 
-* **~6 tokens a second on the 27B**; **~68 on Flash-Next** on an M5 Max
-  (~465 tok/s prefill on short prompts). The 27B's ceiling is a memory
+* **~6 tokens a second on the 27B**; **~68 on Flash-Next** and **~90 on the
+  9B** on an M5 Max (~465 and 200–400 tok/s prefill on short prompts; the
+  9B has not been measured on a 16 GB machine, whose memory bandwidth is
+  several times lower). The 27B's ceiling is a memory
   bandwidth identity, not an efficiency problem. At 32 KB of cache per
   token Flash-Next gets the full 262K window, and each step may generate up
   to 64K tokens at xhigh (32K otherwise) against the 27B's 4K.

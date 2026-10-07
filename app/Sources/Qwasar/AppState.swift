@@ -229,8 +229,8 @@ final class AppState {
         panel.canChooseFiles = false
         panel.showsHiddenFiles = true
         panel.canCreateDirectories = false
-        panel.message = "Choose a model directory — Qwen3.8 27B or Qwen3.8 Flash-Next "
-                      + "(config.json + *.safetensors)."
+        panel.message = "Choose a model directory — Qwen3.5 9B, Qwen3.8 27B or Qwen3.8 "
+                      + "Flash-Next (config.json + *.safetensors)."
         panel.prompt = "Use Model"
         if let startingAt { panel.directoryURL = URL(fileURLWithPath: startingAt) }
         guard panel.runModal() == .OK, let u = panel.url else { return }
@@ -241,7 +241,7 @@ final class AppState {
         }
         guard let family = ModelCatalog.family(of: resolved.path) else {
             engineNote = "\(resolved.lastPathComponent) is not a model the server runs "
-                       + "(Qwen3.8 27B or Flash-Next, 4-bit)"
+                       + "(Qwen3.5 9B, Qwen3.8 27B or Flash-Next, 4-bit)"
             return
         }
         guard access.store(resolved) else {
@@ -286,7 +286,8 @@ final class AppState {
         let u = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath).resolvingSymlinksInPath()
         guard ModelAccess.looksLikeModel(u) else { return "\(u.path) has no config.json and *.safetensors" }
         guard let family = ModelCatalog.family(of: u.path) else {
-            return "\(u.path) is not a model the server runs (Qwen3.8 27B or Flash-Next, 4-bit MLX)"
+            return "\(u.path) is not a model the server runs "
+                 + "(Qwen3.5 9B, Qwen3.8 27B or Flash-Next, 4-bit MLX)"
         }
         guard access.store(u) else { return "could not keep a bookmark for \(u.path)" }
         if let data = access.bookmark { ModelLibrary.remember(data, as: family) }
@@ -710,7 +711,9 @@ final class AppState {
     /// one, else the model's.  Flash-Next's card is plain that lower effort in
     /// agent work costs more than it saves -- "insufficient analysis, more
     /// failures, and repeated retries" -- so it gets its template's default,
-    /// xhigh.  The 27B, at ~6 tokens a second, stays at medium.
+    /// xhigh.  The 27B, at ~6 tokens a second, stays at medium, and so does
+    /// the 9B: medium is the effort with no instruction, which is Qwen3.5's
+    /// own template, and its reasoning runs long enough unprompted.
     func defaultEffort(for p: Project) -> ReasoningEffort {
         p.defaultEffort ?? (activeFamily == .flashNext ? .xhigh : .medium)
     }
@@ -1044,8 +1047,15 @@ final class AppState {
             // The turn: a step, and while the model asks for tools, run them
             // here and continue.  Per-step budget by model, as before.
             // Flash-Next at xhigh reasons at length before it acts; its card
-            // asks for generous output room, so a step gets 64K there.
-            let budget = activeFamily == .flashNext ? (rec.effort == .xhigh ? 65_536 : 32_768) : 4096
+            // asks for generous output room, so a step gets 64K there.  The
+            // 9B's reasoning alone often passes 4K, and at ~15x the 27B's rate
+            // 16K costs it what 4K costs the 27B.
+            let budget: Int
+            switch activeFamily {
+            case .flashNext: budget = rec.effort == .xhigh ? 65_536 : 32_768
+            case .nineB: budget = 16_384
+            default: budget = 4096
+            }
             var stats = TurnStats()
             stats.contextLimit = contextLimit
             var stream = client.turn(sid, text: promptText, maxTokens: budget)

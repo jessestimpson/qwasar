@@ -43,7 +43,9 @@ void qwasar_engine_print_info(const qwasar_engine *e, FILE *out);
 int32_t qwasar_vocab_size(const qwasar_engine *e);
 int32_t qwasar_n_layers(const qwasar_engine *e);
 /* Which model is loaded, for an API to report: an id ("qwen3.8-27b",
- * "qwen3.8-flash-next") and a display name ("Qwen3.8 27B"). */
+ * "qwen3.8-flash-next", "qwen3.5-9b") and a display name ("Qwen3.8 27B").
+ * Sessions are pinned to the id they ran on, so models whose state differs in
+ * shape must not share one. */
 const char *qwasar_model_id(const qwasar_engine *e);
 const char *qwasar_model_name(const qwasar_engine *e);
 /* True if `token` ends generation. */

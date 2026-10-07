@@ -6,16 +6,18 @@
 
 import Foundation
 
-/// The two models qwasar-server runs, told apart by their config.json the way
+/// The models qwasar-server runs, told apart by their config.json the way
 /// the engine tells them apart -- not by folder name, which is whatever the
-/// download happened to be called.
+/// download happened to be called.  Smallest first, the Model menu's order.
 public enum ModelFamily: String, CaseIterable, Sendable, Codable {
-    case dense        // Qwen3.8 27B: model_type qwen3_5
+    case nineB        // Qwen3.5 9B: model_type qwen3_5, hidden_size 4096
+    case dense        // Qwen3.8 27B: model_type qwen3_5, hidden_size 5120
     case flashNext    // Qwen3.8 Flash-Next: model_type qwen4_exp
 
     /// The engine's id for it (`qwasar_model_id`, /v1/server's model.id).
     public var id: String {
         switch self {
+        case .nineB: "qwen3.5-9b"
         case .dense: "qwen3.8-27b"
         case .flashNext: "qwen3.8-flash-next"
         }
@@ -29,6 +31,9 @@ public enum ModelFamily: String, CaseIterable, Sendable, Codable {
     /// One line on what speed to expect, for the rate meter's help.
     public var speedNote: String {
         switch self {
+        case .nineB:
+            "This is Qwen3.5 9B, a dense model; about 90 tok/s on an M5 Max, "
+            + "several times less on a base-model Mac's memory bandwidth."
         case .dense:
             "This is a dense 27B model; about 6 tok/s is the serial bandwidth "
             + "ceiling on a 32 GB M4 — higher means speculation is paying."
@@ -40,6 +45,7 @@ public enum ModelFamily: String, CaseIterable, Sendable, Codable {
 
     public var title: String {
         switch self {
+        case .nineB: "Qwen3.5 9B"
         case .dense: "Qwen3.8 27B"
         case .flashNext: "Qwen3.8 Flash-Next"
         }
@@ -48,6 +54,8 @@ public enum ModelFamily: String, CaseIterable, Sendable, Codable {
     /// What loading it asks of the machine, for the menu's tooltip.
     public var note: String {
         switch self {
+        case .nineB: "Dense, for 16 GB Macs; ~6 GB on disk, ~8 GB in memory with a 32K "
+                   + "context.  The previous Qwen generation: quick, weaker on long tasks."
         case .dense: "Dense; ~18 GB on disk, nearly all of it held in memory."
         case .flashNext: "Mixture of experts; ~104 GB on disk, ~75 GB held in memory "
                        + "(its engram table stays on disk).  The server will not load it "
@@ -65,7 +73,10 @@ public struct FoundModel: Sendable {
 public enum ModelCatalog {
     /// The family of the model in `path`, or nil if the engine would refuse it:
     /// an unsupported model_type, or anything but 4-bit weights in groups of
-    /// 32 or 64 (an FP8 or BF16 download of the same model, say).
+    /// 32 or 64 (an FP8 or BF16 download of the same model, say).  The 9B and
+    /// the 27B share a model_type and are told apart by width, as the engine
+    /// tells them apart; Qwen3.5's 4B, 2B and 0.8B would load too, but are
+    /// untested, so they are not offered.
     public static func family(of path: String) -> ModelFamily? {
         let url = URL(fileURLWithPath: path).appendingPathComponent("config.json")
         guard let data = try? Data(contentsOf: url),
@@ -75,7 +86,13 @@ public enum ModelCatalog {
         let type = json["model_type"] as? String ?? ""
         let family: ModelFamily
         switch type {
-        case "qwen3_5": family = .dense
+        case "qwen3_5":
+            let text = json["text_config"] as? [String: Any]
+            switch text?["hidden_size"] as? Int {
+            case 4096: family = .nineB
+            case 5120: family = .dense
+            default: return nil
+            }
         case "qwen4_exp": family = .flashNext
         case "qwen4_exp_text" where json["text_config"] == nil: family = .flashNext
         default: return nil

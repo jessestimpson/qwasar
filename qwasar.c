@@ -2070,11 +2070,32 @@ float qwasar_default_presence_penalty(const qwasar_engine *e) {
     return e->config.family == QW_FAMILY_QWEN3_5 && e->config.hidden_size < 5120 ? 1.5f : 0.0f;
 }
 int32_t qwasar_n_layers  (const qwasar_engine *e) { return e->config.num_hidden_layers; }
+/* The small Qwen3.5 dense models share the 27B's model_type and are told
+ * apart by width; anything at the 27B's width (Qwen3.5 and 3.6's 27B too)
+ * reports as the 27B. */
+static const struct { int32_t hidden; const char *id, *name; } qw_small_models[] = {
+    { 4096, "qwen3.5-9b",   "Qwen3.5 9B"   },
+    { 2560, "qwen3.5-4b",   "Qwen3.5 4B"   },
+    { 2048, "qwen3.5-2b",   "Qwen3.5 2B"   },
+    { 1024, "qwen3.5-0.8b", "Qwen3.5 0.8B" },
+};
+
+static int qw_small_model(const qwasar_engine *e) {
+    if (e->config.family != QW_FAMILY_QWEN3_5) return -1;
+    for (int i = 0; i < (int)(sizeof qw_small_models / sizeof qw_small_models[0]); i++)
+        if (qw_small_models[i].hidden == e->config.hidden_size) return i;
+    return -1;
+}
+
 const char *qwasar_model_id(const qwasar_engine *e) {
-    return e->config.family == QW_FAMILY_QWEN4_EXP ? "qwen3.8-flash-next" : "qwen3.8-27b";
+    if (e->config.family == QW_FAMILY_QWEN4_EXP) return "qwen3.8-flash-next";
+    const int s = qw_small_model(e);
+    return s >= 0 ? qw_small_models[s].id : "qwen3.8-27b";
 }
 const char *qwasar_model_name(const qwasar_engine *e) {
-    return e->config.family == QW_FAMILY_QWEN4_EXP ? "Qwen3.8 Flash-Next" : "Qwen3.8 27B";
+    if (e->config.family == QW_FAMILY_QWEN4_EXP) return "Qwen3.8 Flash-Next";
+    const int s = qw_small_model(e);
+    return s >= 0 ? qw_small_models[s].name : "Qwen3.8 27B";
 }
 
 bool qwasar_is_eos(const qwasar_engine *e, int32_t token) {

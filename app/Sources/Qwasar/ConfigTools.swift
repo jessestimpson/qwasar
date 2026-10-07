@@ -37,7 +37,7 @@ struct ConfigToolRunner: ToolExecuting {
     """#
 
     static let setSchema = #"""
-    {"type": "function", "function": {"name": "config_set", "description": "Set one configuration key. scope \"app\" is the app itself: server_port (1-65535), server_model (\"flash-next\", \"27b\", or a model folder's path), server_context (tokens, or \"auto\"), server_live_sessions (a number, or \"auto\"), server_running (true or false), start_at_login (true or false), checkpoint_disk_budget_gb (a number), running_notes (true or false: whether the model writes its working notes, off the record, after each reply). A server_port, server_model, server_context, server_live_sessions or server_running change restarts or stops the server -- after your reply finishes, since you are running on it. scope \"project\" (target: its name) also takes default_effort (low, medium, xhigh, or \"auto\") and system_prompt (the project's own guidance for its sessions; empty to remove). Sandbox keys apply at scope global, project or session; resolution is field-wise, session over project over global over the built-in default, and setting a value REPLACES what lower layers said for that key. They apply when a session is next opened. Sandbox keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb, delegate_models (comma-separated remote model ids, empty string for explicitly OFF), delegate_budget_usd, delegate_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
+    {"type": "function", "function": {"name": "config_set", "description": "Set one configuration key. scope \"app\" is the app itself: server_port (1-65535), server_model (\"flash-next\", \"27b\", \"9b\", or a model folder's path), server_context (tokens, or \"auto\"), server_live_sessions (a number, or \"auto\"), server_running (true or false), start_at_login (true or false), checkpoint_disk_budget_gb (a number), running_notes (true or false: whether the model writes its working notes, off the record, after each reply). A server_port, server_model, server_context, server_live_sessions or server_running change restarts or stops the server -- after your reply finishes, since you are running on it. scope \"project\" (target: its name) also takes default_effort (low, medium, xhigh, or \"auto\") and system_prompt (the project's own guidance for its sessions; empty to remove). Sandbox keys apply at scope global, project or session; resolution is field-wise, session over project over global over the built-in default, and setting a value REPLACES what lower layers said for that key. They apply when a session is next opened. Sandbox keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb, delegate_models (comma-separated remote model ids, empty string for explicitly OFF), delegate_budget_usd, delegate_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
     """#
 
     static let clearSchema = #"""
@@ -57,7 +57,7 @@ struct ConfigToolRunner: ToolExecuting {
 
         Sandbox keys: \(SandboxKey.allCases.map { "\($0.rawValue) — \($0.doc)" }.joined(separator: "; ")).
 
-        Two things you cannot do, and what to tell the user instead: the delegation API key is entered by the user through the app menu — Qwasar ▸ Set Delegation API Key… — and lands in the macOS Keychain; you can report whether one is set (config_show shows it) but never read or write it. Delegation needs both that key AND delegate_models granted at some layer, which IS yours to set. And a model folder must hold a Qwen3.8 27B or Flash-Next 4-bit MLX model; you can name one by path, but not download one.
+        Two things you cannot do, and what to tell the user instead: the delegation API key is entered by the user through the app menu — Qwasar ▸ Set Delegation API Key… — and lands in the macOS Keychain; you can report whether one is set (config_show shows it) but never read or write it. Delegation needs both that key AND delegate_models granted at some layer, which IS yours to set. And a model folder must hold a Qwen3.5 9B, Qwen3.8 27B or Flash-Next 4-bit MLX model; you can name one by path, but not download one.
 
         Start with config_show. Change only what the user asked for, and say what changed and when it takes effect.
         """
@@ -229,6 +229,11 @@ extension AppState {
             case "27b", "dense", "qwen3.8-27b":
                 guard let p = ModelLibrary.path(for: .dense) else {
                     return "error: the 27B has not been set up here; give its folder's path"
+                }
+                path = p
+            case "9b", "qwen3.5-9b":
+                guard let p = ModelLibrary.path(for: .nineB) else {
+                    return "error: the 9B has not been set up here; give its folder's path"
                 }
                 path = p
             default:
