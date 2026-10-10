@@ -1176,8 +1176,10 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
 /* Whether `tool` declares parameter `param` a string -- "type": "string", or
  * a type list of only "string" and "null".  Tools come in OpenAI's shape
  * (function.parameters) or Anthropic's (input_schema). */
-static bool param_is_string(const qj_doc *d, const char *tool, const char *param) {
-    if (!d) return false;
+/* The schema of `param` in `tool`'s declaration, or NULL: no such tool, or
+ * the tool does not declare it. */
+static const qj_node *param_schema(const qj_doc *d, const char *tool, const char *param) {
+    if (!d) return NULL;
     const qj_node *tools = qj_get(d, qj_root(d), "tools");
     for (const qj_node *t = qj_first(d, tools); t; t = qj_next(d, t)) {
         const qj_node *fn = qj_get(d, t, "function");
@@ -1187,21 +1189,25 @@ static bool param_is_string(const qj_doc *d, const char *tool, const char *param
         if (!schema) schema = qj_get(d, t, "input_schema");
         const qj_node *props = qj_get(d, schema, "properties");
         const size_t pl = strlen(param);
-        for (const qj_node *m = qj_first(d, props); m; m = qj_next(d, m)) {
-            if (m->key_len != pl || memcmp(d->text + m->key_off, param, pl)) continue;
-            const qj_node *type = qj_get(d, m, "type");
-            if (qj_str_eq(d, type, "string")) return true;
-            if (type && type->type == QJ_ARRAY) {
-                bool is_str = false, other = false;
-                for (const qj_node *e = qj_first(d, type); e; e = qj_next(d, e)) {
-                    if (qj_str_eq(d, e, "string")) is_str = true;
-                    else if (!qj_str_eq(d, e, "null")) other = true;
-                }
-                return is_str && !other;
-            }
-            return false;
+        for (const qj_node *m = qj_first(d, props); m; m = qj_next(d, m))
+            if (m->key_len == pl && !memcmp(d->text + m->key_off, param, pl)) return m;
+        return NULL;
+    }
+    return NULL;
+}
+
+static bool param_is_string(const qj_doc *d, const char *tool, const char *param) {
+    const qj_node *m = param_schema(d, tool, param);
+    if (!m) return false;
+    const qj_node *type = qj_get(d, m, "type");
+    if (qj_str_eq(d, type, "string")) return true;
+    if (type && type->type == QJ_ARRAY) {
+        bool is_str = false, other = false;
+        for (const qj_node *e = qj_first(d, type); e; e = qj_next(d, e)) {
+            if (qj_str_eq(d, e, "string")) is_str = true;
+            else if (!qj_str_eq(d, e, "null")) other = true;
         }
-        return false;
+        return is_str && !other;
     }
     return false;
 }
@@ -1244,10 +1250,51 @@ static void emit_arg_value(str *out, const char *v, bool is_string) {
     str_jsons(out, v ? v : "");
 }
 
+/* Whether parameter `i` is the whole argument object, wrapped: a JSON object
+ * under a name such as "arguments" that the tool does not declare -- the
+ * shape of other tool-call formats ({"name": ..., "arguments": {...}}),
+ * which a model sometimes writes inside <parameter=arguments>.  On true,
+ * `inner` holds the parsed object; the caller frees it. */
+static bool wrapped_args(const qj_doc *tools, const qw_tool_call *c, int i, qj_doc *inner) {
+    static const char *names[] = { "arguments", "parameters", "args", "input" };
+    const char *k = c->params[i].key, *v = c->params[i].value;
+    bool named = false;
+    for (size_t n = 0; n < sizeof names / sizeof *names; n++) if (!strcmp(k, names[n])) named = true;
+    if (!named || !v || param_schema(tools, c->name, k)) return false;
+    while (*v == ' ' || *v == '\n' || *v == '\t' || *v == '\r') v++;
+    if (*v != '{') return false;
+    if (qj_parse(inner, v, strlen(v)) && qj_root(inner)->type == QJ_OBJECT) return true;
+    qj_free(inner);
+    return false;
+}
+
+static bool has_param(const qw_tool_call *c, const char *key, size_t len) {
+    for (int i = 0; i < c->n_params; i++)
+        if (strlen(c->params[i].key) == len && !memcmp(c->params[i].key, key, len)) return true;
+    return false;
+}
+
 void qw_args_json(str *out, const qw_tool_call *c, const qj_doc *tools) {
     str_puts(out, "{");
+    bool first = true;
     for (int i = 0; i < c->n_params; i++) {
-        if (i) str_puts(out, ", ");
+        qj_doc inner;
+        if (wrapped_args(tools, c, i, &inner)) {
+            /* Unwrapped into the call's own arguments; a member also written
+             * as a parameter of its own is that parameter's. */
+            for (const qj_node *m = qj_first(&inner, qj_root(&inner)); m; m = qj_next(&inner, m)) {
+                if (has_param(c, inner.text + m->key_off, m->key_len)) continue;
+                if (!first) str_puts(out, ", ");
+                first = false;
+                str_json(out, inner.text + m->key_off, m->key_len);
+                str_puts(out, ": ");
+                str_node(out, &inner, m);
+            }
+            qj_free(&inner);
+            continue;
+        }
+        if (!first) str_puts(out, ", ");
+        first = false;
         str_jsons(out, c->params[i].key);
         str_puts(out, ": ");
         emit_arg_value(out, c->params[i].value, param_is_string(tools, c->name, c->params[i].key));

@@ -206,7 +206,14 @@ public struct ToolKit: Sendable {
         guard let raw = pathArg(call), let path = backend.resolve(raw),
               let old = call.argument("old_string") ?? call.argument("old"),
               let new = call.argument("new_string") ?? call.argument("new") else {
-            return "error: Edit requires file_path, old_string and new_string"
+            let missing = [("file_path", pathArg(call)),
+                           ("old_string", call.argument("old_string") ?? call.argument("old")),
+                           ("new_string", call.argument("new_string") ?? call.argument("new"))]
+                .filter { $0.1 == nil }.map(\.0)
+            if missing.isEmpty { return "error: Edit cannot use the file_path \(pathArg(call) ?? "")" }
+            return "error: Edit requires file_path, old_string and new_string; missing: "
+                 + missing.joined(separator: ", ") + ". Give each as its own <parameter=...>, "
+                 + "not inside one JSON object."
         }
         switch backend.stat(path) {
         case .success(.missing): return "error: no such file: \(raw). Use Write to create it."
