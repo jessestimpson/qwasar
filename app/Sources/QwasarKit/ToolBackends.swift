@@ -78,10 +78,12 @@ public struct HostBackend: ToolBackend {
 
     public func exec(_ command: String, timeoutMS: Int, maxBytes: Int) -> Result<ExecResult, ToolFailure> {
         let r = Spawn.run("/bin/sh", ["-c", command], cwd: URL(fileURLWithPath: workDir), env: environment,
-                          timeout: TimeInterval(timeoutMS) / 1000, maxBytes: maxBytes)
+                          timeout: TimeInterval(timeoutMS) / 1000, maxBytes: maxBytes,
+                          interrupt: .shared)
         var out = String(decoding: r.output, as: UTF8.self)
         if r.truncated { out += "\n[output stopped at \(maxBytes / 1024 / 1024) MB]" }
-        return .success(ExecResult(status: r.status, output: out, timedOut: r.timedOut))
+        return .success(ExecResult(status: r.status, output: out, timedOut: r.timedOut,
+                                   interrupted: r.interrupted))
     }
 }
 
@@ -122,12 +124,18 @@ public struct GuestBackend: ToolBackend {
     }
 
     public func exec(_ command: String, timeoutMS: Int, maxBytes: Int) -> Result<ExecResult, ToolFailure> {
+        if ToolInterrupt.shared.isInterrupted {
+            return .success(ExecResult(status: -1, output: "", timedOut: false, interrupted: true))
+        }
         let r = call("exec", ["command": .string(command), "timeout_ms": .int(timeoutMS),
                               "max_bytes": .int(maxBytes)],
-                     timeout: timeoutMS / 1000 + 30, timeoutIsResult: true)
+                     timeout: timeoutMS / 1000 + 30, timeoutIsResult: true, interruptible: true)
         switch r {
         case .failure(let f) where f.message.hasPrefix("timeout:"):
             return .success(ExecResult(status: -1, output: "", timedOut: true))
+        case .failure(let f) where f.message.hasPrefix("cancelled:"):
+            // Stop: the warden answers at once and kills the command.
+            return .success(ExecResult(status: -1, output: "", timedOut: false, interrupted: true))
         case .failure(let f): return .failure(f)
         case .success(let s):
             guard let nl = s.firstIndex(of: "\n") else { return .success(ExecResult(status: Int32(s) ?? -1, output: "", timedOut: false)) }
@@ -139,12 +147,23 @@ public struct GuestBackend: ToolBackend {
     /// One warden op, synchronously -- ToolExecuting is synchronous, and the
     /// channel's reader is its own thread, so this cannot deadlock against it.
     private func call(_ op: String, _ args: [String: GuestValue], timeout: Int,
-                      timeoutIsResult: Bool = false) -> Result<String, ToolFailure> {
+                      timeoutIsResult: Bool = false, interruptible: Bool = false) -> Result<String, ToolFailure> {
         let box = GuestBox()
         let done = DispatchSemaphore(value: 0)
+        // Stop cancels the request by its id: the warden answers it at once,
+        // and kills the command it was running.
+        let sent = GuestBox()
+        let token = interruptible ? ToolInterrupt.shared.register { [channel] in
+            guard case .success(let s) = sent.get(), let id = Int(s) else { return }
+            Task.detached {
+                _ = try? await channel.send(op: "cancel", args: ["target": .int(id)], timeout: 5)
+            }
+        } : nil
+        defer { ToolInterrupt.shared.unregister(token) }
         Task.detached { [channel] in
             do {
-                let r = try await channel.send(op: op, args: args, timeout: timeout)
+                let r = try await channel.send(op: op, args: args, timeout: timeout,
+                                               onID: { sent.set(.success(String($0))) })
                 if r.ok == true { box.set(.success(r.result ?? "")) }
                 else {
                     let kind = r.kind ?? "error"

@@ -200,6 +200,33 @@ enum HostToolsSuite {
         f += TestMain.check(todo == "task list updated (1 of 2 done):\n[x] Read the parser\n[~] Fix it", "TodoWrite")
         f += TestMain.check(call("elixir", ["code": "1"]).hasPrefix("error: no such tool"), "guest-only tools are refused")
 
+        // A session's reads, remembered: the same range of an unchanged file
+        // is refused; a changed file, or another range, reads.
+        let led = HostToolRunner(root: tmp, environment: env, timeout: 2, resultCap: 4096, ledger: ReadLedger())
+        func lcall(_ name: String, _ args: [String: String]) -> String {
+            led.run(ToolCall(name: name, arguments: args))
+        }
+        f += TestMain.check(lcall("Read", ["file_path": "src/a.txt"]) == "     1\tneedle in src\n"
+                            && lcall("Read", ["file_path": "src/a.txt"]).hasPrefix("error: src/a.txt (lines 1–1) has not changed"),
+                            "Read: an unchanged file read again is refused")
+        f += TestMain.check(lcall("Read", ["file_path": "long.txt", "offset": "10", "limit": "2"]).hasPrefix("    10\t")
+                            && lcall("Read", ["file_path": "long.txt", "offset": "20", "limit": "2"]).hasPrefix("    20\t"),
+                            "Read: another range of the same file reads")
+        _ = lcall("Edit", ["file_path": "src/a.txt", "old_string": "needle", "new_string": "pin"])
+        f += TestMain.check(lcall("Read", ["file_path": "src/a.txt"]) == "     1\tpin in src\n",
+                            "Read: a changed file reads again")
+
+        // Stop: a running command is killed, and later calls do not run.
+        let t1 = Date()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { ToolInterrupt.shared.interrupt() }
+        let stopped = call("Bash", ["command": "sleep 30 & sleep 30; echo never", "timeout": "60000"])
+        f += TestMain.check(stopped.hasPrefix("[stopped by the user]") && Date().timeIntervalSince(t1) < 5,
+                            "Bash: Stop kills the command and what it started (\(stopped.prefix(40)))")
+        f += TestMain.check(call("Read", ["file_path": "src/a.txt"]).hasPrefix("error: not run"),
+                            "after Stop, the turn's next call does not run")
+        ToolInterrupt.shared.reset()
+        f += TestMain.check(call("Bash", ["command": "echo again"]) == "again\n", "a new turn runs again")
+
         let ro = ToolRunner(root: tmp)
         f += TestMain.check(ro.run(ToolCall(name: "Read", arguments: ["file_path": "/etc/hosts"])).hasPrefix("error"),
                             "the read-only fallback stays inside the project")

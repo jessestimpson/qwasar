@@ -309,7 +309,8 @@ struct QuestionCard: View {
     }
 }
 
-/// Offered at 85% of the window, and when it is full: continue the work in a
+/// Offered at 85% of the window, and when it is full (and done on its own
+/// there unless auto_compact is off): continue the work in a
 /// new session, seeded with this one's notes (spec 2.4).
 struct SuccessorBanner: View {
     @Bindable var state: AppState
@@ -537,10 +538,10 @@ struct PrefillBar: View {
     /// session is replaying one. Same work, same bar, and the wait is worth
     /// naming differently because the reasons a person waits are different.
     var label: String = "reading the prompt"
-
-    /// Measured on the target host (PLAN.md 2.5). Used only to estimate the
-    /// wait; nothing depends on it being exact.
-    private static let tokensPerSecond = 32.0
+    /// Measured (AppState.prefillRate): this prefill's own pace once it has
+    /// reported twice, else the last turn's.  Zero: no estimate shown.  A
+    /// fixed rate was the 27B's on one machine, and wrong by 10x elsewhere.
+    var tokensPerSecond: Double = 0
 
     private var remaining: Int { max(0, total - done) }
 
@@ -561,8 +562,9 @@ struct PrefillBar: View {
     }
 
     private var eta: String {
-        guard remaining > 60 else { return "" }
-        let s = Double(remaining) / Self.tokensPerSecond
+        guard remaining > 60, tokensPerSecond > 0 else { return "" }
+        let s = Double(remaining) / tokensPerSecond
+        if s < 3 { return "" }
         return s < 90 ? String(format: " · about %.0fs left", s)
                       : String(format: " · about %.0f min left", s / 60)
     }
@@ -638,7 +640,7 @@ struct StatusFooter: View {
             // covered everything and there is nothing left to prefill.
             if isPrefilling {
                 PrefillBar(done: state.prefillDone, total: state.prefillTotal,
-                           label: "rebuilding this session")
+                           label: "rebuilding this session", tokensPerSecond: state.prefillRate)
             } else {
                 HStack(spacing: 10) {
                     ProgressView().controlSize(.small)
@@ -656,7 +658,8 @@ struct StatusFooter: View {
 
         default:
             if isPrefilling {
-                PrefillBar(done: state.prefillDone, total: state.prefillTotal)
+                PrefillBar(done: state.prefillDone, total: state.prefillTotal,
+                           tokensPerSecond: state.prefillRate)
             } else {
                 EmptyView()
             }

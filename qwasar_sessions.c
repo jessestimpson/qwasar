@@ -976,6 +976,14 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
     bool reasoning = thinking;
     bool in_call = false, forced = false, ok = true;
     bool naming = false;
+    /* Calls written so far, where the open one began in out->text, and
+     * whether the last one has closed -- a step may carry several calls
+     * ("</tool_call>\n<tool_call>..."), and after one closes the only
+     * continuations are whitespace, another call, or the end of the turn. */
+    int n_calls = 0;
+    size_t call_at = 0;
+    bool call_done = false;
+    int ws_after_call = 0;
     str name = { 0 };
     channel rc = { 0 }, tc = { 0 };
 
@@ -1045,6 +1053,18 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
             out->first_top_p = (float)(1.0 / z);
         }
         if (qwasar_is_eos(st->e, next)) { out->hit_eos = true; break; }
+        if (call_done && next != call_open) {
+            /* After a call: a little whitespace may precede the next one;
+             * anything else -- prose after the calls -- ends the step
+             * unevaluated, as the step used to end at every </tool_call>. */
+            size_t wl = 0;
+            bool wsp = false;
+            const char *wb = qwasar_token_bytes(st->tok, next, &wl, &wsp);
+            bool blank = !wsp && wb && wl > 0 && ++ws_after_call <= 4;
+            for (size_t k = 0; blank && k < wl; k++)
+                if (wb[k] != '\n' && wb[k] != ' ' && wb[k] != '\t' && wb[k] != '\r') blank = false;
+            if (!blank) break;
+        }
         out->n_gen++;
         if (reasoning) out->n_reasoning++;
 
@@ -1076,8 +1096,10 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
             }
             str_add(reasoning ? &out->reasoning : &out->text, bytes, len);
             if (next == call_open) {
+                if (!in_call) chan_send(&tc, false, tc.shown.len, on_delta, ud);
                 in_call = true;
-                chan_send(&tc, false, tc.shown.len, on_delta, ud);
+                call_done = false;
+                call_at = out->text.len - len;
             }
             if (special) {
                 /* structure, not content */
@@ -1103,9 +1125,12 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
             }
         }
 
-        if (!reasoning && next != call_open && go->tools != QW_TOOLS_NONE
-            && qw_tool_call_complete(out->text.p ? out->text.p : "", out->text.len)) {
+        if (!reasoning && in_call && !call_done && next != call_open && go->tools != QW_TOOLS_NONE
+            && qw_tool_call_complete(out->text.p ? out->text.p + call_at : "",
+                                     out->text.len - call_at)) {
             out->has_call = true;
+            call_done = true;
+            ws_after_call = 0;
             /* The token that completed the call -- </tool_call> -- is part of
              * the turn as the chat template writes it ("</function>\n
              * </tool_call><|im_end|>"), so it is evaluated and recorded like
@@ -1117,7 +1142,9 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
             if (!logits) { ok = false; break; }
             if (!s->compat && !s->aside) tokens_append(s, &next, 1);
             if (on_token) on_token(ud, out->n_gen, in_call, out->text.p ? out->text.p : "", out->text.len);
-            break;
+            /* A forced call is one call; otherwise the model may write more. */
+            if (go->tools == QW_TOOLS_FORCE || ++n_calls >= QW_MAX_CALLS) break;
+            continue;
         }
 
         logits = qwasar_session_eval(s->h, &next, 1, err, cap);

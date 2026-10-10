@@ -24,7 +24,10 @@
   without asking, and does the handoff summary get written by the outgoing
   session (cheap, in-context) or by a second pass over the transcript (better,
   and it costs a whole prefill). Leaning: offer at 85%, never automatic, summary
-  from the outgoing session.
+  from the outgoing session. **Since 2026-10-10: automatic at 85%** — the
+  offer alone let a long turn run the window to 94%, where the model, told
+  to stop and report, refused to go on. `auto_compact` sets the mark or
+  turns it off.
 - **Does the agent know how much context it has left?** It should — a model
   budgeting its own remaining window behaves differently, and better, than one
   that hits the wall. But the only appendable channel is a tool result, so this

@@ -46,11 +46,11 @@ public struct SandboxToolRunner: ToolExecuting {
     let kit: ToolKit
 
     public init(channel: VsockChannel, timeout: Int = 180,
-                resultCap: Int = ToolKit.resultCap(flashNext: true)) {
+                resultCap: Int = ToolKit.resultCap(flashNext: true), ledger: ReadLedger? = nil) {
         self.channel = channel
         self.timeout = timeout
         self.kit = ToolKit(backend: GuestBackend(channel: channel), resultCap: resultCap,
-                           defaultTimeoutMS: 120_000)
+                           defaultTimeoutMS: 120_000, ledger: ledger)
     }
 
     public var schemas: [String] { ToolSurface.sandboxSchemas }

@@ -194,6 +194,9 @@ defmodule Warden.Bridge do
   defp cancel(state, target) do
     case Map.fetch(state.inflight, target) do
       {:ok, _} ->
+        # The worker may be inside an exec: end it, so the worker is free
+        # for what comes next rather than running out the command's timeout.
+        Warden.Tools.kill_exec()
         state = %{state | expired: MapSet.put(state.expired, target)}
         respond(state, target, {:error, "cancelled", "cancelled by the host"})
 

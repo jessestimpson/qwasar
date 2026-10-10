@@ -22,10 +22,10 @@ public struct ToolCall: Sendable, Equatable {
 public struct ToolRunner: ToolExecuting {
     let kit: ToolKit
 
-    public init(root: URL, resultCap: Int = ToolKit.resultCap(flashNext: true)) {
+    public init(root: URL, resultCap: Int = ToolKit.resultCap(flashNext: true), ledger: ReadLedger? = nil) {
         kit = ToolKit(backend: HostBackend(root: root, environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"],
                                            confined: true),
-                      resultCap: resultCap)
+                      resultCap: resultCap, ledger: ledger)
     }
 
     public var schemas: [String] { ToolSurface.readOnlySchemas }

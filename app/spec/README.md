@@ -32,7 +32,9 @@ their measurements, and a measurement that contradicts an assumption wins.
 **Since 2026-10-01 §2.4's successor exists, with running notes.** The
 handoff is not written at the end: the outgoing session keeps notes as it
 goes, in asides the server rolls back (API.md §4.11), after each reply.
-The 85% offer, never automatic, is §14's leaning, built.
+The 85% offer, never automatic, was §14's leaning, built; since 2026-10-10
+it is automatic at 85% (`auto_compact`), mid-turn at a tool call or before
+the next message.
 
 **Since 2026-09-30 the tool surface is Claude Code's** — Read, Write, Edit,
 Glob, Grep, Bash, TodoWrite, written once in `ToolKit` over a host or guest

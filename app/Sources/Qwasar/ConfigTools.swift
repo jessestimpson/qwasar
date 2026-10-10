@@ -37,11 +37,11 @@ struct ConfigToolRunner: ToolExecuting {
     """#
 
     static let setSchema = #"""
-    {"type": "function", "function": {"name": "config_set", "description": "Set one configuration key. scope \"app\" is the app itself: server_port (1-65535), server_model (\"flash-next\", \"27b\", \"9b\", or a model folder's path), server_context (tokens, or \"auto\"), server_live_sessions (a number, or \"auto\"), server_thinking (true or false: whether the OpenAI and Anthropic endpoints reason when a request does not say; this app's own sessions are unaffected), server_running (true or false), start_at_login (true or false), checkpoint_disk_budget_gb (a number), running_notes (true or false: whether the model writes its working notes, off the record, after each reply). A server_port, server_model, server_context, server_live_sessions, server_thinking or server_running change restarts or stops the server -- after your reply finishes, since you are running on it. scope \"project\" (target: its name) also takes default_effort (low, medium, xhigh, or \"auto\") and system_prompt (the project's own guidance for its sessions; empty to remove). Sandbox keys apply at scope global, project or session; resolution is field-wise, session over project over global over the built-in default, and setting a value REPLACES what lower layers said for that key. They apply when a session is next opened. Sandbox keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb, delegate_models (comma-separated remote model ids, empty string for explicitly OFF), delegate_budget_usd, delegate_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
+    {"type": "function", "function": {"name": "config_set", "description": "Set one configuration key. scope \"app\" is the app itself: server_port (1-65535), server_model (\"flash-next\", \"27b\", \"9b\", or a model folder's path), server_context (tokens, or \"auto\"), server_live_sessions (a number, or \"auto\"), server_thinking (true or false: whether the OpenAI and Anthropic endpoints reason when a request does not say; this app's own sessions are unaffected), server_running (true or false), start_at_login (true or false), checkpoint_disk_budget_gb (a number), running_notes (true or false: whether the model writes its working notes, off the record, after each reply), auto_compact (a percentage of the context window, 50-98, at which a session continues in a new one on its own, carrying its notes; \"off\" to only offer it). A server_port, server_model, server_context, server_live_sessions, server_thinking or server_running change restarts or stops the server -- after your reply finishes, since you are running on it. scope \"project\" (target: its name) also takes default_effort (low, medium, xhigh, or \"auto\") and system_prompt (the project's own guidance for its sessions; empty to remove). Sandbox keys apply at scope global, project or session; resolution is field-wise, session over project over global over the built-in default, and setting a value REPLACES what lower layers said for that key. They apply when a session is next opened. Sandbox keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb, delegate_models (comma-separated remote model ids, empty string for explicitly OFF), delegate_budget_usd, delegate_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
     """#
 
     static let clearSchema = #"""
-    {"type": "function", "function": {"name": "config_clear", "description": "Clear one key so it falls back to its default -- for app keys the built-in default (server_port 8080; server_context, server_live_sessions and checkpoint_disk_budget_gb back to automatic; start_at_login off, running_notes on), for sandbox keys the next layer down -- or clear a whole sandbox layer by omitting the key.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "The key to clear; omit to clear a whole sandbox layer."}}, "required": ["scope"]}}}
+    {"type": "function", "function": {"name": "config_clear", "description": "Clear one key so it falls back to its default -- for app keys the built-in default (server_port 8080; server_context, server_live_sessions and checkpoint_disk_budget_gb back to automatic; start_at_login off, running_notes on, auto_compact 85), for sandbox keys the next layer down -- or clear a whole sandbox layer by omitting the key.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "The key to clear; omit to clear a whole sandbox layer."}}, "required": ["scope"]}}}
     """#
 
     var schemas: [String] { [Self.showSchema, Self.setSchema, Self.clearSchema] }
@@ -192,7 +192,7 @@ extension AppState {
     /// The keys scope "app" takes.
     static let appKeys = ["server_port", "server_model", "server_context", "server_live_sessions",
                           "server_running", "start_at_login", "checkpoint_disk_budget_gb",
-                          "running_notes"]
+                          "running_notes", "auto_compact"]
 
     private func setApp(key: String, value raw: String) -> String {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -285,6 +285,16 @@ extension AppState {
             runningNotesEnabled = on
             return on ? "ok: running notes are on -- written off the record after each reply, while the user reads"
                       : "ok: running notes are off; Continue in a New Session will write them when it is used"
+        case "auto_compact":
+            if ["off", "false", "0", "none"].contains(value.lowercased()) {
+                autoCompactAt = 0
+                return "ok: auto_compact is off -- Continue in a New Session is offered at 85%, never done on its own"
+            }
+            guard let pct = Double(value.replacingOccurrences(of: "%", with: "")), (50...98).contains(pct) else {
+                return "error: auto_compact is a percentage from 50 to 98, or off"
+            }
+            autoCompactAt = pct / 100
+            return "ok: a session continues in a new one on its own at \(Int(pct))% of its window"
         default:
             return "error: unknown app key \(key). App keys: " + Self.appKeys.joined(separator: ", ")
         }
@@ -296,6 +306,7 @@ extension AppState {
         case "server_context", "server_live_sessions": return setApp(key: key, value: "auto")
         case "start_at_login": return setApp(key: key, value: "false")
         case "running_notes": return setApp(key: key, value: "true")
+        case "auto_compact": return setApp(key: key, value: "85")
         case "checkpoint_disk_budget_gb":
             let free = (serverInfo?.disk?.free_bytes ?? 0) + (serverInfo?.disk?.sessions_bytes ?? 0)
             diskBudgetBytes = free / 4
@@ -365,6 +376,7 @@ extension AppState {
         out.append("  server_thinking: \(server.apiThinking) (API clients' default; not this app's sessions)")
         out.append("  start_at_login: \(login)")
         out.append("  running_notes: \(runningNotesEnabled)")
+        out.append("  auto_compact: " + (autoCompactAt > 0 ? "\(Int((autoCompactAt * 100).rounded()))%" : "off"))
         out.append("  checkpoint_disk_budget_gb: \(String(format: "%.1f", Double(diskBudgetBytes) / 1e9)) "
                    + "(checkpoints use \(formatBytes(sessionsDiskBytes)))")
         if pendingServerRestart { out.append("  (a server restart is pending: after the current reply)") }

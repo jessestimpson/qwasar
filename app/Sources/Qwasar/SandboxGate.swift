@@ -249,6 +249,19 @@ enum SandboxGate {
             got = await tool("Read", ["file_path": "/etc/hostname"])
             expect("a path outside /work is refused", got, got.hasPrefix("error:") && got.contains("escapes"))
 
+            // Stop: the command is killed in the guest, not waited out, and
+            // the warden's worker is free for the next one at once.
+            ToolInterrupt.shared.reset()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1) { ToolInterrupt.shared.interrupt() }
+            let t1 = Date()
+            got = await tool("Bash", ["command": "sleep 30 & sleep 30; echo never"])
+            expect("Bash, stopped", got, got.hasPrefix("[stopped by the user]") && Date().timeIntervalSince(t1) < 5)
+            ToolInterrupt.shared.reset()
+            let t2 = Date()
+            got = await tool("Bash", ["command": "echo after; pgrep sleep | wc -l"])
+            expect("the next command runs at once, nothing left running", got,
+                   got.replacingOccurrences(of: " ", with: "").hasPrefix("after\n0") && Date().timeIntervalSince(t2) < 5)
+
             // Self-modification (PLAN.md 7.2): the agent writes a tool,
             // hot-loads it, and calls it — with no restart and no change to the
             // tool surface, which is what makes it free (§2.2).

@@ -27,8 +27,11 @@ public struct ExecResult: Sendable {
     public var status: Int32
     public var output: String
     public var timedOut: Bool
-    public init(status: Int32, output: String, timedOut: Bool) {
+    /// Stopped by the user (ToolInterrupt) rather than finished.
+    public var interrupted: Bool
+    public init(status: Int32, output: String, timedOut: Bool, interrupted: Bool = false) {
         self.status = status; self.output = output; self.timedOut = timedOut
+        self.interrupted = interrupted
     }
 }
 
@@ -44,7 +47,8 @@ public protocol ToolBackend: Sendable {
     /// The file's full size and its first `maxBytes`, as text.
     func read(_ path: String, maxBytes: Int) -> Result<(size: Int, text: String), ToolFailure>
     func write(_ path: String, _ content: String) -> Result<Void, ToolFailure>
-    /// `sh -c command` in the working directory.
+    /// `sh -c command` in the working directory.  Stop (ToolInterrupt.shared)
+    /// ends it early, with `interrupted` set.
     func exec(_ command: String, timeoutMS: Int, maxBytes: Int) -> Result<ExecResult, ToolFailure>
 }
 
@@ -61,6 +65,9 @@ public struct ToolKit: Sendable {
     public let resultCap: Int
     /// Bash's default timeout, in milliseconds.
     public let defaultTimeoutMS: Int
+    /// The session's reads, so an unchanged file is not read twice; nil
+    /// keeps no record.
+    public let ledger: ReadLedger?
 
     /// Ceilings the tools share.  Raw reads stop here: the guest's frames are
     /// 8 MB, and a file larger than this is not one to read into a context.
@@ -69,16 +76,21 @@ public struct ToolKit: Sendable {
     static let maxLineLength = 2000
     static let maxListed = 250
 
-    public init(backend: ToolBackend, resultCap: Int, defaultTimeoutMS: Int = 120_000) {
+    public init(backend: ToolBackend, resultCap: Int, defaultTimeoutMS: Int = 120_000,
+                ledger: ReadLedger? = nil) {
         self.backend = backend
         self.resultCap = resultCap
         self.defaultTimeoutMS = defaultTimeoutMS
+        self.ledger = ledger
     }
 
     /// The result cap for a model: 64 KB for Flash-Next, 8 KB for the 27B.
     public static func resultCap(flashNext: Bool) -> Int { flashNext ? 64 * 1024 : 8 * 1024 }
 
     public func run(_ call: ToolCall) -> String {
+        if ToolInterrupt.shared.isInterrupted, call.name != "TodoWrite" {
+            return "error: not run -- the user stopped the turn"
+        }
         switch call.name {
         case "Read":      return read(call)
         case "Write":     return write(call)
@@ -138,7 +150,7 @@ public struct ToolKit: Sendable {
         case .failure(let f): return "error: \(f.message)"
         case .success(let r): got = r
         }
-        if got.text.isEmpty { return "[the file is empty]" }
+        if got.text.isEmpty { ledger?.forget(path: path); return "[the file is empty]" }
 
         var lines = got.text.split(separator: "\n", omittingEmptySubsequences: false)
         if got.text.hasSuffix("\n") { lines.removeLast() }
@@ -165,6 +177,11 @@ public struct ToolKit: Sendable {
         if shown < total {
             out += "\n[showing lines \(start)–\(shown) of \(total). Continue with offset=\(shown + 1), "
                  + "or use Grep to find what you need.]"
+        }
+        if let ledger, ledger.repeats(path: path, range: "\(start):\(shown)", output: out) {
+            return "error: \(raw) (lines \(start)–\(shown)) has not changed since you last read it; "
+                 + "its contents are already in this conversation, above. Work from that rather than "
+                 + "reading it again."
         }
         return out
     }
@@ -259,6 +276,7 @@ public struct ToolKit: Sendable {
         case .failure(let f): return "error: \(f.message)"
         case .success(let x): r = x
         }
+        if r.interrupted { return "error: the search was stopped by the user" }
         if r.timedOut { return "error: the search took more than 60s; narrow the pattern or the path" }
         let files = r.output.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
             .map { $0.hasPrefix("./") ? String($0.dropFirst(2)) : $0 }
@@ -306,6 +324,7 @@ public struct ToolKit: Sendable {
         case .failure(let f): return "error: \(f.message)"
         case .success(let x): r = x
         }
+        if r.interrupted { return "error: the search was stopped by the user" }
         if r.timedOut { return "error: the search took more than 60s; narrow it with path or glob" }
         // 0 found, 1 nothing found, 2 an error.  Unreadable files are kept
         // quiet, so a 2 with output is a bad pattern -- whose message is the
@@ -337,6 +356,7 @@ public struct ToolKit: Sendable {
         case .failure(let f): return "error: \(f.message)"
         case .success(let x): r = x
         }
+        if r.interrupted { return tail("[stopped by the user]\n" + r.output) }
         if r.timedOut { return tail("[killed after \(timeout / 1000)s]\n" + r.output) }
         if r.status == 0 { return tail(r.output.isEmpty ? "[no output]" : r.output) }
         return tail("[exit \(r.status)]\n" + r.output)

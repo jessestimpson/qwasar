@@ -18,9 +18,9 @@ public struct HostToolRunner: ToolExecuting {
     /// `timeout` is Bash's default, in seconds; `resultCap` the model's
     /// (ToolKit.resultCap(flashNext:)).
     public init(root: URL, environment: [String: String], timeout: Int = 120,
-                resultCap: Int = ToolKit.resultCap(flashNext: true)) {
+                resultCap: Int = ToolKit.resultCap(flashNext: true), ledger: ReadLedger? = nil) {
         kit = ToolKit(backend: HostBackend(root: root, environment: environment),
-                      resultCap: resultCap, defaultTimeoutMS: timeout * 1000)
+                      resultCap: resultCap, defaultTimeoutMS: timeout * 1000, ledger: ledger)
     }
 
     public var schemas: [String] { ToolSurface.coreSchemas }
@@ -56,11 +56,15 @@ enum Spawn {
         var output = Data()
         var timedOut = false
         var truncated = false
+        var interrupted = false
     }
 
+    /// `interrupt`: Stop kills the process group, as a timeout does.
     static func run(_ exe: String, _ args: [String], cwd: URL, env: [String: String],
-                    timeout: TimeInterval, maxBytes: Int) -> Result {
+                    timeout: TimeInterval, maxBytes: Int,
+                    interrupt: ToolInterrupt? = nil) -> Result {
         var result = Result()
+        if interrupt?.isInterrupted == true { result.interrupted = true; return result }
         var fds: [Int32] = [0, 0]
         guard pipe(&fds) == 0 else { return result }
         let (rd, wr) = (fds[0], fds[1])
@@ -114,6 +118,16 @@ enum Spawn {
         let exited = DispatchSemaphore(value: 0)
         let statusBox = SpawnBox()
         let child = pid
+        let stopped = SpawnBox()
+        let token = interrupt?.register {
+            stopped.status = 1
+            kill(-child, SIGKILL)
+        }
+        if interrupt != nil, token == nil {
+            // Stop came between the check above and the spawn.
+            stopped.status = 1
+            kill(-child, SIGKILL)
+        }
         DispatchQueue.global().async {
             var st: Int32 = 0
             while waitpid(child, &st, 0) == -1 && errno == EINTR {}
@@ -125,6 +139,8 @@ enum Spawn {
             result.timedOut = true
             exited.wait()
         }
+        interrupt?.unregister(token)
+        result.interrupted = stopped.status != 0
         _ = readDone.wait(timeout: .now() + 1)
         close(rd)
 

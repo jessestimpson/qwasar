@@ -84,6 +84,11 @@ final class AppState {
     private(set) var sentCount = 0
     var prefillDone = 0
     var prefillTotal = 0
+    /// Prefill speed, measured: over the prefill in progress once it has
+    /// reported twice, else the last turn's.  Zero until anything is known.
+    var prefillRate = 0.0
+    /// The first report of the prefill in progress, which the rate runs from.
+    private var prefillMark: (done: Int, total: Int, at: Date)?
     /// Live, reported by the session rather than guessed at. Zero means there is
     /// nothing to show -- no live session, or one that has not evaluated yet.
     var contextUsed = 0
@@ -179,6 +184,16 @@ final class AppState {
     private var pendingDefineSource: String?
     private var projectAccess: [UUID: URL] = [:]
     private var cancelFlag = CancelFlag()
+    /// What each session's model has read, so an unchanged file is not read
+    /// into its context twice (ToolKit's Read).  A session's, not a turn's:
+    /// the runner is rebuilt every turn, the context is not.
+    private var readLedgers: [UUID: ReadLedger] = [:]
+    private func readLedger(_ id: UUID) -> ReadLedger {
+        if let l = readLedgers[id] { return l }
+        let l = ReadLedger()
+        readLedgers[id] = l
+        return l
+    }
     /// Items produced by the turn in flight, appended to the log when it ends.
     private var pendingItems: [TranscriptItem] = []
 
@@ -397,9 +412,10 @@ final class AppState {
 
     /// Winds down a running turn before something that needs the engine
     /// queue idle: sets the cancel flag (the decode loop polls it every
-    /// token) and waits for `send()` to finish persisting the turn. Bounded,
-    /// because a tool call in flight is not interruptible and the caller
-    /// must not hang behind it; `send()` guards its own persistence against
+    /// token, and Stop kills a running command) and waits for `send()` to
+    /// finish persisting the turn. Bounded, because a tool call can still
+    /// outlast a Stop -- a guest op, a delegation -- and the caller must not
+    /// hang behind it; `send()` guards its own persistence against
     /// a session closed out from under it.
     private func settleTurn(within seconds: Double = 8) async {
         guard phase == .generating else { return }
@@ -851,6 +867,20 @@ final class AppState {
 
     func send() {
         guard case .ready = phase, let rec = selectedSession else { return }
+        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        draft = ""
+        // A window past the mark goes on in a successor, and the message
+        // with it -- rather than into a session with no room to answer.
+        if shouldCompact(rec) {
+            compact(rec.id, then: text)
+            return
+        }
+        send(text)
+    }
+
+    private func send(_ text: String) {
+        guard case .ready = phase, let rec = selectedSession else { return }
         guard let p = project(of: rec) else { return }
         // The config project has no folder; its tools are the host's own
         // (PLAN.md 8.5). Every other project needs its root back.
@@ -859,9 +889,6 @@ final class AppState {
             phase = .failed("this project's folder is no longer reachable — re-add it")
             return
         }
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        draft = ""
 
         sentCount += 1
         // The turn is this record's from here until its items are persisted,
@@ -906,7 +933,8 @@ final class AppState {
                     let settings = SandboxSettings.resolve(global: globalSandbox,
                                                            project: p.overlay,
                                                            session: rec.sandbox)
-                    runner = ToolRunner(root: root, resultCap: resultCap)
+                    let ledger = readLedger(rec.id)
+                    runner = ToolRunner(root: root, resultCap: resultCap, ledger: ledger)
                     if !rec.isSandboxed {
                         // On this Mac, with the user's own shell environment,
                         // resolved in the project (a login shell can take a
@@ -914,7 +942,7 @@ final class AppState {
                         let env = await Task.detached { ShellEnvironment.resolve(in: root) }.value
                         runner = HostToolRunner(root: root, environment: env,
                                                 timeout: settings.toolTimeoutSeconds,
-                                                resultCap: resultCap)
+                                                resultCap: resultCap, ledger: ledger)
                         sandboxStatus = "on this Mac · \(URL(fileURLWithPath: ShellEnvironment.loginShell).lastPathComponent) environment"
                     } else if let sandboxes, sandboxes.isAvailable {
                         do {
@@ -923,7 +951,7 @@ final class AppState {
                                                                   settings: settings)
                             runner = SandboxToolRunner(channel: ready.channel,
                                                        timeout: settings.toolTimeoutSeconds,
-                                                       resultCap: resultCap)
+                                                       resultCap: resultCap, ledger: ledger)
                             toolsInGuest = true
                             sandboxStatus = String(format: "sandboxed · booted in %.1fs",
                                                    ready.bootSeconds)
@@ -1023,6 +1051,7 @@ final class AppState {
 
             phase = .generating
             cancelFlag.clear()
+            ToolInterrupt.shared.reset()
             prefillDone = 0; prefillTotal = 0
 
             var promptText = text
@@ -1071,6 +1100,13 @@ final class AppState {
             // notes -- notes are taken when a turn ends, so a turn that
             // never ends is asked to find a place to).
             var remindedFill = 0.0
+            // Past the auto-compaction mark at a tool-call boundary: the
+            // model is asked to sum up, and the work goes on in a successor.
+            var compactAfterTurn = false
+            let autoCompact = p.isConfig ? 0 : autoCompactAt
+            // Stop came while tools ran: the step their results start is
+            // cancelled as soon as the server begins it.
+            var cancelSent = false
             // The last event heard, and how often this step's stream has had
             // to be picked up again.
             var lastEventID: String?
@@ -1081,6 +1117,10 @@ final class AppState {
                     var stop = ""
                     for try await se in stream {
                         if !se.id.isEmpty { lastEventID = se.id }
+                        if cancelFlag.isSet, !cancelSent {
+                            cancelSent = true
+                            Task { try? await client.cancel(sid) }
+                        }
                         let ev = se.event
                         switch ev {
                         case .queued(let pos):
@@ -1117,6 +1157,7 @@ final class AppState {
                             stats.specCommitted += committed
                             stats.contextUsed = used
                             stats.contextLimit = limit
+                            if pf > 0.2, prompt >= 256 { prefillRate = Double(prompt) / pf }
                             apply(.context(used: used, limit: limit))
                         case .error(let m):
                             apply(.failed(m)); ended = true
@@ -1148,14 +1189,24 @@ final class AppState {
                         // Asked to sum up, it asked for tools instead.  They
                         // are not run: the session is left awaiting them,
                         // which a next message closes (API.md 4.5).
-                        apply(.note("the model asked for \(calls.count) more tool call(s) after the cap; "
-                                  + "not run -- send a message to carry on"))
+                        apply(.note(compactAfterTurn
+                            ? "the model asked for \(calls.count) more tool call(s); not run -- the work goes on in a new session"
+                            : "the model asked for \(calls.count) more tool call(s) after the cap; "
+                              + "not run -- send a message to carry on"))
                         calls = []
                         ended = true
                     case "tool_calls":
                         var results: [ToolResultPayload] = []
                         let executor = runner      // a let: a captured var is not sendable
                         for (id, c) in calls {
+                            if cancelFlag.isSet {
+                                // Stopped: what is left is answered, not run,
+                                // so the model sees why.
+                                let r = "error: not run -- the user stopped the turn"
+                                apply(.toolResult(name: c.name, result: r))
+                                results.append(ToolResultPayload(id: id, content: r))
+                                continue
+                            }
                             // The tool runs off the main actor: a call into the
                             // guest can take seconds, and the window must not.
                             // The model's questions are the user's to answer:
@@ -1180,7 +1231,35 @@ final class AppState {
                             apply(.note("reached \(steps) rounds of tool calls; asking the model to summarize"))
                             stats.hitStepCap = true
                             wrappingUp = true
-                        } else if !results.isEmpty, stats.contextLimit > 0 {
+                        } else if !results.isEmpty, stats.contextLimit > 0, !cancelFlag.isSet,
+                                  autoCompact > 0,
+                                  Double(stats.contextUsed) / Double(stats.contextLimit) >= autoCompact {
+                            // Compaction: the results go, with the request to
+                            // stop here; the turn's end takes the notes and
+                            // opens the successor, which carries on.
+                            let fill = Double(stats.contextUsed) / Double(stats.contextLimit)
+                            results[results.count - 1].content += "\n\n<system-reminder>\nThe context "
+                                + "window is \(Int(fill * 100))% used. This session is about to continue in a "
+                                + "fresh one: working notes are taken from this conversation, and the work goes "
+                                + "on there with them. Make no more tool calls now. In a few lines, say where "
+                                + "the task stands and what the immediate next step is.\n</system-reminder>"
+                            apply(.note("the context is \(Int(fill * 100))% full; wrapping up to continue in a new session"))
+                            wrappingUp = true
+                            compactAfterTurn = true
+                        } else if !results.isEmpty, stats.contextLimit > 0, autoCompact > 0, !cancelFlag.isSet {
+                            let fill = Double(stats.contextUsed) / Double(stats.contextLimit)
+                            let mark = max(0.5, autoCompact - 0.15)
+                            if fill >= mark, remindedFill < mark {
+                                remindedFill = mark
+                                results[results.count - 1].content += "\n\n<system-reminder>\nThe context "
+                                    + "window is \(Int(fill * 100))% used (\(stats.contextUsed) of "
+                                    + "\(stats.contextLimit) tokens). At \(Int(autoCompact * 100))% this work "
+                                    + "continues in a fresh session automatically, carrying working notes -- keep "
+                                    + "going. Prefer targeted reads (Grep, offset and limit) to whole files, so the "
+                                    + "room lasts.\n</system-reminder>"
+                                apply(.note("the context is \(Int(fill * 100))% full; the model was told"))
+                            }
+                        } else if !results.isEmpty, stats.contextLimit > 0, !cancelFlag.isSet {
                             let fill = Double(stats.contextUsed) / Double(stats.contextLimit)
                             if let mark = [0.9, 0.75].first(where: { fill >= $0 && remindedFill < $0 }) {
                                 remindedFill = mark
@@ -1201,6 +1280,7 @@ final class AppState {
                         ended = true
                     case "context_full":
                         apply(.contextFull(used: stats.contextUsed, limit: stats.contextLimit))
+                        if autoCompact > 0 { compactAfterTurn = true }
                         ended = true
                     default:
                         stats.hitEOS = true; ended = true
@@ -1236,7 +1316,10 @@ final class AppState {
             // Notes, while the user reads: off the record, so they cost
             // the conversation nothing.  Only after a turn that ended on its
             // own, in a session long enough to be worth summarizing.
-            if !p.isConfig, runningNotesEnabled, !stats.interrupted, stats.contextUsed >= 4096,
+            if compactAfterTurn, !stats.interrupted, !cancelFlag.isSet {
+                // The successor takes the notes itself, and carries on.
+                compact(rec.id, then: "Continue the task from where the previous session left off.")
+            } else if !p.isConfig, runningNotesEnabled, !stats.interrupted, stats.contextUsed >= 4096,
                let i = sessions.firstIndex(where: { $0.id == rec.id }),
                (sessions[i].notesTokens ?? 0) < stats.contextUsed {
                 let id = rec.id
@@ -1258,6 +1341,8 @@ final class AppState {
     /// the delegation code watches.
     func interrupt() {
         cancelFlag.set()
+        // A running command -- Bash, a search -- is killed, not waited out.
+        ToolInterrupt.shared.interrupt()
         if pendingQuestion != nil { answerQuestions(nil) }
         guard let rec = liveSessionID.flatMap({ id in sessions.first { $0.id == id } }),
               let sid = rec.serverSessionID, let client else { return }
@@ -1496,43 +1581,82 @@ final class AppState {
     /// archives the old one.  The successor's first message carries the
     /// notes; the old session stays readable.
     func continueInNewSession(_ id: UUID) {
-        guard phase != .generating, let i = sessions.firstIndex(where: { $0.id == id }),
-              let p = project(of: sessions[i]) else { return }
+        Task { await successor(of: id) }
+    }
+
+    /// Fill at which a session continues in a successor on its own (0: never,
+    /// only offered).  The config session's auto_compact.
+    var autoCompactAt: Double {
+        get { UserDefaults.standard.object(forKey: "autoCompactAt") as? Double ?? 0.85 }
+        set { UserDefaults.standard.set(newValue, forKey: "autoCompactAt") }
+    }
+
+    /// Whether a message to `rec` should go to a successor instead: its
+    /// window is past the auto-compaction mark, or was used up.
+    private func shouldCompact(_ rec: SessionRecord) -> Bool {
+        guard autoCompactAt > 0, rec.successorID == nil, rec.contextSize > 0, rec.tokenCount > 0,
+              let p = project(of: rec), !p.isConfig, rec.serverSessionID != nil else { return false }
+        let full = selectedSessionID == rec.id
+            && transcript.contains { if case .contextFull = $0.kind { return true }; return false }
+        return full || Double(rec.tokenCount) / Double(rec.contextSize) >= autoCompactAt
+    }
+
+    /// Continues `id` in a successor, then sends `text` there.
+    private func compact(_ id: UUID, then text: String) {
         Task {
-            if (sessions[i].notesTokens ?? 0) < sessions[i].tokenCount {
-                engineNote = "writing notes for the new session…"
-                await takeNotes(id)
+            // Nothing opened, or nothing can send: the message is the user's again.
+            guard await successor(of: id) != nil, case .ready = phase else {
+                draft = text
+                return
             }
-            guard let k = sessions.firstIndex(where: { $0.id == id }) else { return }
-            let old = sessions[k]
-            var notes = old.notes ?? ""
-            if notes.isEmpty {
-                // No room left to write any: the last thing the model told
-                // the user is the best summary there is.
-                notes = "No working notes were taken. The model's last reply in that session was:\n\n"
-                      + (fullTranscript(of: id).last { if case .assistant = $0.kind { return true }; return false }
-                            .map { if case .assistant(let t) = $0.kind { return t }; return "" } ?? "(none)")
-            }
-            var next = SessionRecord(projectID: p.id, title: Self.successorTitle(old.title),
-                                     contextSize: Int32(serverInfo?.context ?? Int(old.contextSize)),
-                                     storedEffort: old.storedEffort ?? defaultEffort(for: p),
-                                     tools: old.placement)
-            next.ancestorID = old.id
-            next.notes = notes
-            next.notesAt = Date()
-            next.notesTokens = 0
-            sessions.insert(next, at: 0)
-            sessions[k + 1].successorID = next.id
-            sessions[k + 1].state = .archived
-            store?.save(sessions[k + 1])
-            store?.save(next)
-            if isInMemory(old.id) { unload(old.id) }
-            let opening = TranscriptItem(.note("continues “\(old.title)”: its notes go with your first "
-                                               + "message (Notes, above, shows them)"))
-            store?.appendTranscript(next.id, [opening])
-            select(next.id)
-            engineNote = nil
+            send(text)
         }
+    }
+
+    /// Continues `id` in a new session (see continueInNewSession); the new
+    /// session's id, selected, or nil if none was opened.
+    @discardableResult
+    func successor(of id: UUID) async -> UUID? {
+        guard phase != .generating, let rec = sessions.first(where: { $0.id == id }),
+              rec.successorID == nil, let p = project(of: rec) else { return nil }
+        // Notes after the last reply may still be being written.
+        while notesInProgress == id { try? await Task.sleep(for: .milliseconds(100)) }
+        guard let i = sessions.firstIndex(where: { $0.id == id }) else { return nil }
+        if (sessions[i].notesTokens ?? 0) < sessions[i].tokenCount {
+            engineNote = "writing notes for the new session…"
+            await takeNotes(id)
+        }
+        guard let k = sessions.firstIndex(where: { $0.id == id }), sessions[k].successorID == nil
+        else { return nil }
+        let old = sessions[k]
+        var notes = old.notes ?? ""
+        if notes.isEmpty {
+            // No room left to write any: the last thing the model told
+            // the user is the best summary there is.
+            notes = "No working notes were taken. The model's last reply in that session was:\n\n"
+                  + (fullTranscript(of: id).last { if case .assistant = $0.kind { return true }; return false }
+                        .map { if case .assistant(let t) = $0.kind { return t }; return "" } ?? "(none)")
+        }
+        var next = SessionRecord(projectID: p.id, title: Self.successorTitle(old.title),
+                                 contextSize: Int32(serverInfo?.context ?? Int(old.contextSize)),
+                                 storedEffort: old.storedEffort ?? defaultEffort(for: p),
+                                 tools: old.placement)
+        next.ancestorID = old.id
+        next.notes = notes
+        next.notesAt = Date()
+        next.notesTokens = 0
+        sessions.insert(next, at: 0)
+        sessions[k + 1].successorID = next.id
+        sessions[k + 1].state = .archived
+        store?.save(sessions[k + 1])
+        store?.save(next)
+        if isInMemory(old.id) { unload(old.id) }
+        let opening = TranscriptItem(.note("continues “\(old.title)”: its notes go with your first "
+                                           + "message (Notes, above, shows them)"))
+        store?.appendTranscript(next.id, [opening])
+        select(next.id)
+        engineNote = nil
+        return next.id
     }
 
     static func successorTitle(_ t: String) -> String {
@@ -1714,8 +1838,17 @@ final class AppState {
             // keying the bar off "a prefill was reported" left it pinned at 100%
             // for the whole decode phase, which is most of a turn.
             if done < total {
+                // The same prefill as the bar shows, or a new one to time.
+                let same = prefillTotal == total
                 prefillDone = done
                 prefillTotal = total
+                let now = Date()
+                if same, let m = prefillMark, m.total == total, done >= m.done {
+                    let dt = now.timeIntervalSince(m.at)
+                    if done > m.done, dt > 0.1 { prefillRate = Double(done - m.done) / dt }
+                } else {
+                    prefillMark = (done, total, now)
+                }
             } else {
                 prefillTotal = 0
             }

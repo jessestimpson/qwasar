@@ -27,6 +27,9 @@ defmodule Warden.Tools do
   @max_grep_matches 60
   @max_list_entries 300
   @shell_timeout_ms 120_000
+  # The running exec's shell, so a cancel from the host can kill it and what
+  # it started (kill_exec/0).  exec runs one at a time, on the worker.
+  @exec_pid_file "/tmp/warden-exec.pid"
 
   @skip_dirs ~w(.git node_modules .build build _build deps DerivedData .venv __pycache__)
 
@@ -270,7 +273,9 @@ defmodule Warden.Tools do
 
     task =
       Task.async(fn ->
-        System.cmd("/bin/sh", ["-c", command],
+        # The outer shell records its pid and execs the command's shell in
+        # its place, so the pid in the file is the command's.
+        System.cmd("/bin/sh", ["-c", "echo $$ > #{@exec_pid_file}; exec /bin/sh -c \"$1\"", "sh", command],
           cd: @root,
           stderr_to_stdout: true,
           into: %Warden.CappedOutput{max: max},
@@ -278,7 +283,17 @@ defmodule Warden.Tools do
         )
       end)
 
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+    result = Task.yield(task, timeout)
+
+    if result == nil do
+      # Shutting the task down closes the port but leaves the shell running.
+      kill_exec()
+      Task.shutdown(task, :brutal_kill)
+    end
+
+    File.rm(@exec_pid_file)
+
+    case result do
       {:ok, {out, status}} ->
         {:ok, "#{status}\n" <> String.replace_invalid(Warden.CappedOutput.text(out))}
 
@@ -290,6 +305,44 @@ defmodule Warden.Tools do
   end
 
   def exec(_), do: {:error, "args", "exec requires a command"}
+
+  @doc """
+  Kills the running exec's shell and everything descended from it.  Called by
+  the bridge when the host cancels a request (the user pressed Stop), and on a
+  timeout.  No exec running: nothing to do.
+  """
+  def kill_exec do
+    with {:ok, s} <- File.read(@exec_pid_file),
+         {pid, _} <- Integer.parse(String.trim(s)) do
+      pids = [pid | descendants(pid)] |> Enum.map(&Integer.to_string/1)
+      System.cmd("kill", ["-9" | pids], stderr_to_stdout: true)
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp descendants(root) do
+    parents =
+      for dir <- File.ls!("/proc"),
+          {pid, ""} <- [Integer.parse(dir)],
+          {:ok, stat} <- [File.read("/proc/#{dir}/stat")],
+          # "pid (comm) state ppid ...": comm may hold spaces and parens,
+          # so the greedy match runs to the last ") ".
+          [_, _state, ppid] <- [Regex.run(~r/^.*\) (\S) (\d+)/s, stat) || []],
+          {ppid, ""} <- [Integer.parse(ppid)],
+          do: {pid, ppid}
+
+    walk([root], parents, [])
+  end
+
+  defp walk([], _parents, acc), do: acc
+
+  defp walk([p | rest], parents, acc) do
+    kids = for {c, ^p} <- parents, do: c
+    walk(kids ++ rest, parents, kids ++ acc)
+  end
 
   defp int_arg(v, _default) when is_integer(v) and v > 0, do: v
 

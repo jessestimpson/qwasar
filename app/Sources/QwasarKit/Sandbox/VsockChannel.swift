@@ -134,13 +134,16 @@ public final class VsockChannel: @unchecked Sendable {
 
     // MARK: Requests
 
+    /// `onID` hears the request's id before it is written, for a `cancel`
+    /// that names it as its target.
     public func send(op: String, tool: String? = nil, args: [String: GuestValue]? = nil,
-                     timeout: Int = 30) async throws -> GuestResponse {
+                     timeout: Int = 30, onID: (@Sendable (Int) -> Void)? = nil) async throws -> GuestResponse {
         let id = locked { () -> Int in
             let n = nextID
             nextID += 1
             return n
         }
+        onID?(id)
 
         let req = GuestRequest(id: id, op: op, tool: tool, args: args)
         let body = try JSONEncoder().encode(req)

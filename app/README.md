@@ -125,12 +125,15 @@ most clients do, silently (see the warning in the
   *aside* — a step the server runs and then rolls back, so the notes cost
   the conversation nothing, and a message you send stops it at once. The
   header's **Notes** shows them. At 85% of the window (and when it is full)
-  the app offers **Continue in a New Session**: the notes are brought up to
+  the work goes on in a new session by itself: the notes are brought up to
   date, a successor opens in the same project, with the same placement and
   effort, its first message carrying them, and the old session is unloaded
-  and kept, marked as continued. A long turn that never pauses is told at
-  75% and 90% to stop at the next milestone, so notes can be taken.
-  `running_notes` in the config session turns the asides off.
+  and kept, marked as continued. A message sent to a session past the mark
+  goes to its successor; a long turn that crosses it at a tool call is
+  asked to sum up, and the successor is told to carry on. **Continue in a
+  New Session** does the same by hand. `running_notes` in the config
+  session turns the asides off; `auto_compact` moves the mark, or turns it
+  off and leaves only the offer.
 
 The cost of this is the working set: one session is live at a time on a
 32 GB machine and under Flash-Next. Sending a message to another session
