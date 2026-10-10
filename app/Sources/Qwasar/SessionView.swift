@@ -110,21 +110,10 @@ struct SessionHeader: View {
                     }
                     .help("Hand this problem to a more capable remote model -- the "
                           + "same delegation the local model can start itself: same "
-                          + "tools, same /work, same budget. If the local model is "
+                          + "tools, same project, same budget. If the local model is "
                           + "mid-turn -- stuck in a bad line of reasoning, say -- "
                           + "delegating interrupts it. The result also rides along "
                           + "with your next message.")
-                }
-                if state.canRefreshGit {
-                    Button {
-                        state.refreshGit()
-                    } label: {
-                        Label("Refresh Git", systemImage: "arrow.clockwise")
-                    }
-                    .help("Re-seed the sandbox's private .git copy from this "
-                          + "repository's current state. Parks the session; your next "
-                          + "message reboots the sandbox (~2s) with fresh history. "
-                          + "Your files and your real .git are untouched.")
                 }
                 if state.notesInProgress == s.id {
                     HStack(spacing: 4) {
@@ -139,16 +128,13 @@ struct SessionHeader: View {
                     NotesButton(notes: notes, at: s.notesAt, tokens: s.notesTokens,
                                 inherited: s.ancestorID != nil && s.tokenCount == 0)
                 }
-                if let status = state.sandboxStatus {
-                    Label(status, systemImage: status.hasPrefix("sandboxed")
-                          ? "shield.lefthalf.filled" : status.hasPrefix("on this Mac") ? "laptopcomputer" : "eye")
+                if let status = state.toolsStatus {
+                    Label(status, systemImage: status.hasPrefix("on this Mac") ? "laptopcomputer" : "gearshape")
                         .font(.caption)
-                        .foregroundStyle(status.hasPrefix("sandboxed") ? .green : .secondary)
-                        .help(status.hasPrefix("sandboxed")
-                              ? "Tools run in a VM with no network, editing this project's working tree directly — your git shows the edits as uncommitted changes, and your real .git is shadowed out of the VM's reach. Review and commit with your own git."
-                              : status.hasPrefix("on this Mac")
-                                ? "Tools run directly on your Mac, as you, with your login shell's environment."
-                                : "Tools can read your files but cannot change anything.")
+                        .foregroundStyle(.secondary)
+                        .help(status.hasPrefix("on this Mac")
+                              ? "Tools run directly on your Mac, as you, with your login shell's environment."
+                              : "Configuration tools only: no folder, no shell.")
                 }
             }
         }
@@ -635,8 +621,8 @@ struct StatusFooter: View {
             // long this will take.
             //
             // The spinner still has a job: it covers the part before the first
-            // report -- the sandbox boot and the checkpoint read, neither of
-            // which has a denominator -- and the case where the checkpoint
+            // report -- the checkpoint read, which has no
+            // denominator -- and the case where the checkpoint
             // covered everything and there is nothing left to prefill.
             if isPrefilling {
                 PrefillBar(done: state.prefillDone, total: state.prefillTotal,
@@ -795,7 +781,7 @@ struct TranscriptRow: View {
 /// A call the model is still writing.
 ///
 /// The markup of a call is never echoed -- it would bury whatever narration came
-/// before it -- and a `write` or a `define` runs to hundreds of tokens, which at
+/// before it -- and a `Write` runs to hundreds of tokens, which at
 /// ~6 tok/s is minutes. Without this the transcript shows nothing at all for the
 /// longest stretch of many turns, and a person cannot tell a working model from
 /// a wedged one.
@@ -1126,7 +1112,7 @@ struct DelegationCard: View {
 
 /// The user delegates without waiting for the local model to decide --
 /// IDENTICAL to the model's own delegate tool: same remote agent, same
-/// sandboxed tools, same /work, same budget. The answer additionally rides
+/// tools, same project, same budget. The answer additionally rides
 /// along with the user's next message so the local model sees it.
 struct DelegateSheet: View {
     @Bindable var state: AppState

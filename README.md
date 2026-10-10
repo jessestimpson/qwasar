@@ -88,10 +88,6 @@ Several such cases — including wrong first answers — are recorded in the
   reference implementation and measured on the M5 Max, but has not yet been
   run on a 16 GB machine. macOS 14 or later.
 * Xcode command line tools — `cc`, `swiftc`, Foundation, and Metal.
-* For the app's optional sandbox, whose Linux image is built natively on
-  the first run: `python3`, [mise](https://mise.jdx.dev) (it supplies
-  pinned Erlang, Elixir and Zig), and `brew install e2fsprogs`. No Docker,
-  no Linux. Without them the app still builds and runs.
 * Free memory for the model — ~6 GB for the 9B, ~16 GB for the 27B, ~80 GB
   for Flash-Next — plus a few GB for cache and context. The engine checks before it maps
   anything, and refuses a model that does not fit in the memory free at the
@@ -160,10 +156,8 @@ The suggested way to run qwasar:
 cd app && make run
 ```
 
-That builds the engine's server, the app around it, and — the first time —
-the Linux guest that sandboxed sessions run their tools in (a few minutes,
-downloads cached after),
-then opens **Qwasar.app**. It lives in the menu bar; **Open Coding Agent**
+That builds the engine's server and the app around it, then opens
+**Qwasar.app**. It lives in the menu bar; **Open Coding Agent**
 (⌘N) is the window. On first launch, choose the model folder when asked,
 add a project folder, and type. [app/README.md](app/README.md) has the
 details and what to expect.
@@ -175,11 +169,9 @@ The app is opinionated, and the opinions are the point of it:
   accident. Every session says whether it is live, warm on disk, or cold,
   what resuming it will cost, and how much disk its checkpoint holds; every
   prefill shows its progress; nothing is evicted behind your back.
-* **You choose where the model's tools run, per session.** By default on
-  your Mac, as you, with your login shell's environment — your PATH, your
-  toolchains. Or, in a **sandboxed session**, in a VM with no network
-  device, where your project folder is the only thing it can see and your
-  real `.git` is out of its reach.
+* **The model's tools run on your Mac**, as you, with your login shell's
+  environment — your PATH, your toolchains — and Stop kills a running
+  command, not just the generation.
 
 [What the app provides, and why](app/README.md#what-the-app-provides-and-why)
 explains each choice.

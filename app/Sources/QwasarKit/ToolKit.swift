@@ -1,12 +1,9 @@
 // ToolKit.swift -- Read, Write, Edit, Glob, Grep, Bash and TodoWrite, written
 // once, over a backend.
 //
-// A session's tools run on the user's Mac or in the sandbox's guest, and
-// should behave identically in both: the same output format, the same edit
-// contract, the same errors.  So the tools are here, and a backend supplies
-// only what differs -- where a path points, how a file is read and written,
-// and how a command runs: FileManager and posix_spawn on the Mac
-// (HostBackend), four warden primitives in the guest (GuestBackend).
+// The tools are here, and a backend supplies only where they act -- where a
+// path points, how a file is read and written, and how a command runs:
+// FileManager and posix_spawn on the Mac (HostBackend).
 //
 // Results are capped at `resultCap` bytes, and the cap is the model's: every
 // byte of a result is prefilled before the model can react to it, which on
@@ -39,7 +36,7 @@ public protocol ToolBackend: Sendable {
     /// Where relative paths resolve, and what paths are shown relative to.
     var workDir: String { get }
     /// Whether ripgrep is there; without it Grep and Glob fall back to grep
-    /// and find, which the host may need and the guest never does.
+    /// and find.
     var hasRipgrep: Bool { get }
     /// A model-supplied path, made absolute, or nil if it cannot be used.
     func resolve(_ raw: String) -> String?
@@ -69,8 +66,8 @@ public struct ToolKit: Sendable {
     /// keeps no record.
     public let ledger: ReadLedger?
 
-    /// Ceilings the tools share.  Raw reads stop here: the guest's frames are
-    /// 8 MB, and a file larger than this is not one to read into a context.
+    /// Ceilings the tools share.  Raw reads stop here: a file larger than
+    /// this is not one to read into a context.
     static let maxRawRead = 6 * 1024 * 1024
     static let defaultLines = 2000
     static let maxLineLength = 2000

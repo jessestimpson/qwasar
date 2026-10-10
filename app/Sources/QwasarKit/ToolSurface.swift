@@ -8,10 +8,7 @@
 // until 2026-09-30; that list was frozen because the surface is part of every
 // session's prefix, and it changed when the app started from a clean slate.
 //
-// A session on the user's Mac gets the seven core tools.  A sandboxed one gets
-// them too -- implemented once, in ToolKit, over the guest's primitives -- plus
-// the four that only make sense inside the VM: elixir, define, skills, invoke.
-// `fetch` rides alongside when a sandboxed project allows hosts.
+// A session gets the core tools, run on the user's Mac (HostToolRunner).
 
 import Foundation
 
@@ -42,28 +39,6 @@ public enum ToolSurface {
     {"type": "function", "function": {"name": "TodoWrite", "description": "Keep a short task list for work with several steps, and update it as you go: mark an item in_progress when you start it and completed as soon as it is done. Each call replaces the whole list. Skip it for a single simple step.", "parameters": {"type": "object", "properties": {"todos": {"type": "array", "description": "The complete, updated list.", "items": {"type": "object", "properties": {"content": {"type": "string", "description": "The task, as an imperative (\"Fix the parser\")."}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}}}
     """#
 
-    // The sandbox's own: the warden's workspace node and its skills.
-
-    public static let elixirSchema = #"""
-    {"type": "function", "function": {"name": "elixir", "description": "Evaluate Elixir on the workspace node and return the value. State does not persist between calls; define a module if you need something to survive. Use this to try an expression, not to do work a tool should do.", "parameters": {"type": "object", "properties": {"code": {"type": "string", "description": "Elixir expression to evaluate."}}, "required": ["code"]}}}
-    """#
-    public static let defineSchema = #"""
-    {"type": "function", "function": {"name": "define", "description": "Compile and hot-load an Elixir or Erlang module into the workspace node, creating a SKILL: a capability you wrote, distinct from these fixed tools, invokable from now on -- and owned by the PROJECT, so every session of this project has it from its first token.\n\nWHAT IT IS FOR. Moving work off the token stream. A skill that reads, transforms or checks files under /work does in one invoke what would otherwise cost hundreds of generated tokens and several round trips through read and edit -- and generation is by far the slowest thing you do. So expect most skills to take PATHS and act on files, rather than to be pure functions of their arguments. Good candidates: a search across the project that returns only the part that matters; a check that has to run over many files; a transform you will apply more than once. A pure helper used once is cheaper written inline with elixir than defined here.\n\nTHE SKILL CONTRACT. A module becomes invokable if and only if it does all of this:\n  @behaviour Crucible.Skill         -- required; registration keys off this exact attribute\n  def name, do: \"my_skill\"          -- required; THIS string is what invoke takes, not the module name\n  def run(args), do: {:ok, \"text\"}  -- required; args is a map with STRING keys\n  def schema, do: %{...}            -- optional; documentation returned by skills, never enforced\n\nrun/1 must return {:ok, binary} or {:error, binary}. Any other shape -- including {:ok, 42}, a bare string, or :ok -- is inspected and handed back as ok text, which is almost never what you meant. Exceptions are caught and returned as an error with a stacktrace, so do not wrap the body in a rescue.\n\nA complete, loadable example:\ndefmodule LineCount do\n  @behaviour Crucible.Skill\n  def name, do: \"line_count\"\n  def schema, do: %{\"description\" => \"Count the lines in a file under /work\", \"args\" => [\"path\"]}\n  def run(%{\"path\" => p}) do\n    case File.read(Path.join(\"/work\", p)) do\n      {:ok, s} -> {:ok, Integer.to_string(length(String.split(s, \"\\n\")))}\n      {:error, e} -> {:error, \"cannot read #{p}: #{inspect(e)}\"}\n    end\n  end\nend\n\nSkill names are unique across modules: a second module claiming a name already in use is refused, and the refusal names the holder. Redefining the SAME module replaces it and bumps its version. The load is refused if a process is still running the previous version, and that refusal names those processes; stop them or pass force to accept losing them. Modules run on the workspace node, not the warden's, and are replayed there in definition order if it crashes.", "parameters": {"type": "object", "properties": {"source": {"type": "string", "description": "Complete module source."}, "force": {"type": "boolean", "description": "Load even if processes are running the old version, killing them."}}, "required": ["source"]}}}
-    """#
-    public static let skillsSchema = #"""
-    {"type": "function", "function": {"name": "skills", "description": "List the skills you have defined, with their module, version and schema. Skills are capabilities you wrote with define -- distinct from these fixed tools -- and they belong to the project: every session of this project has them.", "parameters": {"type": "object", "properties": {}, "required": []}}}
-    """#
-    public static let invokeSchema = #"""
-    {"type": "function", "function": {"name": "invoke", "description": "Call a skill you defined with define. `name` is the string that skill's name/0 returns, which is not the module name -- call skills to see the names. `args` is handed to its run/1 as a map with string keys; a bare string that is not JSON arrives as %{\"input\" => that_string}.", "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "The skill name, as returned by skills."}, "args": {"type": "object", "description": "Arguments passed to the skill's run/1."}}, "required": ["name"]}}}
-    """#
-
-    /// `fetch` is executed by the HOST under per-project policy (PLAN.md 8.3),
-    /// offered only to a sandboxed session whose project allows hosts, and never
-    /// reaches the guest at all.
-    public static let fetchSchema = #"""
-    {"type": "function", "function": {"name": "fetch", "description": "HTTPS GET a URL and return the response as text. Executed by the host, outside the sandbox, under a per-project allowlist of hosts -- a fetch to a host not on the list is refused and the refusal names the host, so say which host you need and why if the user should add one. GET only; responses are capped and binary content is not delivered.", "parameters": {"type": "object", "properties": {"url": {"type": "string", "description": "The https URL to fetch."}}, "required": ["url"]}}}
-    """#
-
     /// The core surface, in order -- and the order is part of the system turn.
     public static let coreSchemas: [String] = [
         readSchema, writeSchema, editSchema, globSchema, grepSchema, bashSchema, todoSchema,
@@ -74,24 +49,7 @@ public enum ToolSurface {
     public static let coreNames: Set<String> = ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "TodoWrite",
                                                 "AskUserQuestion"]
 
-    /// A sandboxed session's: the core, then the guest's own four.
-    public static let sandboxSchemas: [String] = coreSchemas + [
-        elixirSchema, defineSchema, skillsSchema, invokeSchema,
-    ]
-    public static let guestNames: Set<String> = ["elixir", "define", "skills", "invoke"]
-
-    /// A sandboxed session whose guest did not start: looking, not touching.
-    public static let readOnlySchemas: [String] = [readSchema, globSchema, grepSchema, askSchema]
-    public static let readOnlyNames: Set<String> = ["Read", "Glob", "Grep", "AskUserQuestion"]
-
-    /// The warden ops the host calls, which the sandbox gate checks are all
-    /// dispatchable: the primitives ToolKit is written over, and the guest's
-    /// own tools under their own names.
-    public static let wardenOps: Set<String> = [
-        "read_raw", "stat", "write", "exec", "elixir", "define", "skills", "invoke",
-    ]
-
-    /// Tools that change files or the agent itself. Rendered differently in the
-    /// transcript, because "it rewrote its own tooling" is what a reader scans for.
-    public static let mutating: Set<String> = ["Write", "Edit", "Bash", "define"]
+    /// Tools that change files. Rendered differently in the transcript,
+    /// because a change is what a reader scans for.
+    public static let mutating: Set<String> = ["Write", "Edit", "Bash"]
 }

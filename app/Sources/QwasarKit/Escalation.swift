@@ -1,13 +1,12 @@
 // Escalation.swift -- `delegate`: a remote sub-agent, embedded and budgeted.
 //
 // Spec §15, milestones E1+E2: a remote sub-agent over an OpenAI-compatible
-// streaming API (OpenRouter is the reference), executed by the HOST like
-// `fetch`. E2's addition: the remote model gets the SAME tool surface the
-// local one has (minus `delegate` itself -- nested escalation is refused),
-// because the inner executor's schemas are already OpenAI function schemas
-// and `ToolExecuting` already abstracts the guest: a remote tool call is
-// translated, run through the same vsock into the same /work, and its
-// result sent back. Serialisation with the local agent is by construction --
+// streaming API (OpenRouter is the reference), executed by the HOST. E2's
+// addition: the remote model gets the SAME tool surface the local one has
+// (minus `delegate` itself -- nested escalation is refused), because the
+// inner executor's schemas are already OpenAI function schemas: a remote
+// tool call is translated, run by the same executor on the same project,
+// and its result sent back. Serialisation with the local agent is by construction --
 // the local turn blocks inside this tool call.
 //
 // The embedded-session contract: deltas, cost and completion stream out
@@ -178,7 +177,7 @@ public struct DelegateToolRunner: ToolExecuting {
         let desc = "Delegate a task to a more capable remote model and return its answer. "
             + "Available models: \(models). The first is the default. "
             + "THE REMOTE MODEL HAS YOUR TOOLS: the same read/write/edit/list/grep/bash "
-            + "and the rest, acting on the same /work you act on. Changes it makes are "
+            + "and the rest, acting on the same project you act on. Changes it makes are "
             + "real -- expect files to differ afterwards, and read back anything you "
             + "depend on rather than assuming the state you left. Its tool activity is "
             + "summarised in the result only; the transcript shows the user the detail. "
@@ -188,7 +187,7 @@ public struct DelegateToolRunner: ToolExecuting {
             + "The user can watch and steer the remote model while it works, and the "
             + "delegation ends only when the remote model CEDES CONTROL with its handoff "
             + "tool (or the user or budget ends it). The result you receive is its "
-            + "HANDOFF SUMMARY, which references files in /work rather than restating "
+            + "HANDOFF SUMMARY, which references files in the project rather than restating "
             + "them -- read those files, and use delegation_log if you need the detail "
             + "of what it did. "
             + "WHEN TO USE IT: a problem you have genuinely failed at (not merely found long), "
@@ -216,7 +215,7 @@ public struct DelegateToolRunner: ToolExecuting {
     /// The delegate's own exit (spec 15.2): the ONLY way it ends its run.
     /// Remote-facing only -- never advertised to the local model.
     public static let handoffSchema = #"""
-    {"type": "function", "function": {"name": "handoff", "description": "Cede control back to the session that delegated to you. You MUST call this to finish -- stopping without it means you are waiting on the user, and the conversation stays open. The summary is what the local model continues from, so make it complete and cheap to act on: what you did and found, what remains, and REFERENCE FILES IN /work BY PATH (write your detailed findings into files if they do not fit a summary) rather than restating content -- the local model will read the files, and duplicated prose is duplicated work.", "parameters": {"type": "object", "properties": {"summary": {"type": "string", "description": "The handoff: outcomes, remaining work, open questions, and the /work paths that carry the detail."}}, "required": ["summary"]}}}
+    {"type": "function", "function": {"name": "handoff", "description": "Cede control back to the session that delegated to you. You MUST call this to finish -- stopping without it means you are waiting on the user, and the conversation stays open. The summary is what the local model continues from, so make it complete and cheap to act on: what you did and found, what remains, and REFERENCE FILES IN THE PROJECT BY PATH (write your detailed findings into files if they do not fit a summary) rather than restating content -- the local model will read the files, and duplicated prose is duplicated work.", "parameters": {"type": "object", "properties": {"summary": {"type": "string", "description": "The handoff: outcomes, remaining work, open questions, and the project paths that carry the detail."}}, "required": ["summary"]}}}
     """#
 
     /// The local model's window into a finished delegation (spec 15.2): the
@@ -229,7 +228,7 @@ public struct DelegateToolRunner: ToolExecuting {
         inner.environmentDescription + """
 
 
-        Delegation: `delegate` hands a task to a more capable remote model (\(policy.models.joined(separator: ", "))) under a budget -- $\(String(format: "%.2f", policy.sessionRemainingUSD)) remains this session. The remote model works with YOUR tools on the SAME files: after a delegation, /work reflects whatever it did, so re-read anything you rely on. Reach for it at genuine capability walls, not for effort; say what you already tried.
+        Delegation: `delegate` hands a task to a more capable remote model (\(policy.models.joined(separator: ", "))) under a budget -- $\(String(format: "%.2f", policy.sessionRemainingUSD)) remains this session. The remote model works with YOUR tools on the SAME files: after a delegation, the project reflects whatever it did, so re-read anything you rely on. Reach for it at genuine capability walls, not for effort; say what you already tried.
         """
     }
 
@@ -255,7 +254,7 @@ public struct DelegateToolRunner: ToolExecuting {
             brief += "\n\n---\n\n" + ctx
         }
 
-        // Sync over async, the SandboxToolRunner shape: the engine queue has
+        // Sync over async: the engine queue has
         // nothing else to do, and every await below is bounded by a timeout,
         // the budget, or the mailbox's stop.
         let box = ResultBox()
@@ -338,8 +337,7 @@ public struct DelegateToolRunner: ToolExecuting {
 
             if !r.toolCalls.isEmpty {
                 // The remote model is working. Execute through the inner
-                // chain -- the same vsock, the same guest, the same /work --
-                // and feed the results back. `handoff` is terminal: it is
+                // chain -- the same tools on the same project -- and feed the results back. `handoff` is terminal: it is
                 // the delegate CEDING CONTROL (spec 15.2), so nothing after
                 // it in the same round runs.
                 var assistant: [String: Any] = ["role": "assistant",
@@ -409,11 +407,11 @@ public struct DelegateToolRunner: ToolExecuting {
         emit(.ended(reason: reason, costUSD: cost))
         var header = "delegation to \(model): \(reason) · $\(String(format: "%.4f", cost))"
         if !toolTally.isEmpty {
-            // The local model must know /work moved under it, per delegation
+            // The local model must know the files moved under it, per delegation
             // and concretely -- the schema's general warning is not evidence.
             let tally = toolTally.sorted { $0.key < $1.key }
                 .map { "\($0.key)×\($0.value)" }.joined(separator: ", ")
-            header += " · it used tools on /work: \(tally) -- re-read anything you depend on"
+            header += " · it used tools on the project: \(tally) -- re-read anything you depend on"
         }
         // The local model gets the HANDOFF, not the transcript (spec 15.2);
         // detail is a delegation_log call away. A delegation ended without
@@ -426,7 +424,7 @@ public struct DelegateToolRunner: ToolExecuting {
 
     /// OpenAI tool arguments arrive as a JSON object in a string; ToolCall
     /// carries [String: String]. Non-string values are re-encoded, which is
-    /// the same convention the guest's own dispatch applies.
+    /// the same convention the server's tool-call parser applies.
     static func arguments(from json: String) -> [String: String] {
         guard let d = json.data(using: .utf8),
               let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]

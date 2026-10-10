@@ -43,61 +43,28 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
     // vectors keep comparing like with like.
     public var effort: ReasoningEffort { defaultEffort ?? .medium }
 
-    /// The pre-overlay network field, kept so records written between M5 and
-    /// the overlay model still decode; `overlay` folds it in. Never written
-    /// any more.
-    public var networkAllowlist: [String]?
-    /// This project's layer of sandbox configuration (PLAN.md 8.5).
-    public var sandbox: SandboxOverlay?
-    /// The project's skill library (spec 7.2): every module the agent has
-    /// defined, in definition order, replayed into every session's guest at
-    /// open. A skill written once belongs to the project, not to the VM that
-    /// happened to compile it first.
-    public var skillLibrary: [DefinedSkill]?
+    /// This project's layer of session settings (PLAN.md 8.5).  Named for
+    /// the sandbox it once configured; the stored key stays so records decode.
+    public var sandbox: SettingsOverlay?
 
-    /// The project layer as resolution sees it: the overlay, with the legacy
-    /// network field standing in where the overlay is silent.
-    public var overlay: SandboxOverlay {
-        var o = sandbox ?? SandboxOverlay()
-        if o.networkAllowlist == nil, let legacy = networkAllowlist, !legacy.isEmpty {
-            o.networkAllowlist = legacy
-        }
-        return o
-    }
+    /// The project layer as resolution sees it.
+    public var overlay: SettingsOverlay { sandbox ?? SettingsOverlay() }
 
     public init(id: UUID = UUID(), name: String, rootBookmark: Data,
                 resolvedRoot: URL? = nil, systemPrompt: String = Project.defaultSystem,
                 defaultEffort: ReasoningEffort? = nil,
-                networkAllowlist: [String]? = nil,
-                sandbox: SandboxOverlay? = nil) {
+                sandbox: SettingsOverlay? = nil) {
         self.id = id
         self.name = name
         self.rootBookmark = rootBookmark
         self.resolvedRoot = resolvedRoot
         self.systemPrompt = systemPrompt
         self.defaultEffort = defaultEffort
-        self.networkAllowlist = networkAllowlist
         self.sandbox = sandbox
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, rootBookmark, systemPrompt, defaultEffort, networkAllowlist,
-             sandbox, skillLibrary
-    }
-
-    /// Upsert by module, preserving first-definition order -- later modules
-    /// may reference earlier ones, and definition order is the only ordering
-    /// information there is (the same rule the warden's own replay follows).
-    public mutating func recordDefine(module: String, skillName: String?, source: String) {
-        var lib = skillLibrary ?? []
-        if let i = lib.firstIndex(where: { $0.module == module }) {
-            lib[i].source = source
-            lib[i].skillName = skillName
-        } else {
-            lib.append(DefinedSkill(module: module, skillName: skillName,
-                                    source: source, definedAt: Date()))
-        }
-        skillLibrary = lib
+        case id, name, rootBookmark, systemPrompt, defaultEffort, sandbox
     }
 
     // MARK: The config project (PLAN.md 8.5)
@@ -109,7 +76,7 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
     public var isConfig: Bool { id == Project.configProjectID }
 
     /// The built-in project whose sessions manage Qwasar itself: host-side
-    /// config tools, no folder, no sandbox to boot.
+    /// config tools, no folder.
     public static let configProjectName = "Qwasar Config"
     public static func configProject() -> Project {
         Project(id: configProjectID, name: configProjectName, rootBookmark: Data(),
@@ -142,38 +109,18 @@ public struct Project: Codable, Identifiable, Sendable, Hashable {
     ]
 }
 
-/// One skill (spec 7.2): an agent-defined module, stored at the PROJECT
-/// level so the work survives the VM that compiled it and reaches every
-/// sibling session.
-public struct DefinedSkill: Codable, Sendable, Hashable {
-    public var module: String
-    /// The invoke name, when the module registered as a Crucible.Skill; nil
-    /// for helper modules, which are kept for the same reason the warden's
-    /// manifest keeps them -- later modules may depend on them.
-    public var skillName: String?
-    public var source: String
-    public var definedAt: Date
-
-    public init(module: String, skillName: String?, source: String, definedAt: Date) {
-        self.module = module
-        self.skillName = skillName
-        self.source = source
-        self.definedAt = definedAt
-    }
-}
-
 public enum SessionState: String, Codable, Sendable {
     case live, closed, archived
 }
 
-/// Where a session's tools run, chosen when it is created and fixed after:
-/// the tool surface and the environment description are part of the prefix,
-/// and they differ between the two.
+/// Where a session's tools run.  Only on the user's Mac now; `sandbox` is a
+/// session from when they could run in a Linux VM -- its context speaks of
+/// /work and tools that are gone, so it can be read but not continued.
 public enum ToolPlacement: String, Codable, Sendable {
     /// Directly on the user's Mac, with their shell environment
-    /// (HostToolRunner).  The default.
+    /// (HostToolRunner).
     case host
-    /// In a Linux VM with no network device (SandboxToolRunner).  Opt-in.
+    /// In the VM that was removed.  Kept so those records still decode.
     case sandbox
 }
 
@@ -188,8 +135,7 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
     public var state: SessionState
     public var contextSize: Int32
     public var tokenCount: Int
-    /// Compaction chain (PLAN.md 2.4). A successor inherits the sandbox, not
-    /// the context.
+    /// Compaction chain (PLAN.md 2.4).
     public var ancestorID: UUID?
     public var successorID: UUID?
     /// Fixed for the life of the session once it has evaluated anything.
@@ -200,9 +146,9 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
     /// re-prefilling the entire conversation, so it is settable only before the
     /// first message and inherited from the project after that.
     public var storedEffort: ReasoningEffort?
-    /// This session's layer of sandbox configuration (PLAN.md 8.5): the most
-    /// specific overlay, consulted first. Optional so old records decode.
-    public var sandbox: SandboxOverlay?
+    /// This session's layer of settings (PLAN.md 8.5): the most specific
+    /// overlay, consulted first. Optional so old records decode.
+    public var sandbox: SettingsOverlay?
     /// What this session's delegations have cost (spec §15.3), summed. The
     /// escalation budget is enforced against this, so it persists.
     public var spentUSD: Double?
@@ -227,13 +173,14 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
 
     public var effort: ReasoningEffort { storedEffort ?? .medium }
     public var placement: ToolPlacement { tools ?? .host }
-    public var isSandboxed: Bool { placement == .sandbox }
+    /// A session whose tools ran in the removed VM: readable, not continued.
+    public var ranInSandbox: Bool { placement == .sandbox }
 
     public init(id: UUID = UUID(), projectID: UUID, title: String = "New session",
                 workingSubpath: String = "", createdAt: Date = Date(),
                 state: SessionState = .closed, contextSize: Int32,
                 tokenCount: Int = 0, ancestorID: UUID? = nil, successorID: UUID? = nil,
-                storedEffort: ReasoningEffort? = nil, sandbox: SandboxOverlay? = nil,
+                storedEffort: ReasoningEffort? = nil, sandbox: SettingsOverlay? = nil,
                 tools: ToolPlacement = .host) {
         self.id = id
         self.projectID = projectID

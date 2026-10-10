@@ -1,9 +1,4 @@
-// Tools.swift -- the calls a model makes, and the read-only fallback.
-//
-// A sandboxed session whose guest cannot start still works, against the real
-// tree, but only to look: Read, Glob and Grep, confined by PathGuard to the
-// project directory, and nothing that writes or runs.  The session header
-// says so, and so does the model's environment description.
+// Tools.swift -- the calls a model makes.
 
 import Foundation
 
@@ -19,30 +14,21 @@ public struct ToolCall: Sendable, Equatable {
     public func argument(_ key: String) -> String? { arguments[key] }
 }
 
-public struct ToolRunner: ToolExecuting {
-    let kit: ToolKit
-
-    public init(root: URL, resultCap: Int = ToolKit.resultCap(flashNext: true), ledger: ReadLedger? = nil) {
-        kit = ToolKit(backend: HostBackend(root: root, environment: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin"],
-                                           confined: true),
-                      resultCap: resultCap, ledger: ledger)
-    }
-
-    public var schemas: [String] { ToolSurface.readOnlySchemas }
-
-    public var environmentDescription: String {
-        """
-        # Where you are working
-
-        You are working directly against the user's own files, with READ-ONLY access: Read, Glob and Grep, inside the project directory. You cannot write, edit, or run commands. Investigate and explain, and describe any change you would make rather than attempting it.
-        """
-    }
-
-    public func run(_ call: ToolCall) -> String {
-        guard ToolSurface.readOnlyNames.contains(call.name) else {
-            return "error: \(call.name) is not available: this session is read-only. Available: "
-                 + ToolSurface.readOnlyNames.sorted().joined(separator: ", ")
-        }
-        return kit.run(call)
-    }
+/// Anything that can run a tool call for a session.
+public protocol ToolExecuting: Sendable {
+    func run(_ call: ToolCall) -> String
+    /// Which tools the model should be told about. The surface and the
+    /// executor have to agree, or the model is offered something that will
+    /// come back "no such tool".
+    var schemas: [String] { get }
+    /// What the model is told about where it is working.
+    ///
+    /// This belongs to the executor and not to the project's settings, because
+    /// it is a fact rather than a preference: whether the model can write, and
+    /// what it writes to, is decided by which of these is running. A project's
+    /// system prompt described a read-only world for three milestones after the
+    /// tools stopped being read-only, and the model believed it -- correctly
+    /// refusing to edit anything, and saying so. Derived from the executor, it
+    /// cannot drift.
+    var environmentDescription: String { get }
 }

@@ -6,14 +6,11 @@
 # copied into the bundle as a helper.
 #
 #   make          build and sign Qwasar.app
-#   make run      build, then launch it (the menu bar item); the first run
-#                 builds the guest image too
+#   make run      build, then launch it (the menu bar item)
 #   make agent    ... with the coding agent's window open
-#   make gate     the entitlement and VM probes, headless
-#   make gate-full  ... and the helper on $(MODEL), and one agent turn through it
-#                   (tools on this Mac; SANDBOXED=1 for the VM)
+#   make gate     the helper on $(MODEL), headless
+#   make gate-full  ... and one agent turn through it
 #   make test     the host test suite
-#   make guest    the guest image (native macOS build; no Docker)
 #   make clean
 
 ROOT      := $(abspath ..)
@@ -38,18 +35,18 @@ APP_SRCS  := $(wildcard Sources/Qwasar/*.swift) \
              $(wildcard Sources/Qwasar/*/*.swift)
 KITLIB    := $(BUILD)/libQwasarKit.a
 
-FRAMEWORKS := -framework Foundation -framework Virtualization -framework SwiftUI \
+FRAMEWORKS := -framework Foundation -framework SwiftUI \
               -framework AppKit -framework Security -framework JavaScriptCore \
               -framework ServiceManagement
 LDLIBS    := $(FRAMEWORKS)
 
 # The entitlements the shipping app carries, and the helper's.  Neither is
-# App Sandboxed: a session's host tools run as the user, which a sandbox
-# would forbid; the per-session VM is the isolation (Qwasar.entitlements).
+# App Sandboxed: a session's tools run as the user, which a sandbox would
+# forbid (Qwasar.entitlements).
 ENTITLEMENTS        ?= Qwasar.entitlements
 HELPER_ENTITLEMENTS ?= Helper.entitlements
 
-.PHONY: all help run agent guest-once gate gate-full sandbox test guest clean clean-guest server
+.PHONY: all help run agent gate gate-full test clean server
 
 all: $(APP)
 
@@ -58,15 +55,12 @@ help:
 	@echo "  make              build and sign build/Qwasar.app"
 	@echo "  make run          build, then launch it"
 	@echo "  make agent        build, then launch it with the coding agent's window"
-	@echo "  make guest        build the guest image (native macOS build; no Docker)"
 	@echo "  make test         the host test suite"
-	@echo "  make sandbox      boot a guest and run the sandbox gate"
-	@echo "  make gate         the entitlement and VM probes"
-	@echo "  make gate-full    start the helper on the model and run one agent turn, headless"
-	@echo "  make clean        remove build products, keeping the guest image"
-	@echo "  make clean-guest  remove the guest image too"
+	@echo "  make gate         start the helper on the model, headless"
+	@echo "  make gate-full    ... and run one agent turn through it"
+	@echo "  make clean        remove build products"
 	@echo ""
-	@echo "To start:   make run   (the first run builds the guest image too)"
+	@echo "To start:   make run"
 
 # The server, from the parent tree, with the same deployment floor as the
 # Swift so the bundle honours the minimum it claims.
@@ -97,18 +91,8 @@ $(APP): $(BIN) server Resources/Info.plist $(ENTITLEMENTS) $(HELPER_ENTITLEMENTS
 	@plutil -replace QWDefaultModel -string "$(MODEL)" $(APP)/Contents/Info.plist
 	@plutil -replace QWModelsDir -string "$(MODELS_DIR)" $(APP)/Contents/Info.plist
 	@cp $(HLJS) $(APP)/Contents/Resources/highlight.bundle.js
-	@# The guest image, staged where the app looks for it.  Without it the app
-	@# falls back to the read-only host tools and says so in the session header.
-	@if [ -f $(BUILD)/guest/disk.img ]; then \
-	    mkdir -p $(APP)/Contents/Resources/guest; \
-	    for f in disk.img Image initramfs; do \
-	        cp -c $(BUILD)/guest/$$f $(APP)/Contents/Resources/guest/$$f 2>/dev/null \
-	          || cp $(BUILD)/guest/$$f $(APP)/Contents/Resources/guest/$$f; \
-	    done; \
-	    echo "  guest image staged into the bundle"; \
-	else \
-	    echo "  NO guest image -- run 'make guest'; sessions will be read-only"; \
-	fi
+	@# A guest image staged by an older build has nothing left to use it.
+	@rm -rf $(APP)/Contents/Resources/guest
 	@# The helper, then the app: signing the bundle seals what is inside it.
 	@cp $(ROOT)/qwasar-server $(HELPER)
 	codesign --force --sign - --entitlements $(HELPER_ENTITLEMENTS) \
@@ -118,38 +102,23 @@ $(APP): $(BIN) server Resources/Info.plist $(ENTITLEMENTS) $(HELPER_ENTITLEMENTS
 	@codesign -d --entitlements - $(APP) 2>&1 | sed 's/^/  /'
 	@echo "built $(APP)"
 
-# The guest image first when there is none -- sandboxed sessions need it --
-# but not at the price of the app: without mise or e2fsprogs the build says
-# so and carries on, and sandboxed sessions are read-only until `make guest`.
-run: guest-once
+run:
 	@$(MAKE) --no-print-directory $(APP)
 	open $(APP)
 
-agent: guest-once
+agent:
 	@$(MAKE) --no-print-directory $(APP)
 	open $(APP) --args --agent
 
-guest-once:
-	@[ -f $(BUILD)/guest/disk.img ] || $(MAKE) --no-print-directory guest \
-	  || echo "  warning: no guest image; sandboxed sessions will be read-only (see 'make guest')"
-
-gate: $(APP)
-	@$(BIN) --gate || true
-
-# The full gate: the bundle re-signed with the gate entitlements (a read-only
-# exception for the model folder, since the shipping grant comes from a
-# person clicking a panel), the helper started on $(MODEL), one agent turn
-# through it with the tools in the guest.
+# The helper started on $(MODEL), headless; gate-full adds one agent turn
+# through it, its tools on this Mac in $(ROOT_DIR).
 PROMPT ?= List the files here, then say in one sentence what this project is.
-ROOT_DIR ?= Guest/warden
+ROOT_DIR ?= .
+gate: $(APP)
+	@$(BIN) --gate --model "$(MODEL)" || true
+
 gate-full: $(APP)
-	codesign --force --sign - --entitlements Qwasar.gate.entitlements \
-	         --options runtime --timestamp=none $(APP)
-	@$(BIN) --gate --model "$(MODEL)" --prompt "$(PROMPT)" --root "$(abspath $(ROOT_DIR))" \
-	        --guest "$(abspath $(BUILD)/guest)" $(if $(SANDBOXED),--sandboxed) $(EXTRA) || true
-	@echo "re-signing with the shipping entitlements"
-	@codesign --force --sign - --entitlements $(ENTITLEMENTS) \
-	          --options runtime --timestamp=none $(APP) 2>/dev/null
+	@$(BIN) --gate --model "$(MODEL)" --prompt "$(PROMPT)" --root "$(abspath $(ROOT_DIR))" $(EXTRA) || true
 
 # ---- tests -------------------------------------------------------------------
 
@@ -162,23 +131,6 @@ $(BUILD)/qwasar-test: $(KITLIB) $(TEST_SRCS)
 test: $(BUILD)/qwasar-test
 	@./$(BUILD)/qwasar-test
 
-# M2's gate: clone the image, boot it, and talk to the warden over vsock.
-SANDBOX_ROOT ?= Guest/warden
-sandbox: $(APP)
-	@codesign --force --sign - --entitlements Qwasar.gate.entitlements \
-	          --options runtime --timestamp=none $(APP)
-	@$(BIN) --sandbox --guest "$(abspath $(BUILD)/guest)" \
-	        --root "$(abspath $(SANDBOX_ROOT))" || true
-	@codesign --force --sign - --entitlements $(ENTITLEMENTS) \
-	          --options runtime --timestamp=none $(APP) 2>/dev/null
-
-# ---- guest image -------------------------------------------------------------
-guest:
-	@Guest/mkimage.sh
-
 clean:
 	rm -rf $(BUILD)/Qwasar.app $(BUILD)/*.a $(BUILD)/*.swiftmodule $(BUILD)/*.swiftdoc \
 	       $(BUILD)/*.swiftsourceinfo $(BUILD)/*.abi.json $(BUILD)/qwasar-test
-
-clean-guest:
-	rm -rf $(BUILD)/guest

@@ -8,8 +8,8 @@
 // kept for the record's life (SessionRecord.serverSessionID): the project's
 // prompt and the tool schemas are its prefix, every later message is a delta,
 // and the server owns liveness and warmth (API.md).  The tools still run
-// here -- in the guest when there is one -- on each tool_call the server
-// streams, and their results go back as a continue.
+// here, on this Mac, on each tool_call the server streams, and their results
+// go back as a continue.
 
 import SwiftUI
 import AppKit
@@ -43,7 +43,6 @@ final class AppState {
     private var client: QwasarClient? {
         server.state == .listening ? QwasarClient(base: server.baseURL) : nil
     }
-    let gate = GateCheck.run()
 
     // Data
     var projects: [Project] = []
@@ -105,17 +104,11 @@ final class AppState {
 
     private let access = ModelAccess()
     private(set) var store: Store?
-    /// One guest per session, booted lazily (PLAN.md 6.5). Absent until the
-    /// image has been built, in which case the session falls back to the
-    /// read-only host tools and the UI says so.
-    private var sandboxes: SandboxManager?
-    var sandboxStatus: String?
-    /// The project whose network allowlist is being edited, when the sheet is
-    /// up. Set only from the UI -- no tool result or model output can reach it.
-    var networkEditing: Project?
-    /// The global sandbox layer (PLAN.md 8.5), loaded once and written only
+    /// Where the selected session's tools run, for its header.
+    var toolsStatus: String?
+    /// The global settings layer (PLAN.md 8.5), loaded once and written only
     /// through performConfig -- the config session's single mutation path.
-    var globalSandbox: SandboxOverlay?
+    var globalSettings: SettingsOverlay?
 
     // Delegation (spec §15). The live delegation is what the embedded card
     // renders; the mailbox is the path INTO it. Both exist only while a
@@ -168,7 +161,7 @@ final class AppState {
     var overDiskBudget: Bool { diskBudgetBytes > 0 && sessionsDiskBytes > diskBudgetBytes }
     var showingDiskSheet = false
     private var delegationMailbox: DelegationMailbox?
-    /// Set while the app is quitting and the guests are being flushed.
+    /// Set while the app is quitting.
     var shuttingDown = false
     /// Something the ENGINE has to say, which can happen with no session open:
     /// a draft head accepted, removed, or refused. Cleared when it is read by a
@@ -178,10 +171,6 @@ final class AppState {
     /// The call currently being written, if any. Replaced by a real ToolCard
     /// the moment the call parses.
     var pendingCall: (name: String?, keys: [String], tokens: Int)?
-    /// The source of the define whose result has not landed yet (tools run
-    /// one at a time, so one slot suffices). Captured from the CALL, because
-    /// the result reports what loaded but not what was sent.
-    private var pendingDefineSource: String?
     private var projectAccess: [UUID: URL] = [:]
     private var cancelFlag = CancelFlag()
     /// What each session's model has read, so an unchanged file is not read
@@ -203,14 +192,9 @@ final class AppState {
 
     init() {
         store = try? Store()
-        if let s = store {
-            let guestDir = Bundle.main.resourceURL?.appendingPathComponent("guest")
-                ?? URL(fileURLWithPath: "build/guest")
-            sandboxes = SandboxManager(guestDir: guestDir, stateDir: s.root)
-        }
         projects = store?.loadProjects() ?? []
         sessions = store?.loadSessions() ?? []
-        globalSandbox = store?.loadGlobalOverlay()
+        globalSettings = store?.loadGlobalOverlay()
         // The config project (PLAN.md 8.5): built in, fixed id, synthesized
         // when absent so it exists on first launch and after any store reset.
         if !projects.contains(where: \.isConfig) {
@@ -414,7 +398,7 @@ final class AppState {
     /// queue idle: sets the cancel flag (the decode loop polls it every
     /// token, and Stop kills a running command) and waits for `send()` to
     /// finish persisting the turn. Bounded, because a tool call can still
-    /// outlast a Stop -- a guest op, a delegation -- and the caller must not
+    /// outlast a Stop -- a delegation -- and the caller must not
     /// hang behind it; `send()` guards its own persistence against
     /// a session closed out from under it.
     private func settleTurn(within seconds: Double = 8) async {
@@ -435,7 +419,7 @@ final class AppState {
         // Also shown here: a dotfiles repository, ~/.config, or anything under
         // a hidden directory is a perfectly ordinary thing to want to work on.
         panel.showsHiddenFiles = true
-        panel.message = "Choose a project directory. Sessions start in it; a sandboxed session can see nothing else."
+        panel.message = "Choose a project directory. Sessions start in it."
         panel.prompt = "Add Project"
         guard panel.runModal() == .OK, let u = panel.url else { return }
         let resolved = u.resolvingSymlinksInPath()
@@ -496,9 +480,9 @@ final class AppState {
     /// a key present, budget remaining, and no delegation already live.
     var canDelegate: Bool {
         guard liveDelegation == nil, hasAPIKey,
-              let rec = selectedSession, let p = project(of: rec), !p.isConfig
+              let rec = selectedSession, !rec.ranInSandbox, let p = project(of: rec), !p.isConfig
         else { return false }
-        let s = SandboxSettings.resolve(global: globalSandbox, project: p.overlay,
+        let s = SessionSettings.resolve(global: globalSettings, project: p.overlay,
                                         session: rec.sandbox)
         return !s.agentModels.isEmpty
             && max(0, s.agentBudgetUSD - (rec.spentUSD ?? 0)) > 0
@@ -506,7 +490,7 @@ final class AppState {
 
     var delegationModels: [String] {
         guard let rec = selectedSession, let p = project(of: rec) else { return [] }
-        return SandboxSettings.resolve(global: globalSandbox, project: p.overlay,
+        return SessionSettings.resolve(global: globalSettings, project: p.overlay,
                                        session: rec.sandbox).agentModels
     }
 
@@ -514,15 +498,14 @@ final class AppState {
     /// without waiting for the local model to decide. Interrupts a running
     /// turn -- which is the point, since a model visibly stuck mid-reasoning
     /// is the case this exists for. IDENTICAL to a model-initiated delegation
-    /// in every respect: the remote model gets the same sandboxed tool chain
-    /// against the same /work (the warden serialises tool requests, so a turn
-    /// still winding down cannot collide, only queue).
+    /// in every respect: the remote model gets the same tool chain against
+    /// the same project folder.
     func startDelegation(task: String, model: String?, includeContext: Bool) {
         guard canDelegate, let rec = selectedSession, let p = project(of: rec),
               !task.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         if case .generating = phase, turnSessionID == rec.id { interrupt() }
 
-        let settings = SandboxSettings.resolve(global: globalSandbox, project: p.overlay,
+        let settings = SessionSettings.resolve(global: globalSettings, project: p.overlay,
                                                session: rec.sandbox)
         let remaining = max(0, settings.agentBudgetUSD - (rec.spentUSD ?? 0))
         var brief = task
@@ -533,26 +516,10 @@ final class AppState {
             }
         }
 
-        // The same tool chain a session's local agent gets: the sandbox over
-        // the session's own vsock channel when the guest is up, the read-only
-        // host tools when it is not, network per the same resolved policy.
-        var inner: ToolExecuting
-        if !rec.isSandboxed, let root = root(of: rec) {
-            inner = HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root),
+        // The same tools a session's local agent gets, on this Mac.
+        guard let root = root(of: rec) else { return }
+        let inner = HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root),
                                    timeout: settings.toolTimeoutSeconds, resultCap: resultCap)
-        } else if let channel = sandboxes?.channel(for: rec.id) {
-            inner = SandboxToolRunner(channel: channel,
-                                      timeout: settings.toolTimeoutSeconds, resultCap: resultCap)
-        } else if let root = root(of: rec) {
-            inner = ToolRunner(root: root, resultCap: resultCap)
-        } else {
-            return
-        }
-        if rec.isSandboxed, !settings.networkAllowlist.isEmpty {
-            inner = NetworkToolRunner(inner: inner,
-                                      policy: NetworkPolicy(allowlist: settings.networkAllowlist,
-                                                            maxResponseBytes: settings.fetchMaxKB * 1024))
-        }
 
         let mailbox = DelegationMailbox()
         delegationMailbox = mailbox
@@ -617,21 +584,11 @@ final class AppState {
         case .cost(let usd):
             liveDelegation?.costUSD = usd
         case .toolCall(let name, let args):
-            if name == "define",
-               let d = args.data(using: .utf8),
-               let obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-               let src = obj["source"] as? String {
-                pendingDefineSource = src
-            }
             // Compact: the card is a window, not a full transcript; the
             // arguments are truncated the way the local pending-call row is.
             let brief = args.count > 120 ? String(args.prefix(120)) + "…" : args
             liveDelegation?.log += "\n\n`→ \(name) \(brief)`\n"
         case .toolResult(let name, let result):
-            if name == "define", let src = pendingDefineSource {
-                pendingDefineSource = nil
-                recordDefine(source: src, result: result)
-            }
             let first = result.split(separator: "\n").first.map(String.init) ?? ""
             let brief = first.count > 160 ? String(first.prefix(160)) + "…" : first
             liveDelegation?.log += "`← \(name): \(brief)`\n\n"
@@ -660,18 +617,6 @@ final class AppState {
             liveDelegation = nil
             delegationSessionID = nil
         }
-    }
-
-    /// The single write path for a project's network grant (PLAN.md 8.3).
-    /// Takes effect when a session is next opened; the live session keeps the
-    /// surface it was prefilled with, because the tool list is the system turn.
-    func setNetworkAllowlist(_ p: Project, hosts: [String]) {
-        guard let i = projects.firstIndex(where: { $0.id == p.id }) else { return }
-        var o = projects[i].overlay
-        o.networkAllowlist = hosts.isEmpty ? nil : hosts
-        projects[i].sandbox = o.isEmpty ? nil : o
-        projects[i].networkAllowlist = nil   // legacy field, folded in
-        store?.saveProjects(projects)
     }
 
     func removeProject(_ p: Project) {
@@ -734,13 +679,10 @@ final class AppState {
         p.defaultEffort ?? (activeFamily == .flashNext ? .xhigh : .medium)
     }
 
-    /// A new session in `p`.  Its tools run on this Mac unless `sandboxed`,
-    /// and which is fixed for its life: the tool surface is part of the
-    /// session's prefix.
-    func newSession(in p: Project, sandboxed: Bool = false) {
+    /// A new session in `p`.  Its tools run on this Mac.
+    func newSession(in p: Project) {
         let r = SessionRecord(projectID: p.id, contextSize: Int32(serverInfo?.context ?? 0),
-                              storedEffort: defaultEffort(for: p),
-                              tools: sandboxed ? .sandbox : .host)
+                              storedEffort: defaultEffort(for: p))
         sessions.insert(r, at: 0)
         store?.save(r)
         select(r.id)
@@ -752,7 +694,6 @@ final class AppState {
         if let sid = sessions.first(where: { $0.id == id })?.serverSessionID, let client {
             Task { try? await client.delete(sid) }
         }
-        if let sandboxes { Task { await sandboxes.discard(session: id) } }
         store?.delete(id)
         sessions.removeAll { $0.id == id }
         if selectedSessionID == id { select(sessions.first?.id) }
@@ -833,27 +774,17 @@ final class AppState {
 
     // MARK: Quitting
 
-    /// Flushes everything that lives outside this process before it exits.
-    ///
-    /// The guest's disk is the model's work. A VM that is killed with its host
-    /// never runs the `sync; poweroff` its init traps, so anything still in the
-    /// guest's page cache is lost -- and until this existed, quitting Crucible
-    /// did exactly that, every time. `stopAll` sends the stop request and waits
-    /// out the grace period, which is what gets the guest to flush.
-    ///
-    /// The engine checkpoint is the cheap half and is here for a different
-    /// reason: nothing is lost without it, but a long session re-prefills from
-    /// zero on the next open.
+    /// Flushes everything that lives outside this process before it exits:
+    /// the server's checkpoints.  Nothing is lost without them, but a long
+    /// session re-prefills from zero on the next open.
     func shutdown() async {
         shuttingDown = true
         // AppKit has stopped delivering events by now (terminateLater), so a
         // turn still generating would sit in front of the checkpoint on the
         // serial engine queue for as long as it runs -- minutes, for an
         // agent loop -- with the app beach-balling the whole way, until the
-        // user force-quits and the guest loses its page cache. Interrupt it
-        // first; it stops at the next token.
+        // user force-quits. Interrupt it first; it stops at the next token.
         await settleTurn()
-        if let sandboxes { await sandboxes.stopAll() }
         // The server checkpoints every live session on its way out; the
         // controller allows it a minute for a long conversation.
         if server.isRunning {
@@ -867,6 +798,13 @@ final class AppState {
 
     func send() {
         guard case .ready = phase, let rec = selectedSession else { return }
+        if rec.ranInSandbox {
+            // Its context is the VM's -- /work, tools that are gone -- so it
+            // is closed; the draft stays for a new session.
+            engineNote = "this session ran in the sandbox, which is gone; it can be read but not continued "
+                       + "-- Continue in a New Session carries its notes to one on this Mac"
+            return
+        }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         draft = ""
@@ -906,104 +844,55 @@ final class AppState {
             }
             // Switching sessions: the record's own server session is what
             // resumes -- the server holds or restores it -- so nothing here
-            // replays anything.  The incumbent's guest keeps running until
-            // it is parked or evicted.
+            // replays anything.
             let switching = liveSessionID != rec.id
             if switching { phase = .opening; prefillDone = 0; prefillTotal = 0 }
 
-            var runner: ToolExecuting = ToolRunner(root: root ?? URL(fileURLWithPath: "/"))
-            // Whether the tools run in the guest, for the prompt's environment.
-            var toolsInGuest = false
-            do {
-                // A session's tools run on this Mac, or -- when it was created
-                // sandboxed -- in the guest.  A sandboxed session with no
-                // guest still works, read-only, against the real tree; the
-                // header says which world it is in, because "can this change
-                // my files" is not a detail to leave implicit.
-                if p.isConfig {
-                    // The config project (PLAN.md 8.5): host-side config
-                    // tools, no folder, no VM, no network wrapper.
-                    runner = configToolRunner()
-                    sandboxStatus = "config session — host config tools, no sandbox"
-                } else {
-                    let root = root!    // guarded at the top of send()
-                    // The settings this session runs with: session over
-                    // project over global over the defaults (PLAN.md 8.5),
-                    // resolved once at open and fixed for the boot.
-                    let settings = SandboxSettings.resolve(global: globalSandbox,
-                                                           project: p.overlay,
-                                                           session: rec.sandbox)
-                    let ledger = readLedger(rec.id)
-                    runner = ToolRunner(root: root, resultCap: resultCap, ledger: ledger)
-                    if !rec.isSandboxed {
-                        // On this Mac, with the user's own shell environment,
-                        // resolved in the project (a login shell can take a
-                        // second or two, so off the main actor).
-                        let env = await Task.detached { ShellEnvironment.resolve(in: root) }.value
-                        runner = HostToolRunner(root: root, environment: env,
-                                                timeout: settings.toolTimeoutSeconds,
-                                                resultCap: resultCap, ledger: ledger)
-                        sandboxStatus = "on this Mac · \(URL(fileURLWithPath: ShellEnvironment.loginShell).lastPathComponent) environment"
-                    } else if let sandboxes, sandboxes.isAvailable {
-                        do {
-                            let ready = try await sandboxes.start(session: rec.id,
-                                                                  projectRoot: root,
-                                                                  settings: settings)
-                            runner = SandboxToolRunner(channel: ready.channel,
-                                                       timeout: settings.toolTimeoutSeconds,
-                                                       resultCap: resultCap, ledger: ledger)
-                            toolsInGuest = true
-                            sandboxStatus = String(format: "sandboxed · booted in %.1fs",
-                                                   ready.bootSeconds)
-                            // The project's tools, into this guest (spec
-                            // 7.2): what one session defined, every sibling
-                            // has from its first token.
-                            await replaySkillLibrary(p, channel: ready.channel)
-                        } catch {
-                            sandboxStatus = "read-only — the sandbox did not start"
-                        }
-                    } else {
-                        sandboxStatus = "read-only — no guest image (run `make guest`)"
-                    }
-                    // Network, when the resolved settings grant any (PLAN.md
-                    // 8.3). The fetch tool is the HOST's -- the wrapper
-                    // answers it itself and delegates everything else -- so
-                    // the guest stays exactly as network-less as before.
-                    let net = settings.networkAllowlist
-                    if rec.isSandboxed, !net.isEmpty {
-                        runner = NetworkToolRunner(
-                            inner: runner,
-                            policy: NetworkPolicy(allowlist: net,
-                                                  maxResponseBytes: settings.fetchMaxKB * 1024))
-                        sandboxStatus = (sandboxStatus ?? "") + " · net: \(net.count) host\(net.count == 1 ? "" : "s")"
-                    }
-                    // Delegation (spec §15): advertised only when models are
-                    // granted, a key exists, and budget remains -- the same
-                    // absent-means-absent rule fetch follows.
-                    let remaining = max(0, settings.agentBudgetUSD - (rec.spentUSD ?? 0))
-                    if !settings.agentModels.isEmpty, KeychainAccess.hasKey, remaining > 0 {
-                        let mailbox = DelegationMailbox()
-                        delegationMailbox = mailbox
-                        let sid = rec.id
-                        runner = DelegateToolRunner(
-                            inner: runner,
-                            policy: EscalationPolicy(models: settings.agentModels,
-                                                     sessionRemainingUSD: remaining,
-                                                     turnBudgetUSD: settings.agentTurnBudgetUSD),
-                            mailbox: mailbox,
-                            emit: { ev in
-                                DispatchQueue.main.async {
-                                    MainActor.assumeIsolated {
-                                        self.handleDelegation(ev, session: sid)
-                                    }
+            var runner: ToolExecuting
+            if p.isConfig {
+                // The config project (PLAN.md 8.5): host-side config tools,
+                // no folder.
+                runner = configToolRunner()
+                toolsStatus = "config session — host config tools"
+            } else {
+                let root = root!    // guarded at the top of send()
+                // The settings this session runs with: session over project
+                // over global over the defaults (PLAN.md 8.5).
+                let settings = SessionSettings.resolve(global: globalSettings,
+                                                       project: p.overlay,
+                                                       session: rec.sandbox)
+                // On this Mac, with the user's own shell environment, resolved
+                // in the project (a login shell can take a second or two, so
+                // off the main actor).
+                let env = await Task.detached { ShellEnvironment.resolve(in: root) }.value
+                runner = HostToolRunner(root: root, environment: env,
+                                        timeout: settings.toolTimeoutSeconds,
+                                        resultCap: resultCap, ledger: readLedger(rec.id))
+                toolsStatus = "on this Mac · \(URL(fileURLWithPath: ShellEnvironment.loginShell).lastPathComponent) environment"
+                // Delegation (spec §15): advertised only when models are
+                // granted, a key exists, and budget remains.
+                let remaining = max(0, settings.agentBudgetUSD - (rec.spentUSD ?? 0))
+                if !settings.agentModels.isEmpty, KeychainAccess.hasKey, remaining > 0 {
+                    let mailbox = DelegationMailbox()
+                    delegationMailbox = mailbox
+                    let sid = rec.id
+                    runner = DelegateToolRunner(
+                        inner: runner,
+                        policy: EscalationPolicy(models: settings.agentModels,
+                                                 sessionRemainingUSD: remaining,
+                                                 turnBudgetUSD: settings.agentTurnBudgetUSD),
+                        mailbox: mailbox,
+                        emit: { ev in
+                            DispatchQueue.main.async {
+                                MainActor.assumeIsolated {
+                                    self.handleDelegation(ev, session: sid)
                                 }
-                            },
-                            logProvider: makeLogProvider())
-                        sandboxStatus = (sandboxStatus ?? "")
-                            + String(format: " · delegate: $%.2f", remaining)
-                    }
+                            }
+                        },
+                        logProvider: makeLogProvider())
+                    toolsStatus = (toolsStatus ?? "")
+                        + String(format: " · delegate: $%.2f", remaining)
                 }
-
             }
 
             // The server's session for this record: opened once, with the
@@ -1028,7 +917,7 @@ final class AppState {
                         system: p.isConfig
                             ? runner.environmentDescription + "\n\n" + p.systemPrompt
                             : SystemPrompt.build(toolsDescription: runner.environmentDescription,
-                                                 environment: toolsInGuest ? .guest(root: root!) : .host(root: root!),
+                                                 environment: .host(root: root!),
                                                  projectRoot: root, projectPrompt: p.systemPrompt),
                         tools: runner.schemas, thinking: true, effort: rec.effort.rawValue,
                         metadata: ["client": "qwasar-app", "project": p.name,
@@ -1207,8 +1096,8 @@ final class AppState {
                                 results.append(ToolResultPayload(id: id, content: r))
                                 continue
                             }
-                            // The tool runs off the main actor: a call into the
-                            // guest can take seconds, and the window must not.
+                            // The tool runs off the main actor: a command can
+                            // take seconds, and the window must not.
                             // The model's questions are the user's to answer:
                             // a card in the transcript, and the turn waits.
                             let r = c.name == UserQuestions.toolName
@@ -1374,52 +1263,6 @@ final class AppState {
         }
     }
 
-    // MARK: The project skill library (spec 7.2)
-
-    /// A successful define becomes project property: source keyed by module,
-    /// replayed into every sibling session's guest at open. Helper modules
-    /// are kept too, for the warden's own reason -- later modules may depend
-    /// on them.
-    private func recordDefine(source: String, result: String) {
-        guard !result.hasPrefix("error:") else { return }
-        let first = result.split(separator: "\n").first.map(String.init) ?? ""
-        guard let colon = first.firstIndex(of: ":"), first.contains("exports") else { return }
-        let module = String(first[..<colon])
-        var toolName: String?
-        if let r = result.range(of: #"registered as the skill \"([^\"]+)\""#,
-                                options: .regularExpression) {
-            toolName = String(result[r]).split(separator: "\"").dropFirst().first.map(String.init)
-        }
-        guard let rec = selectedSession,
-              let i = projects.firstIndex(where: { $0.id == rec.projectID }),
-              !projects[i].isConfig else { return }
-        projects[i].recordDefine(module: module, skillName: toolName, source: source)
-        store?.saveProjects(projects)
-    }
-
-    /// Replays the project's library into a freshly booted guest, in
-    /// definition order. Failures are noted, not fatal: a module that no
-    /// longer compiles should not hold the session hostage.
-    private func replaySkillLibrary(_ p: Project, channel: VsockChannel) async {
-        guard let lib = p.skillLibrary, !lib.isEmpty else { return }
-        var loaded = 0, failed = 0
-        for skill in lib {
-            do {
-                let r = try await channel.send(op: "define",
-                                               args: ["source": .string(skill.source),
-                                                      "force": .string("true")],
-                                               timeout: 60)
-                if r.ok == true { loaded += 1 } else { failed += 1 }
-            } catch { failed += 1 }
-        }
-        if loaded > 0 {
-            sandboxStatus = (sandboxStatus ?? "") + " · \(loaded) skill\(loaded == 1 ? "" : "s")"
-        }
-        if failed > 0 {
-            engineNote = "\(failed) skill\(failed == 1 ? "" : "s") failed to reload; define again to update"
-        }
-    }
-
     // MARK: Parking (spec 4.4)
 
     /// Re-reads every session's warmth from the server (spec 4.4: the
@@ -1571,7 +1414,7 @@ final class AppState {
     var offerSuccessor: Bool {
         guard let rec = selectedSession, rec.successorID == nil,
               let p = project(of: rec), !p.isConfig else { return false }
-        return contextFill >= 0.85 || rec.state == .archived
+        return contextFill >= 0.85 || rec.state == .archived || rec.ranInSandbox
             || transcript.contains { if case .contextFull = $0.kind { return true }; return false }
     }
 
@@ -1639,8 +1482,7 @@ final class AppState {
         }
         var next = SessionRecord(projectID: p.id, title: Self.successorTitle(old.title),
                                  contextSize: Int32(serverInfo?.context ?? Int(old.contextSize)),
-                                 storedEffort: old.storedEffort ?? defaultEffort(for: p),
-                                 tools: old.placement)
+                                 storedEffort: old.storedEffort ?? defaultEffort(for: p))
         next.ancestorID = old.id
         next.notes = notes
         next.notesAt = Date()
@@ -1678,8 +1520,7 @@ final class AppState {
     /// writes its checkpoint first, so the next message resumes with
     /// nothing to re-read; without it nothing is written, the memory goes at
     /// once, and the next message re-reads whatever the disk does not cover.
-    /// Either way the server frees the memory outright, and a sandboxed
-    /// session's VM stops -- its disk survives and reboots on the next open.
+    /// Either way the server frees the memory outright.
     func unload(_ id: UUID, save: Bool = true) {
         guard turnSessionID != id || phase != .generating else { return }
         Task {
@@ -1695,8 +1536,7 @@ final class AppState {
                     engineNote = "could not unload the session: \(error)"
                 }
             }
-            if let sandboxes { await sandboxes.stop(session: id) }
-            if liveSessionID == id { liveSessionID = nil; sandboxStatus = nil }
+            if liveSessionID == id { liveSessionID = nil; toolsStatus = nil }
             if let i = sessions.firstIndex(where: { $0.id == id }) {
                 sessions[i].state = .closed
                 store?.save(sessions[i])
@@ -1706,47 +1546,6 @@ final class AppState {
     }
 
     // MARK: Refreshing the .git shadow (spec 7.4)
-
-    /// Whether Refresh Git makes sense right now: a git project, its
-    /// sandbox up, nothing generating. The refresh needs the channel (to
-    /// arm the re-seed) and ends in a park, so both gates are hard.
-    var canRefreshGit: Bool {
-        guard phase != .generating, let rec = selectedSession,
-              sandboxes?.channel(for: rec.id) != nil,
-              let root = root(of: rec) else { return false }
-        var isDir: ObjCBool = false
-        return FileManager.default.fileExists(atPath: root.appendingPathComponent(".git").path,
-                                              isDirectory: &isDir) && isDir.boolValue
-    }
-
-    /// Re-seeds the sandbox's private .git copy from the repository's
-    /// current state. A running guest cannot see the real .git -- the bind
-    /// mount is the point -- so refresh is a reboot: arm the re-seed (the
-    /// guest drops its seed stamp), then park; the next message boots a
-    /// guest whose mount-work re-seeds while nothing but init is running.
-    /// The shadow's private commits are discarded; the user's tree and
-    /// real .git are untouched.
-    func refreshGit() {
-        guard canRefreshGit, let rec = selectedSession,
-              let channel = sandboxes?.channel(for: rec.id) else { return }
-        Task {
-            let r = try? await channel.send(op: "git_refresh", timeout: 30)
-            guard r?.ok == true else {
-                engineNote = "refresh failed: \(r?.error ?? "the guest gave no reason")"
-                return
-            }
-            let item = TranscriptItem(.note("git refresh armed: the sandbox reboots on "
-                + "your next message and re-seeds its private .git copy from the "
-                + "repository's current state. Your files and your real .git are untouched."))
-            if selectedSessionID == rec.id { savedTranscript.append(item) }
-            store?.appendTranscript(rec.id, [item])
-            if liveSessionID == rec.id {
-                unload(rec.id)
-            } else if let sandboxes {
-                await sandboxes.stop(session: rec.id)
-            }
-        }
-    }
 
     /// Appends to the turn in flight.  Never to what is on screen: the view
     /// derives that (`transcript`), and shows it only in the turn's session.
@@ -1875,13 +1674,8 @@ final class AppState {
             pendingCall = (name, keys, n)
         case .toolCall(let c):
             pendingCall = nil
-            if c.name == "define" { pendingDefineSource = c.arguments["source"] }
             appendItem(TranscriptItem(.tool(name: c.name, arguments: c.arguments, result: nil)))
         case .toolResult(let name, let r):
-            if name == "define", let src = pendingDefineSource {
-                pendingDefineSource = nil
-                recordDefine(source: src, result: r)
-            }
             // Fill the open card rather than adding a second item.
             if let i = pendingItems.lastIndex(where: {
                 if case .tool(let n, _, let res) = $0.kind { return n == name && res == nil }

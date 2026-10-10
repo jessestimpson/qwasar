@@ -1,7 +1,7 @@
 // HostToolsSuite.swift -- a session's tools on this Mac.
 //
-// LineEdit is Warden.Edit's contract (the guest's), so its cases are
-// test/unit/warden_edit_test.exs's, one for one.  Then the runner against a
+// LineEdit is the C agent's qw_edit_apply contract, pinned case by case.
+// Then the runner against a
 // temp tree: the file tools, grep's exclusions, and bash -- exit status, the
 // project as its directory, and a timeout that kills what the command started.
 
@@ -198,7 +198,7 @@ enum HostToolsSuite {
                             "Bash: long output keeps its head and tail")
         let todo = call("TodoWrite", ["todos": #"[{"content":"Read the parser","status":"completed"},{"content":"Fix it","status":"in_progress"}]"#])
         f += TestMain.check(todo == "task list updated (1 of 2 done):\n[x] Read the parser\n[~] Fix it", "TodoWrite")
-        f += TestMain.check(call("elixir", ["code": "1"]).hasPrefix("error: no such tool"), "guest-only tools are refused")
+        f += TestMain.check(call("elixir", ["code": "1"]).hasPrefix("error: no such tool"), "an unknown tool is refused")
 
         // A session's reads, remembered: the same range of an unchanged file
         // is refused; a changed file, or another range, reads.
@@ -226,12 +226,6 @@ enum HostToolsSuite {
                             "after Stop, the turn's next call does not run")
         ToolInterrupt.shared.reset()
         f += TestMain.check(call("Bash", ["command": "echo again"]) == "again\n", "a new turn runs again")
-
-        let ro = ToolRunner(root: tmp)
-        f += TestMain.check(ro.run(ToolCall(name: "Read", arguments: ["file_path": "/etc/hosts"])).hasPrefix("error"),
-                            "the read-only fallback stays inside the project")
-        f += TestMain.check(ro.run(ToolCall(name: "Write", arguments: ["file_path": "x", "content": "y"]))
-                                .contains("read-only"), "the read-only fallback does not write")
         return f
     }
 

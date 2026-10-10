@@ -1,12 +1,11 @@
 // ConfigTools.swift -- the Qwasar Config project's tool surface.
 //
 // PLAN.md 8.5. Sessions in the config project manage Qwasar itself, so
-// their tools run on the HOST with no sandbox -- but "unsandboxed" is not
-// "unbounded": the surface is three purpose-built config operations, not a
-// shell. The model can read and write the app's settings (the server's port,
+// their tools run on the HOST -- but not unbounded: the surface is three
+// purpose-built config operations, not a shell. The model can read and write the app's settings (the server's port,
 // model, context, live sessions and running state; start at login; the
 // checkpoint budget), each project's (default effort, its own prompt), and
-// the sandbox configuration at its three layers -- and nothing else; there is
+// the session settings at their three layers -- and nothing else; there is
 // no path from here to the filesystem, the network, or a project's files.
 // The one secret, the delegation API key, stays the user's to enter.
 //
@@ -33,29 +32,29 @@ struct ConfigToolRunner: ToolExecuting {
     let perform: @Sendable (ConfigOp) -> String
 
     static let showSchema = #"""
-    {"type": "function", "function": {"name": "config_show", "description": "Show all of Qwasar's configuration: the app's own settings (the server's port, model, context and live sessions, whether it runs, start at login, the checkpoint disk budget), each project's settings, and the sandbox layers -- global, every project, every session -- with the resolved effective values and the layer each came from. Call this before changing anything.", "parameters": {"type": "object", "properties": {}, "required": []}}}
+    {"type": "function", "function": {"name": "config_show", "description": "Show all of Qwasar's configuration: the app's own settings (the server's port, model, context and live sessions, whether it runs, start at login, the checkpoint disk budget), each project's settings, and the session settings layers -- global, every project, every session -- with the resolved effective values and the layer each came from. Call this before changing anything.", "parameters": {"type": "object", "properties": {}, "required": []}}}
     """#
 
     static let setSchema = #"""
-    {"type": "function", "function": {"name": "config_set", "description": "Set one configuration key. scope \"app\" is the app itself: server_port (1-65535), server_model (\"flash-next\", \"27b\", \"9b\", or a model folder's path), server_context (tokens, or \"auto\"), server_live_sessions (a number, or \"auto\"), server_thinking (true or false: whether the OpenAI and Anthropic endpoints reason when a request does not say; this app's own sessions are unaffected), server_running (true or false), start_at_login (true or false), checkpoint_disk_budget_gb (a number), running_notes (true or false: whether the model writes its working notes, off the record, after each reply), auto_compact (a percentage of the context window, 50-98, at which a session continues in a new one on its own, carrying its notes; \"off\" to only offer it). A server_port, server_model, server_context, server_live_sessions, server_thinking or server_running change restarts or stops the server -- after your reply finishes, since you are running on it. scope \"project\" (target: its name) also takes default_effort (low, medium, xhigh, or \"auto\") and system_prompt (the project's own guidance for its sessions; empty to remove). Sandbox keys apply at scope global, project or session; resolution is field-wise, session over project over global over the built-in default, and setting a value REPLACES what lower layers said for that key. They apply when a session is next opened. Sandbox keys: network_allowlist (comma-separated hosts, `*.host` for subdomains, empty string for explicitly OFF), guest_memory_mb, guest_cpus, tool_timeout_seconds, fetch_max_kb, delegate_models (comma-separated remote model ids, empty string for explicitly OFF), delegate_budget_usd, delegate_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
+    {"type": "function", "function": {"name": "config_set", "description": "Set one configuration key. scope \"app\" is the app itself: server_port (1-65535), server_model (\"flash-next\", \"27b\", \"9b\", or a model folder's path), server_context (tokens, or \"auto\"), server_live_sessions (a number, or \"auto\"), server_thinking (true or false: whether the OpenAI and Anthropic endpoints reason when a request does not say; this app's own sessions are unaffected), server_running (true or false), start_at_login (true or false), checkpoint_disk_budget_gb (a number), running_notes (true or false: whether the model writes its working notes, off the record, after each reply), auto_compact (a percentage of the context window, 50-98, at which a session continues in a new one on its own, carrying its notes; \"off\" to only offer it). A server_port, server_model, server_context, server_live_sessions, server_thinking or server_running change restarts or stops the server -- after your reply finishes, since you are running on it. scope \"project\" (target: its name) also takes default_effort (low, medium, xhigh, or \"auto\") and system_prompt (the project's own guidance for its sessions; empty to remove). Session keys apply at scope global, project or session; resolution is field-wise, session over project over global over the built-in default, and setting a value REPLACES what lower layers said for that key. They apply when a session is next opened. Session keys: tool_timeout_seconds, delegate_models (comma-separated remote model ids, empty string for explicitly OFF), delegate_budget_usd, delegate_turn_budget_usd.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "One of the keys above."}, "value": {"type": "string", "description": "The value, as text."}}, "required": ["scope", "key", "value"]}}}
     """#
 
     static let clearSchema = #"""
-    {"type": "function", "function": {"name": "config_clear", "description": "Clear one key so it falls back to its default -- for app keys the built-in default (server_port 8080; server_context, server_live_sessions and checkpoint_disk_budget_gb back to automatic; start_at_login off, running_notes on, auto_compact 85), for sandbox keys the next layer down -- or clear a whole sandbox layer by omitting the key.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "The key to clear; omit to clear a whole sandbox layer."}}, "required": ["scope"]}}}
+    {"type": "function", "function": {"name": "config_clear", "description": "Clear one key so it falls back to its default -- for app keys the built-in default (server_port 8080; server_context, server_live_sessions and checkpoint_disk_budget_gb back to automatic; start_at_login off, running_notes on, auto_compact 85), for session keys the next layer down -- or clear a whole layer by omitting the key.", "parameters": {"type": "object", "properties": {"scope": {"type": "string", "description": "app, global, project, or session."}, "target": {"type": "string", "description": "Project name or session title/id; required for project and session scope."}, "key": {"type": "string", "description": "The key to clear; omit to clear a whole layer."}}, "required": ["scope"]}}}
     """#
 
     var schemas: [String] { [Self.showSchema, Self.setSchema, Self.clearSchema] }
 
     var environmentDescription: String {
         """
-        You are the Qwasar Config session. Your tools run on the host, with no sandbox, and manage Qwasar's own configuration -- nothing else. There is no file access and no shell here.
+        You are the Qwasar Config session. Your tools run on the host and manage Qwasar's own configuration -- nothing else. There is no file access and no shell here.
 
         Three kinds of setting:
         - The app's own (scope app): the local server -- its port, which model it runs, its context size and how many sessions it keeps in memory (both derived from the model and the machine unless set), whether it runs at all -- plus start at login and the disk budget for parked sessions' checkpoints. Changing the server's port, model, context, live sessions or running state restarts or stops it once your reply is done, because you are running on it: tell the user that, and do not expect to see the result in this turn.
         - A project's (scope project): its default reasoning effort for new sessions, and its own guidance prompt.
-        - Sandbox settings, in three layers -- global, per project, per session -- resolved field-wise, the most specific non-nil value winning: session > project > global > built-in default. Setting a key at a layer REPLACES lower layers' value for that key; clearing it lets resolution fall through. They take effect when a session is next opened, and apply to sandboxed sessions (network and fetch), or to all sessions (tool timeout, delegation).
+        - Session settings, in three layers -- global, per project, per session -- resolved field-wise, the most specific non-nil value winning: session > project > global > built-in default. Setting a key at a layer REPLACES lower layers' value for that key; clearing it lets resolution fall through. They take effect when a session is next opened.
 
-        Sandbox keys: \(SandboxKey.allCases.map { "\($0.rawValue) — \($0.doc)" }.joined(separator: "; ")).
+        Session keys: \(SettingsKey.allCases.map { "\($0.rawValue) — \($0.doc)" }.joined(separator: "; ")).
 
         Two things you cannot do, and what to tell the user instead: the delegation API key is entered by the user through the app menu — Qwasar ▸ Set Delegation API Key… — and lands in the macOS Keychain; you can report whether one is set (config_show shows it) but never read or write it. Delegation needs both that key AND delegate_models granted at some layer, which IS yours to set. And a model folder must hold a Qwen3.5 9B, Qwen3.8 27B or Flash-Next 4-bit MLX model; you can name one by path, but not download one.
 
@@ -102,9 +101,9 @@ extension AppState {
         case .set(let scope, let target, let key, let value):
             if scope.lowercased() == "app" { return setApp(key: key, value: value) }
             if let r = setProjectKey(target: target, key: key, value: value, scope: scope) { return r }
-            guard let k = SandboxKey(rawValue: key) else {
+            guard let k = SettingsKey(rawValue: key) else {
                 return "error: unknown key \(key). Keys: "
-                     + SandboxKey.allCases.map(\.rawValue).joined(separator: ", ")
+                     + SettingsKey.allCases.map(\.rawValue).joined(separator: ", ")
             }
             return mutateOverlay(scope: scope, target: target) { overlay in
                 k.set(value, on: &overlay)
@@ -116,13 +115,13 @@ extension AppState {
             }
             if let key, let r = setProjectKey(target: target, key: key, value: nil, scope: scope) { return r }
             if let key {
-                guard let k = SandboxKey(rawValue: key) else { return "error: unknown key \(key)" }
+                guard let k = SettingsKey(rawValue: key) else { return "error: unknown key \(key)" }
                 return mutateOverlay(scope: scope, target: target) { overlay in
                     k.clear(on: &overlay); return nil
                 }
             }
             return mutateOverlay(scope: scope, target: target) { overlay in
-                overlay = SandboxOverlay(); return nil
+                overlay = SettingsOverlay(); return nil
             }
         }
     }
@@ -130,14 +129,14 @@ extension AppState {
     /// One mutation path for all three layers. The edit closure returns an
     /// error string or nil; the layer is persisted only on success.
     private func mutateOverlay(scope: String, target: String?,
-                               _ edit: (inout SandboxOverlay) -> String?) -> String {
+                               _ edit: (inout SettingsOverlay) -> String?) -> String {
         switch scope.lowercased() {
         case "global":
-            var o = globalSandbox ?? SandboxOverlay()
+            var o = globalSettings ?? SettingsOverlay()
             if let err = edit(&o) { return "error: \(err)" }
-            globalSandbox = o.isEmpty ? nil : o
-            store?.saveGlobalOverlay(globalSandbox)
-            return "ok: global layer is now \(describe(globalSandbox))"
+            globalSettings = o.isEmpty ? nil : o
+            store?.saveGlobalOverlay(globalSettings)
+            return "ok: global layer is now \(describe(globalSettings))"
 
         case "project":
             guard let target else { return "error: project scope needs a target" }
@@ -147,11 +146,10 @@ extension AppState {
                 return "error: no project named \(target). Projects: "
                      + projects.map(\.name).joined(separator: ", ")
             }
-            if projects[i].isConfig { return "error: the config project has no sandbox to configure" }
+            if projects[i].isConfig { return "error: the config project has no session settings" }
             var o = projects[i].overlay
             if let err = edit(&o) { return "error: \(err)" }
             projects[i].sandbox = o.isEmpty ? nil : o
-            projects[i].networkAllowlist = nil    // folded into the overlay now
             store?.saveProjects(projects)
             return "ok: project \(projects[i].name) layer is now \(describe(projects[i].sandbox))"
 
@@ -166,7 +164,7 @@ extension AppState {
                     ? "error: no session titled \(target); config_show lists them"
                     : "error: \(matches.count) sessions share that title; use the id"
             }
-            var o = sessions[i].sandbox ?? SandboxOverlay()
+            var o = sessions[i].sandbox ?? SettingsOverlay()
             if let err = edit(&o) { return "error: \(err)" }
             sessions[i].sandbox = o.isEmpty ? nil : o
             store?.save(sessions[i])
@@ -179,9 +177,9 @@ extension AppState {
         }
     }
 
-    private func describe(_ o: SandboxOverlay?) -> String {
+    private func describe(_ o: SettingsOverlay?) -> String {
         guard let o, !o.isEmpty else { return "empty (falls through)" }
-        let parts = SandboxKey.allCases.compactMap { k in
+        let parts = SettingsKey.allCases.compactMap { k in
             k.value(in: o).map { "\(k.rawValue)=\($0)" }
         }
         return parts.joined(separator: ", ")
@@ -319,7 +317,7 @@ extension AppState {
     }
 
     /// default_effort and system_prompt, at scope project; nil when `key` is
-    /// not one of them (a sandbox key, handled by the layers).
+    /// not one of them (a session key, handled by the layers).
     private func setProjectKey(target: String?, key: String, value: String?, scope: String) -> String? {
         guard ["default_effort", "system_prompt"].contains(key) else { return nil }
         guard scope.lowercased() == "project" else { return "error: \(key) is a project setting; use scope project" }
@@ -390,27 +388,25 @@ extension AppState {
             out.append("project \(p.name): default_effort=\(p.defaultEffort?.rawValue ?? "auto (\(defaultEffort(for: p).rawValue))"), "
                        + "system_prompt=" + (p.systemPrompt.isEmpty ? "(none)" : "\"\(p.systemPrompt.prefix(200))\""))
         }
-        out.append("sandbox layers:")
-        out += ["defaults: " + SandboxKey.allCases.map { k in
+        out.append("session settings layers:")
+        out += ["defaults: " + SettingsKey.allCases.map { k in
             "\(k.rawValue)=\(k.value(in: defaultsAsOverlay) ?? "?")"
         }.joined(separator: ", ")]
-        out.append("global: \(describe(globalSandbox))")
+        out.append("global: \(describe(globalSettings))")
         // Presence only, by design (spec §15.4): there is no operation that
         // returns the key.
         out.append("delegation API key: \(KeychainAccess.status())")
         for p in projects where !p.isConfig {
             out.append("project \(p.name) [\(p.id.uuidString)]: \(describe(p.sandbox ?? (p.overlay.isEmpty ? nil : p.overlay)))")
             for s in sessions where s.projectID == p.id {
-                let eff = SandboxSettings.resolve(global: globalSandbox,
+                let eff = SessionSettings.resolve(global: globalSettings,
                                                   project: p.overlay,
                                                   session: s.sandbox)
-                let prov = SandboxKey.allCases.map { k in
-                    "\(k.rawValue) ← \(SandboxSettings.provenance(of: k, global: globalSandbox, project: p.overlay, session: s.sandbox).rawValue)"
+                let prov = SettingsKey.allCases.map { k in
+                    "\(k.rawValue) ← \(SessionSettings.provenance(of: k, global: globalSettings, project: p.overlay, session: s.sandbox).rawValue)"
                 }.joined(separator: ", ")
                 out.append("  session \(s.title) [\(s.id.uuidString)]: layer \(describe(s.sandbox))")
-                out.append("    effective: network=[\(eff.networkAllowlist.joined(separator: ", "))] "
-                         + "memory=\(eff.guestMemoryMB)MB cpus=\(eff.guestCPUs) "
-                         + "timeout=\(eff.toolTimeoutSeconds)s fetch_cap=\(eff.fetchMaxKB)KB "
+                out.append("    effective: timeout=\(eff.toolTimeoutSeconds)s "
                          + "agent=[\(eff.agentModels.joined(separator: ", "))] "
                          + String(format: "spent=$%.4f of $%.2f", s.spentUSD ?? 0, eff.agentBudgetUSD))
                 out.append("    provenance: \(prov)")
@@ -419,11 +415,10 @@ extension AppState {
         return out.joined(separator: "\n")
     }
 
-    private var defaultsAsOverlay: SandboxOverlay {
-        let d = SandboxSettings.defaults
-        return SandboxOverlay(networkAllowlist: d.networkAllowlist,
-                              guestMemoryMB: d.guestMemoryMB, guestCPUs: d.guestCPUs,
-                              toolTimeoutSeconds: d.toolTimeoutSeconds,
-                              fetchMaxKB: d.fetchMaxKB)
+    private var defaultsAsOverlay: SettingsOverlay {
+        let d = SessionSettings.defaults
+        return SettingsOverlay(toolTimeoutSeconds: d.toolTimeoutSeconds, agentModels: d.agentModels,
+                               agentBudgetUSD: d.agentBudgetUSD,
+                               agentTurnBudgetUSD: d.agentTurnBudgetUSD)
     }
 }

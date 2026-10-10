@@ -40,8 +40,8 @@ public final class ReadLedger: @unchecked Sendable {
 }
 
 /// Stop, as the tools hear it.  `interrupt()` runs every registered handler
-/// -- a host command's process group killed, a guest command cancelled -- and
-/// holds until `reset()`, so a call that starts after Stop does not run.
+/// -- a running command's process group is killed -- and holds until
+/// `reset()`, so a call that starts after Stop does not run.
 public final class ToolInterrupt: @unchecked Sendable {
     /// One per app: one turn runs at a time, and Stop stops it.
     public static let shared = ToolInterrupt()

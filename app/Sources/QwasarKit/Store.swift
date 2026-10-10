@@ -41,16 +41,16 @@ public final class Store: @unchecked Sendable {
         try? e.encode(p).write(to: projectsURL, options: .atomic)
     }
 
-    // MARK: Global sandbox configuration (PLAN.md 8.5)
+    // MARK: Global session settings (PLAN.md 8.5); the file keeps its old name
 
     private var globalOverlayURL: URL { root.appendingPathComponent("sandbox.json") }
 
-    public func loadGlobalOverlay() -> SandboxOverlay? {
+    public func loadGlobalOverlay() -> SettingsOverlay? {
         guard let d = try? Data(contentsOf: globalOverlayURL) else { return nil }
-        return try? JSONDecoder().decode(SandboxOverlay.self, from: d)
+        return try? JSONDecoder().decode(SettingsOverlay.self, from: d)
     }
 
-    public func saveGlobalOverlay(_ o: SandboxOverlay?) {
+    public func saveGlobalOverlay(_ o: SettingsOverlay?) {
         guard let o, !o.isEmpty else {
             try? FileManager.default.removeItem(at: globalOverlayURL)
             return

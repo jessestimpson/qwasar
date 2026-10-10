@@ -249,10 +249,10 @@ enum EscalationSuite {
         f += TestMain.check((schema.contains("a/b") || schema.contains("a\\/b")) && schema.contains("2.50"),
                             "the schema names models and remaining budget")
         f += TestMain.check(!schema.contains("SECRET"), "and no secret")
-        f += TestMain.check(SandboxSettings.resolve(
-                global: SandboxOverlay(agentModels: ["x/y"]),
+        f += TestMain.check(SessionSettings.resolve(
+                global: SettingsOverlay(agentModels: ["x/y"]),
                 project: nil,
-                session: SandboxOverlay(agentModels: [])).agentModels.isEmpty,
+                session: SettingsOverlay(agentModels: [])).agentModels.isEmpty,
             "a session's empty agent_models turns escalation OFF over a global grant")
 
         // delegation_log (spec 15.2): the local model pulls detail on demand
@@ -276,7 +276,7 @@ enum EscalationSuite {
         f += TestMain.check(!r.schemas.contains { $0.contains("\"handoff\"") },
                             "handoff is never advertised to the LOCAL model")
 
-        // ---- E2: the remote agent works the sandbox by proxy ------------
+        // ---- E2: the remote agent works the project by proxy ------------
 
         // The gate shape from spec §15.6: the remote model edits a file and
         // the result of that edit feeds back into its next request.
@@ -295,7 +295,7 @@ enum EscalationSuite {
         f += TestMain.check(out.contains("wrote notes.txt; read it there"),
                             "and the handoff references the file rather than the content")
         f += TestMain.check(out.contains("write×1") && out.contains("re-read"),
-                            "the result header tallies the tools so the local model knows /work moved")
+                            "the result header tallies the tools so the local model knows the files moved")
         let second = Stub.lock.withLock { Stub.script.requests.last }
         let toolMsg = (second?["messages"] as? [[String: Any]])?.first {
             ($0["role"] as? String) == "tool"

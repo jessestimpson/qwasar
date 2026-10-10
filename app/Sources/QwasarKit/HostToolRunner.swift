@@ -1,7 +1,6 @@
 // HostToolRunner.swift -- tool calls, run directly on the user's Mac.
 //
-// A session is sandboxed or not, chosen when it is created.  This is "not":
-// the core tools (ToolKit) against the user's own filesystem, as the user,
+// The core tools (ToolKit) against the user's own filesystem, as the user,
 // with the user's shell environment (ShellEnvironment) -- so Bash finds what
 // their Terminal finds: Homebrew, mise, cargo, the project's pinned
 // toolchain.  Nothing is confined.  Relative paths are the project's;

@@ -29,6 +29,15 @@ invariants live in §10.
 House rule, carried over from when this was one file: design decisions carry
 their measurements, and a measurement that contradicts an assumption wins.
 
+**Since 2026-10-10 there is no sandbox, and no Elixir.** Sessions run their
+tools on the user's Mac only. The Linux guest, the warden, the `elixir`,
+`define`, `skills` and `invoke` tools, the project skill library, `fetch`
+and its network allowlist, and the Virtualization entitlement are gone,
+and §6, §7's guest half and §8's VM threat model describe what was. The
+settings layers of PLAN.md 8.5 remain, for Bash's timeout and delegation.
+A session created sandboxed still decodes; it is readable, and continues
+only as a successor on the Mac.
+
 **Since 2026-10-01 §2.4's successor exists, with running notes.** The
 handoff is not written at the end: the outgoing session keeps notes as it
 goes, in asides the server rolls back (API.md §4.11), after each reply.

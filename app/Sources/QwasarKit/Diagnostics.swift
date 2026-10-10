@@ -36,10 +36,6 @@ public enum Diagnostics {
         entitlement("com.apple.security.app-sandbox") == true
     }
 
-    public static var hasVirtualization: Bool {
-        entitlement("com.apple.security.virtualization") == true
-    }
-
     /// The app's own container, which under App Sandbox is where writes land
     /// whatever path the code asks for.
     public static var homeDirectory: String {

@@ -69,53 +69,6 @@ struct APIKeySheet: View {
     }
 }
 
-// MARK: - Network allowlist
-
-/// The one place network gets granted (PLAN.md 8.3): a person, per project,
-/// host by host. Nothing the model does can open this sheet or grow the list.
-struct NetworkSheet: View {
-    @Bindable var state: AppState
-    let project: Project
-    @State private var text = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Network access — \(project.name)").font(.headline)
-            Text("One host per line (e.g. hexdocs.pm, *.github.io). Empty means "
-                 + "network OFF, which is the default. `fetch` is HTTPS GET only, "
-                 + "run by the app under this list — the sandbox itself still has "
-                 + "no network device.")
-                .font(.caption).foregroundStyle(.secondary)
-            Text("Plainly: with any host granted, a prompt injection in a file "
-                 + "the model reads could encode project contents into request "
-                 + "URLs to that host. Leave this empty for confidential work.")
-                .font(.caption).foregroundStyle(.orange)
-            TextEditor(text: $text)
-                .font(.body.monospaced())
-                .frame(minHeight: 120)
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(.quaternary))
-            Text("Applies when a session is next opened; changing the tool "
-                 + "surface re-prefills that session once.")
-                .font(.caption2).foregroundStyle(.tertiary)
-            HStack {
-                Spacer()
-                Button("Cancel") { state.networkEditing = nil }
-                Button("Save") {
-                    let hosts = text.split(whereSeparator: \.isNewline)
-                        .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
-                        .filter { !$0.isEmpty }
-                    state.setNetworkAllowlist(project, hosts: hosts)
-                    state.networkEditing = nil
-                }
-                .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(16)
-        .frame(width: 440)
-        .onAppear { text = (project.overlay.networkAllowlist ?? []).joined(separator: "\n") }
-    }
-}
-
 // MARK: - Sidebar
 
 struct Sidebar: View {
@@ -157,34 +110,15 @@ struct Sidebar: View {
                                 }
                             }
                     }
-                    if project.isConfig {
-                        Button {
-                            state.newSession(in: project)
-                        } label: {
-                            Label("New Session", systemImage: "plus").font(.caption)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                    } else {
-                        // Click for a session on this Mac; the arrow offers a
-                        // sandboxed one.  Which it is cannot change later.
-                        Menu {
-                            Button("New Session") { state.newSession(in: project) }
-                            Button("New Sandboxed Session") {
-                                state.newSession(in: project, sandboxed: true)
-                            }
-                        } label: {
-                            Label("New Session", systemImage: "plus").font(.caption)
-                        } primaryAction: {
-                            state.newSession(in: project)
-                        }
-                        .menuStyle(.borderlessButton)
-                        .fixedSize()
-                        .foregroundStyle(.secondary)
-                        .help("A new session whose tools run on this Mac, with your shell "
-                              + "environment. From the arrow: one whose tools run in a VM "
-                              + "with no network, seeing only this folder.")
+                    Button {
+                        state.newSession(in: project)
+                    } label: {
+                        Label("New Session", systemImage: "plus").font(.caption)
                     }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help(project.isConfig ? "A new configuration session."
+                          : "A new session whose tools run on this Mac, with your shell environment.")
                 } header: {
                     HStack {
                         Text(project.name)
@@ -194,7 +128,7 @@ struct Sidebar: View {
                                 .foregroundStyle(.secondary)
                                 .help("Built in. Sessions here manage Qwasar's "
                                       + "configuration -- the server, the projects, "
-                                      + "the sandbox -- with host-side tools: no "
+                                      + "the settings -- with host-side tools: no "
                                       + "folder, no shell.")
                         } else if project.resolvedRoot == nil {
                             Image(systemName: "exclamationmark.triangle.fill")
@@ -204,7 +138,6 @@ struct Sidebar: View {
                     }
                     .contextMenu {
                         if !project.isConfig {
-                            Button("Network…") { state.networkEditing = project }
                             Button("Remove Project", role: .destructive) {
                                 state.removeProject(project)
                             }
@@ -214,9 +147,6 @@ struct Sidebar: View {
             }
         }
         .listStyle(.sidebar)
-        .sheet(item: $state.networkEditing) { p in
-            NetworkSheet(state: state, project: p)
-        }
         .sheet(isPresented: $state.showingDiskSheet) { DiskSheet(state: state) }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 6) {
@@ -295,10 +225,10 @@ struct SessionRow: View {
                 HStack(spacing: 4) {
                     Text(session.title).lineLimit(1)
                         .foregroundStyle(session.successorID != nil ? .secondary : .primary)
-                    if session.isSandboxed {
+                    if session.ranInSandbox {
                         Image(systemName: "shippingbox")
                             .font(.caption2).foregroundStyle(.secondary)
-                            .help("Sandboxed: its tools run in a VM with no network.")
+                            .help("Ran in the sandbox, which has been removed: readable, not continued.")
                     }
                 }
                 if let detail {

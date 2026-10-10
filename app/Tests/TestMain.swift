@@ -22,14 +22,11 @@ struct TestMain {
         let args = CommandLine.arguments
         var failures = 0
 
-        print("== pathguard");  failures += PathGuardSuite.run()
         print("== host tools"); failures += HostToolsSuite.run()
-        print("== network");    failures += NetworkPolicySuite.run()
-        print("== overlay");    failures += SandboxOverlaySuite.run()
+        print("== overlay");    failures += SettingsOverlaySuite.run()
         print("== delegation");  failures += EscalationSuite.run()
         print("== client");     failures += ClientSuite.run()
         print("== store");      failures += StoreSuite.run()
-        print("== guestimage"); failures += GuestImageSuite.run()
         print("== markdown");   failures += MarkdownSuite.run(args)
 
         print("")

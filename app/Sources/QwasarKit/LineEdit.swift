@@ -1,7 +1,6 @@
 // LineEdit.swift -- line-anchored search and replace, for host sessions.
 //
-// The same contract as the guest's Warden.Edit and the C agent's
-// qw_edit_apply, because it is the contract the `edit` tool's description
+// The same contract as the C agent's qw_edit_apply, because it is the contract the `edit` tool's description
 // states and the model was promised:
 //
 //   * whole lines only -- a fragment of a line never matches;
@@ -11,7 +10,7 @@
 //   * a file with no trailing newline neither gains nor loses one.
 //
 // Bytes, not Characters: the splice addresses the file's own bytes, and the
-// comparison is exact.  Tests/HostToolsSuite.swift is Warden.Edit's cases.
+// comparison is exact.  Tests/HostToolsSuite.swift pins its cases.
 
 import Foundation
 

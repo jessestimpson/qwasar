@@ -65,7 +65,7 @@ final class QwasarAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     }
 
     /// Quitting from the window quits the app, server and all.  Held until
-    /// the guests have flushed and the server has checkpointed: `terminateLater`
+    /// the server has checkpointed: `terminateLater`
     /// is the only hook macOS gives for asynchronous cleanup on quit.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let state else { return .terminateNow }

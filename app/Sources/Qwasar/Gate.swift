@@ -1,15 +1,12 @@
 // Gate.swift -- the milestone gates, headless.
 //
-// Two halves.  The first is M0's: is the bundle sandboxed, does Virtualization
-// instantiate a VM (GateCheck).  The second is the renovation's (PLAN-qwasar.md
-// §4.2): can this sandboxed app run qwasar-server as its helper, with the
-// helper reading a model folder the app was granted -- and then a real turn
-// through it, tools in the guest when there is one.
+// The renovation's (PLAN-qwasar.md §4.2): can this app run qwasar-server as
+// its helper, on a model folder -- and then a real turn through it, the tools
+// on this Mac.
 //
-//   Qwasar --gate                              probes only
 //   Qwasar --gate --model <dir> [--prompt ..]  starts the helper on that model
 //   Qwasar --gate --server <url> [--prompt ..] uses a server that is running
-//   --root <dir> --sandboxed --guest <dir>     tools on this Mac, or with --sandboxed in the VM
+//   --root <dir>                               where the turn's tools run
 
 import Foundation
 import QwasarKit
@@ -18,16 +15,11 @@ import QwasarKit
 enum Gate {
     static func run(_ args: [String]) async -> Int32 {
         print("=== Qwasar gate ===")
-        let report = GateCheck.run()
-        print("\n-- entitlements and virtualization")
-        for line in report.detail { print("  \(line)") }
-        print("  verdict: \(report.virtualizationVerdict)")
-
         let model = QwasarMain.value(of: "--model", in: args)
         let serverURL = QwasarMain.value(of: "--server", in: args)
         guard model != nil || serverURL != nil else {
             print("\n-- server\n  skipped: pass --model <dir> to start the helper, or --server <url>")
-            return report.vmInstantiates ? 0 : 1
+            return 1
         }
 
         var controller: ServerController?
@@ -49,8 +41,7 @@ enum Gate {
             case .listening: print(String(format: "  listening after %.1fs", Date().timeIntervalSince(t0)))
             case .failed(let why):
                 print("  FAILED: \(why)")
-                print("  (under App Sandbox the helper must inherit the app's grant to the model folder;")
-                print("   see \(c.logURL.path))")
+                print("  (see \(c.logURL.path))")
                 return 1
             default: print("  did not come up: \(c.state)"); return 1
             }
@@ -74,35 +65,14 @@ enum Gate {
         print("  root: \(root.path)")
         print("  > \(prompt)\n")
 
-        // On this Mac by default, as a new session is; `--sandboxed` for the
-        // VM, as the "New Sandboxed Session" is.
-        var runner: ToolExecuting = HostToolRunner(root: root,
-                                                   environment: ShellEnvironment.resolve(in: root))
-        var sandboxes: SandboxManager?
-        if args.contains("--sandboxed") {
-            runner = ToolRunner(root: root)
-            let guestDir = URL(fileURLWithPath: QwasarMain.value(of: "--guest", in: args) ?? "build/guest")
-            let stateDir = FileManager.default.temporaryDirectory.appendingPathComponent("qwasar-gate-vm-\(UUID().uuidString)")
-            let m = SandboxManager(guestDir: guestDir, stateDir: stateDir)
-            sandboxes = m
-            let id = UUID()
-            do {
-                let ready = try await m.start(session: id, projectRoot: root)
-                print(String(format: "  sandbox: booted in %.2fs, tools run in /work", ready.bootSeconds))
-                runner = SandboxToolRunner(channel: ready.channel)
-            } catch {
-                print("  sandbox unavailable (\(error)); falling back to the read-only host tools")
-            }
-        } else {
-            print("  tools: on this Mac, \(ShellEnvironment.loginShell) environment")
-        }
-        defer { if let s = sandboxes { Task { await s.stopAll() } } }
+        let runner = HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root))
+        print("  tools: on this Mac, \(ShellEnvironment.loginShell) environment")
 
         let opened: OpenedSession
         do {
             opened = try await client.open(system: SystemPrompt.build(
                                                toolsDescription: runner.environmentDescription,
-                                               environment: runner is SandboxToolRunner ? .guest(root: root) : .host(root: root),
+                                               environment: .host(root: root),
                                                projectRoot: root, projectPrompt: Project.defaultSystem),
                                            tools: runner.schemas, thinking: true,
                                            effort: QwasarMain.value(of: "--effort", in: args) ?? "low",

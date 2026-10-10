@@ -43,13 +43,6 @@ public enum SystemPrompt {
             return Environment(workingDirectory: root.path, isGitRepo: git, gitBranch: branch,
                                platform: "macOS \(v.majorVersion).\(v.minorVersion).\(v.patchVersion) (arm64), shell \(ShellEnvironment.loginShell)")
         }
-
-        /// The sandbox's guest, whose /work is `root`.
-        public static func guest(root: URL) -> Environment {
-            let (git, branch) = gitState(root)
-            return Environment(workingDirectory: "/work", isGitRepo: git, gitBranch: branch,
-                               platform: "Linux (Alpine, arm64) in a VM with no network, /bin/sh")
-        }
     }
 
     public static func build(toolsDescription: String, environment e: Environment,

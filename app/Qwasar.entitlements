@@ -2,19 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Not App Sandboxed.  A session's tools run either on this Mac, as the
-         user with their shell environment (HostToolRunner), or in a VM with
-         no network device (SandboxToolRunner) - chosen per session.  The
-         first is impossible under App Sandbox: everything a sandboxed app
+    <!-- Not App Sandboxed, and nothing granted.  A session's tools run on
+         this Mac, as the user with their shell environment (HostToolRunner),
+         which is impossible under App Sandbox: everything a sandboxed app
          starts inherits its sandbox, so `bash` could reach neither the
-         user's files nor their toolchains.  The isolation that matters is the
-         VM's, and it does not depend on this one.
-
-         virtualization runs that VM.  com.apple.vm.networking is deliberately
-         absent (spec 8.1, 8.3), so even a misconfigured guest cannot be given
-         a network device.  The Makefile still signs with the hardened
-         runtime. -->
-    <key>com.apple.security.virtualization</key>
-    <true/>
+         user's files nor their toolchains.  The Makefile still signs with
+         the hardened runtime. -->
 </dict>
 </plist>
