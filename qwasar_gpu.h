@@ -382,6 +382,45 @@ void qw_op_attn_decode(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vca
                        int32_t head_dim, int32_t max_ctx, int32_t base_pos,
                        float scale);
 
+/* The same, tiled for many query rows (metal4/attn_tensor.metal): each K and
+ * V block is read once for QW_FA_BQ queries rather than once per query.
+ * Returns false, encoding nothing, where tensor ops are unavailable or the
+ * head is not 256 wide. */
+bool qw_op_attn_prefill(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                        int32_t rows, int32_t q_heads, int32_t kv_heads,
+                        int32_t head_dim, int32_t max_ctx, int32_t base_pos,
+                        float scale);
+
+/* Few query rows at depth (metal/attn.metal, qw_attn_decode_gqa): each
+ * threadgroup reads a slice of one KV head's keys once for all
+ * QW_ATTN_GQA query heads that share it, and a second pass merges the
+ * slices.  Returns false where the shape is not the 27B's 6:1 grouping or the
+ * scratch cannot be had. */
+bool qw_op_attn_decode_split(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                             int32_t rows, int32_t q_heads, int32_t kv_heads,
+                             int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale);
+
+/* What the graph calls: the tiled kernel from QW_FA_MIN_ROWS query rows; below
+ * that, the split one from QW_ATTN_SPLIT_MIN_KEYS keys and the per-query one
+ * under it; and the per-query one wherever another declines.
+ * QWASAR_ATTN=decode keeps the per-query kernel throughout. */
+void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                int32_t rows, int32_t q_heads, int32_t kv_heads,
+                int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale);
+
+/* Tiling for qw_attn_prefill_tensor, injected into its compile: BQ query rows
+ * by BK keys per step, SG simdgroups sharing each op. */
+#define QW_FA_BQ 32
+#define QW_FA_BK 32
+#define QW_FA_SG 4
+#define QW_FA_MIN_ROWS 16
+#define QW_ATTN_GQA 6
+#define QW_ATTN_GS 8
+/* The split kernel's crossover on an M4: per-query 22.8 ms against split
+ * 22.7 at 20K keys (16 layers); 17.7 against 18.9 at 16K, 27.8 against 26.4
+ * at 24K. */
+#define QW_ATTN_SPLIT_MIN_KEYS 20480
+
 /* ---- token selection ------------------------------------------------------
  *
  * Argmax and runner-up per row of a logits block, on the GPU.  This replaces a

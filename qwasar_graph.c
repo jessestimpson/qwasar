@@ -648,11 +648,11 @@ static void qw_encode_attention_layer(qwasar_session *s, qw_cmd c,
                    qw_ref_at(s->k, 0), qw_ref_at(s->v, 0),
                    rows, cfg->num_key_value_heads, hd, s->max_ctx, s->n_past);
 
-    qw_op_attn_decode(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->q, 0),
+    qw_op_attn(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->q, 0),
                       qw_ref_at(s->kcache, kv_stride * fi * sizeof(uint16_t)),
-                      qw_ref_at(s->vcache, kv_stride * fi * sizeof(uint16_t)),
-                      rows, cfg->num_attention_heads, cfg->num_key_value_heads,
-                      hd, s->max_ctx, s->n_past, 1.0f / sqrtf((float)hd));
+               qw_ref_at(s->vcache, kv_stride * fi * sizeof(uint16_t)),
+               rows, cfg->num_attention_heads, cfg->num_key_value_heads,
+               hd, s->max_ctx, s->n_past, 1.0f / sqrtf((float)hd));
 
     /* The output gate is what makes this "gated attention". */
     qw_op_mul_sigmoid(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->gate, 0),
@@ -725,10 +725,10 @@ static void qw_encode_mtp_rows(qwasar_session *s, qw_cmd c, qw_ref hidden,
     qw_op_kv_write(c, qw_ref_at(s->mtp_kcache, 0), qw_ref_at(s->mtp_vcache, 0),
                    qw_ref_at(s->k, 0), qw_ref_at(s->v, 0),
                    rows, cfg->num_key_value_heads, hd, s->max_ctx, s->mtp_n_past);
-    qw_op_attn_decode(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->q, 0),
+    qw_op_attn(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->q, 0),
                       qw_ref_at(s->mtp_kcache, 0), qw_ref_at(s->mtp_vcache, 0),
-                      rows, cfg->num_attention_heads, cfg->num_key_value_heads,
-                      hd, s->max_ctx, s->mtp_n_past, 1.0f / sqrtf((float)hd));
+               rows, cfg->num_attention_heads, cfg->num_key_value_heads,
+               hd, s->max_ctx, s->mtp_n_past, 1.0f / sqrtf((float)hd));
     qw_op_mul_sigmoid(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->gate, 0),
                       rows * sh->q_dim);
     qw_encode_qlinear(c, &m->q_o, qw_ref_at(s->hn2, 0), qw_ref_at(s->attn_out, 0), rows);

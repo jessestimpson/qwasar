@@ -23,7 +23,8 @@ METAL_SRCS := metal/common.metal \
               $(filter-out metal/common.metal,$(sort $(wildcard metal/*.metal)))
 # metal4/ is a second library, compiled at Metal 4 on first use: kernels that
 # need tensor ops, kept apart so a system without them loses only those.
-METAL4_SRCS := $(sort $(wildcard metal4/*.metal))
+METAL4_SRCS := metal4/common.metal \
+               $(filter-out metal4/common.metal,$(sort $(wildcard metal4/*.metal)))
 CORE_OBJS  := qwasar.o qwasar_graph.o qwasar_kvstore.o qwasar_tokenizer.o qwasar_flash_cpu.o qwasar_flash_graph.o \
               qwasar_toolcall.o qwasar_sample.o qwasar_json.o qwasar_cpu.o \
               qwasar_image.o qwasar_video.o qwasar_vision.o qwasar_metal.o

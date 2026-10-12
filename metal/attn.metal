@@ -160,3 +160,125 @@ kernel void qw_kv_write(
     kc[dst] = half(k[src]);
     vc[dst] = half(v[src]);
 }
+
+/* ---- decode at depth: one read of each key for its whole GQA group ---------
+ *
+ * qw_attn_decode gives every query head its own threadgroup, so the six query
+ * heads that share a KV head each walk that head's whole cache, and one token
+ * is 24 threadgroups.  The repeated reads mostly hit cache -- it sustains
+ * ~50-60 GB/s of unique KV -- but at depth it is still the larger share of a
+ * token's attention: on an M4, 40 ms for the 16 layers at 32K, 87 ms at 64K.
+ *
+ * Here a threadgroup takes one KV head, all QW_ATTN_GQA query heads that read
+ * it, and one slice of the keys; each of its QW_ATTN_GS simdgroups walks the
+ * slice 32 dims to a lane as before, scoring a key against all the heads once
+ * it is loaded.  Every simdgroup leaves a partial softmax -- its max, its sum,
+ * its unnormalised output -- and qw_attn_merge combines them.  Splitting the
+ * keys is what fills the GPU: four KV heads alone are four threadgroups.
+ *
+ * Measured on an M4, 16 layers, one token: 34 ms against 40 at 32K, 64 against
+ * 87 at 64K -- but slower below ~20K keys (5.3 against 3.0 ms at 2K), where
+ * the merge pass and six reductions a key cost more than the reads saved;
+ * hence QW_ATTN_SPLIT_MIN_KEYS. */
+
+/* Injected from qwasar_gpu.h by the runtime compile; the fallbacks serve
+ * only `make check-metal`. */
+#ifndef QW_ATTN_GQA
+#define QW_ATTN_GQA 6
+#define QW_ATTN_GS  8
+#endif
+
+struct qw_attn_split_args {
+    uint  rows, q_heads, kv_heads, max_ctx, base_pos;
+    uint  splits;      /* key slices */
+    uint  per_split;   /* keys per slice */
+    float scale;
+};
+
+kernel void qw_attn_decode_gqa(
+    device const float   *q     [[buffer(0)]],   /* [rows, q_heads, D] */
+    device const half    *kc    [[buffer(1)]],
+    device const half    *vc    [[buffer(2)]],
+    device       float   *pacc  [[buffer(3)]],   /* [rows, q_heads, parts, D] */
+    device       float   *pstat [[buffer(4)]],   /* [rows, q_heads, parts, 2]: max, sum */
+    constant qw_attn_split_args &a [[buffer(5)]],
+    uint2 tgid     [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+    const uint split = tgid.x;
+    const uint row = tgid.y / a.kv_heads, kvh = tgid.y % a.kv_heads;
+    const uint parts = a.splits * QW_ATTN_GS;
+    const uint part = split * QW_ATTN_GS + simd_gid;
+    const int  last = (int)(a.base_pos + row);                  /* causal */
+    const int  k_begin = (int)(split * a.per_split);
+    const int  k_end = min((int)(k_begin + a.per_split), last + 1);
+
+    float qv[QW_ATTN_GQA][QW_ATTN_PER_THREAD], acc[QW_ATTN_GQA][QW_ATTN_PER_THREAD];
+    float run_max[QW_ATTN_GQA], run_sum[QW_ATTN_GQA];
+#pragma unroll
+    for (int h = 0; h < QW_ATTN_GQA; ++h) {
+        const device float *qp = q + ((ulong)row * a.q_heads + kvh * QW_ATTN_GQA + h) * QW_ATTN_D
+                                   + simd_lid * QW_ATTN_PER_THREAD;
+#pragma unroll
+        for (int i = 0; i < QW_ATTN_PER_THREAD; ++i) { qv[h][i] = a.scale * qp[i]; acc[h][i] = 0.0f; }
+        run_max[h] = -FLT_MAX;
+        run_sum[h] = 0.0f;
+    }
+
+    for (int t = k_begin + (int)simd_gid; t < k_end; t += QW_ATTN_GS) {
+        const device half *kp = kc + ((ulong)kvh * a.max_ctx + t) * QW_ATTN_D + simd_lid * QW_ATTN_PER_THREAD;
+        const device half *vp = vc + ((ulong)kvh * a.max_ctx + t) * QW_ATTN_D + simd_lid * QW_ATTN_PER_THREAD;
+        float kv[QW_ATTN_PER_THREAD], vv[QW_ATTN_PER_THREAD];
+#pragma unroll
+        for (int i = 0; i < QW_ATTN_PER_THREAD; ++i) { kv[i] = float(kp[i]); vv[i] = float(vp[i]); }
+#pragma unroll
+        for (int h = 0; h < QW_ATTN_GQA; ++h) {
+            float score = 0.0f;
+#pragma unroll
+            for (int i = 0; i < QW_ATTN_PER_THREAD; ++i) score = fma(qv[h][i], kv[i], score);
+            score = simd_sum(score);
+            const float new_max = max(run_max[h], score);
+            const float factor  = exp(run_max[h] - new_max);
+            const float w       = exp(score - new_max);
+            run_max[h] = new_max;
+            run_sum[h] = run_sum[h] * factor + w;
+#pragma unroll
+            for (int i = 0; i < QW_ATTN_PER_THREAD; ++i) acc[h][i] = fma(acc[h][i], factor, w * vv[i]);
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < QW_ATTN_GQA; ++h) {
+        const ulong idx = ((ulong)row * a.q_heads + kvh * QW_ATTN_GQA + h) * parts + part;
+        device float *op = pacc + idx * QW_ATTN_D + simd_lid * QW_ATTN_PER_THREAD;
+#pragma unroll
+        for (int i = 0; i < QW_ATTN_PER_THREAD; ++i) op[i] = acc[h][i];
+        if (simd_lid == 0) { pstat[idx * 2] = run_max[h]; pstat[idx * 2 + 1] = run_sum[h]; }
+    }
+}
+
+/* Combines qw_attn_decode_gqa's partial softmaxes: one threadgroup per
+ * (row, query head), a thread per output dimension.  A part that saw no keys
+ * has sum 0 and drops out. */
+kernel void qw_attn_merge(
+    device const float *pacc  [[buffer(0)]],
+    device const float *pstat [[buffer(1)]],
+    device       float *out   [[buffer(2)]],   /* [rows, q_heads, D] */
+    constant uint      &parts [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint d    [[thread_index_in_threadgroup]])
+{
+    const device float *st = pstat + (ulong)tgid * parts * 2;
+    float m = -FLT_MAX;
+    for (uint p = 0; p < parts; ++p) if (st[p * 2 + 1] > 0.0f) m = max(m, st[p * 2]);
+    float sum = 0.0f, o = 0.0f;
+    const device float *ac = pacc + (ulong)tgid * parts * QW_ATTN_D + d;
+    for (uint p = 0; p < parts; ++p) {
+        if (st[p * 2 + 1] <= 0.0f) continue;
+        const float f = exp(st[p * 2] - m);
+        sum += st[p * 2 + 1] * f;
+        o += ac[(ulong)p * QW_ATTN_D] * f;
+    }
+    out[(ulong)tgid * QW_ATTN_D + d] = sum > 0.0f ? o / sum : 0.0f;
+}

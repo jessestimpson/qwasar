@@ -94,6 +94,8 @@ bool qw_gpu_init(char *err, size_t errcap) {
             @"QW_GMM_BK" : @(QW_GMM_BK),
             @"QW_GMM_SG_M" : @(QW_GMM_SG_M),
             @"QW_GMM_SG_N" : @(QW_GMM_SG_N),
+            @"QW_ATTN_GQA" : @(QW_ATTN_GQA),
+            @"QW_ATTN_GS" : @(QW_ATTN_GS),
         };
         g_library = [g_device newLibraryWithSource:source options:opts error:&nserr];
         if (!g_library) {
@@ -610,6 +612,9 @@ static id<MTLLibrary> qw_tmm_library(void) {
                 @"QW_TMM_BN" : @(QW_TMM_BN),
                 @"QW_TMM_BK" : @(QW_TMM_BK),
                 @"QW_TMM_SG" : @(QW_TMM_SG),
+                @"QW_FA_BQ" : @(QW_FA_BQ),
+                @"QW_FA_BK" : @(QW_FA_BK),
+                @"QW_FA_SG" : @(QW_FA_SG),
             };
             NSError *err = nil;
             g_tmm_library = [g_device newLibraryWithSource:[NSString stringWithUTF8String:qwasar_metal4_source]
@@ -697,6 +702,21 @@ static qw_tmm_choice qw_tmm_choose(void) {
     return ch;
 }
 
+/* The command's scratch for partial results, at least `need` bytes; nil if it
+ * cannot be had.  Shared by every split op: a serial encoder orders each
+ * split's reduce before the next split writes. */
+static id<MTLBuffer> qw_cmd_scratch(qw_cmd c, size_t need) {
+    if (c->scratch_len < need) {
+        /* Anything already encoded holds its own reference to the old one. */
+        if (c->scratch) CFBridgingRelease((CFTypeRef)c->scratch);
+        id<MTLBuffer> b = [g_device newBufferWithLength:need options:MTLResourceStorageModePrivate];
+        if (!b) { c->scratch = NULL; c->scratch_len = 0; return nil; }
+        c->scratch = (void *)CFBridgingRetain(b);
+        c->scratch_len = need;
+    }
+    return (__bridge id<MTLBuffer>)c->scratch;
+}
+
 /* Too few output tiles to fill the GPU: split K across threadgroups, each
  * slice's partial product into the command's scratch, then one pass to sum
  * them (metal/qmm.metal).  Below QW_QMM_SPLIT_BELOW tiles, enough slices to
@@ -717,16 +737,8 @@ static bool qw_qmm_q4_splitk(qw_cmd c, qw_ref y, qw_ref x, qw_ref w, qw_ref scal
     const uint32_t kslice = (uint32_t)((((NSUInteger)k + splits - 1) / splits + step - 1) / step * step);
     splits = ((NSUInteger)k + kslice - 1) / kslice;
 
-    const size_t need = (size_t)splits * rows * n * sizeof(float);
-    if (c->scratch_len < need) {
-        /* Anything already encoded holds its own reference to the old one. */
-        if (c->scratch) CFBridgingRelease((CFTypeRef)c->scratch);
-        id<MTLBuffer> b = [g_device newBufferWithLength:need options:MTLResourceStorageModePrivate];
-        if (!b) { c->scratch = NULL; c->scratch_len = 0; return false; }
-        c->scratch = (void *)CFBridgingRetain(b);
-        c->scratch_len = need;
-    }
-    id<MTLBuffer> part = (__bridge id<MTLBuffer>)c->scratch;
+    id<MTLBuffer> part = qw_cmd_scratch(c, (size_t)splits * rows * n * sizeof(float));
+    if (!part) return false;
 
     id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmm_q4_splitk", group);
     id<MTLComputePipelineState> rs = qw_pipeline(@"qw_qmm_reduce");
@@ -1332,6 +1344,95 @@ void qw_op_attn_decode(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vca
     [enc setBytes:&args length:sizeof args atIndex:4];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows * q_heads), 1, 1)
         threadsPerThreadgroup:MTLSizeMake(32 * 32, 1, 1)];
+}
+
+bool qw_op_attn_prefill(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                        int32_t rows, int32_t q_heads, int32_t kv_heads,
+                        int32_t head_dim, int32_t max_ctx, int32_t base_pos,
+                        float scale) {
+    if (!c || !c->enc || rows <= 0 || head_dim != 256 || kv_heads <= 0 || q_heads % kv_heads) return false;
+    id<MTLComputePipelineState> ps = qw_tmm_pipeline(@"qw_attn_prefill_tensor");
+    if (!ps) return false;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, q, 0);
+    qw_set(enc, kcache, 1);
+    qw_set(enc, vcache, 2);
+    qw_set(enc, out, 3);
+    qw_attn_args args = { (uint32_t)rows, (uint32_t)q_heads, (uint32_t)kv_heads,
+                          (uint32_t)(q_heads / kv_heads), (uint32_t)max_ctx,
+                          (uint32_t)base_pos, scale };
+    [enc setBytes:&args length:sizeof args atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows + QW_FA_BQ - 1) / QW_FA_BQ,
+                                          (NSUInteger)q_heads, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * QW_FA_SG, 1, 1)];
+    return true;
+}
+
+typedef struct {
+    uint32_t rows, q_heads, kv_heads, max_ctx, base_pos, splits, per_split;
+    float    scale;
+} qw_attn_split_args;
+
+bool qw_op_attn_decode_split(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                             int32_t rows, int32_t q_heads, int32_t kv_heads,
+                             int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale) {
+    if (!c || !c->enc || rows <= 0 || head_dim != 256 || kv_heads <= 0
+        || q_heads != kv_heads * QW_ATTN_GQA) return false;
+    /* Slices of at least 256 keys, and no more than 32 of them: at 64K that
+     * is 128 threadgroups of 2048 keys. */
+    const uint32_t n_keys = (uint32_t)(base_pos + rows);
+    uint32_t per = (n_keys + 31) / 32;
+    if (per < 256) per = 256;
+    const uint32_t splits = (n_keys + per - 1) / per;
+    const uint32_t parts = splits * QW_ATTN_GS;
+    const size_t n_part = (size_t)rows * q_heads * parts;
+    id<MTLBuffer> scratch = qw_cmd_scratch(c, n_part * (head_dim + 2) * sizeof(float));
+    if (!scratch) return false;
+    id<MTLComputePipelineState> ps = qw_pipeline(@"qw_attn_decode_gqa");
+    id<MTLComputePipelineState> ms = qw_pipeline(@"qw_attn_merge");
+    if (!ps || !ms) return false;
+
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    const NSUInteger stat_off = n_part * (NSUInteger)head_dim * sizeof(float);
+    [enc setComputePipelineState:ps];
+    qw_set(enc, q, 0);
+    qw_set(enc, kcache, 1);
+    qw_set(enc, vcache, 2);
+    [enc setBuffer:scratch offset:0 atIndex:3];
+    [enc setBuffer:scratch offset:stat_off atIndex:4];
+    qw_attn_split_args args = { (uint32_t)rows, (uint32_t)q_heads, (uint32_t)kv_heads,
+                                (uint32_t)max_ctx, (uint32_t)base_pos, splits, per, scale };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(splits, (NSUInteger)(rows * kv_heads), 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * QW_ATTN_GS, 1, 1)];
+    if (c->parallel > 0) [enc memoryBarrierWithResources:&scratch count:1];
+    [enc setComputePipelineState:ms];
+    [enc setBuffer:scratch offset:0 atIndex:0];
+    [enc setBuffer:scratch offset:stat_off atIndex:1];
+    qw_set(enc, out, 2);
+    [enc setBytes:&parts length:sizeof parts atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows * q_heads), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake((NSUInteger)head_dim, 1, 1)];
+    return true;
+}
+
+void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                int32_t rows, int32_t q_heads, int32_t kv_heads,
+                int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale) {
+    static int tiled = -1;
+    if (tiled < 0) {
+        const char *v = getenv("QWASAR_ATTN");
+        tiled = !(v && !strcmp(v, "decode"));
+    }
+    if (tiled && rows >= QW_FA_MIN_ROWS
+        && qw_op_attn_prefill(c, out, q, kcache, vcache, rows, q_heads, kv_heads,
+                              head_dim, max_ctx, base_pos, scale)) return;
+    if (tiled && rows < QW_FA_MIN_ROWS && base_pos + rows >= QW_ATTN_SPLIT_MIN_KEYS
+        && qw_op_attn_decode_split(c, out, q, kcache, vcache, rows, q_heads, kv_heads,
+                                   head_dim, max_ctx, base_pos, scale)) return;
+    qw_op_attn_decode(c, out, q, kcache, vcache, rows, q_heads, kv_heads,
+                      head_dim, max_ctx, base_pos, scale);
 }
 
 void qw_op_swiglu(qw_cmd c, qw_ref y, qw_ref gate, qw_ref up, int32_t n) {

@@ -43,13 +43,6 @@
  * order (element i at bit 4*(i%8) of little-endian word i/8); tests/test_tmm
  * is what holds that, since nothing in the header says so. */
 
-#include <metal_stdlib>
-#include <metal_tensor>
-#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-
-using namespace metal;
-using namespace mpp::tensor_ops;
-
 /* Injected from qwasar_gpu.h by the runtime compile; these serve only an
  * offline syntax check. */
 #ifndef QW_TMM_BM
