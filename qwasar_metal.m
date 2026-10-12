@@ -612,6 +612,10 @@ static id<MTLLibrary> qw_tmm_library(void) {
                 @"QW_TMM_BN" : @(QW_TMM_BN),
                 @"QW_TMM_BK" : @(QW_TMM_BK),
                 @"QW_TMM_SG" : @(QW_TMM_SG),
+                @"QW_TMP_BM" : @(QW_TMP_BM),
+                @"QW_TMP_BN" : @(QW_TMP_BN),
+                @"QW_TMP_BK" : @(QW_TMP_BK),
+                @"QW_TMP_SG" : @(QW_TMP_SG),
                 @"QW_FA_BQ" : @(QW_FA_BQ),
                 @"QW_FA_BK" : @(QW_FA_BK),
                 @"QW_FA_SG" : @(QW_FA_SG),
@@ -631,6 +635,13 @@ static id<MTLLibrary> qw_tmm_library(void) {
 }
 
 bool qw_tmm_available(void) { return qw_tmm_library() != nil; }
+
+/* An M5 or later: Apple10 is the first family whose GPU cores carry matrix
+ * units, and where kernels built around them win.  On an M5 Max it reports
+ * Apple10; an M4 stops at Apple9. */
+bool qw_gpu_has_matrix_units(void) {
+    return g_device && [g_device supportsFamily:MTLGPUFamilyApple10];
+}
 
 static id<MTLComputePipelineState> qw_tmm_pipeline(NSString *name) {
     NSString *key = [@"tmm/" stringByAppendingString:name];
@@ -655,10 +666,12 @@ bool qw_op_tmm_q4(qw_cmd c, qw_tmm_kind kind, qw_ref y, qw_ref x,
                   int32_t k, int32_t n, int32_t rows, int32_t group) {
     if (!c || !c->enc || rows <= 0 || n <= 0) return false;
     if (group == 0) group = 64;
-    if ((group != 32 && group != 64) || k % QW_TMM_BK != 0) return false;
-    if (kind != QW_TMM_DEQUANT && kind != QW_TMM_INT4) return false;
+    if (kind != QW_TMM_DEQUANT && kind != QW_TMM_INT4 && kind != QW_TMM_PIPE) return false;
+    const bool pipe = kind == QW_TMM_PIPE;
+    const NSUInteger bm = pipe ? QW_TMP_BM : QW_TMM_BM, bn = pipe ? QW_TMP_BN : QW_TMM_BN;
+    if ((group != 32 && group != 64) || k % (pipe ? QW_TMP_BK : QW_TMM_BK) != 0) return false;
     NSString *name = [NSString stringWithFormat:@"qw_tmm_q4_%s_g%d",
-                      kind == QW_TMM_INT4 ? "int4" : "dequant", group];
+                      kind == QW_TMM_INT4 ? "int4" : pipe ? "pipe" : "dequant", group];
     id<MTLComputePipelineState> ps = qw_tmm_pipeline(name);
     if (!ps) return false;
 
@@ -671,30 +684,31 @@ bool qw_op_tmm_q4(qw_cmd c, qw_tmm_kind kind, qw_ref y, qw_ref x,
     qw_set(enc, y, 4);
     qw_matmul_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)rows };
     [enc setBytes:&args length:sizeof args atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + QW_TMM_BN - 1) / QW_TMM_BN,
-                                          ((NSUInteger)rows + QW_TMM_BM - 1) / QW_TMM_BM, 1)
-        threadsPerThreadgroup:MTLSizeMake(32 * QW_TMM_SG, 1, 1)];
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + bn - 1) / bn, ((NSUInteger)rows + bm - 1) / bm, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * (pipe ? QW_TMP_SG : QW_TMM_SG), 1, 1)];
     return true;
 }
 
-/* Which kernel qw_op_qmm_q4 runs.  The tensor-op dequant form is the default:
- * on an M4 it measured 2.9-3.0 TFLOP/s on the 27B's MLP shapes against qmm's
- * 1.7-2.0, and took a 2,069-token prefill from 34-38 to 41-50 tok/s with the
- * same greedy output.  Shapes too narrow to fill the GPU still take qmm's
- * split-K, which the tensor-op kernels do not have, and qmm remains wherever
- * tensor ops are unavailable.
+/* Which kernel qw_op_qmm_q4 runs.  A tensor-op form is the default: on an M4
+ * the dequant form measured 2.9-3.0 TFLOP/s on the 27B's MLP shapes against
+ * qmm's 1.7-2.0, and took a 2,069-token prefill from 34-38 to 41-50 tok/s
+ * with the same greedy output.  On an M5 (Apple10) pipe takes over: 35-40
+ * TFLOP/s against dequant's 13-14 and qmm's 10-11 on the M5 Max.  Shapes too
+ * narrow to fill the GPU still take qmm's split-K, which the tensor-op kernels
+ * do not have, and qmm remains wherever tensor ops are unavailable.
  *
- * QWASAR_TMM overrides: "qmm" for the simdgroup kernel throughout, "dequant"
- * or "int4" to force a tensor-op form on every shape, split-K ones included --
- * what a measurement on an M5 wants. */
+ * QWASAR_TMM overrides: "qmm" for the simdgroup kernel throughout, "dequant",
+ * "pipe" or "int4" to force a tensor-op form on every shape, split-K ones
+ * included. */
 typedef struct { qw_tmm_kind kind; bool forced; } qw_tmm_choice;
 
 static qw_tmm_choice qw_tmm_choose(void) {
     static int state = -1;   /* kind | forced << 4 */
     if (state < 0) {
         const char *v = getenv("QWASAR_TMM");
-        if (!v || !*v)                 state = QW_TMM_DEQUANT;
+        if (!v || !*v)                 state = qw_gpu_has_matrix_units() ? QW_TMM_PIPE : QW_TMM_DEQUANT;
         else if (!strcmp(v, "dequant")) state = QW_TMM_DEQUANT | 1 << 4;
+        else if (!strcmp(v, "pipe"))    state = QW_TMM_PIPE | 1 << 4;
         else if (!strcmp(v, "int4"))    state = QW_TMM_INT4 | 1 << 4;
         else                            state = 0;   /* "qmm", or anything unrecognised */
     }
@@ -777,6 +791,14 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
     }
     const qw_tmm_choice tmm = qw_tmm_choose();
     if (tmm.forced && qw_op_tmm_q4(c, tmm.kind, y, x, w, scales, biases, k, n, rows, group)) return;
+    /* pipe outruns qmm's split-K on narrow shapes too, once it has a few
+     * tiles to spread: on the M5 Max Flash-Next's mixer down-projection
+     * (n 320, 1024 rows, 48 tiles) 0.49 -> 0.24 ms, its delta gates (n 64,
+     * 16 tiles) 0.24 -> 0.20; the 27B's gates at 256 rows (4 tiles) stay
+     * faster split, 0.21 against 0.27. */
+    if (tmm.kind == QW_TMM_PIPE
+        && ((NSUInteger)n + QW_TMP_BN - 1) / QW_TMP_BN * (((NSUInteger)rows + QW_TMP_BM - 1) / QW_TMP_BM) >= 16
+        && qw_op_tmm_q4(c, tmm.kind, y, x, w, scales, biases, k, n, rows, group)) return;
     const NSUInteger tiles_n = ((NSUInteger)n + QW_QMM_BN - 1) / QW_QMM_BN;
     const NSUInteger tiles_m = ((NSUInteger)rows + QW_QMM_BM - 1) / QW_QMM_BM;
     if (qw_qmm_q4_splitk(c, y, x, w, scales, biases, k, n, rows, group, tiles_n * tiles_m)) return;

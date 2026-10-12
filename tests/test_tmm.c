@@ -14,7 +14,7 @@
  * same and the speed is not the M5's.
  *
  *   tests/test_tmm           correctness
- *   tests/test_tmm --bench   time all three on model shapes */
+ *   tests/test_tmm --bench   time qmm and the three forms on model shapes */
 
 #include "qwasar_gpu.h"
 #include "qwasar_model.h"
@@ -86,9 +86,9 @@ static const uint16_t *qw_b(const qweight *q) {
     return (const uint16_t *)((uint8_t *)qw_buf_contents(q->buf) + q->b_off);
 }
 
-typedef enum { USE_QMM, USE_DEQUANT, USE_INT4 } impl;
+typedef enum { USE_QMM, USE_DEQUANT, USE_INT4, USE_PIPE } impl;
 static const char *impl_name(impl i) {
-    return i == USE_DEQUANT ? "dequant" : i == USE_INT4 ? "int4" : "qmm";
+    return i == USE_DEQUANT ? "dequant" : i == USE_INT4 ? "int4" : i == USE_PIPE ? "pipe" : "qmm";
 }
 
 /* Encodes one product; returns false if the op declined it. */
@@ -99,7 +99,7 @@ static bool encode(qw_cmd c, impl which, const qweight *q, qw_ref y, qw_ref x, i
         qw_op_qmm_q4(c, y, x, w, s, b, q->k, q->n, rows, q->group);
         return true;
     }
-    return qw_op_tmm_q4(c, which == USE_INT4 ? QW_TMM_INT4 : QW_TMM_DEQUANT,
+    return qw_op_tmm_q4(c, which == USE_INT4 ? QW_TMM_INT4 : which == USE_PIPE ? QW_TMM_PIPE : QW_TMM_DEQUANT,
                         y, x, w, s, b, q->k, q->n, rows, q->group);
 }
 
@@ -137,7 +137,7 @@ static void test_case(int32_t k, int32_t n, int32_t rows, int32_t group, uint32_
     /* Every row of the first and last token tiles, and a stride through the
      * rest: the tile seams in n are at multiples of QW_TMM_BN. */
     float *wrow = malloc((size_t)k * sizeof(float));
-    for (impl which = USE_DEQUANT; which <= USE_INT4; which++) {
+    for (impl which = USE_DEQUANT; which <= USE_PIPE; which++) {
         qw_buf yb = NULL;
         float *y = run(which, &q, xb, x_off, rows, &yb);
         CHECK(y != NULL, "%s declined k=%d n=%d g=%d", impl_name(which), k, n, group);
@@ -146,7 +146,8 @@ static void test_case(int32_t k, int32_t n, int32_t rows, int32_t group, uint32_
         double worst = 0.0, worst_qmm = 0.0;
         int32_t wr = -1, wn = -1, checked = 0;
         for (int32_t o = 0; o < n; o++) {
-            if (o % 7 && o % QW_TMM_BN && (o + 1) % QW_TMM_BN && o != n - 1) continue;
+            if (o % 7 && o % QW_TMM_BN && (o + 1) % QW_TMM_BN && o % QW_TMP_BN && (o + 1) % QW_TMP_BN
+                && o != n - 1) continue;
             qw_cpu_dequant_row(wrow, qw_w(&q), qw_s(&q), qw_b(&q), k, o, group);
             for (int32_t t = 0; t < rows; t++) {
                 if (t > 2 && t < rows - 2 && t % 5) continue;
@@ -166,10 +167,9 @@ static void test_case(int32_t k, int32_t n, int32_t rows, int32_t group, uint32_
                 checked++;
             }
         }
-        /* Each form rounds one operand to half: dequant the weights (x is
-         * read as float), int4 the activations (the nibbles are exact).  qmm
-         * rounds both, so each form's distance from qmm is the other's from
-         * the CPU.  On a long contraction the errors average out and
+        /* dequant rounds one operand to half, the weights (x is read as
+         * float); int4 the other, the activations (the nibbles are exact);
+         * pipe both, as qmm does.  On a long contraction the errors average out and
          * qw_qmm_q4_g64's tolerance applies (tests/test_qmv explains the
          * budget); on a short one they need not, and the bound is the
          * rigorous one -- two half roundings, 2 * 2^-11 of the sum of
@@ -210,7 +210,7 @@ static void bench(const char *label, int32_t k, int32_t n, int32_t rows, int32_t
     for (size_t i = 0; i < (size_t)rows * k; i++) x[i] = rng_unit(&r);
 
     printf("  %-26s k=%-5d n=%-5d rows=%-4d g=%-2d", label, k, n, rows, group);
-    for (impl which = USE_QMM; which <= USE_INT4; which++) {
+    for (impl which = USE_QMM; which <= USE_PIPE; which++) {
         double best = 1e300;
         bool declined = false;
         for (int it = 0; it < 6 && !declined; it++) {
@@ -255,6 +255,11 @@ int main(int argc, char **argv) {
         bench("27B mlp.down_proj", 17408, 5120, 1024, 64);
         bench("Flash-Next in_proj_qkv", 2560, 10240, 1024, 32);
         bench("Flash-Next expert gate", 2560, 640, 64, 32);
+        /* Narrow: qmm takes these by split-K (QW_QMM_SPLIT_BELOW). */
+        bench("27B delta gates", 5120, 48, 256, 64);
+        bench("Flash-Next delta gates", 2560, 64, 1024, 32);
+        bench("Flash-Next mixer down", 2560, 320, 1024, 32);
+        bench("Flash-Next shared down", 640, 2560, 1024, 32);
         return 0;
     }
 
@@ -278,6 +283,8 @@ int main(int argc, char **argv) {
           "group 128 should be declined");
     CHECK(!qw_op_tmm_q4(c, QW_TMM_DEQUANT, z, z, z, z, z, 2592, 64, 8, 32),
           "k not a multiple of QW_TMM_BK should be declined");
+    CHECK(!qw_op_tmm_q4(c, QW_TMM_PIPE, z, z, z, z, z, 2576, 64, 8, 32),
+          "k not a multiple of QW_TMP_BK should be declined");
     qw_cmd_wait(c);
     qw_cmd_free(c);
 

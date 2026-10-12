@@ -117,35 +117,51 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
                   int32_t k, int32_t n, int32_t rows, int32_t group);
 
-/* The same product on Metal 4 tensor ops (metal4/qmm_tensor.metal), in two
- * candidate forms to be measured against each other and against
- * qw_op_qmm_q4 on an M5, whose GPU matrix units only tensor ops reach:
+/* The same product on Metal 4 tensor ops (metal4/qmm_tensor.metal), in three
+ * forms:
  *
  *   QW_TMM_DEQUANT  weight tiles unpacked to half in threadgroup memory
+ *   QW_TMM_PIPE     the same with x staged as half and the next K step's
+ *                   loads in flight during this step's matmul
  *   QW_TMM_INT4     packed nibbles fed to the op as uint4b_format, one
  *                   matmul per quantisation group, scale and bias after
  *
- * qw_op_qmm_q4 runs the dequant form by default wherever it applies -- it
- * beat qmm by 1.5x on an M4, which has no matrix units -- and QWASAR_TMM
- * (qmm, dequant, int4) overrides; see qw_tmm_choose in qwasar_metal.m.
- * Returns false, encoding nothing,
- * where tensor ops are unavailable or the shape is unsupported (group 32 or
- * 64; k a multiple of QW_TMM_BK). */
-typedef enum { QW_TMM_DEQUANT = 1, QW_TMM_INT4 = 2 } qw_tmm_kind;
+ * qw_op_qmm_q4 runs pipe by default on an M5 (Apple10, whose GPU has matrix
+ * units only tensor ops reach) and dequant on earlier GPUs, where it beat qmm
+ * by 1.5x; QWASAR_TMM (qmm, dequant, pipe, int4) overrides -- see
+ * qw_tmm_choose in qwasar_metal.m.  Returns false, encoding nothing, where
+ * tensor ops are unavailable or the shape is unsupported (group 32 or 64; k a
+ * multiple of the form's BK). */
+typedef enum { QW_TMM_DEQUANT = 1, QW_TMM_INT4 = 2, QW_TMM_PIPE = 3 } qw_tmm_kind;
 
 bool qw_tmm_available(void);
+/* An M5 or later, whose GPU has matrix units (MTLGPUFamilyApple10). */
+bool qw_gpu_has_matrix_units(void);
 bool qw_op_tmm_q4(qw_cmd c, qw_tmm_kind kind, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
                   int32_t k, int32_t n, int32_t rows, int32_t group);
 
 /* Tiling for the tensor-op matmuls, injected into their compile like the
  * qmm constants below: BM tokens by BN weight rows per threadgroup, K in
- * steps of BK (the dequant form; the int4 form steps by the group), SG
- * simdgroups sharing each op. */
+ * steps of BK (the int4 form steps by the group), SG simdgroups sharing each
+ * op.  QW_TMM_* is the dequant and int4 forms', tuned on an M4.  QW_TMP_* is
+ * pipe's, swept on the M5 Max (tests/test_tmm --bench, the 27B's MLP and
+ * Flash-Next's in_proj_qkv at 256-1024 rows): 64x128x32 with 8 simdgroups
+ * runs 35-40 TFLOP/s.  64x64x64/4 26, 128x64x32/8 32-40, 64x128x64/8 32-35,
+ * 128x128x32/16 30-34; 4 simdgroups at BN 128 fell to 12, and BM 128 with BN
+ * 128 to 12-17 at 8.  The dequant form on the same machine: 13-14. */
+#ifndef QW_TMM_BM
 #define QW_TMM_BM 64
 #define QW_TMM_BN 64
 #define QW_TMM_BK 64
 #define QW_TMM_SG 4
+#endif
+#ifndef QW_TMP_BM
+#define QW_TMP_BM 64
+#define QW_TMP_BN 128
+#define QW_TMP_BK 32
+#define QW_TMP_SG 8
+#endif
 
 /* y = x * w^T for an unquantised bf16 weight, blocked like qw_op_qmvb_q4.
  * Only the MTP draft head is dense. */
@@ -415,9 +431,11 @@ void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
  * row to 1.17 s (2.8 TFLOP/s).  BQ 64 was slower at every BK (1.95-2.23 s),
  * BQ 16 worse with depth, and 8 simdgroups no different from 4.  BK 256 does
  * not fit: the score tile alone would be 32 KB. */
+#ifndef QW_FA_BQ
 #define QW_FA_BQ 32
 #define QW_FA_BK 128
 #define QW_FA_SG 4
+#endif
 #define QW_FA_MIN_ROWS 16
 #define QW_ATTN_GQA 6
 #define QW_ATTN_GS 8

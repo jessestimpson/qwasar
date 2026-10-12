@@ -1,21 +1,21 @@
-/* Quantised matmul on Metal 4 tensor ops: two candidate replacements for
- * qw_qmm_q4_g64 on prefill, written to be measured against each other on an
- * M5, whose GPU cores have matrix units ("neural accelerators") that only
- * mpp::tensor_ops reaches.  PLAN-flash-next.md measured 52.5 TFLOP/s through
- * them on a dense half matmul of a delta projection's shape, against the
- * ~11.4 ceiling of the 8x8 simdgroup_matrix tile qw_qmm_q4_g64 is built on.
+/* Quantised matmul on Metal 4 tensor ops: replacements for qw_qmm_q4_g64 on
+ * prefill.  An M5's GPU cores have matrix units ("neural accelerators") that
+ * only mpp::tensor_ops reaches; PLAN-flash-next.md measured 52.5 TFLOP/s
+ * through them on a dense half matmul of a delta projection's shape, against
+ * the ~11.4 ceiling of the 8x8 simdgroup_matrix tile qw_qmm_q4_g64 is built
+ * on.  The pipe form below reaches 35-40 of it on the 27B's MLP shapes.
  *
  * The same source runs on M1-M4, where the compiler lowers the ops onto the
- * ordinary simdgroup matrix path: correct, and slower than qw_qmm_q4_g64.
- * Correctness is therefore testable anywhere (tests/test_tmm); speed is only
- * worth measuring on an M5.
+ * ordinary simdgroup matrix path, and there the dequant form is the one that
+ * wins (qwasar_metal.m, qw_tmm_choose).  Correctness is testable anywhere
+ * (tests/test_tmm).
  *
  * This file is its own library, compiled at Metal 4 (qwasar_metal.m,
  * qw_tmm_library) only when something asks for it, so a macOS or device
  * without tensor ops loses these kernels and nothing else.  It shares no
  * helpers with metal/: it does not see common.metal.
  *
- * Both compute y[r][n] = sum_k dequant(w)[n][k] * x[r][k] over a BM x BN
+ * All three compute y[r][n] = sum_k dequant(w)[n][k] * x[r][k] over a BM x BN
  * output tile per threadgroup -- BM tokens by BN weight rows -- with the
  * product held in a cooperative tensor across the whole K walk.  They differ
  * in where the 4-bit weights become numbers:
@@ -26,6 +26,12 @@
  *            qw_qmm_q4_g64 with the inner product swapped out; its risk is
  *            that the unpacking, hidden today behind a slow multiply, is what
  *            remains once the multiply is several times faster.
+ *
+ *   pipe     The dequant form rebuilt for the M5's matrix units, where the
+ *            multiply stopped hiding anything: x is staged as half beside the
+ *            weights, and the next K step's words, scales and x are loaded
+ *            into registers before this step's matmul runs and unpacked after
+ *            it, so the loads overlap the op.  Its own tiling, QW_TMP_*.
  *
  *   int4     Hands the packed nibbles to matmul2d as uint4b_format, read
  *            straight from the mmap'd weights with no staging at all.  The op
@@ -50,6 +56,10 @@
 #define QW_TMM_BN 64
 #define QW_TMM_BK 64
 #define QW_TMM_SG 4
+#define QW_TMP_BM 64
+#define QW_TMP_BN 128
+#define QW_TMP_BK 32
+#define QW_TMP_SG 8
 #endif
 
 struct qw_tmm_args {
@@ -126,6 +136,103 @@ kernel void qw_tmm_q4_dequant(
     }
 
     /* The store clips to Y's extents, so ragged edges need nothing here. */
+    auto ys = Y.slice(col0, row0);
+    acc.store(ys);
+}
+
+/* ---- pipe ----------------------------------------------------------------- */
+
+template <uint G>
+kernel void qw_tmm_q4_pipe(
+    device const uint   *w      [[buffer(0)]],
+    device const ushort *scales [[buffer(1)]],
+    device const ushort *biases [[buffer(2)]],
+    device       float  *x      [[buffer(3)]],
+    device       float  *y      [[buffer(4)]],
+    constant qw_tmm_args &a     [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint T  = QW_TMP_SG * 32;
+    constexpr uint NW = QW_TMP_BN * QW_TMP_BK / 8 / T;   /* packed words a thread loads per step */
+    constexpr uint NX = QW_TMP_BM * QW_TMP_BK / 4 / T;   /* float4s of x a thread loads per step */
+    static_assert(NW * T * 8 == QW_TMP_BN * QW_TMP_BK, "the weight tile must split evenly");
+    static_assert(NX * T * 4 == QW_TMP_BM * QW_TMP_BK, "the x tile must split evenly");
+    threadgroup half Ws[QW_TMP_BN * QW_TMP_BK];   /* [BN][BK], K contiguous */
+    threadgroup half Xs[QW_TMP_BM * QW_TMP_BK];   /* [BM][BK] */
+
+    const uint row0 = tgid.y * QW_TMP_BM, col0 = tgid.x * QW_TMP_BN;
+    const uint words = a.k / 8, groups = a.k / G;
+
+    qw_tmm_dev_f32 Y(y, dextents<int32_t, 2>(a.n, a.rows));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>
+        Wt(Ws, dextents<int32_t, 2>(QW_TMP_BK, QW_TMP_BN));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>
+        Xt(Xs, dextents<int32_t, 2>(QW_TMP_BK, QW_TMP_BM));
+    constexpr auto desc = matmul2d_descriptor(QW_TMP_BM, QW_TMP_BN, QW_TMP_BK,
+                                              false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<QW_TMP_SG>> op;
+    auto acc = op.template get_destination_cooperative_tensor<decltype(Xt), decltype(Wt), float>();
+#pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+
+    /* One K step in flight in registers.  Consecutive threads take
+     * consecutive words of a weight row and consecutive float4s of an x row,
+     * so both reads coalesce; a word never spans two groups (8 divides G). */
+    uint   rw[NW];
+    ushort rs[NW], rb[NW];
+    float4 rx[NX];
+    auto load = [&](uint k0) {
+#pragma unroll
+        for (uint i = 0; i < NW; ++i) {
+            const uint idx = tid + i * T;
+            const uint gn = col0 + idx / (QW_TMP_BK / 8), kw = k0 / 8 + idx % (QW_TMP_BK / 8);
+            const bool in = gn < a.n;
+            rw[i] = in ? w[(ulong)gn * words + kw] : 0u;
+            rs[i] = in ? scales[(ulong)gn * groups + kw * 8 / G] : ushort(0);
+            rb[i] = in ? biases[(ulong)gn * groups + kw * 8 / G] : ushort(0);
+        }
+#pragma unroll
+        for (uint i = 0; i < NX; ++i) {
+            const uint idx = tid + i * T;
+            const uint gm = row0 + idx / (QW_TMP_BK / 4), kq = idx % (QW_TMP_BK / 4);
+            rx[i] = gm < a.rows ? *(device const float4 *)(x + (ulong)gm * a.k + k0 + kq * 4)
+                                : float4(0.0f);
+        }
+    };
+
+    load(0);
+    for (uint k0 = 0; k0 < a.k; k0 += QW_TMP_BK) {
+#pragma unroll
+        for (uint i = 0; i < NW; ++i) {
+            const uint idx = tid + i * T;
+            const float s = qw_tmm_bf16(rs[i]), b = qw_tmm_bf16(rb[i]);
+            half4 lo, hi;
+#pragma unroll
+            for (uint j = 0; j < 4; ++j) {
+                lo[j] = half(fma(s, float((rw[i] >> (4 * j)) & 0xF), b));
+                hi[j] = half(fma(s, float((rw[i] >> (4 * j + 16)) & 0xF), b));
+            }
+            threadgroup half4 *dst = (threadgroup half4 *)(Ws + (idx / (QW_TMP_BK / 8)) * QW_TMP_BK
+                                                              + (idx % (QW_TMP_BK / 8)) * 8);
+            dst[0] = lo;
+            dst[1] = hi;
+        }
+#pragma unroll
+        for (uint i = 0; i < NX; ++i) {
+            const uint idx = tid + i * T;
+            *(threadgroup half4 *)(Xs + (idx / (QW_TMP_BK / 4)) * QW_TMP_BK + (idx % (QW_TMP_BK / 4)) * 4)
+                = half4(rx[i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k0 + QW_TMP_BK < a.k) load(k0 + QW_TMP_BK);
+        op.run(Xt, Wt, acc);
+        /* Ws and Xs are rewritten next step. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     auto ys = Y.slice(col0, row0);
     acc.store(ys);
 }
@@ -216,3 +323,5 @@ QW_TMM_INSTANCE(dequant, 32)
 QW_TMM_INSTANCE(dequant, 64)
 QW_TMM_INSTANCE(int4, 32)
 QW_TMM_INSTANCE(int4, 64)
+QW_TMM_INSTANCE(pipe, 32)
+QW_TMM_INSTANCE(pipe, 64)
