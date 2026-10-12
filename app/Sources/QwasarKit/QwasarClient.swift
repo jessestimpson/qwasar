@@ -381,11 +381,12 @@ public final class QwasarClient: Sendable {
     /// ends after `done` or `error`.  A refusal before the stream starts
     /// throws ClientError.refused.
     public func turn(_ id: String, text: String, attachments: [Attachment] = [],
-                     temperature: Float? = nil, topNSigma: Double = 0,
+                     temperature: Float? = nil, topNSigma: Double = 0, thinkingBudget: Int = 0,
                      maxTokens: Int = 0) -> AsyncThrowingStream<StreamEvent, Error> {
         var body: [String: Any] = ["text": text]
         if maxTokens > 0 { body["max_tokens"] = maxTokens }
-        if let s = Self.sampling(temperature: temperature, topNSigma: topNSigma) { body["sampling"] = s }
+        if let s = Self.sampling(temperature: temperature, topNSigma: topNSigma,
+                                 thinkingBudget: thinkingBudget) { body["sampling"] = s }
         if !attachments.isEmpty {
             body["images"] = attachments.map { ["kind": $0.kind, "media_type": $0.mediaType,
                                                  "data": $0.data.base64EncodedString()] }
@@ -394,20 +395,24 @@ public final class QwasarClient: Sendable {
     }
 
     public func continueStep(_ id: String, results: [ToolResultPayload], temperature: Float? = nil,
-                             topNSigma: Double = 0, maxTokens: Int = 0) -> AsyncThrowingStream<StreamEvent, Error> {
+                             topNSigma: Double = 0, thinkingBudget: Int = 0,
+                             maxTokens: Int = 0) -> AsyncThrowingStream<StreamEvent, Error> {
         var body: [String: Any] = ["results": results.map { ["id": $0.id, "content": $0.content] }]
         if maxTokens > 0 { body["max_tokens"] = maxTokens }
-        if let s = Self.sampling(temperature: temperature, topNSigma: topNSigma) { body["sampling"] = s }
+        if let s = Self.sampling(temperature: temperature, topNSigma: topNSigma,
+                                 thinkingBudget: thinkingBudget) { body["sampling"] = s }
         return stream("v1/sessions/\(id)/continue", body: body)
     }
 
     /// A step's `sampling` object (API.md §4.4), only the fields set: the
     /// server fills the rest from the model's own generation config.  nil
     /// when nothing is, so the body carries no sampling at all.
-    public static func sampling(temperature: Float?, topNSigma: Double) -> [String: Any]? {
+    public static func sampling(temperature: Float?, topNSigma: Double,
+                                thinkingBudget: Int = 0) -> [String: Any]? {
         var s: [String: Any] = [:]
         if let temperature { s["temperature"] = temperature }
         if topNSigma > 0 { s["top_n_sigma"] = topNSigma }
+        if thinkingBudget > 0 { s["thinking_budget"] = thinkingBudget }
         return s.isEmpty ? nil : s
     }
 

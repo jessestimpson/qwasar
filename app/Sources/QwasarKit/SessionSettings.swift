@@ -32,20 +32,30 @@ public struct SettingsOverlay: Codable, Sendable, Equatable, Hashable {
     /// within this many standard deviations of the largest.  0 is off -- an
     /// opinion, where nil is silence.
     public var topNSigma: Double?
+    /// Reads and searches without an edit before the turn is reminded
+    /// (ExplorationNudge); 0 is off.
+    public var exploreNudgeAfter: Int?
+    /// Reasoning tokens a step may spend before the server closes its
+    /// thinking (API.md §4.4, sampling.thinking_budget); 0 is no cap.
+    public var thinkingBudget: Int?
 
     public init(toolTimeoutSeconds: Int? = nil, agentModels: [String]? = nil,
                 agentBudgetUSD: Double? = nil, agentTurnBudgetUSD: Double? = nil,
-                topNSigma: Double? = nil) {
+                topNSigma: Double? = nil, exploreNudgeAfter: Int? = nil,
+                thinkingBudget: Int? = nil) {
         self.toolTimeoutSeconds = toolTimeoutSeconds
         self.agentModels = agentModels
         self.agentBudgetUSD = agentBudgetUSD
         self.agentTurnBudgetUSD = agentTurnBudgetUSD
         self.topNSigma = topNSigma
+        self.exploreNudgeAfter = exploreNudgeAfter
+        self.thinkingBudget = thinkingBudget
     }
 
     public var isEmpty: Bool {
         toolTimeoutSeconds == nil && agentModels == nil && agentBudgetUSD == nil
-            && agentTurnBudgetUSD == nil && topNSigma == nil
+            && agentTurnBudgetUSD == nil && topNSigma == nil && exploreNudgeAfter == nil
+            && thinkingBudget == nil
     }
 }
 
@@ -57,6 +67,8 @@ public enum SettingsKey: String, CaseIterable, Sendable {
     case agentBudgetUSD = "delegate_budget_usd"
     case agentTurnBudgetUSD = "delegate_turn_budget_usd"
     case topNSigma = "top_n_sigma"
+    case exploreNudgeAfter = "explore_nudge_after"
+    case thinkingBudget = "thinking_budget"
 
     public var doc: String {
         switch self {
@@ -68,6 +80,12 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .topNSigma:
             return "top-n-sigma sampling: keep only tokens whose logit is within n standard deviations of the top one, "
                 + "the same tokens at any temperature; 0 is off (default), 1 is the paper's suggestion"
+        case .exploreNudgeAfter:
+            return "reads and searches (Read, Grep, Glob) without an edit before a turn is reminded to act, "
+                + "and between reminders; 0 is off (default 10)"
+        case .thinkingBudget:
+            return "reasoning tokens a step may spend before the server closes its thinking and the model "
+                + "acts on what it has; 0 is no cap (default), 2048-4096 is a reasonable start"
         }
     }
 
@@ -96,6 +114,17 @@ public enum SettingsKey: String, CaseIterable, Sendable {
             guard let d = Double(value.trimmingCharacters(in: .whitespaces)),
                   (0...10).contains(d) else { return "top_n_sigma needs a number in 0...10 (0 is off)" }
             overlay.topNSigma = d
+        case .exploreNudgeAfter:
+            guard let n = Int(value.trimmingCharacters(in: .whitespaces)), (0...200).contains(n) else {
+                return "explore_nudge_after needs an integer in 0...200 (0 is off)"
+            }
+            overlay.exploreNudgeAfter = n
+        case .thinkingBudget:
+            guard let n = Int(value.trimmingCharacters(in: .whitespaces)),
+                  n == 0 || (256...65536).contains(n) else {
+                return "thinking_budget needs 0 (no cap) or an integer in 256...65536"
+            }
+            overlay.thinkingBudget = n
         }
         return nil
     }
@@ -107,6 +136,8 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .agentBudgetUSD: overlay.agentBudgetUSD = nil
         case .agentTurnBudgetUSD: overlay.agentTurnBudgetUSD = nil
         case .topNSigma: overlay.topNSigma = nil
+        case .exploreNudgeAfter: overlay.exploreNudgeAfter = nil
+        case .thinkingBudget: overlay.thinkingBudget = nil
         }
     }
 
@@ -117,6 +148,8 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .agentBudgetUSD: return overlay.agentBudgetUSD.map { String(format: "%.2f", $0) }
         case .agentTurnBudgetUSD: return overlay.agentTurnBudgetUSD.map { String(format: "%.2f", $0) }
         case .topNSigma: return overlay.topNSigma.map { String(format: "%g", $0) }
+        case .exploreNudgeAfter: return overlay.exploreNudgeAfter.map(String.init)
+        case .thinkingBudget: return overlay.thinkingBudget.map(String.init)
         }
     }
 }
@@ -131,12 +164,16 @@ public struct SessionSettings: Sendable, Equatable {
     public var agentTurnBudgetUSD: Double
     /// 0 = off: the model's own sampling, as before this setting existed.
     public var topNSigma: Double
+    public var exploreNudgeAfter: Int
+    public var thinkingBudget: Int
 
     public static let defaults = SessionSettings(toolTimeoutSeconds: 180,
                                                  agentModels: [],
                                                  agentBudgetUSD: 5.0,
                                                  agentTurnBudgetUSD: 1.0,
-                                                 topNSigma: 0)
+                                                 topNSigma: 0,
+                                                 exploreNudgeAfter: 10,
+                                                 thinkingBudget: 0)
 
     public enum Layer: String, Sendable { case session, project, global, builtin = "built-in" }
 
@@ -151,7 +188,9 @@ public struct SessionSettings: Sendable, Equatable {
             agentModels: pick({ $0.agentModels }, defaults.agentModels),
             agentBudgetUSD: pick({ $0.agentBudgetUSD }, defaults.agentBudgetUSD),
             agentTurnBudgetUSD: pick({ $0.agentTurnBudgetUSD }, defaults.agentTurnBudgetUSD),
-            topNSigma: pick({ $0.topNSigma }, defaults.topNSigma))
+            topNSigma: pick({ $0.topNSigma }, defaults.topNSigma),
+            exploreNudgeAfter: pick({ $0.exploreNudgeAfter }, defaults.exploreNudgeAfter),
+            thinkingBudget: pick({ $0.thinkingBudget }, defaults.thinkingBudget))
     }
 
     /// Which layer decided `key`, for display.

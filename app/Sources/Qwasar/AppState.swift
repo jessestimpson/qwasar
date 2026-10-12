@@ -976,10 +976,16 @@ final class AppState {
             }
             var stats = TurnStats()
             stats.contextLimit = contextLimit
+            let turnSettings = SessionSettings.resolve(global: globalSettings, project: p.overlay,
+                                                       session: rec.sandbox)
             // Sampling the user has set (top_n_sigma); otherwise the model's own.
-            let topNSigma = SessionSettings.resolve(global: globalSettings, project: p.overlay,
-                                                    session: rec.sandbox).topNSigma
-            var stream = client.turn(sid, text: promptText, topNSigma: topNSigma, maxTokens: budget)
+            let topNSigma = turnSettings.topNSigma
+            let thinkingBudget = turnSettings.thinkingBudget
+            // A reminder when the turn keeps reading without changing
+            // anything.  Not for the config session, which has no files.
+            var nudge = ExplorationNudge(after: p.isConfig ? 0 : turnSettings.exploreNudgeAfter)
+            var stream = client.turn(sid, text: promptText, topNSigma: topNSigma,
+                                     thinkingBudget: thinkingBudget, maxTokens: budget)
             var steps = 0
             var ended = false
             // A guard against a runaway loop, not a working limit: a long
@@ -1109,9 +1115,16 @@ final class AppState {
                             apply(.toolResult(name: c.name, result: r))
                             results.append(ToolResultPayload(id: id, content: r))
                             stats.toolCalls += 1
+                            nudge.record(c.name)
                         }
                         calls = []
                         steps += 1
+                        // Rides on this round's last result, ahead of any
+                        // wrap-up below, which then has the last word.
+                        if !results.isEmpty, !cancelFlag.isSet, let text = nudge.reminder() {
+                            results[results.count - 1].content += "\n\n" + text
+                            apply(.note("\(nudge.streak) reads and searches without an edit; the model was reminded"))
+                        }
                         if steps >= maxSteps, !results.isEmpty {
                             // The results still go -- nothing ran for
                             // nothing -- with the request riding on the last.
@@ -1164,7 +1177,7 @@ final class AppState {
                             }
                         }
                         stream = client.continueStep(sid, results: results, topNSigma: topNSigma,
-                                                     maxTokens: budget)
+                                                     thinkingBudget: thinkingBudget, maxTokens: budget)
                     case "cancelled":
                         stats.interrupted = true; ended = true
                     case "length":

@@ -409,7 +409,9 @@ extension AppState {
                 out.append("    effective: timeout=\(eff.toolTimeoutSeconds)s "
                          + "agent=[\(eff.agentModels.joined(separator: ", "))] "
                          + String(format: "spent=$%.4f of $%.2f ", s.spentUSD ?? 0, eff.agentBudgetUSD)
-                         + "top_n_sigma=\(eff.topNSigma > 0 ? String(format: "%g", eff.topNSigma) : "off")")
+                         + "top_n_sigma=\(eff.topNSigma > 0 ? String(format: "%g", eff.topNSigma) : "off") "
+                         + "explore_nudge_after=\(eff.exploreNudgeAfter > 0 ? String(eff.exploreNudgeAfter) : "off") "
+                         + "thinking_budget=\(eff.thinkingBudget > 0 ? String(eff.thinkingBudget) : "none")")
                 out.append("    provenance: \(prov)")
             }
         }
@@ -420,6 +422,7 @@ extension AppState {
         let d = SessionSettings.defaults
         return SettingsOverlay(toolTimeoutSeconds: d.toolTimeoutSeconds, agentModels: d.agentModels,
                                agentBudgetUSD: d.agentBudgetUSD,
-                               agentTurnBudgetUSD: d.agentTurnBudgetUSD, topNSigma: d.topNSigma)
+                               agentTurnBudgetUSD: d.agentTurnBudgetUSD, topNSigma: d.topNSigma,
+                               exploreNudgeAfter: d.exploreNudgeAfter, thinkingBudget: d.thinkingBudget)
     }
 }

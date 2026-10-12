@@ -70,9 +70,48 @@ enum SettingsOverlaySuite {
         f += TestMain.check(QwasarClient.sampling(temperature: nil, topNSigma: 1.5)?["top_n_sigma"] as? Double == 1.5
                             && QwasarClient.sampling(temperature: nil, topNSigma: 1.5)?["temperature"] == nil,
                             "top_n_sigma alone sends only top_n_sigma")
+        f += TestMain.check(SettingsKey.exploreNudgeAfter.set("6", on: &o) == nil && o.exploreNudgeAfter == 6,
+                            "explore_nudge_after parses")
+        f += TestMain.check(SessionSettings.defaults.exploreNudgeAfter == 10,
+                            "the exploration nudge is on by default, at 10")
+
+        // The nudge: reads and searches count, a change ends the streak, Bash
+        // is neither, and a round crossing the mark gets one reminder.
+        var n = ExplorationNudge(after: 3)
+        n.record("Read"); n.record("Grep")
+        f += TestMain.check(n.reminder() == nil, "no reminder below the mark")
+        n.record("Bash"); n.record("TodoWrite")
+        f += TestMain.check(n.streak == 2 && n.reminder() == nil, "Bash and TodoWrite neither count nor reset")
+        n.record("Glob"); n.record("Read"); n.record("Read")
+        let first = n.reminder()
+        f += TestMain.check(first?.contains("5 reads and searches this turn, and no edit yet") == true,
+                            "the reminder names the streak before any edit")
+        f += TestMain.check(n.reminder() == nil, "one reminder per crossing, not per call")
+        n.record("Read"); n.record("Read")
+        f += TestMain.check(n.reminder() == nil, "the next is `after` more reads away")
+        n.record("Read")
+        f += TestMain.check(n.reminder() != nil, "and then it comes")
+        n.record("Edit")
+        f += TestMain.check(n.streak == 0 && n.reminder() == nil, "an edit ends the streak")
+        n.record("Read"); n.record("Read"); n.record("Grep")
+        f += TestMain.check(n.reminder()?.contains("3 reads and searches since your last edit") == true,
+                            "after an edit, the count restarts and the wording says so")
+        var quiet = ExplorationNudge(after: 0)
+        for _ in 0..<50 { quiet.record("Read") }
+        f += TestMain.check(quiet.reminder() == nil, "0 is off")
+
         SettingsKey.toolTimeoutSeconds.clear(on: &o)
         SettingsKey.agentModels.clear(on: &o)
         SettingsKey.topNSigma.clear(on: &o)
+        f += TestMain.check(SettingsKey.thinkingBudget.set("4096", on: &o) == nil && o.thinkingBudget == 4096,
+                            "thinking_budget parses")
+        f += TestMain.check(SettingsKey.thinkingBudget.set("12", on: &o) != nil && o.thinkingBudget == 4096,
+                            "a thinking_budget too small to think in is refused")
+        let budgeted = QwasarClient.sampling(temperature: nil, topNSigma: 0, thinkingBudget: 2048)
+        f += TestMain.check(budgeted?["thinking_budget"] as? Int == 2048,
+                            "a thinking budget rides in the step's sampling")
+        SettingsKey.exploreNudgeAfter.clear(on: &o)
+        SettingsKey.thinkingBudget.clear(on: &o)
         f += TestMain.check(o.isEmpty, "clearing every set key leaves an empty layer")
 
         // Records from when sessions could run in a VM still decode: the
