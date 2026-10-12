@@ -117,6 +117,36 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
                   qw_ref w, qw_ref scales, qw_ref biases,
                   int32_t k, int32_t n, int32_t rows, int32_t group);
 
+/* The same product on Metal 4 tensor ops (metal4/qmm_tensor.metal), in two
+ * candidate forms to be measured against each other and against
+ * qw_op_qmm_q4 on an M5, whose GPU matrix units only tensor ops reach:
+ *
+ *   QW_TMM_DEQUANT  weight tiles unpacked to half in threadgroup memory
+ *   QW_TMM_INT4     packed nibbles fed to the op as uint4b_format, one
+ *                   matmul per quantisation group, scale and bias after
+ *
+ * qw_op_qmm_q4 runs the dequant form by default wherever it applies -- it
+ * beat qmm by 1.5x on an M4, which has no matrix units -- and QWASAR_TMM
+ * (qmm, dequant, int4) overrides; see qw_tmm_choose in qwasar_metal.m.
+ * Returns false, encoding nothing,
+ * where tensor ops are unavailable or the shape is unsupported (group 32 or
+ * 64; k a multiple of QW_TMM_BK). */
+typedef enum { QW_TMM_DEQUANT = 1, QW_TMM_INT4 = 2 } qw_tmm_kind;
+
+bool qw_tmm_available(void);
+bool qw_op_tmm_q4(qw_cmd c, qw_tmm_kind kind, qw_ref y, qw_ref x,
+                  qw_ref w, qw_ref scales, qw_ref biases,
+                  int32_t k, int32_t n, int32_t rows, int32_t group);
+
+/* Tiling for the tensor-op matmuls, injected into their compile like the
+ * qmm constants below: BM tokens by BN weight rows per threadgroup, K in
+ * steps of BK (the dequant form; the int4 form steps by the group), SG
+ * simdgroups sharing each op. */
+#define QW_TMM_BM 64
+#define QW_TMM_BN 64
+#define QW_TMM_BK 64
+#define QW_TMM_SG 4
+
 /* y = x * w^T for an unquantised bf16 weight, blocked like qw_op_qmvb_q4.
  * Only the MTP draft head is dense. */
 void qw_op_dmat_bf16(qw_cmd c, qw_ref y, qw_ref x, qw_ref w,

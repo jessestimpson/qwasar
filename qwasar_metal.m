@@ -19,10 +19,13 @@
 #include "qwasar_gpu.h"
 
 #include "qwasar_metal_src.inc"   /* static const char qwasar_metal_source[] */
+#include "qwasar_metal4_src.inc"  /* static const char qwasar_metal4_source[] */
 
 static id<MTLDevice>       g_device;
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary>      g_library;
+static id<MTLLibrary>      g_tmm_library;   /* metal4/, built on first use */
+static int                 g_tmm_state;     /* 0 untried, 1 built, -1 unavailable */
 static id<MTLBinaryArchive> g_archive;
 static NSURL              *g_archive_url;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipelines;
@@ -134,6 +137,8 @@ void qw_gpu_shutdown(void) {
         g_archive     = nil;
         g_archive_url = nil;
         g_library     = nil;
+        g_tmm_library = nil;
+        g_tmm_state   = 0;
         g_queue       = nil;
         g_device      = nil;
     }
@@ -584,6 +589,114 @@ void qw_op_qmv_q4(qw_cmd c, qw_ref y, qw_ref x,
     [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
 }
 
+/* ---- tensor-op matmuls ----------------------------------------------------
+ *
+ * metal4/ is a library of its own: it needs the Metal 4 language and the
+ * MetalPerformancePrimitives headers, and a failure to build it -- an older
+ * macOS, a device without tensor ops -- must cost those kernels and nothing
+ * else.  So it is compiled on first use rather than at init, and kept out of
+ * the binary archive, whose key is the main library's source. */
+
+static id<MTLLibrary> qw_tmm_library(void) {
+    if (g_tmm_state) return g_tmm_state > 0 ? g_tmm_library : nil;
+    g_tmm_state = -1;
+    if (!g_device) return nil;
+    if (@available(macOS 26.0, *)) {
+        @autoreleasepool {
+            MTLCompileOptions *opts = [MTLCompileOptions new];
+            opts.languageVersion = MTLLanguageVersion4_0;
+            opts.preprocessorMacros = @{
+                @"QW_TMM_BM" : @(QW_TMM_BM),
+                @"QW_TMM_BN" : @(QW_TMM_BN),
+                @"QW_TMM_BK" : @(QW_TMM_BK),
+                @"QW_TMM_SG" : @(QW_TMM_SG),
+            };
+            NSError *err = nil;
+            g_tmm_library = [g_device newLibraryWithSource:[NSString stringWithUTF8String:qwasar_metal4_source]
+                                                   options:opts error:&err];
+            if (!g_tmm_library) {
+                fprintf(stderr, "qwasar: tensor-op kernels unavailable: %s\n",
+                        [[err localizedDescription] UTF8String]);
+                return nil;
+            }
+            g_tmm_state = 1;
+        }
+    }
+    return g_tmm_library;
+}
+
+bool qw_tmm_available(void) { return qw_tmm_library() != nil; }
+
+static id<MTLComputePipelineState> qw_tmm_pipeline(NSString *name) {
+    NSString *key = [@"tmm/" stringByAppendingString:name];
+    id<MTLComputePipelineState> ps = g_pipelines[key];
+    if (ps) return ps;
+    id<MTLLibrary> lib = qw_tmm_library();
+    id<MTLFunction> fn = [lib newFunctionWithName:name];
+    if (!fn) return nil;
+    NSError *err = nil;
+    ps = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!ps) {
+        fprintf(stderr, "qwasar: pipeline %s failed: %s\n", [name UTF8String],
+                [[err localizedDescription] UTF8String]);
+        return nil;
+    }
+    g_pipelines[key] = ps;
+    return ps;
+}
+
+bool qw_op_tmm_q4(qw_cmd c, qw_tmm_kind kind, qw_ref y, qw_ref x,
+                  qw_ref w, qw_ref scales, qw_ref biases,
+                  int32_t k, int32_t n, int32_t rows, int32_t group) {
+    if (!c || !c->enc || rows <= 0 || n <= 0) return false;
+    if (group == 0) group = 64;
+    if ((group != 32 && group != 64) || k % QW_TMM_BK != 0) return false;
+    if (kind != QW_TMM_DEQUANT && kind != QW_TMM_INT4) return false;
+    NSString *name = [NSString stringWithFormat:@"qw_tmm_q4_%s_g%d",
+                      kind == QW_TMM_INT4 ? "int4" : "dequant", group];
+    id<MTLComputePipelineState> ps = qw_tmm_pipeline(name);
+    if (!ps) return false;
+
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, w, 0);
+    qw_set(enc, scales, 1);
+    qw_set(enc, biases, 2);
+    qw_set(enc, x, 3);
+    qw_set(enc, y, 4);
+    qw_matmul_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)rows };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + QW_TMM_BN - 1) / QW_TMM_BN,
+                                          ((NSUInteger)rows + QW_TMM_BM - 1) / QW_TMM_BM, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * QW_TMM_SG, 1, 1)];
+    return true;
+}
+
+/* Which kernel qw_op_qmm_q4 runs.  The tensor-op dequant form is the default:
+ * on an M4 it measured 2.9-3.0 TFLOP/s on the 27B's MLP shapes against qmm's
+ * 1.7-2.0, and took a 2,069-token prefill from 34-38 to 41-50 tok/s with the
+ * same greedy output.  Shapes too narrow to fill the GPU still take qmm's
+ * split-K, which the tensor-op kernels do not have, and qmm remains wherever
+ * tensor ops are unavailable.
+ *
+ * QWASAR_TMM overrides: "qmm" for the simdgroup kernel throughout, "dequant"
+ * or "int4" to force a tensor-op form on every shape, split-K ones included --
+ * what a measurement on an M5 wants. */
+typedef struct { qw_tmm_kind kind; bool forced; } qw_tmm_choice;
+
+static qw_tmm_choice qw_tmm_choose(void) {
+    static int state = -1;   /* kind | forced << 4 */
+    if (state < 0) {
+        const char *v = getenv("QWASAR_TMM");
+        if (!v || !*v)                 state = QW_TMM_DEQUANT;
+        else if (!strcmp(v, "dequant")) state = QW_TMM_DEQUANT | 1 << 4;
+        else if (!strcmp(v, "int4"))    state = QW_TMM_INT4 | 1 << 4;
+        else                            state = 0;   /* "qmm", or anything unrecognised */
+    }
+    qw_tmm_choice ch = { (qw_tmm_kind)(state & 0xF), (state >> 4) != 0 };
+    return ch;
+}
+
 /* Too few output tiles to fill the GPU: split K across threadgroups, each
  * slice's partial product into the command's scratch, then one pass to sum
  * them (metal/qmm.metal).  Below QW_QMM_SPLIT_BELOW tiles, enough slices to
@@ -650,9 +763,12 @@ void qw_op_qmm_q4(qw_cmd c, qw_ref y, qw_ref x,
         fprintf(stderr, "qwasar: qmm needs k divisible by %d, got %d\n", QW_QMM_BK, k);
         return;
     }
+    const qw_tmm_choice tmm = qw_tmm_choose();
+    if (tmm.forced && qw_op_tmm_q4(c, tmm.kind, y, x, w, scales, biases, k, n, rows, group)) return;
     const NSUInteger tiles_n = ((NSUInteger)n + QW_QMM_BN - 1) / QW_QMM_BN;
     const NSUInteger tiles_m = ((NSUInteger)rows + QW_QMM_BM - 1) / QW_QMM_BM;
     if (qw_qmm_q4_splitk(c, y, x, w, scales, biases, k, n, rows, group, tiles_n * tiles_m)) return;
+    if (tmm.kind && qw_op_tmm_q4(c, tmm.kind, y, x, w, scales, biases, k, n, rows, group)) return;
     id<MTLComputePipelineState> ps = qw_pipeline_q(@"qw_qmm_q4_g64", group);
     if (!ps) return;
 

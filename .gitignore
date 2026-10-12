@@ -15,6 +15,7 @@ __pycache__/
 
 # generated: embedded Metal sources (see Makefile / tools/bin2c.c)
 qwasar_metal_src.inc
+qwasar_metal4_src.inc
 .metal_check.metal
 
 # downloaded weights and the symlinks download_model.sh points at them

@@ -21,6 +21,9 @@ LDLIBS   ?= -lm -pthread -framework Foundation -framework Metal \
 # files are concatenated into a single translation unit, so it must come first.
 METAL_SRCS := metal/common.metal \
               $(filter-out metal/common.metal,$(sort $(wildcard metal/*.metal)))
+# metal4/ is a second library, compiled at Metal 4 on first use: kernels that
+# need tensor ops, kept apart so a system without them loses only those.
+METAL4_SRCS := $(sort $(wildcard metal4/*.metal))
 CORE_OBJS  := qwasar.o qwasar_graph.o qwasar_kvstore.o qwasar_tokenizer.o qwasar_flash_cpu.o qwasar_flash_graph.o \
               qwasar_toolcall.o qwasar_sample.o qwasar_json.o qwasar_cpu.o \
               qwasar_image.o qwasar_video.o qwasar_vision.o qwasar_metal.o
@@ -80,7 +83,10 @@ tools/bin2c: tools/bin2c.c
 qwasar_metal_src.inc: tools/bin2c $(METAL_SRCS) Makefile
 	./tools/bin2c qwasar_metal_source $(METAL_SRCS) > $@
 
-qwasar_metal.o: qwasar_metal.m qwasar_gpu.h qwasar_metal_src.inc
+qwasar_metal4_src.inc: tools/bin2c $(METAL4_SRCS) Makefile
+	./tools/bin2c qwasar_metal4_source $(METAL4_SRCS) > $@
+
+qwasar_metal.o: qwasar_metal.m qwasar_gpu.h qwasar_metal_src.inc qwasar_metal4_src.inc
 	$(CC) $(OBJCFLAGS) -c -o $@ $<
 
 qwasar.o:      qwasar.c qwasar.h qwasar_gpu.h qwasar_json.h qwasar_model.h
@@ -107,7 +113,7 @@ QWASAR_TEST_MODEL ?= $(HOME)/.lmstudio/models/lmstudio-community/Qwen3.8-27B-MLX
 # See PLAN.md section 5, milestone 3 for where it comes from.
 QWASAR_TEST_MTP ?= $(HOME)/.cache/qwasar/mtp/Qwen3.8-27B-MTP-bf16
 
-TESTS := tests/test_json tests/test_toolcall tests/test_sample tests/test_tokenizer tests/test_qmv tests/test_ops \
+TESTS := tests/test_json tests/test_toolcall tests/test_sample tests/test_tokenizer tests/test_qmv tests/test_tmm tests/test_ops \
          tests/test_gdn tests/test_attn tests/test_kvstore tests/test_mtp tests/test_verify tests/test_vision tests/test_forward \
          tests/test_select tests/test_tui tests/test_flashnext tests/test_sparse tests/test_tokenizer_marks \
          tests/test_flashnext_real
@@ -147,6 +153,9 @@ tests/test_vision: tests/test_vision.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar
 
 tests/test_mtp: tests/test_mtp.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_mtp.c $(CORE_OBJS) $(LDLIBS)
+
+tests/test_tmm: tests/test_tmm.c $(CORE_OBJS) qwasar_gpu.h qwasar_model.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_tmm.c $(CORE_OBJS) $(LDLIBS)
 
 tests/test_ops: tests/test_ops.c $(CORE_OBJS) qwasar.h qwasar_gpu.h qwasar_model.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_ops.c $(CORE_OBJS) $(LDLIBS)
@@ -225,4 +234,4 @@ check-metal:
 	fi
 
 clean:
-	rm -f qwasar qwasar-agent qwasar-server libqwasar.a *.o tools/bin2c qwasar_metal_src.inc .metal_check.metal $(TESTS) tests/*.o
+	rm -f qwasar qwasar-agent qwasar-server libqwasar.a *.o tools/bin2c qwasar_metal_src.inc qwasar_metal4_src.inc .metal_check.metal $(TESTS) tests/*.o

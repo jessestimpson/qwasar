@@ -83,40 +83,31 @@ static void top_k(const float *v, int32_t n, int k, int32_t *idx) {
     }
 }
 
-int main(int argc, char **argv) {
-    const char *model  = getenv("QWASAR_TEST_MODEL");
-    const char *gpath  = getenv("QWASAR_GOLDEN");
-    if (argc > 1) model = argv[1];
-    if (argc > 2) gpath = argv[2];
-    if (!gpath) gpath = "tests/golden.bin";
-    if (!model) { fprintf(stderr, "skip: set QWASAR_TEST_MODEL\n"); return 0; }
-
+/* Replays one golden file through a fresh session.  Returns false only when
+ * the file is missing, which is a skip rather than a failure. */
+static bool check_golden(qwasar_engine *e, const char *gpath) {
     golden g;
     memset(&g, 0, sizeof g);
     if (!golden_load(&g, gpath)) {
         fprintf(stderr, "skip: no golden vectors at %s\n"
                         "      generate with: reference/mlx-vlm/.venv/bin/python \\\n"
-                        "        tools/dump_golden.py <model-dir> %s\n", gpath, gpath);
-        return 0;
+                        "        tools/dump_golden.py <model-dir> %s%s\n", gpath, gpath,
+                strstr(gpath, "long") ? " long" : "");
+        return false;
     }
 
     char err[512];
-    qwasar_options opts = { .model_path = model, .context_size = 4096 };
-    qwasar_engine *e = qwasar_engine_load(&opts, err, sizeof err);
-    if (!e) { fprintf(stderr, "load failed: %s\n", err); return 1; }
-
     CHECK(qwasar_vocab_size(e) == g.vocab, "vocab %d vs golden %d",
           qwasar_vocab_size(e), g.vocab);
 
     qwasar_session *s = qwasar_session_new(e, err, sizeof err);
-    if (!s) { fprintf(stderr, "session failed: %s\n", err); return 1; }
+    if (!s) { fprintf(stderr, "session failed: %s\n", err); fails++; return true; }
 
     CHECK(qwasar_session_set_capture(s, g.capture, g.n_capture), "cannot set capture");
 
-    printf("  prompt: %d tokens\n", g.n_tokens);
+    printf("  %s: %d tokens\n", gpath, g.n_tokens);
     const float *logits = qwasar_session_eval(s, g.tokens, g.n_tokens, err, sizeof err);
-    if (!logits) { fprintf(stderr, "eval failed: %s\n", err); return 1; }
-
+    if (!logits) { fprintf(stderr, "eval failed: %s\n", err); fails++; qwasar_session_free(s); return true; }
     /* Walk the drift forward.  Smooth growth is bf16-versus-fp32 accumulation;
      * a jump at one layer is a bug in that layer's kind. */
     printf("  %-8s %-14s %s\n", "layer", "kind", "rel l2 vs reference");
@@ -157,10 +148,35 @@ int main(int argc, char **argv) {
         CHECK(got[i] == want[i], "top5 rank %d: %d, reference says %d", i, got[i], want[i]);
 
     qwasar_session_free(s);
+    return true;
+}
+
+/* tests/golden.bin is a 17-token prompt, which prefills through the batched
+ * matvec: below QW_QMM_MIN_ROWS no matmul runs at all.  tests/golden_long.bin
+ * is 364 tokens -- a 256-token chunk and a ragged 108 -- so it is the one that
+ * holds the prefill matmul, whichever kernel qw_op_qmm_q4 picks (QWASAR_TMM). */
+int main(int argc, char **argv) {
+    const char *model = getenv("QWASAR_TEST_MODEL");
+    const char *gpath = getenv("QWASAR_GOLDEN");
+    if (argc > 1) model = argv[1];
+    if (argc > 2) gpath = argv[2];
+    if (!model) { fprintf(stderr, "skip: set QWASAR_TEST_MODEL\n"); return 0; }
+
+    const char *paths[2] = { gpath ? gpath : "tests/golden.bin", "tests/golden_long.bin" };
+    const int n_paths = gpath ? 1 : 2;
+
+    char err[512];
+    qwasar_options opts = { .model_path = model, .context_size = 4096 };
+    qwasar_engine *e = qwasar_engine_load(&opts, err, sizeof err);
+    if (!e) { fprintf(stderr, "load failed: %s\n", err); return 1; }
+
+    int ran = 0;
+    for (int i = 0; i < n_paths; i++) ran += check_golden(e, paths[i]);
+
     qwasar_engine_free(e);
     qw_gpu_shutdown();
 
     if (fails) { fprintf(stderr, "%d check(s) failed\n", fails); return 1; }
-    printf("ok: forward\n");
+    if (ran) printf("ok: forward\n");
     return 0;
 }
