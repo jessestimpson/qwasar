@@ -299,13 +299,17 @@ int32_t qwasar_session_draft_depth(qwasar_session *s);
 
 /* ---- sampling ---------------------------------------------------------------
  *
- * Filters apply in a fixed order: temperature, top-k, min-p, top-p.
- * `temperature = 0` means greedy and is exactly reproducible. */
+ * Filters apply in a fixed order: temperature, top-k, min-p and top-n-sigma,
+ * top-p.  `temperature = 0` means greedy and is exactly reproducible. */
 typedef struct {
     float    temperature;
     int32_t  top_k;        /* 0 = off */
     float    top_p;        /* 1 = off */
     float    min_p;        /* 0 = off */
+    /* Keeps tokens whose logit is within top_n_sigma standard deviations (over
+     * the whole vocabulary, masked tokens aside) of the largest; the same set
+     * at any temperature.  0 = off; the paper's default is 1. */
+    float    top_n_sigma;
     /* Subtracted from the logit of every token the reply has already produced
      * (qwasar_presence below); 0 = off, negative = the model's default
      * (qwasar_default_presence_penalty).  Not read by qwasar_sample: the

@@ -1,10 +1,19 @@
 /* Token sampling.
  *
- * The filter chain runs in a fixed order: temperature, then top-k, then min-p,
- * then top-p.  Order is a real choice rather than a detail -- min-p thresholds
- * against the most likely token, so running it after top-k means the threshold
- * is computed from whatever top-k left, which is what callers expect from the
- * name.
+ * The filter chain runs in a fixed order: temperature, then top-k, then min-p
+ * and top-n-sigma, then top-p.  Order is a real choice rather than a detail --
+ * min-p thresholds against the most likely token, so running it after top-k
+ * means the threshold is computed from whatever top-k left, which is what
+ * callers expect from the name.
+ *
+ * Top-n-sigma (Tang et al., arXiv 2411.07641) keeps the tokens whose logit is
+ * within n standard deviations of the largest: most of a vocabulary's logits
+ * are roughly Gaussian noise, and the tokens worth sampling stand clear of it.
+ * Unlike min-p and top-p it keeps the same set at every temperature, because
+ * temperature scales the gap to the mode and the spread alike.  The spread is
+ * of the whole vocabulary, so it is taken before top-k narrows anything; after
+ * that it is a threshold against the mode exactly as min-p is, and the two
+ * share one pass -- whichever is stricter decides.
  *
  * The full vocabulary is 248320 entries and sorting it costs more than a decode
  * step can spare, so nothing is sorted until the distribution has been pruned.
@@ -82,16 +91,46 @@ static int32_t qw_top_k(const float *logits, int32_t n, int32_t k, int32_t *top)
     return k;
 }
 
+/* Logits at or below this are masked rather than scored -- the tool-call
+ * constraint in qwasar_sessions.c writes -1e30 -- and stay out of the spread.
+ * A comparison, not isinf: the build is -ffast-math. */
+#define QW_LOGIT_MASKED (-1e29f)
+
+/* The unnormalised weight exp((l - max) / T) a candidate must reach: min-p's
+ * threshold, or top-n-sigma's l >= max - n*sigma in the same terms, whichever
+ * is higher.  0 when neither is on. */
+static float qw_keep_threshold(const float *logits, int32_t n, const qwasar_sampling *sp,
+                               float inv_t) {
+    float keep = sp->min_p > 0.0f ? sp->min_p : 0.0f;
+    if (sp->top_n_sigma > 0.0f) {
+        double sum = 0.0, sq = 0.0;
+        int32_t live = 0;
+        for (int32_t i = 0; i < n; i++) {
+            if (logits[i] <= QW_LOGIT_MASKED) continue;
+            sum += logits[i];
+            sq += (double)logits[i] * logits[i];
+            live++;
+        }
+        if (live > 1) {
+            const double mean = sum / live, var = sq / live - mean * mean;
+            const double sigma = var > 0.0 ? sqrt(var) : 0.0;
+            const float w = (float)exp(-(double)sp->top_n_sigma * sigma * inv_t);
+            if (w > keep) keep = w;
+        }
+    }
+    return keep;
+}
+
 static int32_t qw_filter(const float *logits, int32_t n, const qwasar_sampling *sp,
                          float max_logit, qw_cand **out) {
     const float inv_t = 1.0f / sp->temperature;
+    const float keep = qw_keep_threshold(logits, n, sp, inv_t);
     /* With top_k -- the model's own defaults set 20 -- only the k largest
      * logits can survive, and min_p and top_p only ever keep a prefix of
      * that ranking, so the vocabulary is never weighted or sorted whole:
      * one pass with a k-heap, then the k.  Sorting all 248K candidates, as
      * below, was ~15 ms of every sampled token. */
     if (sp->top_k > 0 && sp->top_k < n) {
-        const float keep = sp->min_p > 0.0f ? sp->min_p : 0.0f;
         int32_t *top = malloc((size_t)sp->top_k * sizeof *top);
         qw_cand *cand = malloc((size_t)sp->top_k * sizeof *cand);
         *out = cand;
@@ -122,7 +161,6 @@ static int32_t qw_filter(const float *logits, int32_t n, const qwasar_sampling *
     /* Prune before ordering.  exp(x - max) is 1 at the mode, so a candidate is
      * kept when its unnormalised weight clears min_p; that is the same test as
      * against the normalised max probability, without needing the sum yet. */
-    const float keep = sp->min_p > 0.0f ? sp->min_p : 0.0f;
     qw_cand *cand = malloc((size_t)n * sizeof *cand);
     *out = cand;
     if (!cand) return -1;
@@ -163,6 +201,7 @@ void qwasar_sampling_defaults(qwasar_sampling *sp) {
     sp->top_k = 20;
     sp->top_p = 0.95f;
     sp->min_p = 0.0f;
+    sp->top_n_sigma = 0.0f;
     sp->presence_penalty = -1.0f;   /* resolved against the model by the caller */
     sp->seed = 0;
 }
@@ -199,6 +238,15 @@ void qwasar_presence_free(qwasar_presence *p) {
     p->n = 0;
 }
 
+/* Whether any filter is on, given `n` live logits: off, every entry point
+ * takes the streaming no-filter path, so they share the same law. */
+static bool qw_filtering(const qwasar_sampling *sp, int32_t n) {
+    return (sp->top_k > 0 && sp->top_k < n)
+        || (sp->top_p > 0.0f && sp->top_p < 1.0f)
+        || (sp->min_p > 0.0f)
+        || (sp->top_n_sigma > 0.0f);
+}
+
 int32_t qwasar_sample(const float *logits, int32_t n, const qwasar_sampling *sp,
                       uint64_t *rng) {
     if (n <= 0) return 0;
@@ -215,11 +263,7 @@ int32_t qwasar_sample(const float *logits, int32_t n, const qwasar_sampling *sp,
     for (int32_t i = 1; i < n; i++) if (logits[i] > max_logit) max_logit = logits[i];
 
     const float inv_t = 1.0f / sp->temperature;
-    const bool filtering = (sp->top_k > 0 && sp->top_k < n)
-                        || (sp->top_p > 0.0f && sp->top_p < 1.0f)
-                        || (sp->min_p > 0.0f);
-
-    if (!filtering) {
+    if (!qw_filtering(sp, n)) {
         /* Sample straight from the unsorted distribution: two passes, no
          * allocation, no ordering. */
         double sum = 0.0;
@@ -254,14 +298,6 @@ int32_t qwasar_sample(const float *logits, int32_t n, const qwasar_sampling *sp,
 }
 
 float qwasar_rng_uniform(uint64_t *state) { return qw_rng_float(state); }
-
-/* Whether any filter is on, given `n` live logits.  Mirrors the test in
- * qwasar_sample so the streaming no-filter path stays shared behaviour. */
-static bool qw_filtering(const qwasar_sampling *sp, int32_t n) {
-    return (sp->top_k > 0 && sp->top_k < n)
-        || (sp->top_p > 0.0f && sp->top_p < 1.0f)
-        || (sp->min_p > 0.0f);
-}
 
 float qwasar_sample_prob(const float *logits, int32_t n,
                          const qwasar_sampling *sp, int32_t token) {

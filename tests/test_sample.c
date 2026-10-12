@@ -192,12 +192,26 @@ static void exact_dist(const float *v, int32_t n, const qwasar_sampling *sp,
                        double *p) {
     float mx = v[0];
     for (int32_t i = 1; i < n; i++) if (v[i] > mx) mx = v[i];
+    /* top-n-sigma in its own terms -- a logit floor below the mode, over the
+     * spread of the unmasked logits -- rather than the sampler's weights. */
+    double floor_logit = -1e300;
+    if (sp->top_n_sigma > 0.0f) {
+        double sum = 0.0, sq = 0.0;
+        int32_t live = 0;
+        for (int32_t i = 0; i < n; i++) {
+            if (v[i] <= -1e29f) continue;
+            sum += v[i]; sq += (double)v[i] * v[i]; live++;
+        }
+        const double mean = sum / live;
+        floor_logit = mx - sp->top_n_sigma * sqrt(sq / live - mean * mean);
+    }
     typedef struct { int32_t id; double w; } ent;
     ent e[256];
     int32_t m = 0;
     for (int32_t i = 0; i < n; i++) {
         double w = exp((double)(v[i] - mx) / (double)sp->temperature);
         if (sp->min_p > 0.0 && w < (double)sp->min_p) continue;
+        if ((double)v[i] < floor_logit) continue;
         e[m].id = i; e[m].w = w; m++;
     }
     for (int32_t i = 0; i < m; i++)          /* insertion sort, descending */
@@ -220,6 +234,93 @@ static void exact_dist(const float *v, int32_t n, const qwasar_sampling *sp,
     for (int32_t i = 0; i < m; i++) total += e[i].w;
     for (int32_t i = 0; i < n; i++) p[i] = 0.0;
     for (int32_t i = 0; i < m; i++) p[e[i].id] = e[i].w / total;
+}
+
+/* Top-n-sigma keeps the logits within n standard deviations of the mode, and
+ * keeps the same ones at every temperature -- the property it exists for, and
+ * the one min-p, on the same logits, does not have.  Checked exactly through
+ * qwasar_sample_prob against brute force, on both of qw_filter's paths (with
+ * and without top-k), then by drawing. */
+static void test_top_n_sigma(void) {
+    const int32_t n = 200;
+    float v[201];
+    /* A noise floor, plus a few tokens standing clear of it.  The spread of
+     * this vocabulary is ~0.83, so n = 1 keeps logits above ~5.18: ids 7, 3
+     * and 9, not 1 -- none within 0.1 of the floor, so float rounding in the
+     * sampler's weight test cannot move one across it. */
+    for (int32_t i = 0; i < n; i++) v[i] = -0.5f + 0.004f * (float)((i * 37) % 200) * 0.25f;
+    v[7] = 6.0f; v[3] = 5.6f; v[9] = 5.35f; v[1] = 4.9f;
+
+    qwasar_sampling sp;
+    qwasar_sampling_defaults(&sp);
+    sp.top_p = 1.0f;
+    sp.top_n_sigma = 1.0f;
+
+    const float temps[] = { 0.3f, 1.0f, 4.0f };
+    for (int path = 0; path < 2; path++) {
+        sp.top_k = path ? 20 : 0;
+        for (size_t t = 0; t < sizeof temps / sizeof *temps; t++) {
+            sp.temperature = temps[t];
+            double p[201];
+            exact_dist(v, n, &sp, p);
+            int32_t support = 0;
+            for (int32_t i = 0; i < n; i++) {
+                const float got = qwasar_sample_prob(v, n, &sp, i);
+                CHECK(fabs((double)got - p[i]) < 1e-5, "T=%.1f top_k=%d prob(%d): %g vs %g",
+                      (double)temps[t], sp.top_k, i, (double)got, p[i]);
+                support += got > 0.0f;
+            }
+            CHECK(support == 3 && p[7] > 0 && p[3] > 0 && p[9] > 0,
+                  "T=%.1f top_k=%d: support %d, want exactly ids 7, 3, 9",
+                  (double)temps[t], sp.top_k, support);
+        }
+    }
+
+    /* min-p on the same logits widens as the temperature rises: 3 tokens at
+     * T=0.3, the whole vocabulary at T=4.  Asserted so the comparison above
+     * means something. */
+    qwasar_sampling mp;
+    qwasar_sampling_defaults(&mp);
+    mp.top_k = 0; mp.top_p = 1.0f; mp.min_p = 0.1f;
+    int32_t cold = 0, hot = 0;
+    mp.temperature = 0.3f;
+    for (int32_t i = 0; i < n; i++) cold += qwasar_sample_prob(v, n, &mp, i) > 0.0f;
+    mp.temperature = 4.0f;
+    for (int32_t i = 0; i < n; i++) hot += qwasar_sample_prob(v, n, &mp, i) > 0.0f;
+    CHECK(cold < hot, "min-p should widen with temperature (%d vs %d)", cold, hot);
+
+    /* Masked logits -- the tool-call constraint writes -1e30 -- stay out of
+     * the spread: masking the tail changes nothing about who survives. */
+    sp.top_k = 0;
+    sp.temperature = 1.0f;
+    float masked[201];
+    memcpy(masked, v, sizeof v);
+    masked[n] = -1e30f;
+    masked[n - 1] = -1e30f;
+    double pm[201], pv[201];
+    exact_dist(masked, n + 1, &sp, pm);
+    exact_dist(v, n, &sp, pv);
+    for (int32_t i = 0; i < n + 1; i++) {
+        const float got = qwasar_sample_prob(masked, n + 1, &sp, i);
+        CHECK(fabs((double)got - pm[i]) < 1e-5, "masked prob(%d): %g vs %g", i, (double)got, pm[i]);
+        CHECK((got > 0.0f) == (i < n - 1 && pv[i] > 0.0),
+              "masking changed whether id %d survives", i);
+    }
+
+    /* Draws come only from the support, in its proportions. */
+    sp.temperature = 1.5f;
+    double p[201];
+    exact_dist(v, n, &sp, p);
+    uint64_t rng = 31337;
+    const int32_t N = 200000;
+    int32_t counts[200] = {0};
+    for (int32_t i = 0; i < N; i++) counts[qwasar_sample(v, n, &sp, &rng)]++;
+    double tv = 0.0;
+    for (int32_t i = 0; i < n; i++) tv += fabs((double)counts[i] / N - p[i]);
+    CHECK(0.5 * tv < 0.005, "top_n_sigma draws: total variation %g", 0.5 * tv);
+
+    printf("  top_n_sigma=1           keeps 7, 3, 9 at T=0.3, 1 and 4; "
+           "min-p goes %d -> %d\n", cold, hot);
 }
 
 /* The property the sampled verify stands on: accept a point-mass proposal
@@ -337,6 +438,7 @@ int main(void) {
     test_seed_reproducibility();
     test_edges();
     test_rejection_law();
+    test_top_n_sigma();
     test_presence();
     if (fails) { fprintf(stderr, "%d check(s) failed\n", fails); return 1; }
     printf("ok: sample\n");

@@ -216,7 +216,7 @@ session).
   "text": "What does qw_edit_apply do?",
   "images": [ {"kind": "image", "media_type": "image/png", "data": "<base64>"} ],
   "sampling": {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0,
-               "presence_penalty": 0, "seed": 0},
+               "top_n_sigma": 0, "presence_penalty": 0, "seed": 0},
   "max_tokens": 32768
 }
 ```
@@ -229,6 +229,10 @@ fields take the model's own generation defaults, `seed` 0 means the clock.
 the step has already produced (control tokens such as `<tool_call>` are
 exempt); absent, it is 1.5 for the small Qwen3.5 models, whose reasoning
 otherwise tends to loop, and 0 for the rest.
+`top_n_sigma` keeps only tokens whose logit is within that many standard
+deviations of the largest (arXiv 2411.07641) -- the same set at any
+temperature, so it is the filter to pair with a high one; 0, the default, is
+off, and 1 is the paper's suggestion.
 `max_tokens` bounds this step's generation (reasoning included); absent
 means the room the window has left.
 

@@ -220,7 +220,7 @@ streams prefill progress. Sessions live on the server, survive its restarts,
 and park to checkpoints on disk.
 
 Both compat endpoints take `temperature`, `top_p`, `top_k`, `min_p`,
-`presence_penalty`, `seed`, `max_tokens`, `stream`, and `tools`; the default
+`top_n_sigma`, `presence_penalty`, `seed`, `max_tokens`, `stream`, and `tools`; the default
 sampling is the model's own generation config, plus a presence penalty of 1.5
 for the 9B (0 for the others). The OpenAI one also honours `stop`, `tool_choice` (`none`,
 `auto`, `required`, or a named function), and
@@ -492,7 +492,7 @@ qwasar_toolcall.c   tool-call parsing and the line-anchored edit matcher
 qwasar_cpu.c        scalar fp32 reference twins for every kernel
 qwasar_metal.m      Metal runtime: device, library, pipelines, dispatch
 qwasar_vision.c     the vision tower; qwasar_image.c and qwasar_video.m decode
-qwasar_sample.c     temperature, top-k, top-p and min-p sampling
+qwasar_sample.c     temperature, top-k, top-p, min-p and top-n-sigma sampling
 qwasar_cli.c        ./qwasar
 qwasar_server.c     ./qwasar-server, and its OpenAI and Anthropic endpoints
 qwasar_api.c        the Session API's endpoints (API.md)
