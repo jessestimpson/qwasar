@@ -7,10 +7,12 @@
  * under 4 at 64K -- almost all of it this kernel.
  *
  * Here a threadgroup takes BQ query rows of one head and walks the keys BK at
- * a time, so each K and V block is read once for BQ queries:
+ * a time (32 and 128; qwasar_gpu.h has the measurements), so each K and V
+ * block is read once for BQ queries:
  *
  *   S = Q K^T             matmul2d into threadgroup memory (BQ x BK, float)
- *   online softmax        per row: running max m and sum l, the block's
+ *   online softmax        per row, over QW_FA_SPLIT threads: running max m
+ *                         and sum l, the block's
  *                         weights written over S in place, and the factor
  *                         alpha = exp(m_old - m_new) the output is rescaled by
  *   O = alpha O + P V     matmul2d accumulating into a cooperative tensor
@@ -26,9 +28,11 @@
 
 #ifndef QW_FA_BQ
 #define QW_FA_BQ 32
-#define QW_FA_BK 32
+#define QW_FA_BK 128
 #define QW_FA_SG 4
 #endif
+/* Threads per row in the softmax step: all of them, BQ rows to SG*32. */
+#define QW_FA_SPLIT ((QW_FA_SG * 32) / QW_FA_BQ)
 #define QW_FA_D  256
 
 struct qw_fa_args {
@@ -94,29 +98,33 @@ kernel void qw_attn_prefill_tensor(
         qk.run(q0, kb, St);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        /* One thread a row: the block's max, the weights, the rescale. */
-        if (tid < QW_FA_BQ) {
-            const uint r = r0 + tid;
-            threadgroup float *row = S + tid * QW_FA_BK;
-            if (r < a.rows) {
-                /* Not -INFINITY: fast-math may assume there are none. */
-                const int last = (int)(a.base_pos + r);     /* the last key this row sees */
-                const int live = min((int)QW_FA_BK, last - (int)k0 + 1);
-                float mx = m_run[tid];
-                for (int j = 0; j < live; ++j) mx = max(mx, row[j] * a.scale);
-                const float al = exp(m_run[tid] - mx);
-                float sum = 0.0f;
-                for (int j = 0; j < (int)QW_FA_BK; ++j) {
+        /* QW_FA_SPLIT threads a row, adjacent lanes of one simdgroup, each
+         * taking every QW_FA_SPLIT-th key: the block's max and sum are
+         * shuffled across the group, and its first thread keeps the row's
+         * running state. */
+        {
+            const uint rr = tid / QW_FA_SPLIT, part = tid % QW_FA_SPLIT;
+            const uint r = r0 + rr;
+            threadgroup float *row = S + rr * QW_FA_BK;
+            const bool valid = rr < QW_FA_BQ && r < a.rows;
+            /* Not -INFINITY: fast-math may assume there are none. */
+            const int live = valid ? min((int)QW_FA_BK, (int)(a.base_pos + r) - (int)k0 + 1) : 0;
+            const float m_old = valid ? m_run[rr] : -FLT_MAX;
+            float mx = m_old;
+            for (int j = (int)part; j < live; j += QW_FA_SPLIT) mx = max(mx, row[j] * a.scale);
+            for (uint o = 1; o < QW_FA_SPLIT; o <<= 1) mx = max(mx, simd_shuffle_xor(mx, (ushort)o));
+            float sum = 0.0f;
+            if (rr < QW_FA_BQ)
+                for (int j = (int)part; j < (int)QW_FA_BK; j += QW_FA_SPLIT) {
                     const float p = j < live ? exp(row[j] * a.scale - mx) : 0.0f;
                     row[j] = p;
                     sum += p;
                 }
-                m_run[tid] = mx;
-                l_run[tid] = l_run[tid] * al + sum;
-                alpha[tid] = al;
-            } else {
-                for (int j = 0; j < (int)QW_FA_BK; ++j) row[j] = 0.0f;
-                alpha[tid] = 1.0f;
+            for (uint o = 1; o < QW_FA_SPLIT; o <<= 1) sum += simd_shuffle_xor(sum, (ushort)o);
+            if (rr < QW_FA_BQ && part == 0) {
+                const float al = valid ? exp(m_old - mx) : 1.0f;
+                if (valid) { m_run[rr] = mx; l_run[rr] = l_run[rr] * al + sum; }
+                alpha[rr] = al;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -409,9 +409,14 @@ void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
                 int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale);
 
 /* Tiling for qw_attn_prefill_tensor, injected into its compile: BQ query rows
- * by BK keys per step, SG simdgroups sharing each op. */
+ * by BK keys per step, SG simdgroups sharing each op.  Measured on an M4, a
+ * 256-row chunk 32K deep, 16 layers: BK 32 -> 64 -> 128 took it 1.66 -> 1.57
+ * -> 1.35 s, and spreading the softmax over every thread rather than one a
+ * row to 1.17 s (2.8 TFLOP/s).  BQ 64 was slower at every BK (1.95-2.23 s),
+ * BQ 16 worse with depth, and 8 simdgroups no different from 4.  BK 256 does
+ * not fit: the score tile alone would be 32 KB. */
 #define QW_FA_BQ 32
-#define QW_FA_BK 32
+#define QW_FA_BK 128
 #define QW_FA_SG 4
 #define QW_FA_MIN_ROWS 16
 #define QW_ATTN_GQA 6
