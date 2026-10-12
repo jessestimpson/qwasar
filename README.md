@@ -220,7 +220,7 @@ streams prefill progress. Sessions live on the server, survive its restarts,
 and park to checkpoints on disk.
 
 Both compat endpoints take `temperature`, `top_p`, `top_k`, `min_p`,
-`top_n_sigma`, `presence_penalty`, `seed`, `max_tokens`, `stream`, and `tools`; the default
+`top_n_sigma`, `thinking_budget` (Anthropic's `thinking.budget_tokens` too), `presence_penalty`, `seed`, `max_tokens`, `stream`, and `tools`; the default
 sampling is the model's own generation config, plus a presence penalty of 1.5
 for the 9B (0 for the others). The OpenAI one also honours `stop`, `tool_choice` (`none`,
 `auto`, `required`, or a named function), and

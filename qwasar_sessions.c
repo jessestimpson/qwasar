@@ -963,6 +963,48 @@ static const float *force_call(qw_store *st, qw_sess *s, bool after_think, const
     return logits;
 }
 
+/* Closes a reasoning block that has spent its budget, the way Qwen3's
+ * thinking budget does (Qwen3 technical report, arXiv 2505.09388, 4.3): the
+ * sentence, </think>, and the blank line the chat template puts after it.
+ * Qwen reports the model answers sensibly from reasoning cut off this way,
+ * an ability it says came from merging the thinking and non-thinking modes
+ * rather than from training for it.  The report's own text has a full stop
+ * after </think>; the template does not, and nothing the model sees in
+ * training puts one there, so this follows the template.  A paragraph break
+ * comes first, because the cut falls wherever the count does, often
+ * mid-sentence.  The sentence is shown as the reasoning's last words; the
+ * blank line after </think> is structure, as in force_call. */
+static const float *cap_thinking(qw_store *st, qw_sess *s, int32_t think_close, channel *rc,
+                                 qw_delta_fn on_delta, void *ud, qw_genres *out,
+                                 char *err, size_t cap) {
+    static const char note[] =
+        "\n\nConsidering the limited time by the user, I have to give the solution "
+        "based on the thinking directly now.\n";
+    int32_t n_note = 0, n_gap = 0;
+    int32_t *nt = qwasar_encode(st->tok, note, &n_note);
+    int32_t *gap = qwasar_encode(st->tok, "\n\n", &n_gap);
+    int32_t *ids = malloc(sizeof *ids * (size_t)(n_note + 1 + n_gap));
+    const float *logits = NULL;
+    if (ids && nt && gap) {
+        int32_t n = 0;
+        for (int32_t i = 0; i < n_note; i++) ids[n++] = nt[i];
+        ids[n++] = think_close;
+        for (int32_t i = 0; i < n_gap; i++) ids[n++] = gap[i];
+        str_puts(&out->reasoning, note);
+        str_puts(&rc->shown, note);
+        chan_send(rc, true, rc->shown.len, on_delta, ud);
+        out->n_gen += n;
+        out->n_reasoning += n_note;
+        out->thinking_capped = true;
+        logits = qwasar_session_eval(s->h, ids, n, err, cap);
+        if (logits && !s->compat && !s->aside) tokens_append(s, ids, n);
+    } else {
+        snprintf(err, cap, "out of memory");
+    }
+    free(ids); free(nt); free(gap);
+    return logits;
+}
+
 void qw_genres_free(qw_genres *g) { str_free(&g->text); str_free(&g->reasoning); }
 
 bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sampling *sp,
@@ -1003,6 +1045,12 @@ bool qw_generate(qw_store *st, qw_sess *s, const float *logits, const qwasar_sam
     }
 
     for (int32_t i = 0; i < max_tokens; i++) {
+        if (reasoning && sp->thinking_budget > 0 && out->n_reasoning >= sp->thinking_budget
+            && think_close >= 0) {
+            logits = cap_thinking(st, s, think_close, &rc, on_delta, ud, out, err, cap);
+            if (!logits) { ok = false; break; }
+            reasoning = false;
+        }
         if (go->tools == QW_TOOLS_FORCE && !reasoning && !forced) {
             forced = in_call = true;
             logits = force_call(st, s, thinking, go->force_name, call_open, out, err, cap);
@@ -1714,6 +1762,9 @@ static bool run_step(qw_store *st, qw_sess *s, int32_t *fresh, int32_t n_fresh,
     }
     if (g.call_in_reasoning)
         qw_log("  %s: step %d: a tool call opened inside the reasoning block; read as its end", s->id, s->step);
+    if (g.thinking_capped)
+        qw_log("  %s: step %d: reasoning reached its %d-token budget and was closed", s->id, s->step,
+               sp->thinking_budget);
     if (st->verbose)
         qw_log("  %s: step %d: %d tokens prefilled in %.2fs, %d generated in %.2fs (%.1f tok/s), %s",
                s->id, s->step, n_fresh, prefill_s, g.n_gen, decode_s,

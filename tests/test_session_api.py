@@ -294,6 +294,26 @@ class Steps(unittest.TestCase):
         for r in find(ev2, "reasoning"):
             self.assertGreaterEqual(r["tokens"], 1)
 
+    def test_thinking_budget_closes_the_reasoning(self):
+        # At the budget the server writes Qwen3's own closing sentence and
+        # </think>, and the step goes on as the answer.  Greedy and a budget
+        # of 4, so the toy cannot close its reasoning first.
+        sid = SRV.open()
+        status, ev = SRV.stream("POST", f"/v1/sessions/{sid}/turn",
+                                {"text": "List the files.", "max_tokens": 40,
+                                 "sampling": {"temperature": 0, "thinking_budget": 4}})
+        self.assertEqual(status, 200)
+        reasoning = "".join(r["text"] for r in find(ev, "reasoning"))
+        self.assertTrue(reasoning.rstrip().endswith(
+            "I have to give the solution based on the thinking directly now."), reasoning)
+        done = ev[-1][2]
+        self.assertGreater(done["usage"]["generated"], done["usage"]["reasoning"])
+        # Without a budget the same step is not closed for it.
+        sid2 = SRV.open()
+        _, ev2 = SRV.stream("POST", f"/v1/sessions/{sid2}/turn",
+                            {"text": "List the files.", "max_tokens": 40, "sampling": {"temperature": 0}})
+        self.assertNotIn("directly now", "".join(r["text"] for r in find(ev2, "reasoning")))
+
     def test_shared_prefix_is_read_by_the_next_session(self):
         a = SRV.open()
         SRV.stream("POST", f"/v1/sessions/{a}/turn", dict(FAST, text="one"))

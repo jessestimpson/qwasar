@@ -445,6 +445,11 @@ static void read_sampling(qwasar_sampling *sp, const qj_doc *d, const qj_node *r
     if ((n = qj_get(d, root, "top_k")) && n->type == QJ_NUMBER) sp->top_k = (int32_t)n->u.num;
     if ((n = qj_get(d, root, "min_p")) && n->type == QJ_NUMBER) sp->min_p = (float)n->u.num;
     if ((n = qj_get(d, root, "top_n_sigma")) && n->type == QJ_NUMBER) sp->top_n_sigma = (float)n->u.num;
+    /* Anthropic's thinking.budget_tokens, which is what it means there too;
+     * thinking_budget at the top level for OpenAI-shaped clients. */
+    const qj_node *th = qj_get(d, root, "thinking");
+    if ((n = qj_get(d, th, "budget_tokens")) && n->type == QJ_NUMBER) sp->thinking_budget = (int32_t)n->u.num;
+    if ((n = qj_get(d, root, "thinking_budget")) && n->type == QJ_NUMBER) sp->thinking_budget = (int32_t)n->u.num;
     if ((n = qj_get(d, root, "presence_penalty")) && n->type == QJ_NUMBER) sp->presence_penalty = (float)n->u.num;
     if ((n = qj_get(d, root, "seed")) && n->type == QJ_NUMBER) sp->seed = (uint64_t)n->u.num;
 }

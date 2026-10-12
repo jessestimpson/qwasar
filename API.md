@@ -216,7 +216,7 @@ session).
   "text": "What does qw_edit_apply do?",
   "images": [ {"kind": "image", "media_type": "image/png", "data": "<base64>"} ],
   "sampling": {"temperature": 1.0, "top_k": 20, "top_p": 0.95, "min_p": 0,
-               "top_n_sigma": 0, "presence_penalty": 0, "seed": 0},
+               "top_n_sigma": 0, "presence_penalty": 0, "thinking_budget": 0, "seed": 0},
   "max_tokens": 32768
 }
 ```
@@ -233,6 +233,11 @@ otherwise tends to loop, and 0 for the rest.
 deviations of the largest (arXiv 2411.07641) -- the same set at any
 temperature, so it is the filter to pair with a high one; 0, the default, is
 off, and 1 is the paper's suggestion.
+`thinking_budget` caps the step's reasoning: at that many reasoning tokens the
+server closes the block itself, writing the sentence Qwen3 was trained to
+answer from ("Considering the limited time by the user, I have to give the
+solution based on the thinking directly now.") and `</think>`, and the step
+goes on as the answer or a tool call; 0, the default, is no cap.
 `max_tokens` bounds this step's generation (reasoning included); absent
 means the room the window has left.
 

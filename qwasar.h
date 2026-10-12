@@ -315,6 +315,11 @@ typedef struct {
      * (qwasar_default_presence_penalty).  Not read by qwasar_sample: the
      * generation loop, which knows the reply, applies it to the logits first. */
     float    presence_penalty;
+    /* Reasoning tokens a step may spend before the server closes its <think>
+     * block for it, with the sentence Qwen3 was trained to answer from (its
+     * technical report, arXiv 2505.09388, section 4.3); 0 = no cap.  Like
+     * presence_penalty, read by the generation loop, not by qwasar_sample. */
+    int32_t  thinking_budget;
     uint64_t seed;
 } qwasar_sampling;
 

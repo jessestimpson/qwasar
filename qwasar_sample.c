@@ -202,6 +202,7 @@ void qwasar_sampling_defaults(qwasar_sampling *sp) {
     sp->top_p = 0.95f;
     sp->min_p = 0.0f;
     sp->top_n_sigma = 0.0f;
+    sp->thinking_budget = 0;
     sp->presence_penalty = -1.0f;   /* resolved against the model by the caller */
     sp->seed = 0;
 }
