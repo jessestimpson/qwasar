@@ -56,8 +56,23 @@ enum SettingsOverlaySuite {
                             "the model list splits and trims")
         f += TestMain.check(SettingsKey.agentModels.set("", on: &o) == nil && o.agentModels == [],
                             "empty string sets the explicit OFF")
+        f += TestMain.check(SettingsKey.topNSigma.set("1", on: &o) == nil && o.topNSigma == 1,
+                            "top_n_sigma parses")
+        f += TestMain.check(SettingsKey.topNSigma.set("-1", on: &o) != nil && o.topNSigma == 1,
+                            "a negative top_n_sigma is refused and changes nothing")
+        let sigmaOff = SessionSettings.resolve(global: SettingsOverlay(topNSigma: 1), project: nil,
+                                               session: SettingsOverlay(topNSigma: 0))
+        f += TestMain.check(sigmaOff.topNSigma == 0, "a session's 0 turns top_n_sigma off over a global 1")
+        f += TestMain.check(SessionSettings.defaults.topNSigma == 0,
+                            "top_n_sigma is off unless set: the model's own sampling")
+        f += TestMain.check(QwasarClient.sampling(temperature: nil, topNSigma: 0) == nil,
+                            "nothing set sends no sampling object")
+        f += TestMain.check(QwasarClient.sampling(temperature: nil, topNSigma: 1.5)?["top_n_sigma"] as? Double == 1.5
+                            && QwasarClient.sampling(temperature: nil, topNSigma: 1.5)?["temperature"] == nil,
+                            "top_n_sigma alone sends only top_n_sigma")
         SettingsKey.toolTimeoutSeconds.clear(on: &o)
         SettingsKey.agentModels.clear(on: &o)
+        SettingsKey.topNSigma.clear(on: &o)
         f += TestMain.check(o.isEmpty, "clearing every set key leaves an empty layer")
 
         // Records from when sessions could run in a VM still decode: the

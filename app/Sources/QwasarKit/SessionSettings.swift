@@ -28,18 +28,24 @@ public struct SettingsOverlay: Codable, Sendable, Equatable, Hashable {
     public var agentBudgetUSD: Double?
     /// Ceiling per single delegation, USD.
     public var agentTurnBudgetUSD: Double?
+    /// Top-n-sigma sampling (API.md §4.4): keep the tokens whose logit is
+    /// within this many standard deviations of the largest.  0 is off -- an
+    /// opinion, where nil is silence.
+    public var topNSigma: Double?
 
     public init(toolTimeoutSeconds: Int? = nil, agentModels: [String]? = nil,
-                agentBudgetUSD: Double? = nil, agentTurnBudgetUSD: Double? = nil) {
+                agentBudgetUSD: Double? = nil, agentTurnBudgetUSD: Double? = nil,
+                topNSigma: Double? = nil) {
         self.toolTimeoutSeconds = toolTimeoutSeconds
         self.agentModels = agentModels
         self.agentBudgetUSD = agentBudgetUSD
         self.agentTurnBudgetUSD = agentTurnBudgetUSD
+        self.topNSigma = topNSigma
     }
 
     public var isEmpty: Bool {
         toolTimeoutSeconds == nil && agentModels == nil && agentBudgetUSD == nil
-            && agentTurnBudgetUSD == nil
+            && agentTurnBudgetUSD == nil && topNSigma == nil
     }
 }
 
@@ -50,6 +56,7 @@ public enum SettingsKey: String, CaseIterable, Sendable {
     case agentModels = "delegate_models"
     case agentBudgetUSD = "delegate_budget_usd"
     case agentTurnBudgetUSD = "delegate_turn_budget_usd"
+    case topNSigma = "top_n_sigma"
 
     public var doc: String {
         switch self {
@@ -58,6 +65,9 @@ public enum SettingsKey: String, CaseIterable, Sendable {
             return "remote model ids `delegate` may use (spec §15); comma-separated, empty string for explicitly OFF"
         case .agentBudgetUSD: return "delegation ceiling per session, USD (default 5.00)"
         case .agentTurnBudgetUSD: return "delegation ceiling per single delegation, USD (default 1.00)"
+        case .topNSigma:
+            return "top-n-sigma sampling: keep only tokens whose logit is within n standard deviations of the top one, "
+                + "the same tokens at any temperature; 0 is off (default), 1 is the paper's suggestion"
         }
     }
 
@@ -82,6 +92,10 @@ public enum SettingsKey: String, CaseIterable, Sendable {
             guard let d = Double(value.trimmingCharacters(in: .whitespaces)),
                   (0...1000).contains(d) else { return "delegate_turn_budget_usd needs a number in 0...1000" }
             overlay.agentTurnBudgetUSD = d
+        case .topNSigma:
+            guard let d = Double(value.trimmingCharacters(in: .whitespaces)),
+                  (0...10).contains(d) else { return "top_n_sigma needs a number in 0...10 (0 is off)" }
+            overlay.topNSigma = d
         }
         return nil
     }
@@ -92,6 +106,7 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .agentModels: overlay.agentModels = nil
         case .agentBudgetUSD: overlay.agentBudgetUSD = nil
         case .agentTurnBudgetUSD: overlay.agentTurnBudgetUSD = nil
+        case .topNSigma: overlay.topNSigma = nil
         }
     }
 
@@ -101,6 +116,7 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .agentModels: return overlay.agentModels.map { $0.isEmpty ? "(explicitly off)" : $0.joined(separator: ", ") }
         case .agentBudgetUSD: return overlay.agentBudgetUSD.map { String(format: "%.2f", $0) }
         case .agentTurnBudgetUSD: return overlay.agentTurnBudgetUSD.map { String(format: "%.2f", $0) }
+        case .topNSigma: return overlay.topNSigma.map { String(format: "%g", $0) }
         }
     }
 }
@@ -113,11 +129,14 @@ public struct SessionSettings: Sendable, Equatable {
     public var agentModels: [String]
     public var agentBudgetUSD: Double
     public var agentTurnBudgetUSD: Double
+    /// 0 = off: the model's own sampling, as before this setting existed.
+    public var topNSigma: Double
 
     public static let defaults = SessionSettings(toolTimeoutSeconds: 180,
                                                  agentModels: [],
                                                  agentBudgetUSD: 5.0,
-                                                 agentTurnBudgetUSD: 1.0)
+                                                 agentTurnBudgetUSD: 1.0,
+                                                 topNSigma: 0)
 
     public enum Layer: String, Sendable { case session, project, global, builtin = "built-in" }
 
@@ -131,7 +150,8 @@ public struct SessionSettings: Sendable, Equatable {
             toolTimeoutSeconds: pick({ $0.toolTimeoutSeconds }, defaults.toolTimeoutSeconds),
             agentModels: pick({ $0.agentModels }, defaults.agentModels),
             agentBudgetUSD: pick({ $0.agentBudgetUSD }, defaults.agentBudgetUSD),
-            agentTurnBudgetUSD: pick({ $0.agentTurnBudgetUSD }, defaults.agentTurnBudgetUSD))
+            agentTurnBudgetUSD: pick({ $0.agentTurnBudgetUSD }, defaults.agentTurnBudgetUSD),
+            topNSigma: pick({ $0.topNSigma }, defaults.topNSigma))
     }
 
     /// Which layer decided `key`, for display.

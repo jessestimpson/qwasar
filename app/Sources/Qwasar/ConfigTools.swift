@@ -408,7 +408,8 @@ extension AppState {
                 out.append("  session \(s.title) [\(s.id.uuidString)]: layer \(describe(s.sandbox))")
                 out.append("    effective: timeout=\(eff.toolTimeoutSeconds)s "
                          + "agent=[\(eff.agentModels.joined(separator: ", "))] "
-                         + String(format: "spent=$%.4f of $%.2f", s.spentUSD ?? 0, eff.agentBudgetUSD))
+                         + String(format: "spent=$%.4f of $%.2f ", s.spentUSD ?? 0, eff.agentBudgetUSD)
+                         + "top_n_sigma=\(eff.topNSigma > 0 ? String(format: "%g", eff.topNSigma) : "off")")
                 out.append("    provenance: \(prov)")
             }
         }
@@ -419,6 +420,6 @@ extension AppState {
         let d = SessionSettings.defaults
         return SettingsOverlay(toolTimeoutSeconds: d.toolTimeoutSeconds, agentModels: d.agentModels,
                                agentBudgetUSD: d.agentBudgetUSD,
-                               agentTurnBudgetUSD: d.agentTurnBudgetUSD)
+                               agentTurnBudgetUSD: d.agentTurnBudgetUSD, topNSigma: d.topNSigma)
     }
 }

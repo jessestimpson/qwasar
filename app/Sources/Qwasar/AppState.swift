@@ -976,7 +976,10 @@ final class AppState {
             }
             var stats = TurnStats()
             stats.contextLimit = contextLimit
-            var stream = client.turn(sid, text: promptText, maxTokens: budget)
+            // Sampling the user has set (top_n_sigma); otherwise the model's own.
+            let topNSigma = SessionSettings.resolve(global: globalSettings, project: p.overlay,
+                                                    session: rec.sandbox).topNSigma
+            var stream = client.turn(sid, text: promptText, topNSigma: topNSigma, maxTokens: budget)
             var steps = 0
             var ended = false
             // A guard against a runaway loop, not a working limit: a long
@@ -1160,7 +1163,8 @@ final class AppState {
                                 apply(.note("the context is \(Int(fill * 100))% full; the model was told"))
                             }
                         }
-                        stream = client.continueStep(sid, results: results, maxTokens: budget)
+                        stream = client.continueStep(sid, results: results, topNSigma: topNSigma,
+                                                     maxTokens: budget)
                     case "cancelled":
                         stats.interrupted = true; ended = true
                     case "length":
