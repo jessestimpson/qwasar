@@ -29,7 +29,7 @@ CORE_OBJS  := qwasar.o qwasar_graph.o qwasar_kvstore.o qwasar_tokenizer.o qwasar
               qwasar_toolcall.o qwasar_sample.o qwasar_json.o qwasar_cpu.o \
               qwasar_image.o qwasar_video.o qwasar_vision.o qwasar_metal.o
 
-.PHONY: all clean test test-api help check-metal
+.PHONY: all clean test test-api help check-metal bench
 
 all: qwasar qwasar-agent qwasar-server
 
@@ -42,6 +42,7 @@ help:
 	@echo "  make test-api-toy  the Session API suite on the toy fixture (seconds, no real model)"
 	@echo "  make clean    remove build outputs"
 	@echo "  make check-metal  offline kernel syntax check (needs the Metal Toolchain)"
+	@echo "  make bench    benchmark tools in tools/bench (qwbench, tempmon, attnbench, fabench; sweep.py drives them)"
 
 qwasar: qwasar_cli.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -205,6 +206,20 @@ test-api-toy: qwasar-server
 	QWASAR_TEST_MODEL=tests/fixtures/flashnext-tiny-q4 PYTHONPATH=tests \
 		python3 -m unittest -v test_session_api
 
+# Benchmarks, kept out of `all`: tools/bench/sweep.py drives qwbench and
+# tempmon through a long unattended sweep; attnbench and fabench time the
+# attention kernels alone.
+BENCH_BINS := tools/bench/qwbench tools/bench/attnbench tools/bench/fabench tools/bench/tempmon
+
+bench: $(BENCH_BINS)
+
+tools/bench/qwbench tools/bench/attnbench tools/bench/fabench: tools/bench/%: tools/bench/%.c $(CORE_OBJS) qwasar.h qwasar_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(LDLIBS)
+
+# Reads SoC temperatures through IOKit's HID event system, without root.
+tools/bench/tempmon: tools/bench/tempmon.m
+	$(CC) -O2 -fobjc-arc -o $@ $< -framework Foundation -framework IOKit
+
 # Optional offline syntax check for the kernels.
 #
 # The shipping build never needs the Metal Toolchain -- kernels are compiled at
@@ -235,4 +250,4 @@ check-metal:
 	fi
 
 clean:
-	rm -f qwasar qwasar-agent qwasar-server libqwasar.a *.o tools/bin2c qwasar_metal_src.inc qwasar_metal4_src.inc .metal_check.metal $(TESTS) tests/*.o
+	rm -f qwasar qwasar-agent qwasar-server libqwasar.a *.o tools/bin2c qwasar_metal_src.inc qwasar_metal4_src.inc .metal_check.metal $(TESTS) tests/*.o $(BENCH_BINS)

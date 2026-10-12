@@ -6,6 +6,10 @@
 *.o
 *.dSYM/
 tools/bin2c
+tools/bench/qwbench
+tools/bench/attnbench
+tools/bench/fabench
+tools/bench/tempmon
 
 # compiled test binaries, but keep their sources
 tests/test_*
