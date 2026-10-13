@@ -2,6 +2,7 @@
 //
 // The suites, in order of how much they cost to run:
 //   policy     pure: which tool calls run, ask, or are refused (nothing runs)
+//   containment  Seatbelt, proven with canaries: touch and nc in a temp tree
 //   host tools a session's tools on this Mac: edit's contract, the runner, the
 //              user's shell environment (starts their login shell once)
 //   client     pure; the Session API's event stream, decoded
@@ -23,6 +24,7 @@ struct TestMain {
         var failures = 0
 
         print("== policy");     failures += ToolPolicySuite.run()
+        print("== containment"); failures += ContainmentSuite.run()
         print("== host tools"); failures += HostToolsSuite.run()
         print("== overlay");    failures += SettingsOverlaySuite.run()
         print("== delegation");  failures += EscalationSuite.run()

@@ -1,9 +1,10 @@
 ## 16. Tool safety: dangerous calls, detected and contained
 
-*Specified 2026-10-13. Steps 1–3 of §16.8 built the same day: ToolPolicy
-(+ ShellLexer), GatedToolRunner, the approval card, standing approvals and
-`tool_approval`, with their suites. Every session's tools are gated; the
-headless gate declines every question.*
+*Specified 2026-10-13. Steps 1–4 of §16.8 built the same day: ToolPolicy
+(+ ShellLexer), GatedToolRunner, the approval card, standing approvals,
+`tool_approval`, Seatbelt containment for Bash and `tool_containment`, with
+their suites. Every session's tools are gated and contained; the headless
+gate declines every question.*
 
 Since 2026-10-10 a session's tools run on the user's Mac, as the user, with
 their login-shell environment (HostToolRunner, ShellEnvironment), outside App
@@ -185,7 +186,59 @@ same mechanism Codex CLI and Claude Code use on macOS:
   person turn it off for a project that cannot live with it, with the same
   three-layer overlay rule as §8.5.
 
-#### 16.5.1 Known costs, to be measured rather than guessed
+#### As built (2026-10-13), and what measuring it changed
+
+- **Last match wins in SBPL.** That is why the `.git/hooks` deny comes
+  after the allows. Pinned by canaries, not assumed.
+- **Seatbelt's `localhost` includes this Mac's own interface addresses.**
+  A connection to the Mac's LAN address succeeds under the profile. Any
+  other address is refused in the kernel before a packet leaves (tested
+  against TEST-NET-1, 192.0.2.1, which belongs to no one). This Mac is
+  not the network, so the profile keeps the rule.
+- **DNS is closed.** Connecting to `/private/var/run/mDNSResponder` is
+  denied, so name lookups cannot carry data out. A network grant reopens it.
+- **Grants travel as a `@TaskLocal`** (`ContainmentGrants.current`), set
+  by the gate around an approved call. A model can never pass a grant as an
+  argument. Each ask in ToolPolicy carries its grant: network for a network
+  command, the named paths for outside writes, `anywhere` for installs and
+  computed paths, and nothing for unknown commands or inline code, which
+  run contained even when approved. `curl | bash` approved gets network
+  for curl and nothing more for bash.
+- **Sandboxes do not nest, and swiftc uses one.** swift-frontend runs
+  macro plugins under `sandbox-exec`, which fails inside our profile
+  (`sandbox_apply: Operation not permitted`), so every `@Observable` failed
+  to expand and the app could not build contained. Contained commands find
+  shims first on PATH: `swiftc` and `swift` wrappers that run the next real
+  one with `-disable-sandbox` (`--disable-sandbox` for SwiftPM). The outer
+  profile is the stricter of the two. The shims live in the app's store,
+  which no contained command can write. `xcrun swiftc` bypasses them.
+- **The containment found a test-hygiene bug.** StoreSuite wrote into the
+  user's real store (`~/Library/Application Support/Crucible`), and the
+  profile refused it. `Store(root:)` now exists, and the suite uses a temp
+  directory.
+- **The kernel does not log denials for ad-hoc profiles**, so the build
+  measurements read "Operation not permitted" from the builds' own output.
+  That is also exactly what the model sees, followed by the diagnosis line
+  the backend appends.
+- **The model is told.** HostToolRunner's environment description says
+  whether commands are sandboxed and what that means, and the session
+  header shows `sandboxed`, `unsandboxed` or `sandbox unavailable`.
+
+#### 16.5.1 Known costs, measured (2026-10-13)
+
+Contained, each of these passed with the default profile and the shims:
+this repository's `make` (the C engine, Metal included), `make -C app` (the
+Swift app, macros and codesign included), and `make -C app test`. Inside a
+sandbox, the canary suite skips with a reason, because profiles cannot
+nest; `Containment.alreadySandboxed` asks the kernel, and the backend then
+runs commands plainly under the outer sandbox. A dependency-free Cargo
+crate (`cargo build && cargo test`), npm package (`npm test`) and Python
+venv (`python3 -m venv`, py_compile, run) also passed, with no denials.
+Not measured: Go (not installed), and anything that fetches dependencies,
+which asks for the network by design.
+
+The list below was the plan; the cache list in Containment.swift is what
+shipped, and grows from denials observed in real sessions.
 
 - Toolchains write outside the tree: `~/.cargo`, `~/.npm`, `~/.cache`,
   `~/Library/Caches`, `~/Library/Developer` (SwiftPM, DerivedData),

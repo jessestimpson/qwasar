@@ -11,7 +11,10 @@ import QwasarKit
 enum StoreSuite {
     static func run() -> Int {
         var f = 0
-        guard let store = try? Store() else {
+        // A store of its own, never the user's.
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("qwasar-store-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        guard let store = try? Store(root: tmp) else {
             print("  FAIL cannot open the store"); return 1
         }
 
@@ -47,8 +50,7 @@ enum StoreSuite {
 
         // A crash mid-turn: a truncated final line, as an interrupted write
         // leaves behind.
-        let f2 = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Crucible/sessions/\(rec.id.uuidString)/transcript.jsonl")
+        let f2 = store.root.appendingPathComponent("sessions/\(rec.id.uuidString)/transcript.jsonl")
         if let h = try? FileHandle(forWritingTo: f2) {
             _ = try? h.seekToEnd()
             try? h.write(contentsOf: Data(#"{"id":"broken","at":0,"kind":"#.utf8))

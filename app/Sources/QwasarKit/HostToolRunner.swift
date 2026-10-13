@@ -16,9 +16,12 @@ public struct HostToolRunner: ToolExecuting {
 
     /// `timeout` is Bash's default, in seconds; `resultCap` the model's
     /// (ToolKit.resultCap(flashNext:)).
+    /// `contained`: Bash under Seatbelt (spec §16.5), the default.
     public init(root: URL, environment: [String: String], timeout: Int = 120,
-                resultCap: Int = ToolKit.resultCap(flashNext: true), ledger: ReadLedger? = nil) {
-        kit = ToolKit(backend: HostBackend(root: root, environment: environment),
+                resultCap: Int = ToolKit.resultCap(flashNext: true), ledger: ReadLedger? = nil,
+                contained: Bool = true) {
+        kit = ToolKit(backend: HostBackend(root: root, environment: environment,
+                                           containment: contained ? Containment(root: root.path) : nil),
                       resultCap: resultCap, defaultTimeoutMS: timeout * 1000, ledger: ledger)
     }
 
@@ -28,7 +31,7 @@ public struct HostToolRunner: ToolExecuting {
         """
         # Where you are working
 
-        Your tools run directly on the user's Mac, as the user -- there is no sandbox. Relative paths resolve against the project directory; absolute paths and ~ work too. Bash runs /bin/sh in the project directory with the user's login-shell environment, so their PATH, toolchains and network are all available.
+        Your tools run directly on the user's Mac, as the user. Relative paths resolve against the project directory; absolute paths and ~ work too. Bash runs /bin/sh in the project directory with the user's login-shell environment, so their PATH and toolchains are available.\(containmentDescription)
 
         Every change is real and immediate: edits land in the user's files and commands act on their machine. Do not run destructive or irreversible commands -- deleting files the task does not need deleted, force-pushing, rewriting git history, installing or removing software system-wide -- unless the user asked for exactly that.
         """ + (kit.backend.hasRipgrep ? "" : """
@@ -36,6 +39,14 @@ public struct HostToolRunner: ToolExecuting {
 
         ripgrep is not installed here, so Grep runs grep -E: POSIX extended regular expressions, where \\d and (?i) do not work -- use [0-9] and the -i parameter.
         """)
+    }
+
+    private var containmentDescription: String {
+        guard kit.backend is HostBackend, (kit.backend as? HostBackend)?.containment != nil else {
+            return " Commands are not sandboxed: they can reach the network and write anywhere the user can."
+        }
+        return " Commands run in a sandbox: they can write only inside the project, the temp directories and "
+             + "toolchain caches, and have no network. A command that needs more asks the user first."
     }
 
     public func run(_ call: ToolCall) -> String {

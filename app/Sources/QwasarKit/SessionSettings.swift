@@ -40,11 +40,15 @@ public struct SettingsOverlay: Codable, Sendable, Equatable, Hashable {
     public var thinkingBudget: Int?
     /// Spec §16.6: whether calls the policy flags ask first.
     public var toolApproval: ToolApprovalMode?
+    /// Spec §16.5: Bash under Seatbelt.  false is a person's choice for a
+    /// project that cannot live with it.
+    public var toolContainment: Bool?
 
     public init(toolTimeoutSeconds: Int? = nil, agentModels: [String]? = nil,
                 agentBudgetUSD: Double? = nil, agentTurnBudgetUSD: Double? = nil,
                 topNSigma: Double? = nil, exploreNudgeAfter: Int? = nil,
-                thinkingBudget: Int? = nil, toolApproval: ToolApprovalMode? = nil) {
+                thinkingBudget: Int? = nil, toolApproval: ToolApprovalMode? = nil,
+                toolContainment: Bool? = nil) {
         self.toolTimeoutSeconds = toolTimeoutSeconds
         self.agentModels = agentModels
         self.agentBudgetUSD = agentBudgetUSD
@@ -53,12 +57,13 @@ public struct SettingsOverlay: Codable, Sendable, Equatable, Hashable {
         self.exploreNudgeAfter = exploreNudgeAfter
         self.thinkingBudget = thinkingBudget
         self.toolApproval = toolApproval
+        self.toolContainment = toolContainment
     }
 
     public var isEmpty: Bool {
         toolTimeoutSeconds == nil && agentModels == nil && agentBudgetUSD == nil
             && agentTurnBudgetUSD == nil && topNSigma == nil && exploreNudgeAfter == nil
-            && thinkingBudget == nil && toolApproval == nil
+            && thinkingBudget == nil && toolApproval == nil && toolContainment == nil
     }
 }
 
@@ -73,6 +78,7 @@ public enum SettingsKey: String, CaseIterable, Sendable {
     case exploreNudgeAfter = "explore_nudge_after"
     case thinkingBudget = "thinking_budget"
     case toolApproval = "tool_approval"
+    case toolContainment = "tool_containment"
 
     public var doc: String {
         switch self {
@@ -94,6 +100,10 @@ public enum SettingsKey: String, CaseIterable, Sendable {
             return "ask (default): commands that delete, write outside the project, use the network, rewrite "
                 + "git history, install software, or are unrecognised show the user a card first; trusted: they run "
                 + "without asking. Catastrophic commands are refused either way"
+        case .toolContainment:
+            return "on (default): Bash runs in a sandbox that can write only the project, temp directories and "
+                + "toolchain caches, with no network unless an approved command needs it; off: commands run "
+                + "unconfined, as the user"
         }
     }
 
@@ -138,6 +148,12 @@ public enum SettingsKey: String, CaseIterable, Sendable {
                 return "tool_approval is ask or trusted"
             }
             overlay.toolApproval = m
+        case .toolContainment:
+            switch value.trimmingCharacters(in: .whitespaces).lowercased() {
+            case "on", "true", "yes": overlay.toolContainment = true
+            case "off", "false", "no": overlay.toolContainment = false
+            default: return "tool_containment is on or off"
+            }
         }
         return nil
     }
@@ -152,6 +168,7 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .exploreNudgeAfter: overlay.exploreNudgeAfter = nil
         case .thinkingBudget: overlay.thinkingBudget = nil
         case .toolApproval: overlay.toolApproval = nil
+        case .toolContainment: overlay.toolContainment = nil
         }
     }
 
@@ -165,6 +182,7 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .exploreNudgeAfter: return overlay.exploreNudgeAfter.map(String.init)
         case .thinkingBudget: return overlay.thinkingBudget.map(String.init)
         case .toolApproval: return overlay.toolApproval?.rawValue
+        case .toolContainment: return overlay.toolContainment.map { $0 ? "on" : "off" }
         }
     }
 }
@@ -182,6 +200,7 @@ public struct SessionSettings: Sendable, Equatable {
     public var exploreNudgeAfter: Int
     public var thinkingBudget: Int
     public var toolApproval: ToolApprovalMode
+    public var toolContainment: Bool
 
     public static let defaults = SessionSettings(toolTimeoutSeconds: 180,
                                                  agentModels: [],
@@ -190,7 +209,8 @@ public struct SessionSettings: Sendable, Equatable {
                                                  topNSigma: 0,
                                                  exploreNudgeAfter: 10,
                                                  thinkingBudget: 0,
-                                                 toolApproval: .ask)
+                                                 toolApproval: .ask,
+                                                 toolContainment: true)
 
     public enum Layer: String, Sendable { case session, project, global, builtin = "built-in" }
 
@@ -208,7 +228,8 @@ public struct SessionSettings: Sendable, Equatable {
             topNSigma: pick({ $0.topNSigma }, defaults.topNSigma),
             exploreNudgeAfter: pick({ $0.exploreNudgeAfter }, defaults.exploreNudgeAfter),
             thinkingBudget: pick({ $0.thinkingBudget }, defaults.thinkingBudget),
-            toolApproval: pick({ $0.toolApproval }, defaults.toolApproval))
+            toolApproval: pick({ $0.toolApproval }, defaults.toolApproval),
+            toolContainment: pick({ $0.toolContainment }, defaults.toolContainment))
     }
 
     /// Which layer decided `key`, for display.

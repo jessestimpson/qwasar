@@ -413,6 +413,7 @@ extension AppState {
                          + "explore_nudge_after=\(eff.exploreNudgeAfter > 0 ? String(eff.exploreNudgeAfter) : "off") "
                          + "thinking_budget=\(eff.thinkingBudget > 0 ? String(eff.thinkingBudget) : "none") "
                          + "tool_approval=\(eff.toolApproval.rawValue) "
+                         + "tool_containment=\(eff.toolContainment ? "on" : "off") "
                          + "standing_approvals=\(s.approvals?.count ?? 0)")
                 out.append("    provenance: \(prov)")
             }
@@ -426,6 +427,6 @@ extension AppState {
                                agentBudgetUSD: d.agentBudgetUSD,
                                agentTurnBudgetUSD: d.agentTurnBudgetUSD, topNSigma: d.topNSigma,
                                exploreNudgeAfter: d.exploreNudgeAfter, thinkingBudget: d.thinkingBudget,
-                               toolApproval: d.toolApproval)
+                               toolApproval: d.toolApproval, toolContainment: d.toolContainment)
     }
 }

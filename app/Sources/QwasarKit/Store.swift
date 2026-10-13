@@ -15,12 +15,18 @@ import Foundation
 public final class Store: @unchecked Sendable {
     public let root: URL
 
-    public init() throws {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory,
-                                            in: .userDomainMask)[0]
-        root = base.appendingPathComponent("Crucible", isDirectory: true)
-        try FileManager.default.createDirectory(at: root.appendingPathComponent("sessions"),
+    /// The app's store, or one at `root` -- the test suite's, so `make test`
+    /// leaves the user's sessions alone (and runs under containment, which
+    /// would refuse the write: spec §16.5).
+    public init(root: URL? = nil) throws {
+        self.root = root ?? Store.defaultRoot
+        try FileManager.default.createDirectory(at: self.root.appendingPathComponent("sessions"),
                                                 withIntermediateDirectories: true)
+    }
+
+    public static var defaultRoot: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Crucible", isDirectory: true)
     }
 
     private var projectsURL: URL { root.appendingPathComponent("projects.json") }

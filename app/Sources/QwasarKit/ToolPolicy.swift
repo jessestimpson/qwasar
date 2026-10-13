@@ -17,13 +17,14 @@ import Foundation
 
 public enum Verdict: Sendable, Equatable {
     case allow
-    /// The user decides.  `high` marks a card worth reading twice.
-    case ask(reasons: [String], high: Bool)
+    /// The user decides.  `high` marks a card worth reading twice; `grant`
+    /// is what the call needs beyond containment's default, if approved.
+    case ask(reasons: [String], high: Bool, grant: ContainmentGrant)
     /// Refused without asking: the catastrophic set (§16.9).
     case deny(reason: String)
 
-    static func asking(_ reason: String, high: Bool = false) -> Verdict {
-        .ask(reasons: [reason], high: high)
+    static func asking(_ reason: String, high: Bool = false, grant: ContainmentGrant = .none) -> Verdict {
+        .ask(reasons: [reason], high: high, grant: grant)
     }
 
     /// The worse of two; two asks keep both reasons.
@@ -33,8 +34,8 @@ public enum Verdict: Sendable, Equatable {
         case (_, .deny): return b
         case (.allow, _): return b
         case (_, .allow): return a
-        case let (.ask(r1, h1), .ask(r2, h2)):
-            return .ask(reasons: r1 + r2.filter { !r1.contains($0) }, high: h1 || h2)
+        case let (.ask(r1, h1, g1), .ask(r2, h2, g2)):
+            return .ask(reasons: r1 + r2.filter { !r1.contains($0) }, high: h1 || h2, grant: g1 + g2)
         }
     }
 
@@ -123,16 +124,18 @@ public enum ToolPolicy {
         if Paths.within(path, ctx.root) {
             if path == ctx.root { return .allow }
             let rel = String(path.dropFirst(ctx.root.count + 1))
-            return executesLater(rel).map { .asking($0) } ?? .allow
+            return executesLater(rel).map { .asking($0, grant: ContainmentGrant(paths: [path])) } ?? .allow
         }
         if ctx.scratch.contains(where: { Paths.within(path, $0) }) { return .allow }
         let sensitive = sensitiveInHome.contains { Paths.within(path, ctx.home + "/" + $0) }
             || sensitiveSystem.contains { Paths.within(path, $0) }
-        return .asking("writes outside the project: \(shown(path, ctx))", high: sensitive)
+        return .asking("writes outside the project: \(shown(path, ctx))", high: sensitive,
+                       grant: ContainmentGrant(paths: [path]))
     }
 
     /// A write to a path a command computes at run time.
-    static let unknownWrite = Verdict.asking("writes to a path computed when it runs")
+    static let unknownWrite = Verdict.asking("writes to a path computed when it runs",
+                                             grant: ContainmentGrant(anywhere: true))
 
     static func writing(_ path: String?, _ ctx: PolicyContext) -> Verdict {
         path.map { writing($0, ctx) } ?? unknownWrite
@@ -370,6 +373,15 @@ public enum ToolPolicy {
         "tailscale", "nmap", "mosh", "sshpass", "ssh-copy-id", "rclone", "s3cmd",
     ]
 
+    static let cloudCLIs: Set<String> = ["gh", "glab", "aws", "gcloud", "gsutil", "az", "kubectl", "helm", "docker",
+                                         "podman", "terraform", "heroku", "fly", "flyctl", "vercel", "netlify",
+                                         "wrangler", "ngrok", "tailscale", "rclone", "s3cmd"]
+
+    /// Approved, these run with the network; installing ones may also write
+    /// wherever they install.
+    static let net = ContainmentGrant(network: true)
+    static let install = ContainmentGrant(network: true, anywhere: true)
+
     static let catastrophicNames: Set<String> = ["shutdown", "reboot", "halt", "fdisk", "gpt", "pdisk", "asr",
                                                  "csrutil", "nvram", "bless", "newfs", "mkfs"]
 
@@ -410,8 +422,19 @@ public enum ToolPolicy {
             }
             return .allow
         }
-        if network.contains(name) { return .asking("uses the network (\(name))") }
-        if systemSettings.contains(name) { return .asking("changes system settings (\(name))", high: true) }
+        if network.contains(name) {
+            // The ssh family writes known_hosts; the cloud CLIs keep their
+            // own config and credentials -- approved, they write where they
+            // must.
+            let grant = ["ssh", "scp", "sftp", "ssh-copy-id", "mosh", "sshpass"].contains(name)
+                ? ContainmentGrant(network: true, paths: [ctx.home + "/.ssh"])
+                : cloudCLIs.contains(name) ? ContainmentGrant(network: true, anywhere: true)
+                : ContainmentGrant(network: true)
+            return .asking("uses the network (\(name))", grant: grant)
+        }
+        if systemSettings.contains(name) {
+            return .asking("changes system settings (\(name))", high: true, grant: ContainmentGrant(anywhere: true))
+        }
         if shells.contains(name) { return shellCase(name, args, ctx, cwd: cwd, piped: piped, stdin: stdin, depth: depth) }
         if interpreters.contains(name) {
             return interpreterCase(name, args, ctx, cwd: cwd, piped: piped, stdin: stdin)
@@ -458,7 +481,7 @@ public enum ToolPolicy {
 
         case "rsync":
             if args.contains(where: { $0.text.contains(":") || $0.text.hasPrefix("rsync://") }) {
-                return .asking("copies over the network (rsync)")
+                return .asking("copies over the network (rsync)", grant: ContainmentGrant(network: true, anywhere: true))
             }
             guard let dest = operands(args, valued: ["-e", "--rsh", "--exclude", "--include", "--filter",
                                                      "-f", "--files-from", "--exclude-from"]).last
@@ -585,7 +608,8 @@ public enum ToolPolicy {
         case "kill", "pkill", "killall":
             return .asking("stops processes (\(name))")
         case "crontab":
-            return args.contains { $0.text == "-l" } ? .allow : .asking("changes scheduled jobs (crontab)", high: true)
+            return args.contains { $0.text == "-l" } ? .allow
+                : .asking("changes scheduled jobs (crontab)", high: true, grant: ContainmentGrant(anywhere: true))
         case "defaults":
             let sub = args.first?.text ?? ""
             return ["read", "read-type", "domains", "find", "help"].contains(sub)
@@ -620,58 +644,58 @@ public enum ToolPolicy {
             let sub = args.first?.text ?? ""
             return ["list", "ls", "info", "search", "--prefix", "--cellar", "--repository", "--version", "config",
                     "deps", "uses", "leaves", "outdated", "desc", "doctor", "--env", "commands", "help"].contains(sub)
-                ? .allow : .asking("changes Homebrew's installs (brew \(sub))", high: true)
+                ? .allow : .asking("changes Homebrew's installs (brew \(sub))", high: true, grant: install)
         case "port", "mas":
-            return .asking("installs or removes software (\(name))", high: true)
+            return .asking("installs or removes software (\(name))", high: true, grant: install)
         case "npm", "pnpm", "yarn", "bun":
             return nodePackages(name, args)
         case "npx", "pnpx", "bunx":
-            return .asking("downloads and runs a package (\(name))")
+            return .asking("downloads and runs a package (\(name))", grant: net)
         case "pip", "pip3", "pipx":
             return pip(name, args)
         case "uv":
             let sub = args.first?.text ?? ""
             if sub == "pip" { return pip("uv pip", args.dropFirst()) }
             return ["run", "tree", "--version", "version", "help"].contains(sub)
-                ? .allow : .asking("changes Python packages or uses the network (uv \(sub))")
+                ? .allow : .asking("changes Python packages or uses the network (uv \(sub))", grant: install)
         case "poetry", "pdm", "hatch", "pipenv", "conda", "mamba":
             let sub = args.first?.text ?? ""
             return ["run", "show", "check", "env", "--version", "version", "list", "info", "shell", "test"].contains(sub)
-                ? .allow : .asking("changes Python packages or uses the network (\(name) \(sub))")
+                ? .allow : .asking("changes Python packages or uses the network (\(name) \(sub))", grant: install)
         case "gem":
             let sub = args.first?.text ?? ""
             return ["list", "env", "which", "contents", "--version", "help", "search", "info"].contains(sub)
-                ? .allow : .asking("changes Ruby gems (gem \(sub))")
+                ? .allow : .asking("changes Ruby gems (gem \(sub))", grant: install)
         case "bundle", "bundler":
             let sub = args.first?.text ?? ""
             return ["exec", "list", "show", "check", "--version", "info", "config"].contains(sub)
-                ? .allow : .asking("changes Ruby gems or uses the network (bundle \(sub))")
+                ? .allow : .asking("changes Ruby gems or uses the network (bundle \(sub))", grant: install)
         case "cargo":
             let sub = args.first?.text ?? ""
             return ["build", "b", "check", "c", "test", "t", "run", "r", "clippy", "fmt", "doc", "bench", "tree",
                     "metadata", "--version", "-V", "version", "help", "clean", "nextest", "expand", "new", "init",
                     "locate-project", "pkgid", "verify-project"].contains(sub)
-                ? .allow : .asking("changes Rust installs or uses the network (cargo \(sub))")
+                ? .allow : .asking("changes Rust installs or uses the network (cargo \(sub))", grant: install)
         case "go":
             let sub = args.first?.text ?? ""
             if sub == "env", args.contains(where: { $0.text == "-w" || $0.text == "-u" }) {
-                return .asking("changes Go's settings (go env -w)")
+                return .asking("changes Go's settings (go env -w)", grant: ContainmentGrant(anywhere: true))
             }
             if sub == "mod" {
                 let m = args.dropFirst().first?.text ?? ""
                 return ["graph", "why", "verify", "edit", "init"].contains(m)
-                    ? .allow : .asking("uses the network (go mod \(m))")
+                    ? .allow : .asking("uses the network (go mod \(m))", grant: net)
             }
             return ["build", "test", "vet", "run", "fmt", "env", "version", "list", "doc", "help", "generate",
                     "clean", "tool"].contains(sub)
-                ? .allow : .asking("changes Go installs or uses the network (go \(sub))")
+                ? .allow : .asking("changes Go installs or uses the network (go \(sub))", grant: install)
         case "swift":
             let sub = args.first?.text ?? ""
             if sub == "package" {
                 let m = args.dropFirst().first?.text ?? ""
                 return ["describe", "dump-package", "show-dependencies", "init", "clean", "compute-checksum",
                         "dump-symbol-graph", "diagnose-api-breaking-changes", "plugin"].contains(m)
-                    ? .allow : .asking("uses the network (swift package \(m))")
+                    ? .allow : .asking("uses the network (swift package \(m))", grant: net)
             }
             if ["build", "test", "run", "--version", "-version", "format", "symbolgraph-extract", "demangle",
                 "help", "repl", ""].contains(sub) { return .allow }
@@ -681,16 +705,16 @@ public enum ToolPolicy {
             let sub = args.first?.text ?? ""
             return ["exec", "x", "run", "r", "ls", "list", "current", "which", "where", "env", "doctor", "version",
                     "--version", "help", "tasks", "outdated"].contains(sub)
-                ? .allow : .asking("changes installed toolchains (\(name) \(sub))")
+                ? .allow : .asking("changes installed toolchains (\(name) \(sub))", grant: install)
         case "mix":
             let sub = args.first?.text ?? ""
             return sub.hasPrefix("deps.get") || sub.hasPrefix("deps.update") || sub.hasPrefix("hex") || sub.hasPrefix("archive.install")
                 || sub.hasPrefix("local.")
-                ? .asking("uses the network (mix \(sub))") : .allow
+                ? .asking("uses the network (mix \(sub))", grant: install) : .allow
         case "dotnet":
             let sub = args.first?.text ?? ""
             return ["restore", "add", "tool", "workload", "nuget", "new"].contains(sub)
-                ? .asking("uses the network (dotnet \(sub))") : .allow
+                ? .asking("uses the network (dotnet \(sub))", grant: install) : .allow
         default:
             return .asking("\(name) is not a command this app knows to be safe")
         }
@@ -724,7 +748,7 @@ public enum ToolPolicy {
     static func builderCase(_ name: String, _ args: ArraySlice<ShellWord>, _ ctx: PolicyContext,
                             cwd: String?) -> Verdict {
         if args.contains(where: { $0.text == "install" || $0.text == "--install" || $0.text == "uninstall" }) {
-            return .asking("\(name) install writes outside the project")
+            return .asking("\(name) install writes outside the project", grant: ContainmentGrant(anywhere: true))
         }
         // Run in another directory, it builds someone else's code.
         for opt in ["-C", "--directory", "-chdir", "--project-dir"] {
@@ -748,7 +772,8 @@ public enum ToolPolicy {
         var v = Verdict.allow
         for t in targets {
             guard let p = path(t, cwd) else {
-                v += .asking("\(verb)\(recursive ? " -r" : "") on a path computed when it runs", high: recursive)
+                v += .asking("\(verb)\(recursive ? " -r" : "") on a path computed when it runs", high: recursive,
+                             grant: ContainmentGrant(anywhere: true))
                 continue
             }
             if !filtered, catastrophic(p, glob: t.glob, ctx) && (recursive || t.glob) {
@@ -756,9 +781,10 @@ public enum ToolPolicy {
             }
             let inside = Paths.within(p, ctx.root) || ctx.scratch.contains { Paths.within(p, $0) }
             if !inside {
-                v += .asking("deletes outside the project: \(shown(p, ctx))", high: true)
+                v += .asking("deletes outside the project: \(shown(p, ctx))", high: true,
+                             grant: ContainmentGrant(paths: [p]))
             } else if Paths.within(p, ctx.root), let why = executesLater(String(p.dropFirst(min(p.count, ctx.root.count + 1)))) {
-                v += .asking(why.replacingOccurrences(of: "writes", with: "deletes"))
+                v += .asking(why.replacingOccurrences(of: "writes", with: "deletes"), grant: ContainmentGrant(paths: [p]))
             } else if recursive {
                 v += .asking("deletes recursively: \(shown(p, ctx))", high: p == ctx.root)
             }
@@ -933,11 +959,11 @@ public enum ToolPolicy {
              "reset", "clean", "config", "remote", "gc", "archive", "sparse-checkout", "update-index", "mergetool":
             mutating = gitMutating(sub, sargs, f, ctx, cwd: dir)
         case "push":
-            return v + .asking("pushes to a remote (git push)", high: true)
+            return v + .asking("pushes to a remote (git push)", high: true, grant: net)
         case "fetch", "pull", "clone", "ls-remote", "submodule", "lfs":
             if sub == "submodule", let m = sargs.first?.text, ["status", "summary"].contains(m) { return v }
             if sub == "submodule", sargs.first?.text == "foreach" { return v + .asking("git submodule foreach runs a command") }
-            return v + .asking("uses the network (git \(sub))")
+            return v + .asking("uses the network (git \(sub))", grant: net)
         case "rebase":
             mutating = .asking("rewrites history (git rebase)")
         case "filter-branch", "filter-repo", "replace":
@@ -1026,7 +1052,7 @@ public enum ToolPolicy {
 
     static func nodePackages(_ name: String, _ args: ArraySlice<ShellWord>) -> Verdict {
         if flags(args).contains("g") || flags(args).contains("--global") {
-            return .asking("installs packages globally (\(name) -g)", high: true)
+            return .asking("installs packages globally (\(name) -g)", high: true, grant: install)
         }
         let sub = args.first?.text ?? (name == "yarn" ? "install" : "")
         let network: Set<String> = ["install", "i", "ci", "add", "update", "up", "upgrade", "remove", "rm",
@@ -1036,7 +1062,7 @@ public enum ToolPolicy {
                                     "patch", "import", "fetch"]
         if network.contains(sub) {
             if sub == "config", args.dropFirst().first.map({ ["get", "list", "ls"].contains($0.text) }) == true { return .allow }
-            return .asking("changes dependencies or uses the network (\(name) \(sub))")
+            return .asking("changes dependencies or uses the network (\(name) \(sub))", grant: net)
         }
         let known: Set<String> = ["test", "t", "tst", "run", "run-script", "start", "stop", "restart", "ls", "list",
                                   "why", "explain", "help", "root", "prefix", "bin", "--version", "-v", "build"]
@@ -1047,7 +1073,7 @@ public enum ToolPolicy {
     static func pip(_ name: String, _ args: ArraySlice<ShellWord>) -> Verdict {
         let sub = args.first?.text ?? ""
         return ["list", "show", "freeze", "check", "--version", "-V", "help", "inspect", "config"].contains(sub)
-            ? .allow : .asking("changes Python packages or uses the network (\(name) \(sub))")
+            ? .allow : .asking("changes Python packages or uses the network (\(name) \(sub))", grant: install)
     }
 }
 

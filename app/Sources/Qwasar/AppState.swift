@@ -524,7 +524,8 @@ final class AppState {
         // The same tools a session's local agent gets, on this Mac.
         guard let root = root(of: rec) else { return }
         let inner = gated(HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root),
-                                         timeout: settings.toolTimeoutSeconds, resultCap: resultCap),
+                                         timeout: settings.toolTimeoutSeconds, resultCap: resultCap,
+                                         contained: settings.toolContainment),
                           root: root, session: rec, mode: settings.toolApproval, inTurn: false)
 
         let mailbox = DelegationMailbox()
@@ -961,9 +962,12 @@ final class AppState {
                 let env = await Task.detached { ShellEnvironment.resolve(in: root) }.value
                 runner = gated(HostToolRunner(root: root, environment: env,
                                               timeout: settings.toolTimeoutSeconds,
-                                              resultCap: resultCap, ledger: readLedger(rec.id)),
+                                              resultCap: resultCap, ledger: readLedger(rec.id),
+                                              contained: settings.toolContainment),
                                root: root, session: rec, mode: settings.toolApproval, inTurn: true)
                 toolsStatus = "on this Mac · \(URL(fileURLWithPath: ShellEnvironment.loginShell).lastPathComponent) environment"
+                    + (settings.toolContainment ? (Containment.available ? " · sandboxed" : " · sandbox unavailable")
+                                                : " · unsandboxed")
                 // Delegation (spec §15): advertised only when models are
                 // granted, a key exists, and budget remains.
                 let remaining = max(0, settings.agentBudgetUSD - (rec.spentUSD ?? 0))

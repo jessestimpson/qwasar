@@ -8,8 +8,12 @@ public struct HostBackend: ToolBackend {
     public let workDir: String
     public let environment: [String: String]
     public let hasRipgrep: Bool
+    /// Seatbelt for every command (spec §16.5); nil runs them as the user,
+    /// unconfined -- a person's choice for a project (tool_containment).
+    public let containment: Containment?
 
-    public init(root: URL, environment: [String: String]) {
+    public init(root: URL, environment: [String: String], containment: Containment? = nil) {
+        self.containment = containment
         self.workDir = URL(fileURLWithPath: root.path).resolvingSymlinksInPath().path
         var env = environment
         // No pagers, no colour, nothing waiting on a terminal that is not there.
@@ -73,11 +77,29 @@ public struct HostBackend: ToolBackend {
     }
 
     public func exec(_ command: String, timeoutMS: Int, maxBytes: Int) -> Result<ExecResult, ToolFailure> {
-        let r = Spawn.run("/bin/sh", ["-c", command], cwd: URL(fileURLWithPath: workDir), env: environment,
+        let grant = ContainmentGrants.current
+        var exe = "/bin/sh", args = ["-c", command]
+        var env = environment
+        var note = ""
+        if let containment, !Containment.alreadySandboxed {
+            if Containment.available {
+                (exe, args) = containment.argv(command, grant: grant)
+                if let shims = Containment.prepareShims() {
+                    env["PATH"] = shims + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+                }
+            } else {
+                note = "[containment unavailable: \(Containment.sandboxExec) is missing, so this ran unconfined]\n"
+            }
+        }
+        let r = Spawn.run(exe, args, cwd: URL(fileURLWithPath: workDir), env: env,
                           timeout: TimeInterval(timeoutMS) / 1000, maxBytes: maxBytes,
                           interrupt: .shared)
-        var out = String(decoding: r.output, as: UTF8.self)
+        var out = note + String(decoding: r.output, as: UTF8.self)
         if r.truncated { out += "\n[output stopped at \(maxBytes / 1024 / 1024) MB]" }
+        if containment != nil, Containment.available, !Containment.alreadySandboxed,
+           let why = Containment.diagnosis(out, status: r.status, grant: grant) {
+            out += "\n" + why
+        }
         return .success(ExecResult(status: r.status, output: out, timedOut: r.timedOut,
                                    interrupted: r.interrupted))
     }

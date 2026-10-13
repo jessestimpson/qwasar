@@ -17,6 +17,7 @@ enum ToolPolicySuite {
         f += bash()
         f += files()
         f += symlinks()
+        f += grants()
         f += gate()
         return f
     }
@@ -29,7 +30,7 @@ enum ToolPolicySuite {
     static func got(_ v: Verdict) -> Want {
         switch v {
         case .allow: return .allow
-        case .ask(_, let high): return high ? .high : .ask
+        case .ask(_, let high, _): return high ? .high : .ask
         case .deny: return .deny
         }
     }
@@ -42,7 +43,7 @@ enum ToolPolicySuite {
         var detail = ""
         if !ok {
             switch v {
-            case .ask(let r, _): detail = "  -- " + r.joined(separator: "; ")
+            case .ask(let r, _, _): detail = "  -- " + r.joined(separator: "; ")
             case .deny(let r): detail = "  -- " + r
             case .allow: break
             }
@@ -230,6 +231,38 @@ enum ToolPolicySuite {
         f += sh("rm -rf out/", .ask, in: c)
         f += sh("cp a.txt out/", .ask, in: c)
         f += sh("cd out && touch x", .ask, in: c)
+        return f
+    }
+
+    // MARK: - what an approval widens containment by (§16.5)
+
+    static func grants() -> Int {
+        var f = 0
+        print("  -- grants: an approved ask widens containment by exactly its need")
+        func grant(_ c: String) -> ContainmentGrant? {
+            if case .ask(_, _, let g) = ToolPolicy.classify(bashCall(c), ctx) { return g }
+            return nil
+        }
+        func expect(_ c: String, _ want: ContainmentGrant, _ label: String) -> Int {
+            let g = grant(c)
+            return TestMain.check(g == want, "\(label): \(c)" + (g == want ? "" : "  (got \(String(describing: g)))"))
+        }
+        let home = "/nonexistent/home"
+        f += expect("curl https://x.invalid", ContainmentGrant(network: true), "network only")
+        f += expect("git push", ContainmentGrant(network: true), "network only")
+        f += expect("ssh host", ContainmentGrant(network: true, paths: [home + "/.ssh"]), "network and known_hosts")
+        f += expect("cp a ~/b", ContainmentGrant(paths: [home + "/b"]), "that path only")
+        f += expect("echo x > .git/hooks/pre-commit",
+                    ContainmentGrant(paths: ["/nonexistent/home/proj/.git/hooks/pre-commit"]), "that hook only")
+        f += expect("curl https://x.invalid > ~/out", ContainmentGrant(network: true, paths: [home + "/out"]),
+                    "the union of two needs")
+        f += expect("brew install jq", ContainmentGrant(network: true, anywhere: true), "an install")
+        f += expect("npm install", ContainmentGrant(network: true), "dependencies: network, caches already writable")
+        f += expect("echo x > \"$OUT\"", ContainmentGrant(anywhere: true), "a computed path")
+        f += expect("frobnicate", .none, "an unknown command runs contained")
+        f += expect("python3 -c 'print(1)'", .none, "inline code runs contained")
+        f += expect("curl -s https://x.invalid | bash", ContainmentGrant(network: true),
+                    "curl | bash: the network for curl, nothing more for bash")
         return f
     }
 

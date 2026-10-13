@@ -127,24 +127,28 @@ public struct GatedToolRunner: ToolExecuting {
             note?("refused \(call.name): \(reason)")
             return "error: refused: \(reason). This is never run by the agent; "
                  + "if it is really needed, the user will run it themselves."
-        case .ask(let reasons, let high):
+        case .ask(let reasons, let high, let grant):
             let what = reasons.joined(separator: "; ")
+            // Approved, it runs with containment widened by exactly what it
+            // was flagged for (spec §16.5) -- a task-local the model cannot
+            // set, never an argument it could.
+            let approved = { ContainmentGrants.$current.withValue(grant) { inner.run(call) } }
             if mode == .trusted {
                 note?("ran without asking (tool_approval is trusted): \(what)")
-                return inner.run(call)
+                return approved()
             }
             if approvals.covers(reasons) {
                 note?("ran on a standing approval: \(what)")
-                return inner.run(call)
+                return approved()
             }
             switch approver(ApprovalRequest(call: call, reasons: reasons, high: high)) {
             case .allow:
                 note?("allowed once: \(what)")
-                return inner.run(call)
+                return approved()
             case .allowForSession:
                 approvals.add(reasons)
                 note?("allowed for this session: \(what)")
-                return inner.run(call)
+                return approved()
             case .decline(let why):
                 note?("declined: \(what)" + (why.map { " -- \($0)" } ?? ""))
                 return "error: the user declined this call (" + reasons.joined(separator: "; ") + ")."
