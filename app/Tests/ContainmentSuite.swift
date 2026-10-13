@@ -63,6 +63,38 @@ enum ContainmentSuite {
         _ = sh("touch '\(home.path)/.zshrc'")
         f += TestMain.check(!exists(home.appendingPathComponent(".zshrc")), "it cannot write the home directory")
 
+        print("  -- what runs later, unconfined, cannot be planted")
+        // A script the policy allows could otherwise write these inside the
+        // project, and the user's own git, direnv, editor or CI would run
+        // them outside any sandbox.
+        let sub = proj.appendingPathComponent("vendor/lib")
+        for d in [".git", ".vscode", ".github/workflows", ".husky"] {
+            try? fm.createDirectory(at: proj.appendingPathComponent(d), withIntermediateDirectories: true)
+        }
+        try? fm.createDirectory(at: sub.appendingPathComponent(".git/hooks"), withIntermediateDirectories: true)
+        for target in [".git/config", "vendor/lib/.git/config", "vendor/lib/.git/hooks/post-checkout", ".envrc",
+                       ".vscode/tasks.json", ".github/workflows/ci.yml", ".husky/pre-commit"] {
+            _ = sh("touch '\(proj.path)/\(target)'")
+            f += TestMain.check(!exists(proj.appendingPathComponent(target)), "it cannot write \(target)")
+        }
+        _ = sh("touch '\(proj.path)/.git/index' '\(proj.path)/.github/README.md'")
+        f += TestMain.check(exists(proj.appendingPathComponent(".git/index"))
+                            && exists(proj.appendingPathComponent(".github/README.md")),
+                            "the rest of .git and .github stay writable: git and the project work as usual")
+        _ = sh("touch '\(proj.path)/.git/config'", ContainmentGrant(paths: [proj.path + "/.git/config"]))
+        f += TestMain.check(exists(proj.appendingPathComponent(".git/config")), "an approved git config write lands")
+
+        print("  -- signals")
+        let victim = Process()
+        victim.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        victim.arguments = ["30"]
+        try? victim.run()
+        let pid = victim.processIdentifier
+        f += TestMain.check(sh("kill -0 \(pid)").status != 0, "it cannot signal a process outside its sandbox")
+        f += TestMain.check(sh("sleep 5 & kill $!").status == 0, "it can stop what it started")
+        f += TestMain.check(sh("kill -0 \(pid)", ContainmentGrant(ipc: true)).status == 0, "with an ipc grant it can signal")
+        victim.terminate()
+
         print("  -- grants widen by exactly what was approved")
         _ = sh("touch '\(outside.path)/one'", ContainmentGrant(paths: [outside.path + "/one"]))
         _ = sh("touch '\(outside.path)/two'", ContainmentGrant(paths: [outside.path + "/one"]))
@@ -93,6 +125,41 @@ enum ContainmentSuite {
         f += TestMain.check(sh("nc -U /private/var/run/mDNSResponder </dev/null", ContainmentGrant(network: true)).status == 0,
                             "with a network grant it is")
 
+        print("  -- other processes: what a daemon would do for a command")
+        // Each would act outside the sandbox if it got through; each canary
+        // is a touch or a preference in a domain made up for this suite,
+        // and each is cleaned up unsandboxed afterwards.
+        let uid = getuid()
+        _ = sh("launchctl submit -l com.qwasar.canary.submit -- /usr/bin/touch '\(outside.path)/submit'")
+        let plist = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0"><dict><key>Label</key><string>com.qwasar.canary.bootstrap</string>
+            <key>ProgramArguments</key><array><string>/usr/bin/touch</string><string>\(outside.path)/bootstrap</string></array>
+            <key>RunAtLoad</key><true/></dict></plist>
+            """
+        try? plist.write(to: proj.appendingPathComponent("canary.plist"), atomically: true, encoding: .utf8)
+        _ = sh("launchctl bootstrap gui/\(uid) canary.plist")
+        Thread.sleep(forTimeInterval: 1.5)
+        f += TestMain.check(!exists(outside.appendingPathComponent("submit")), "launchd will not run a job submitted from inside")
+        f += TestMain.check(!exists(outside.appendingPathComponent("bootstrap")),
+                            "nor bootstrap a plist the command wrote in the project")
+        for label in ["com.qwasar.canary.submit", "com.qwasar.canary.bootstrap"] {
+            _ = Spawn0.run("/bin/launchctl", ["remove", label])
+        }
+        _ = sh("defaults write com.qwasar.canary.containment probe -string written")
+        let pref = Spawn0.run("/usr/bin/defaults", ["read", "com.qwasar.canary.containment", "probe"])
+        f += TestMain.check(!pref.contains("written"), "cfprefsd will not write a preference for it")
+        _ = Spawn0.run("/usr/bin/defaults", ["delete", "com.qwasar.canary.containment"])
+        f += TestMain.check(sh("defaults read -g AppleLocale").status == 0, "reading preferences still works")
+        let ae = sh("osascript -e 'return 1'")
+        f += TestMain.check(ae.status != 0 && ae.output.contains("not permitted"),
+                            "osascript cannot be run, so no Apple Events are sent")
+        _ = sh("defaults write com.qwasar.canary.containment probe -string granted", ContainmentGrant(ipc: true))
+        f += TestMain.check(Spawn0.run("/usr/bin/defaults", ["read", "com.qwasar.canary.containment", "probe"]).contains("granted"),
+                            "with an ipc grant it can")
+        _ = Spawn0.run("/usr/bin/defaults", ["delete", "com.qwasar.canary.containment"])
+
         print("  -- through the gate")
         // The point of containment: a command the policy allows -- the
         // project's own script -- that does what the policy cannot see.
@@ -109,6 +176,22 @@ enum ContainmentSuite {
         let m = sh("echo x", ContainmentGrant(network: true, paths: ["/x\"y"], anywhere: false))
         f += TestMain.check(m.status == 0, "a path with a quote in it does not break the profile")
         return f
+    }
+
+    /// Cleanup and controls, run unsandboxed: never a command from the
+    /// suite's canaries, only removals of what they might have left.
+    enum Spawn0 {
+        static func run(_ exe: String, _ args: [String]) -> String {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: exe)
+            p.arguments = args
+            let out = Pipe()
+            p.standardOutput = out
+            p.standardError = out
+            try? p.run()
+            p.waitUntilExit()
+            return String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        }
     }
 
     struct KitOver: ToolExecuting {

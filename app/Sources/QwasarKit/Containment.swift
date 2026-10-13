@@ -11,10 +11,15 @@
 // network for an approved curl, one path for an approved cp -- and the
 // grant travels as a task-local, never as an argument the model could pass.
 //
-// What this does not confine: other processes.  A command that asks a
-// daemon to act -- cfprefsd for `defaults write`, LaunchServices for
-// `open`, Apple Events for osascript -- has the daemon do the writing,
-// outside the sandbox.  The policy asks before each of those.
+// Other processes are the hard part: a daemon that acts for a command acts
+// outside its sandbox.  Measured with canaries (ContainmentSuite): launchd
+// refuses jobs from a sandboxed caller, by `submit` or by `bootstrap` of a
+// plist the command wrote; cfprefsd does not -- `defaults write` landed --
+// so preference writes are denied; and Apple Events got through even with
+// appleevent-send and the AE server's mach service denied, so the senders
+// themselves (osascript, automator, shortcuts) may not be executed.  Any
+// other program that sends Apple Events -- Python with PyObjC, say -- is
+// not covered; the policy asks before the direct ones.
 
 import Darwin
 import Foundation
@@ -27,11 +32,16 @@ public struct ContainmentGrant: Sendable, Equatable, Hashable {
     /// Write anywhere the user can: an approved install, a write to a path
     /// computed at run time.
     public var anywhere = false
+    /// Have other processes act for it, or act on them: send Apple Events
+    /// (osascript, automator, shortcuts), write preferences through
+    /// cfprefsd, signal processes outside its own sandbox.
+    public var ipc = false
 
-    public init(network: Bool = false, paths: [String] = [], anywhere: Bool = false) {
+    public init(network: Bool = false, paths: [String] = [], anywhere: Bool = false, ipc: Bool = false) {
         self.network = network
         self.paths = paths
         self.anywhere = anywhere
+        self.ipc = ipc
     }
 
     public static let none = ContainmentGrant()
@@ -39,7 +49,7 @@ public struct ContainmentGrant: Sendable, Equatable, Hashable {
     public static func + (a: ContainmentGrant, b: ContainmentGrant) -> ContainmentGrant {
         ContainmentGrant(network: a.network || b.network,
                          paths: a.paths + b.paths.filter { !a.paths.contains($0) },
-                         anywhere: a.anywhere || b.anywhere)
+                         anywhere: a.anywhere || b.anywhere, ipc: a.ipc || b.ipc)
     }
 }
 
@@ -94,22 +104,48 @@ public struct Containment: Sendable {
         "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 
+    /// Inside the project, but run later by something the user trusts and
+    /// that runs unconfined: a script that writes these plants what the
+    /// sandbox would not let it do itself.  git's config (core.fsmonitor,
+    /// core.hooksPath) and hooks, in nested repositories too; direnv; the
+    /// editor's tasks; CI.
+    static let plantable = [".envrc", ".vscode", ".github/workflows", ".husky", ".pre-commit-config.yaml"]
+
+    /// SBPL regexes are POSIX: every metacharacter in a path is escaped.
+    static func regexEscaped(_ s: String) -> String {
+        var out = ""
+        for ch in s {
+            if "\\.^$*+?()[]{}|/\"".contains(ch) { out.append("\\") }
+            out.append(ch)
+        }
+        return out
+    }
+
     /// The profile a command runs under.  In SBPL the last matching rule
-    /// wins, so each deny comes before the allows that carve it open, and
-    /// the hooks deny comes after them all (pinned by the canary suite).
+    /// wins (pinned by the canary suite), so the order is the meaning: deny
+    /// every write, allow the writable set, deny what is plantable inside
+    /// it, then allow exactly what an approval granted.
     public func profile(_ grant: ContainmentGrant = .none) -> String {
         var p = ["(version 1)", "(allow default)"]
         if !grant.anywhere {
-            let paths = (writable + grant.paths.map { Paths.physical(Paths.lexical($0)) })
-                .map { "(subpath \(Containment.quoted($0)))" }
             p.append("(deny file-write*)")
-            p.append("(allow file-write* " + paths.joined(separator: " ")
+            p.append("(allow file-write* " + writable.map { "(subpath \(Containment.quoted($0)))" }.joined(separator: " ")
                      + " (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\")"
                      + " (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/\") (regex #\"^/dev/ttys\"))")
-            let hooks = root + "/.git/hooks"
-            if !grant.paths.contains(where: { Paths.within(Paths.physical(Paths.lexical($0)), hooks) }) {
-                p.append("(deny file-write* (subpath \(Containment.quoted(hooks))))")
+            p.append("(deny file-write* (regex #\"^" + Containment.regexEscaped(root) + "/(.*/)?\\.git/(hooks|config)(/|$)\")"
+                     + Containment.plantable.map { " (subpath \(Containment.quoted(root + "/" + $0)))" }.joined() + ")")
+            if !grant.paths.isEmpty {
+                p.append("(allow file-write* " + grant.paths.map {
+                    "(subpath \(Containment.quoted(Paths.physical(Paths.lexical($0)))))"
+                }.joined(separator: " ") + ")")
             }
+        }
+        if !grant.ipc {
+            p.append("(deny signal)")
+            p.append("(allow signal (target same-sandbox))")
+            p.append("(deny user-preference-write)")
+            p.append("(deny process-exec (literal \"/usr/bin/osascript\") (literal \"/usr/bin/automator\")"
+                     + " (literal \"/usr/bin/shortcuts\"))")
         }
         if !grant.network {
             // "localhost" matches this Mac's own interface addresses as well

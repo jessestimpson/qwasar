@@ -695,19 +695,20 @@ public enum ToolPolicy {
                 return .asking("sources a script from outside the project")
             }
             return .allow
-        case "osascript":
-            return .asking("runs AppleScript, which can drive other apps", high: true)
+        case "osascript", "automator", "shortcuts":
+            return .asking("\(name) drives other apps, which act outside the sandbox", high: true,
+                           grant: ContainmentGrant(ipc: true))
         case "open":
             return .asking("opens an app, file or URL")
         case "kill", "pkill", "killall":
-            return .asking("stops processes (\(name))")
+            return .asking("stops processes (\(name))", grant: ContainmentGrant(ipc: true))
         case "crontab":
             return args.contains { $0.text == "-l" } ? .allow
                 : .asking("changes scheduled jobs (crontab)", high: true, grant: ContainmentGrant(anywhere: true))
         case "defaults":
             let sub = args.first?.text ?? ""
             return ["read", "read-type", "domains", "find", "help"].contains(sub)
-                ? .allow : .asking("changes app preferences (defaults \(sub))")
+                ? .allow : .asking("changes app preferences (defaults \(sub))", grant: ContainmentGrant(ipc: true))
         case "security":
             return .asking("uses the keychain (security)", high: true)
         case "launchctl":
@@ -1053,11 +1054,18 @@ public enum ToolPolicy {
              "reset", "clean", "config", "remote", "gc", "archive", "sparse-checkout", "update-index", "mergetool":
             mutating = gitMutating(sub, sargs, f, ctx, cwd: dir)
         case "push":
-            return v + .asking("pushes to a remote (git push)", high: true, grant: net)
+            // -u records the upstream in .git/config, which containment
+            // otherwise protects.
+            return v + .asking("pushes to a remote (git push)", high: true,
+                               grant: ContainmentGrant(network: true, paths: [gitConfig(dir, ctx)]))
         case "fetch", "pull", "clone", "ls-remote", "submodule", "lfs":
             if sub == "submodule", let m = sargs.first?.text, ["status", "summary"].contains(m) { return v }
             if sub == "submodule", sargs.first?.text == "foreach" { return v + .asking("git submodule foreach runs a command") }
-            return v + .asking("uses the network (git \(sub))", grant: net)
+            // clone and submodule write a repository's config: approved,
+            // they may.
+            return v + .asking("uses the network (git \(sub))",
+                               grant: ["clone", "submodule"].contains(sub) ? install
+                                    : ContainmentGrant(network: true, paths: [gitConfig(dir, ctx)]))
         case "rebase":
             mutating = .asking("rewrites history (git rebase)")
         case "filter-branch", "filter-repo", "replace":
@@ -1073,12 +1081,22 @@ public enum ToolPolicy {
         return v + mutating
     }
 
+    /// The repository's config, which containment protects (§16.5): the
+    /// path an approval that must write it is granted.
+    static func gitConfig(_ dir: String?, _ ctx: PolicyContext) -> String {
+        (dir ?? ctx.root) + "/.git/config"
+    }
+
     static func gitMutating(_ sub: String, _ a: ArraySlice<ShellWord>, _ f: Set<String>, _ ctx: PolicyContext,
                             cwd: String?) -> Verdict {
         let ops = operands(a)
         switch sub {
         case "init":
-            return ops.first.map { writing(path($0, cwd), ctx) } ?? .allow
+            // A new repository's config and hooks are what containment
+            // protects, so creating one is the user's call.
+            let target = ops.first.flatMap { path($0, cwd) } ?? cwd ?? ctx.root
+            return writing(target, ctx) + .asking("creates a git repository (git init)",
+                                                  grant: ContainmentGrant(paths: [target + "/.git"]))
         case "commit":
             return f.contains("--amend") ? .asking("rewrites the last commit (git commit --amend)") : .allow
         case "stash":
@@ -1087,6 +1105,10 @@ public enum ToolPolicy {
         case "branch":
             if f.contains("D") || (f.contains("d") && (f.contains("f") || f.contains("--force"))) {
                 return .asking("deletes a branch that may not be merged (git branch -D)")
+            }
+            if f.contains("u") || f.contains("--set-upstream-to") || f.contains("--unset-upstream") {
+                return .asking("sets a branch's upstream in .git/config",
+                               grant: ContainmentGrant(paths: [gitConfig(cwd, ctx)]))
             }
             return .allow
         case "tag":
@@ -1126,12 +1148,14 @@ public enum ToolPolicy {
                           "--remove-section"]
             let global = f.contains("--global") || f.contains("--system")
             if f.contains(where: { writes.contains($0) }) || (!f.contains(where: { reads.contains($0) }) && ops.count >= 2) {
-                return .asking("changes git configuration, which can make git run commands", high: global)
+                return .asking("changes git configuration, which can make git run commands", high: global,
+                               grant: global ? ContainmentGrant(anywhere: true) : ContainmentGrant(paths: [gitConfig(cwd, ctx)]))
             }
             return .allow
         case "remote":
             let m = ops.first?.text ?? ""
-            return ["", "show", "get-url"].contains(m) ? .allow : .asking("changes git remotes (git remote \(m))")
+            return ["", "show", "get-url"].contains(m) ? .allow
+                : .asking("changes git remotes (git remote \(m))", grant: ContainmentGrant(paths: [gitConfig(cwd, ctx)]))
         case "gc":
             return a.contains(where: { $0.text.hasPrefix("--prune") }) ? .asking("git gc --prune discards unreachable commits") : .allow
         case "archive":

@@ -250,7 +250,13 @@ enum ToolPolicySuite {
         }
         let home = "/nonexistent/home"
         f += expect("curl https://x.invalid", ContainmentGrant(network: true), "network only")
-        f += expect("git push", ContainmentGrant(network: true), "network only")
+        f += expect("git push", ContainmentGrant(network: true, paths: ["/nonexistent/home/proj/.git/config"]),
+                    "network, and .git/config for -u")
+        f += expect("git remote add origin https://x.invalid", ContainmentGrant(paths: ["/nonexistent/home/proj/.git/config"]),
+                    "the repository's config only")
+        f += expect("git init", ContainmentGrant(paths: ["/nonexistent/home/proj/.git"]), "a new repository's .git")
+        f += expect("kill 1234", ContainmentGrant(ipc: true), "signals to other processes")
+        f += expect("osascript -e 'return 1'", ContainmentGrant(ipc: true), "Apple Events")
         f += expect("ssh host", ContainmentGrant(network: true, paths: [home + "/.ssh"]), "network and known_hosts")
         f += expect("cp a ~/b", ContainmentGrant(paths: [home + "/b"]), "that path only")
         f += expect("echo x > .git/hooks/pre-commit",

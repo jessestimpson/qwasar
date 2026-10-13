@@ -261,6 +261,43 @@ same mechanism Codex CLI and Claude Code use on macOS:
   whether commands are sandboxed and what that means, and the session
   header shows `sandboxed`, `unsandboxed` or `sandbox unavailable`.
 
+#### Red-teaming the profile itself (step 6, 2026-10-13)
+
+The question was what stops the model from writing a script and running it.
+The rules cannot see inside a file that does not exist until runtime, and
+running the project's own code is the job. So the answer has to be the
+profile, and probing it with canaries found holes that a contained script
+could use:
+
+- **Daemons acting for the command.** launchd refuses a sandboxed caller,
+  whether by `submit` or by `bootstrap` of a plist the command wrote (an
+  unsandboxed control loads the same plist), so that route is closed.
+  cfprefsd did not refuse: `defaults write` landed, which is a persistence
+  vector, since apps keep startup commands in preferences. Now
+  `(deny user-preference-write)`.
+- **Apple Events.** Sandboxed `osascript` got an answer from Finder, so it
+  could have Terminal run anything unconfined. Denying `appleevent-send`
+  and the AE server's mach service did not stop it; denying exec of
+  `osascript`, `automator` and `shortcuts` does. Any other sender, such as
+  Python with PyObjC, is not covered.
+- **Planting what runs later, unconfined.** A contained script could write
+  `.git/config` (core.fsmonitor or core.hooksPath runs at the user's next
+  `git status`), hooks in nested repositories, `.envrc`, `.vscode`, CI
+  workflows and `.husky`. All are now denied by a regex and subpaths that
+  come after the writable allow. Git asks that must write `.git/config`
+  (push -u, remote, config, branch -u) grant that path, and `git init` now
+  asks.
+- **Signals.** `kill -9` of the user's editor was possible. Now
+  `(deny signal) (allow signal (target same-sandbox))`, so a command can
+  stop what it started and nothing else.
+- Approved osascript, defaults write and kill carry `ipc`, which lifts
+  these rules for that call. This repository's `make`, `make -C app` and
+  `make -C app test` still pass under the full profile.
+
+What a contained script can still do: damage the project itself (delete
+untracked work, edit a Makefile the user later runs), read anything the
+user can read without being able to send it, and use CPU and disk.
+
 #### 16.5.1 Known costs, measured (2026-10-13)
 
 Contained, each of these passed with the default profile and the shims:
