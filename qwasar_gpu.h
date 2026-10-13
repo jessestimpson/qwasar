@@ -156,6 +156,20 @@ bool qw_op_tmm_q4(qw_cmd c, qw_tmm_kind kind, qw_ref y, qw_ref x,
 #define QW_TMM_BK 64
 #define QW_TMM_SG 4
 #endif
+/* The grouped experts' tensor-op matmul (qw_tmm_q4_gather): pipe's loop over
+ * one expert's tile of up to BM pairs.  Swept on the M5 Max with
+ * tools/bench/gmmbench (one Flash-Next layer's three expert matmuls, 256 /
+ * 1024 / 2048-token chunks): 32x128x32 with 4 simdgroups 5.0 / 5.8 / 10.1 ms
+ * against the simdgroup kernel's 9.7 / 19.3 / 32.6.  64-row tiles win only
+ * at 2048 (9.2-9.3), 16-row ones only at 256 (4.8), 8 simdgroups lose at
+ * every size, and an accumulator over 32 floats a thread (BM * BN / SG >
+ * 1024) spills: 64x128/4 and 32x256/4 ran 26-33 ms. */
+#ifndef QW_TGM_BM
+#define QW_TGM_BM 32
+#define QW_TGM_BN 128
+#define QW_TGM_BK 32
+#define QW_TGM_SG 4
+#endif
 #ifndef QW_TMP_BM
 #define QW_TMP_BM 64
 #define QW_TMP_BN 128

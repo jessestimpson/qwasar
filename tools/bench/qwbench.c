@@ -6,7 +6,7 @@
  * The JSON carries every chunk's completion time (so one long prompt gives the
  * prefill rate at every depth) and every decode token's time.
  *
- *   tools/bench/qwbench <model-dir> <corpus> <N> <D> */
+ *   tools/bench/qwbench <model-dir> <corpus> <N> <D>   (QWBENCH_CHUNK=n: chunk size) */
 #include "qwasar.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,7 +44,10 @@ int main(int argc, char **argv) {
     for (int32_t i = 0; i < N; i++) ids[i] = ct[i % nc];
 
     const double t_load0 = now();
-    qwasar_options opts = { .model_path = model, .context_size = N + D + 64 };
+    /* QWBENCH_CHUNK: prefill tokens per forward pass, else the engine's default. */
+    const char *cv = getenv("QWBENCH_CHUNK");
+    qwasar_options opts = { .model_path = model, .context_size = N + D + 64,
+                            .prefill_chunk = cv ? atoi(cv) : 0 };
     qwasar_engine *e = qwasar_engine_load(&opts, err, sizeof err);
     if (!e) { printf("{\"n\": %d, \"error\": \"load: %s\"}\n", N, err); return 3; }
     qwasar_session *s = qwasar_session_new(e, err, sizeof err);

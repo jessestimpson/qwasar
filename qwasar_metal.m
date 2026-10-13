@@ -616,6 +616,10 @@ static id<MTLLibrary> qw_tmm_library(void) {
                 @"QW_TMP_BN" : @(QW_TMP_BN),
                 @"QW_TMP_BK" : @(QW_TMP_BK),
                 @"QW_TMP_SG" : @(QW_TMP_SG),
+                @"QW_TGM_BM" : @(QW_TGM_BM),
+                @"QW_TGM_BN" : @(QW_TGM_BN),
+                @"QW_TGM_BK" : @(QW_TGM_BK),
+                @"QW_TGM_SG" : @(QW_TGM_SG),
                 @"QW_FA_BQ" : @(QW_FA_BQ),
                 @"QW_FA_BK" : @(QW_FA_BK),
                 @"QW_FA_SG" : @(QW_FA_SG),
@@ -1660,16 +1664,40 @@ void qw_op_qmv_q4_swiglu(qw_cmd c, qw_ref y, qw_ref gate, qw_ref up, int32_t str
 typedef struct { uint32_t pairs, E, BM, max_tiles; } qw_group_args;
 typedef struct { uint32_t k, n, K, x_by_pair; } qw_gmm_args;
 
+/* Which grouped matmul prefill's experts take: the tensor-op one
+ * (metal4/qmm_tensor.metal, qw_tmm_q4_gather) on an M5, the simdgroup one
+ * (metal/sparse.metal) elsewhere or with QWASAR_GMM=simd.  The grouping and
+ * the matmul must cut tiles alike, so both ask here for the tile's rows. */
+static bool qw_gmm_tensor(void) {
+    static int state = -1;
+    if (state < 0) {
+        const char *v = getenv("QWASAR_GMM");
+        if (v && !strcmp(v, "simd"))       state = 0;
+        else if (v && !strcmp(v, "tensor")) state = qw_tmm_available();
+        else state = qw_gpu_has_matrix_units() && qw_tmm_available();
+    }
+    return state > 0;
+}
+
+static int32_t qw_gmm_rows(void) { return qw_gmm_tensor() ? QW_TGM_BM : QW_GMM_BM; }
+
+/* The bound for the smaller tile, which the buffers are sized by. */
 int32_t qw_moe_max_tiles(int32_t pairs, int32_t E) {
-    return (pairs < E ? pairs : E) + (pairs + QW_GMM_BM - 1) / QW_GMM_BM;
+    const int32_t bm = QW_GMM_BM < QW_TGM_BM ? QW_GMM_BM : QW_TGM_BM;
+    return (pairs < E ? pairs : E) + (pairs + bm - 1) / bm;
+}
+
+static int32_t qw_moe_tiles_for(int32_t pairs, int32_t E, int32_t bm) {
+    return (pairs < E ? pairs : E) + (pairs + bm - 1) / bm;
 }
 
 void qw_op_moe_group(qw_cmd c, qw_ref perm, qw_ref tiles, qw_ref cursor, qw_ref idx,
                      int32_t pairs, int32_t E) {
     QW_BEGIN("qw_moe_group")
     qw_set(enc, idx, 0); qw_set(enc, perm, 1); qw_set(enc, tiles, 2); qw_set(enc, cursor, 3);
-    qw_group_args args = { (uint32_t)pairs, (uint32_t)E, (uint32_t)QW_GMM_BM,
-                           (uint32_t)qw_moe_max_tiles(pairs, E) };
+    const int32_t bm = qw_gmm_rows();
+    qw_group_args args = { (uint32_t)pairs, (uint32_t)E, (uint32_t)bm,
+                           (uint32_t)qw_moe_tiles_for(pairs, E, bm) };
     [enc setBytes:&args length:sizeof args atIndex:4];
     /* One threadgroup of QW_GROUP_THREADS (metal/sparse.metal). */
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
@@ -1680,6 +1708,28 @@ void qw_op_qmm_q4_gather(qw_cmd c, qw_ref y, qw_ref x, qw_ref perm, qw_ref tiles
                          int32_t k, int32_t n, int32_t pairs, int32_t E, int32_t K,
                          bool x_by_pair, int32_t group) {
     if (!c || !c->enc) return;
+    if (qw_gmm_tensor()) {
+        /* Its grouping was cut to QW_TGM_BM, so there is no falling back to
+         * the simdgroup kernel here: a refusal is loud. */
+        if (group == 0) group = 64;
+        id<MTLComputePipelineState> ps = (group == 32 || group == 64) && k % QW_TGM_BK == 0
+            ? qw_tmm_pipeline([NSString stringWithFormat:@"qw_tmm_q4_gather_g%d", group]) : nil;
+        if (!ps) {
+            fprintf(stderr, "qwasar: tensor grouped qmm declined k=%d group=%d\n", k, group);
+            return;
+        }
+        id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+        [enc setComputePipelineState:ps];
+        qw_set(enc, w, 0); qw_set(enc, scales, 1); qw_set(enc, biases, 2);
+        qw_set(enc, x, 3); qw_set(enc, y, 4);
+        qw_gmm_args args = { (uint32_t)k, (uint32_t)n, (uint32_t)K, x_by_pair ? 1u : 0u };
+        [enc setBytes:&args length:sizeof args atIndex:5];
+        qw_set(enc, perm, 6); qw_set(enc, tiles, 7);
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + QW_TGM_BN - 1) / QW_TGM_BN,
+                                              (NSUInteger)qw_moe_tiles_for(pairs, E, QW_TGM_BM), 1)
+            threadsPerThreadgroup:MTLSizeMake(32 * QW_TGM_SG, 1, 1)];
+        return;
+    }
     if (k % QW_GMM_BK != 0) {
         fprintf(stderr, "qwasar: grouped qmm needs k divisible by %d, got %d\n", QW_GMM_BK, k);
         return;
@@ -1696,7 +1746,7 @@ void qw_op_qmm_q4_gather(qw_cmd c, qw_ref y, qw_ref x, qw_ref perm, qw_ref tiles
     /* The tile count is the GPU's; launch the bound, and tiles past the
      * count return at once. */
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + QW_GMM_BN - 1) / QW_GMM_BN,
-                                          (NSUInteger)qw_moe_max_tiles(pairs, E), 1)
+                                          (NSUInteger)qw_moe_tiles_for(pairs, E, QW_GMM_BM), 1)
         threadsPerThreadgroup:MTLSizeMake(QW_GMM_THREADS, 1, 1)];
 }
 

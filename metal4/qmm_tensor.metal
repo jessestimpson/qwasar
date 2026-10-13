@@ -237,6 +237,148 @@ kernel void qw_tmm_q4_pipe(
     acc.store(ys);
 }
 
+/* ---- gather ---------------------------------------------------------------
+ *
+ * pipe over prefill's grouped experts: the tensor-op twin of metal/sparse.metal's
+ * qw_qmm_q4_gather, and the same contract.  qw_moe_group has sorted the
+ * chunk's (token, expert) pairs by expert and cut each expert's run into tiles
+ * of up to QW_TGM_BM; a threadgroup takes one tile and BN rows of its expert's
+ * slice of the bank.  x's rows are gathered through perm as they are loaded,
+ * and each result is written straight from the cooperative tensor to its
+ * pair's row of y. */
+
+#ifndef QW_TGM_BM
+#define QW_TGM_BM 32
+#define QW_TGM_BN 128
+#define QW_TGM_BK 32
+#define QW_TGM_SG 4
+#endif
+
+struct qw_tgm_args { uint k, n, K, x_by_pair; };
+
+template <uint G>
+kernel void qw_tmm_q4_gather(
+    device const uint    *wb     [[buffer(0)]],   /* bank [E, n, k/8] */
+    device const ushort  *sb     [[buffer(1)]],   /* bank [E, n, k/G] bf16 */
+    device const ushort  *bb     [[buffer(2)]],
+    device const float   *x      [[buffer(3)]],   /* [rows or pairs, k] */
+    device       float   *y      [[buffer(4)]],   /* [pairs, n] */
+    constant qw_tgm_args &a      [[buffer(5)]],
+    device const int     *perm   [[buffer(6)]],   /* [pairs], sorted by expert */
+    device const int     *tiles  [[buffer(7)]],   /* [0] = count; then (expert, start, len) */
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint T  = QW_TGM_SG * 32;
+    constexpr uint NW = QW_TGM_BN * QW_TGM_BK / 8 / T;
+    constexpr uint NX = QW_TGM_BM * QW_TGM_BK / 4 / T;
+    static_assert(NW * T * 8 == QW_TGM_BN * QW_TGM_BK, "the weight tile must split evenly");
+    static_assert(NX * T * 4 == QW_TGM_BM * QW_TGM_BK, "the x tile must split evenly");
+    threadgroup half Ws[QW_TGM_BN * QW_TGM_BK];
+    threadgroup half Xs[QW_TGM_BM * QW_TGM_BK];
+
+    if ((int)tgid.y >= tiles[0]) return;
+    device const int *tl = tiles + 1 + tgid.y * 3;
+    const uint expert = (uint)tl[0], first = (uint)tl[1], len = (uint)tl[2];
+    const uint col0 = tgid.x * QW_TGM_BN;
+    const uint words = a.k / 8, groups = a.k / G;
+    device const uint   *w      = wb + (ulong)expert * a.n * words;
+    device const ushort *scales = sb + (ulong)expert * a.n * groups;
+    device const ushort *biases = bb + (ulong)expert * a.n * groups;
+
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>
+        Wt(Ws, dextents<int32_t, 2>(QW_TGM_BK, QW_TGM_BN));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>
+        Xt(Xs, dextents<int32_t, 2>(QW_TGM_BK, QW_TGM_BM));
+    constexpr auto desc = matmul2d_descriptor(QW_TGM_BM, QW_TGM_BN, QW_TGM_BK,
+                                              false, true, false,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<QW_TGM_SG>> op;
+    auto acc = op.template get_destination_cooperative_tensor<decltype(Xt), decltype(Wt), float>();
+#pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i)) acc[i] = 0.0f;
+
+    /* Each thread's x rows are the same at every K step: find them once.  A
+     * pair's row is its own (after the expert's first matmul) or its token's. */
+    device const float *xrow[NX];
+#pragma unroll
+    for (uint i = 0; i < NX; ++i) {
+        const uint mm = (tid + i * T) / (QW_TGM_BK / 4);
+        xrow[i] = nullptr;
+        if (mm < len) {
+            const uint p = (uint)perm[first + mm];
+            xrow[i] = x + (ulong)(a.x_by_pair ? p : p / a.K) * a.k;
+        }
+    }
+
+    uint   rw[NW];
+    ushort rs[NW], rb[NW];
+    float4 rx[NX];
+    auto load = [&](uint k0) {
+#pragma unroll
+        for (uint i = 0; i < NW; ++i) {
+            const uint idx = tid + i * T;
+            const uint gn = col0 + idx / (QW_TGM_BK / 8), kw = k0 / 8 + idx % (QW_TGM_BK / 8);
+            const bool in = gn < a.n;
+            rw[i] = in ? w[(ulong)gn * words + kw] : 0u;
+            rs[i] = in ? scales[(ulong)gn * groups + kw * 8 / G] : ushort(0);
+            rb[i] = in ? biases[(ulong)gn * groups + kw * 8 / G] : ushort(0);
+        }
+#pragma unroll
+        for (uint i = 0; i < NX; ++i) {
+            const uint kq = (tid + i * T) % (QW_TGM_BK / 4);
+            rx[i] = xrow[i] ? *(device const float4 *)(xrow[i] + k0 + kq * 4) : float4(0.0f);
+        }
+    };
+
+    load(0);
+    for (uint k0 = 0; k0 < a.k; k0 += QW_TGM_BK) {
+#pragma unroll
+        for (uint i = 0; i < NW; ++i) {
+            const uint idx = tid + i * T;
+            const float s = qw_tmm_bf16(rs[i]), b = qw_tmm_bf16(rb[i]);
+            half4 lo, hi;
+#pragma unroll
+            for (uint j = 0; j < 4; ++j) {
+                lo[j] = half(fma(s, float((rw[i] >> (4 * j)) & 0xF), b));
+                hi[j] = half(fma(s, float((rw[i] >> (4 * j + 16)) & 0xF), b));
+            }
+            threadgroup half4 *dst = (threadgroup half4 *)(Ws + (idx / (QW_TGM_BK / 8)) * QW_TGM_BK
+                                                              + (idx % (QW_TGM_BK / 8)) * 8);
+            dst[0] = lo;
+            dst[1] = hi;
+        }
+#pragma unroll
+        for (uint i = 0; i < NX; ++i) {
+            const uint idx = tid + i * T;
+            *(threadgroup half4 *)(Xs + (idx / (QW_TGM_BK / 4)) * QW_TGM_BK + (idx % (QW_TGM_BK / 4)) * 4)
+                = half4(rx[i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (k0 + QW_TGM_BK < a.k) load(k0 + QW_TGM_BK);
+        op.run(Xt, Wt, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* Scattered to the pairs' rows; rows past the tile's length were zeros. */
+#pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (!acc.is_valid_element(i)) continue;
+        auto ix = acc.get_multidimensional_index(i);   /* (n, m) within the tile */
+        const uint gn = col0 + ix[0], mm = ix[1];
+        if (mm < len && gn < a.n) y[(ulong)perm[first + mm] * a.n + gn] = acc[i];
+    }
+}
+
+#define QW_TGM_INSTANCE(G)                                                                \
+    template [[host_name("qw_tmm_q4_gather_g" #G)]] kernel void qw_tmm_q4_gather<G>(       \
+        device const uint *, device const ushort *, device const ushort *,                \
+        device const float *, device float *, constant qw_tgm_args &,                     \
+        device const int *, device const int *, uint2, uint);
+QW_TGM_INSTANCE(32)
+QW_TGM_INSTANCE(64)
+
 /* ---- int4 ----------------------------------------------------------------- */
 
 template <uint G>
