@@ -1,5 +1,5 @@
 /* Time to first token and decode, against mlx-vlm (tools/bench/mlx_ttft.py
- * is its twin; README.md, Flash-Next, has the comparison).  Loads the model,
+ * is its twin; docs/benchmarks.md has the comparison).  Loads the model,
  * warms up on a session of its own -- 2,600 tokens, past Flash-Next's
  * sparse-attention budget, and a few decode steps, so no kernel is compiled
  * in the timed part -- then a fresh session, with no checkpoint and no shared
