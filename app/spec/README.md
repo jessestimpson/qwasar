@@ -25,6 +25,7 @@ invariants live in §10.
 | [13-rules.md](13-rules.md) | rules for this codebase |
 | [14-open-questions.md](14-open-questions.md) | open questions |
 | [15-delegation.md](15-delegation.md) | delegation: remote sub-agents, embedded, budgeted, steerable |
+| [16-tool-safety.md](16-tool-safety.md) | dangerous tool calls: the policy, the approval card, Seatbelt containment, and testing it safely |
 
 House rule, carried over from when this was one file: design decisions carry
 their measurements, and a measurement that contradicts an assumption wins.

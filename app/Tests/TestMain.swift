@@ -1,7 +1,7 @@
 // TestMain.swift -- `make test`.
 //
 // The suites, in order of how much they cost to run:
-//   pathguard  no I/O beyond a temp tree; the security boundary
+//   policy     pure: which tool calls run, ask, or are refused (nothing runs)
 //   host tools a session's tools on this Mac: edit's contract, the runner, the
 //              user's shell environment (starts their login shell once)
 //   client     pure; the Session API's event stream, decoded
@@ -22,6 +22,7 @@ struct TestMain {
         let args = CommandLine.arguments
         var failures = 0
 
+        print("== policy");     failures += ToolPolicySuite.run()
         print("== host tools"); failures += HostToolsSuite.run()
         print("== overlay");    failures += SettingsOverlaySuite.run()
         print("== delegation");  failures += EscalationSuite.run()

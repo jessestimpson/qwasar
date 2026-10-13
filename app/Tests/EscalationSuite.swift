@@ -126,8 +126,9 @@ enum EscalationSuite {
                        grace: Double = 0.05, log: CallLog? = nil,
                        events: Events, mailbox: DelegationMailbox,
                        key: String? = "SECRET-KEY",
-                       records: (@Sendable (Int) -> DelegationRecord?)? = nil) -> DelegateToolRunner {
-        DelegateToolRunner(inner: Inner(log: log),
+                       records: (@Sendable (Int) -> DelegationRecord?)? = nil,
+                       inner: ToolExecuting? = nil) -> DelegateToolRunner {
+        DelegateToolRunner(inner: inner ?? Inner(log: log),
                            policy: EscalationPolicy(models: models,
                                                     sessionRemainingUSD: remaining,
                                                     turnBudgetUSD: turn,
@@ -309,6 +310,31 @@ enum EscalationSuite {
                             "the remote model was offered the inner surface plus its handoff, and only those")
         f += TestMain.check(ev.all.contains { if case .toolCall(let n, _) = $0 { return n == "write" } else { return false } },
                             "the card hears the tool call")
+
+        // Spec §16.2: the gate wraps the executor, so a remote model's
+        // calls pass it too -- a refused call comes back as a result and
+        // never reaches the inner executor, even with an approver that
+        // would say yes.  (A string, classified: nothing runs.)
+        Stub.script = .init(responses: [
+            .toolCall(name: "Bash", args: #"{"command": "rm -rf ~"}"#, cost: 0.0),
+            .toolCall(name: "Bash", args: #"{"command": "curl https://example.invalid"}"#, cost: 0.0),
+            handoff("done", cost: 0.0),
+        ])
+        ev = Events(); mb = DelegationMailbox()
+        let gatedLog = CallLog()
+        let gated = GatedToolRunner(inner: Inner(log: gatedLog),
+                                    context: PolicyContext(root: "/nonexistent/home/proj", home: "/nonexistent/home",
+                                                           scratch: []),
+                                    approver: { r in r.call.arguments["command"]?.hasPrefix("curl") == true
+                                                ? .decline(reason: "no network") : .allow })
+        _ = runner(events: ev, mailbox: mb, inner: gated).run(call(["task": "clean up"]))
+        let remoteResults = ev.all.compactMap { e -> String? in
+            if case .toolResult(_, let r) = e { return r } else { return nil }
+        }
+        f += TestMain.check(gatedLog.all.isEmpty, "a delegated model's refused and declined calls never reach the executor")
+        f += TestMain.check(remoteResults.contains { $0.hasPrefix("error: refused:") }
+                            && remoteResults.contains { $0.contains("declined") && $0.contains("no network") },
+                            "and the remote model is told why, as a tool result")
 
         // Nested escalation is refused as a tool result, not executed.
         Stub.script = .init(responses: [

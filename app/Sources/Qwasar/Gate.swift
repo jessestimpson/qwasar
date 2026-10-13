@@ -65,8 +65,12 @@ enum Gate {
         print("  root: \(root.path)")
         print("  > \(prompt)\n")
 
-        let runner = HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root))
-        print("  tools: on this Mac, \(ShellEnvironment.loginShell) environment")
+        // Gated, and headless: no one is here to answer a question, so every
+        // question is a no (spec §16.2).
+        let runner = GatedToolRunner(inner: HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root)),
+                                     context: PolicyContext(root: root.path),
+                                     approver: GatedToolRunner.headless)
+        print("  tools: on this Mac, \(ShellEnvironment.loginShell) environment, gated (headless: asks are declined)")
 
         let opened: OpenedSession
         do {

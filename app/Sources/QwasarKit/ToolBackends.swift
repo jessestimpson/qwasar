@@ -26,11 +26,19 @@ public struct HostBackend: ToolBackend {
     }
 
     public func resolve(_ raw: String) -> String? {
+        HostBackend.absolutePath(raw, workDir: workDir, home: NSHomeDirectory())
+    }
+
+    /// A model-supplied path as the file tools take it: relative to
+    /// `workDir`, ~ for `home`, absolute as given.  ToolPolicy judges the
+    /// same path the tool will write, so this is the one rule for both.
+    public static func absolutePath(_ raw: String, workDir: String, home: String) -> String? {
         if raw.utf8.contains(0) { return nil }
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let abs: String
         if t.isEmpty || t == "." { abs = workDir }
-        else if t == "~" || t.hasPrefix("~/") { abs = (t as NSString).expandingTildeInPath }
+        else if t == "~" { abs = home }
+        else if t.hasPrefix("~/") { abs = home + t.dropFirst() }
         else if t.hasPrefix("/") { abs = t }
         else { abs = workDir + "/" + t }
         return URL(fileURLWithPath: abs).standardizedFileURL.path

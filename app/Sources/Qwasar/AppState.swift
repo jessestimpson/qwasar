@@ -518,8 +518,9 @@ final class AppState {
 
         // The same tools a session's local agent gets, on this Mac.
         guard let root = root(of: rec) else { return }
-        let inner = HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root),
-                                   timeout: settings.toolTimeoutSeconds, resultCap: resultCap)
+        let inner = gated(HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root),
+                                         timeout: settings.toolTimeoutSeconds, resultCap: resultCap),
+                          root: root)
 
         let mailbox = DelegationMailbox()
         delegationMailbox = mailbox
@@ -546,6 +547,16 @@ final class AppState {
                 }
             }
         }
+    }
+
+    /// The tool gate (spec §16.2), around the executor so a delegation's
+    /// calls pass it too.  Off by default until the approval card exists
+    /// (§16.8 step 3): `defaults write <bundle id> toolGate -bool YES`
+    /// turns it on, and then every question is a no.
+    private func gated(_ runner: ToolExecuting, root: URL) -> ToolExecuting {
+        guard UserDefaults.standard.bool(forKey: "toolGate") else { return runner }
+        return GatedToolRunner(inner: runner, context: PolicyContext(root: root.path),
+                               approver: { _ in .decline(reason: "the approval card is not built yet") })
     }
 
     /// The tail of the conversation, for the delegation brief: the last user
@@ -865,9 +876,10 @@ final class AppState {
                 // in the project (a login shell can take a second or two, so
                 // off the main actor).
                 let env = await Task.detached { ShellEnvironment.resolve(in: root) }.value
-                runner = HostToolRunner(root: root, environment: env,
-                                        timeout: settings.toolTimeoutSeconds,
-                                        resultCap: resultCap, ledger: readLedger(rec.id))
+                runner = gated(HostToolRunner(root: root, environment: env,
+                                              timeout: settings.toolTimeoutSeconds,
+                                              resultCap: resultCap, ledger: readLedger(rec.id)),
+                               root: root)
                 toolsStatus = "on this Mac · \(URL(fileURLWithPath: ShellEnvironment.loginShell).lastPathComponent) environment"
                 // Delegation (spec §15): advertised only when models are
                 // granted, a key exists, and budget remains.
