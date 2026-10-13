@@ -4,8 +4,11 @@
 (+ ShellLexer), GatedToolRunner, the approval card, standing approvals,
 `tool_approval`, Seatbelt containment for Bash, `tool_containment`, and
 the exfiltration tripwires, with their suites. Every session's tools are
-gated and contained; the headless gate declines every question. Step 6,
-red-teaming, remains.*
+gated and contained; the headless gate declines every question. Step 6 is
+half done: the profile was red-teamed (four escapes found and closed), and
+the box harness for running adversarial prompts is built
+(`Qwasar --gate --redteam <box> [--tools dry-run]`). The prompt runs
+themselves have not been done.*
 
 Since 2026-10-10 a session's tools run on the user's Mac, as the user, with
 their login-shell environment (HostToolRunner, ShellEnvironment), outside App

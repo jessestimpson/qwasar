@@ -160,6 +160,35 @@ enum ContainmentSuite {
                             "with an ipc grant it can")
         _ = Spawn0.run("/usr/bin/defaults", ["delete", "com.qwasar.canary.containment"])
 
+        print("  -- the red-team box (§16.7.4)")
+        // The box is this suite's tree; a second temp directory, beside it,
+        // stands in for the real home.
+        let beyond = URL(fileURLWithPath: fm.temporaryDirectory.path).resolvingSymlinksInPath()
+            .appendingPathComponent("qwasar-beyond-\(UUID().uuidString)")
+        try? fm.createDirectory(at: beyond, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: beyond) }
+        try? "FAKE OUTSIDE SECRET\n".write(to: beyond.appendingPathComponent("secret"), atomically: true, encoding: .utf8)
+        try? fm.createDirectory(at: home.appendingPathComponent(".ssh"), withIntermediateDirectories: true)
+        try? "FAKE BOX KEY\n".write(to: home.appendingPathComponent(".ssh/id_ed25519"), atomically: true, encoding: .utf8)
+        let boxed = Containment(root: proj.path, home: home.path, scratch: [], hidden: [beyond.path])
+        let boxEnv = ["PATH": "/usr/bin:/bin", "HOME": home.path]
+        let real = BoxBackend(inner: HostBackend(root: proj, environment: boxEnv, containment: boxed),
+                              box: t.path, home: home.path, dryRun: false)
+        let boxKit = KitOver(backend: real)
+        let outRead = boxKit.run(ToolCall(name: "Read", arguments: ["file_path": beyond.path + "/secret"]))
+        f += TestMain.check(!outRead.contains("FAKE OUTSIDE SECRET"), "the file tools cannot read outside the box")
+        let tilde = boxKit.run(ToolCall(name: "Read", arguments: ["file_path": "~/.ssh/id_ed25519"]))
+        f += TestMain.check(tilde.contains("FAKE BOX KEY"), "~ is the box's fake home")
+        let hiddenCat = boxKit.run(ToolCall(name: "Bash", arguments: ["command": "cat '\(beyond.path)/secret'"]))
+        f += TestMain.check(!hiddenCat.contains("FAKE OUTSIDE SECRET") && hiddenCat.contains("not permitted"),
+                            "Bash cannot read what the box hides, by absolute path either")
+        let dry = BoxBackend(inner: HostBackend(root: proj, environment: boxEnv, containment: boxed),
+                             box: t.path, home: home.path, dryRun: true)
+        _ = KitOver(backend: dry).run(ToolCall(name: "Bash", arguments: ["command": "touch '\(proj.path)/dry'"]))
+        _ = KitOver(backend: dry).run(ToolCall(name: "Write", arguments: ["file_path": "drywrite", "content": "x"]))
+        f += TestMain.check(!exists(proj.appendingPathComponent("dry")) && !exists(proj.appendingPathComponent("drywrite"))
+                            && dry.log.count == 2, "a dry run records the command and the write, and runs neither")
+
         print("  -- through the gate")
         // The point of containment: a command the policy allows -- the
         // project's own script -- that does what the policy cannot see.

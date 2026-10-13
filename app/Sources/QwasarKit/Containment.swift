@@ -77,6 +77,11 @@ public struct Containment: Sendable {
     public let root: String
     /// Writable without asking: the root, scratch, caches.  Canonical.
     public let writable: [String]
+    /// Not even readable -- the red-team box hides the real home, so no
+    /// command can put a real secret in front of the model (§16.7.4) --
+    /// except what `revealed` gives back.
+    public let hidden: [String]
+    public let revealed: [String]
 
     /// Under the home directory: where toolchains keep what they download
     /// and build.  Measured, not guessed: grown from the denials real builds
@@ -90,7 +95,10 @@ public struct Containment: Sendable {
 
     /// `scratch` nil: the per-user temporary directory's parent (so the
     /// compilers' caches beside $TMPDIR) and /tmp.
-    public init(root: String, home: String = NSHomeDirectory(), scratch: [String]? = nil) {
+    public init(root: String, home: String = NSHomeDirectory(), scratch: [String]? = nil,
+                hidden: [String] = [], revealed: [String] = []) {
+        self.hidden = hidden.map { Paths.physical(Paths.lexical($0)) }
+        self.revealed = revealed.map { Paths.physical(Paths.lexical($0)) }
         let r = Paths.physical(Paths.lexical(root))
         let h = Paths.physical(Paths.lexical(home))
         let s = scratch ?? [Paths.parent(Paths.physical(Paths.lexical(NSTemporaryDirectory()))), "/tmp"]
@@ -127,6 +135,12 @@ public struct Containment: Sendable {
     /// it, then allow exactly what an approval granted.
     public func profile(_ grant: ContainmentGrant = .none) -> String {
         var p = ["(version 1)", "(allow default)"]
+        if !hidden.isEmpty {
+            p.append("(deny file-read* " + hidden.map { "(subpath \(Containment.quoted($0)))" }.joined(separator: " ") + ")")
+            if !revealed.isEmpty {
+                p.append("(allow file-read* " + revealed.map { "(subpath \(Containment.quoted($0)))" }.joined(separator: " ") + ")")
+            }
+        }
         if !grant.anywhere {
             p.append("(deny file-write*)")
             p.append("(allow file-write* " + writable.map { "(subpath \(Containment.quoted($0)))" }.joined(separator: " ")
@@ -189,11 +203,15 @@ public struct Containment: Sendable {
         #!/bin/sh
         # Written by Qwasar (spec §16.5): \(name), with the compiler's nested sandbox off,
         # because this command already runs in one.
-        self_dir=$(cd "$(dirname "$0")" && pwd -P)
+        # Found by PATH, so $0 is "<its PATH entry>/\(name)": compared as text,
+        # never by resolving directories -- under a profile that hides the
+        # home directory, its ancestors cannot be resolved.
+        self_dir=$(dirname "$0")
         real=
         IFS=:
         for d in $PATH; do
-          [ "$(cd "$d" 2>/dev/null && pwd -P)" = "$self_dir" ] && continue
+          [ "$d" = "$self_dir" ] && continue
+          [ "$d/\(name)" = "$0" ] && continue
           if [ -x "$d/\(name)" ]; then real="$d/\(name)"; break; fi
         done
         unset IFS

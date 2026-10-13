@@ -104,3 +104,59 @@ public struct HostBackend: ToolBackend {
                                    interrupted: r.interrupted))
     }
 }
+
+/// The red-team box (spec §16.7.4): a project and a fake home under one
+/// directory, and nothing else.  `~` is the fake home; the file tools --
+/// which run in this process, outside any sandbox -- see nothing outside
+/// the box, so a model told to read a real key reads "no such file".  Dry
+/// run records every command and write and runs none of them; otherwise
+/// commands run through the inner backend, whose containment should hide
+/// the real home too.
+public final class BoxBackend: ToolBackend, @unchecked Sendable {
+    public let inner: HostBackend
+    public let box: String
+    public let home: String
+    public let dryRun: Bool
+    private let lock = NSLock()
+    private var _log: [String] = []
+
+    public init(inner: HostBackend, box: String, home: String, dryRun: Bool) {
+        self.inner = inner
+        self.box = Paths.physical(Paths.lexical(box))
+        self.home = Paths.physical(Paths.lexical(home))
+        self.dryRun = dryRun
+    }
+
+    /// Every command and write the tools attempted, in order.
+    public var log: [String] { lock.withLock { _log } }
+    private func record(_ s: String) { lock.withLock { _log.append(s) } }
+
+    public var workDir: String { inner.workDir }
+    public var hasRipgrep: Bool { inner.hasRipgrep }
+
+    public func resolve(_ raw: String) -> String? {
+        HostBackend.absolutePath(raw, workDir: workDir, home: home)
+    }
+
+    private func inBox(_ p: String) -> Bool { Paths.within(Paths.physical(p), box) }
+
+    public func stat(_ path: String) -> Result<PathKind, ToolFailure> {
+        inBox(path) ? inner.stat(path) : .success(.missing)
+    }
+
+    public func read(_ path: String, maxBytes: Int) -> Result<(size: Int, text: String), ToolFailure> {
+        inBox(path) ? inner.read(path, maxBytes: maxBytes) : .failure(ToolFailure("no such file: \(path)"))
+    }
+
+    public func write(_ path: String, _ content: String) -> Result<Void, ToolFailure> {
+        record("write \(path)")
+        if dryRun { return .success(()) }
+        return inBox(path) ? inner.write(path, content) : .failure(ToolFailure("cannot write \(path)"))
+    }
+
+    public func exec(_ command: String, timeoutMS: Int, maxBytes: Int) -> Result<ExecResult, ToolFailure> {
+        record("exec \(command)")
+        if dryRun { return .success(ExecResult(status: 0, output: "", timedOut: false)) }
+        return inner.exec(command, timeoutMS: timeoutMS, maxBytes: maxBytes)
+    }
+}

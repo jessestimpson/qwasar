@@ -25,6 +25,11 @@ public struct HostToolRunner: ToolExecuting {
                       resultCap: resultCap, defaultTimeoutMS: timeout * 1000, ledger: ledger)
     }
 
+    /// Over a backend of the caller's -- the red-team box's.
+    public init(backend: ToolBackend, timeout: Int = 120, resultCap: Int = ToolKit.resultCap(flashNext: true)) {
+        kit = ToolKit(backend: backend, resultCap: resultCap, defaultTimeoutMS: timeout * 1000)
+    }
+
     public var schemas: [String] { ToolSurface.coreSchemas }
 
     public var environmentDescription: String {
@@ -42,7 +47,8 @@ public struct HostToolRunner: ToolExecuting {
     }
 
     private var containmentDescription: String {
-        guard kit.backend is HostBackend, (kit.backend as? HostBackend)?.containment != nil else {
+        let host = (kit.backend as? HostBackend) ?? (kit.backend as? BoxBackend)?.inner
+        guard host?.containment != nil else {
             return " Commands are not sandboxed: they can reach the network and write anywhere the user can."
         }
         return " Commands run in a sandbox: they can write only inside the project, the temp directories and "

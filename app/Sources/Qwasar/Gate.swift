@@ -7,6 +7,13 @@
 //   Qwasar --gate --model <dir> [--prompt ..]  starts the helper on that model
 //   Qwasar --gate --server <url> [--prompt ..] uses a server that is running
 //   --root <dir>                               where the turn's tools run
+//   --redteam <box> [--tools dry-run]          spec §16.7.4: the tools in a box
+//
+// A red-team box is <box>/proj (the root), <box>/home (a fake ~) and
+// <box>/tmp.  The file tools see nothing outside it; Bash runs contained,
+// with the real home hidden even from reads, so nothing real can reach the
+// model, this log, or whoever reads this log.  --tools dry-run records every
+// command and write and runs none.  Each call's verdict is printed.
 
 import Foundation
 import QwasarKit
@@ -60,17 +67,41 @@ enum Gate {
             print("\n-- turn\n  skipped: pass --prompt to run one")
             return 0
         }
-        let root = URL(fileURLWithPath: QwasarMain.value(of: "--root", in: args) ?? FileManager.default.currentDirectoryPath)
+        var root = URL(fileURLWithPath: QwasarMain.value(of: "--root", in: args) ?? FileManager.default.currentDirectoryPath)
+        let redteam = QwasarMain.value(of: "--redteam", in: args)
+        let dryRun = QwasarMain.value(of: "--tools", in: args) == "dry-run"
+        var box: BoxBackend?
+        let ctx: PolicyContext
+        let runner: GatedToolRunner
+        if let redteam {
+            let b = URL(fileURLWithPath: redteam).resolvingSymlinksInPath()
+            let home = b.appendingPathComponent("home"), tmp = b.appendingPathComponent("tmp")
+            root = b.appendingPathComponent("proj")
+            let env = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin", "HOME": home.path,
+                       "TMPDIR": tmp.path + "/", "USER": NSUserName(), "LANG": "en_US.UTF-8"]
+            let containment = Containment(root: root.path, home: home.path, scratch: [tmp.path],
+                                          hidden: [NSHomeDirectory()], revealed: [Containment.shimDirectory.path])
+            let bb = BoxBackend(inner: HostBackend(root: root, environment: env, containment: containment),
+                                box: b.path, home: home.path, dryRun: dryRun)
+            box = bb
+            ctx = PolicyContext(root: root.path, home: home.path, scratch: [tmp.path])
+            runner = GatedToolRunner(inner: HostToolRunner(backend: bb), context: ctx, approver: GatedToolRunner.headless)
+        } else {
+            ctx = PolicyContext(root: root.path)
+            // Gated, and headless: no one is here to answer a question, so
+            // every question is a no (spec §16.2).
+            runner = GatedToolRunner(inner: HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root)),
+                                     context: ctx, approver: GatedToolRunner.headless)
+        }
         print("\n-- agent turn")
         print("  root: \(root.path)")
         print("  > \(prompt)\n")
-
-        // Gated, and headless: no one is here to answer a question, so every
-        // question is a no (spec §16.2).
-        let runner = GatedToolRunner(inner: HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root)),
-                                     context: PolicyContext(root: root.path),
-                                     approver: GatedToolRunner.headless)
-        print("  tools: on this Mac, \(ShellEnvironment.loginShell) environment, gated (headless: asks are declined)")
+        if let redteam {
+            print("  tools: red-team box \(redteam), \(dryRun ? "DRY RUN (nothing runs)" : "contained, real home hidden"), "
+                  + "gated (headless: asks are declined)")
+        } else {
+            print("  tools: on this Mac, \(ShellEnvironment.loginShell) environment, gated (headless: asks are declined)")
+        }
 
         let opened: OpenedSession
         do {
@@ -118,6 +149,11 @@ enum Gate {
                 if stop == "tool_calls", !calls.isEmpty {
                     var results: [ToolResultPayload] = []
                     for (id, c) in calls {
+                        if redteam != nil {
+                            let secrets = ToolPolicy.secretsRead(c, ctx)
+                            print("    [policy] \(Gate.describe(ToolPolicy.classify(c, ctx)))"
+                                  + (secrets.isEmpty ? "" : " · reads secrets: \(secrets.joined(separator: ", "))"))
+                        }
                         let r = runner.run(c)
                         let head = r.split(separator: "\n").prefix(3).joined(separator: "\n    ")
                         print("    \(c.name): \(head)\(r.split(separator: "\n").count > 3 ? "\n    …" : "")")
@@ -171,7 +207,20 @@ enum Gate {
             _ = t0
         }
         _ = try? await client.park(opened.id)
+        if let box {
+            print("\n-- attempted (\(dryRun ? "dry run: none of it ran" : "what passed the gate ran, contained in the box"))")
+            for e in box.log { print("  \(e)") }
+            if box.log.isEmpty { print("  (no commands or writes)") }
+        }
         print("\n  \(ok ? "GATE PASSES" : "gate incomplete")")
         return ok ? 0 : 1
+    }
+
+    static func describe(_ v: Verdict) -> String {
+        switch v {
+        case .allow: return "allow"
+        case .deny(let r): return "DENY: \(r)"
+        case .ask(let rs, let high, _): return "\(high ? "ASK (high)" : "ask"): \(rs.joined(separator: "; "))"
+        }
     }
 }
