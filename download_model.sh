@@ -1,14 +1,19 @@
 #!/bin/sh
 # qwasar model downloader.
 #
-# Fetches the weights qwasar needs and links them where the binaries look by
-# default, so that after
+# Fetches the weights qwasar needs and links them beside the binaries, so
+# that after
 #
-#     ./download_model.sh model
+#     ./download_model.sh 27b
 #
 # this works from the project directory with no arguments:
 #
 #     ./qwasar -p "Hello"
+#
+# A target is the part of the model's name that tells it apart -- 9b, 27b,
+# flash-next, and 27b-mtp for the 27B's draft head -- and each links
+# ./qwasar-<target>.  ./qwasar-model, which the binaries use when -m is
+# absent, points at the first model downloaded, or at any with --default.
 #
 # Three models, one engine: Qwen3.8 27B (dense, ~16 GB, runs on a 32 GB Mac),
 # Qwen3.8 Flash-Next (a 125B mixture of experts with 6B active, ~111 GB,
@@ -98,58 +103,45 @@ usage() {
 qwasar model downloader
 
 Usage:
-  ./download_model.sh            (suggest a model for this Mac's memory)
-  ./download_model.sh model      [--force] [--verify] [--token TOKEN]
-  ./download_model.sh 9b         [--default] [--force] [--verify] [--token TOKEN]
-  ./download_model.sh flash-next [--default] [--force] [--verify] [--token TOKEN]
-  ./download_model.sh mtp-head   [--verify] [--token TOKEN]
-  ./download_model.sh all        [--verify] [--token TOKEN]
+  ./download_model.sh                (suggest a model for this Mac's memory)
+  ./download_model.sh TARGET... [--default] [--force] [--verify] [--token TOKEN]
 
-Targets:
-
-  model
-       Qwen3.8 27B, dense, MLX affine 4-bit, group 64.  About 16 GB on disk
-       and in memory; runs on a 32 GB Mac.  Other quantisations of the same
-       model (8-bit, 6-bit, FP8, GGUF) will not load: the kernels are built
-       around the MLX affine 4-bit format on purpose (PLAN.md section 1.2).
-
-       Repository: $MODEL_REPO
-       Links ./qwasar-model, which every qwasar binary uses when -m is absent.
+Targets -- each links ./qwasar-TARGET:
 
   9b
        Qwen3.5 9B, dense, MLX affine 4-bit, group 64.  About 6 GB on disk and
        ~8 GB in memory with a 32K context, so it runs on a 16 GB Mac.  The
        previous Qwen generation, but the same hybrid architecture, tokenizer
        and chat format.  Faster than the 27B and weaker on long agent tasks.
-
        Repository: $NINEB_REPO
-       Links ./qwasar-9b.  With --default, ./qwasar-model points at it too,
-       so the binaries use it when -m is absent.
+
+  27b
+       Qwen3.8 27B, dense, MLX affine 4-bit, group 64.  About 16 GB on disk
+       and in memory; runs on a 32 GB Mac.  Other quantisations of the same
+       model (8-bit, 6-bit, FP8, GGUF) will not load: the kernels are built
+       around the MLX affine 4-bit format on purpose (PLAN.md section 1.2).
+       Repository: $MODEL_REPO
 
   flash-next
        Qwen3.8 Flash-Next: a 125B mixture of experts with 6B active per
        token, MLX affine 4-bit (group 32).  About 111 GB on disk; ~80 GB of
        it is held in memory and the engram table stays on disk, so it needs
-       a 128 GB Mac.  Decodes at ~68 t/s on an M5 Max.
-
+       a 128 GB Mac.  Decodes at ~60 t/s on an M5 Max.
        Repository: $FLASH_REPO
-       Links ./qwasar-flash-next.  With --default, ./qwasar-model points at
-       it too, so the binaries use it when -m is absent.
 
-  mtp-head
+  27b-mtp
        The 27B's multi-token-prediction draft head, bf16.  About 850 MB.
        Optional: speculative decoding with it is about 1.5x on the 27B
-       (qwasar --mtp ./qwasar-mtp --spec).  Flash-Next does not use it.
-
+       (qwasar --mtp ./qwasar-27b-mtp --spec).  Flash-Next does not use it.
        Repository: $MTP_REPO
-       Links ./qwasar-mtp, which is what to pass to --mtp.
 
-  all
-       The 27B and its draft head -- what runs on any supported Mac.
-       Flash-Next is its own target: it is 111 GB and needs 128 GB.
+Several targets may be given at once: ./download_model.sh 27b 27b-mtp
+
+./qwasar-model is what every qwasar binary uses when -m is absent.  The
+first model downloaded becomes it; --default moves it to the one(s) given.
 
 Options:
-  --default      (9b, flash-next) Also point ./qwasar-model at it.
+  --default      Point ./qwasar-model at this model (the last one given).
   --force        Download even on a machine with too little memory to run
                  it, e.g. to copy it to another Mac.
   --verify       Check the SHA-256 of every downloaded file.  Sizes are always
@@ -162,6 +154,9 @@ Environment:
   QWASAR_MODEL_DIR  Where downloads are kept.  Default: ./models
   QWASAR_MODEL      Checked by the binaries before ./qwasar-model, so an
                     existing copy elsewhere can be used without downloading.
+
+Earlier names still work: model (now 27b), mtp-head (now 27b-mtp), and all
+(now 27b 27b-mtp).
 
 Every repository is pinned to a revision, so a re-run fetches the same bytes
 this was tested against rather than whatever main has become.
@@ -194,13 +189,13 @@ fastest model and the one the agent is best on.
 
     ./download_model.sh flash-next --default
 
-The 27B also runs here (./download_model.sh model), at ~16 GB.
+The 27B also runs here (./download_model.sh 27b), at ~16 GB.
 EOF
     elif [ "$mem" -ge "$MODEL_MIN_MEM_GB" ]; then
         cat <<EOF
 Suggested: Qwen3.8 27B -- ~16 GB download and in memory.
 
-    ./download_model.sh model
+    ./download_model.sh 27b
 
 For speed over quality, Qwen3.5 9B runs here too (./download_model.sh 9b).
 Flash-Next needs a 128 GB Mac.
@@ -229,21 +224,10 @@ if [ $# -eq 0 ]; then
     exit 0
 fi
 
-TARGET=$1
-shift
-case "$TARGET" in
-    model|9b|flash-next|mtp-head|all) ;;
-    -h|--help|help) usage; exit 0 ;;
-    *)
-        echo "Unknown target: $TARGET" >&2
-        echo >&2
-        usage >&2
-        exit 1
-        ;;
-esac
-
+TARGETS=
 while [ $# -gt 0 ]; do
     case "$1" in
+        -h|--help|help) usage; exit 0 ;;
         --token)
             shift
             [ $# -gt 0 ] || { echo "Missing value after --token" >&2; exit 1; }
@@ -252,13 +236,30 @@ while [ $# -gt 0 ]; do
         --verify) VERIFY=1 ;;
         --force) FORCE=1 ;;
         --default) AS_DEFAULT=1 ;;
-        *) echo "Unknown option: $1" >&2; exit 1 ;;
+        9b|27b|flash-next|27b-mtp) TARGETS="$TARGETS $1" ;;
+        # The names before 27b and 27b-mtp, kept so scripts and habits work.
+        model)    echo "(model is now called 27b)" >&2; TARGETS="$TARGETS 27b" ;;
+        mtp-head) echo "(mtp-head is now called 27b-mtp)" >&2; TARGETS="$TARGETS 27b-mtp" ;;
+        all)      echo "(all is now: 27b 27b-mtp)" >&2; TARGETS="$TARGETS 27b 27b-mtp" ;;
+        -*) echo "Unknown option: $1" >&2; exit 1 ;;
+        *)
+            echo "Unknown target: $1" >&2
+            echo >&2
+            usage >&2
+            exit 1
+            ;;
     esac
     shift
 done
+[ -n "$TARGETS" ] || { usage >&2; exit 1; }
 
-if [ "$AS_DEFAULT" -eq 1 ] && [ "$TARGET" != "flash-next" ] && [ "$TARGET" != "9b" ]; then
-    echo "--default applies to 9b and flash-next; model already links ./qwasar-model" >&2
+# The model --default points ./qwasar-model at: the last model target given.
+DEFAULT_TARGET=
+for t in $TARGETS; do
+    [ "$t" = 27b-mtp ] || DEFAULT_TARGET=$t
+done
+if [ "$AS_DEFAULT" -eq 1 ] && [ -z "$DEFAULT_TARGET" ]; then
+    echo "--default needs a model target; 27b-mtp is the 27B's draft head" >&2
     exit 1
 fi
 
@@ -309,17 +310,19 @@ too_small() {
 }
 
 if [ "$FORCE" -eq 0 ] && [ "$(mem_gb)" -gt 0 ]; then
-    case "$TARGET" in
-        flash-next)
-            [ "$(mem_gb)" -ge "$FLASH_MIN_MEM_GB" ] || too_small Flash-Next \
-                "Flash-Next holds ~80 GB of weights in memory, so it needs a 128 GB Mac." ;;
-        model|all)
-            [ "$(mem_gb)" -ge "$MODEL_MIN_MEM_GB" ] || too_small "the 27B" \
-                "The 27B holds ~16 GB of weights plus its context, so it needs a 32 GB Mac." ;;
-        9b)
-            [ "$(mem_gb)" -ge "$NINEB_MIN_MEM_GB" ] || too_small "the 9B" \
-                "The 9B needs ~8 GB free with a 32K context, so it needs a 16 GB Mac." ;;
-    esac
+    for t in $TARGETS; do
+        case "$t" in
+            flash-next)
+                [ "$(mem_gb)" -ge "$FLASH_MIN_MEM_GB" ] || too_small Flash-Next \
+                    "Flash-Next holds ~80 GB of weights in memory, so it needs a 128 GB Mac." ;;
+            27b)
+                [ "$(mem_gb)" -ge "$MODEL_MIN_MEM_GB" ] || too_small "the 27B" \
+                    "The 27B holds ~16 GB of weights plus its context, so it needs a 32 GB Mac." ;;
+            9b)
+                [ "$(mem_gb)" -ge "$NINEB_MIN_MEM_GB" ] || too_small "the 9B" \
+                    "The 9B needs ~8 GB free with a 32K context, so it needs a 16 GB Mac." ;;
+        esac
+    done
 fi
 
 # Asking the server for the expected size and digest rather than pinning them
@@ -412,68 +415,59 @@ fetch() {
     echo "Linked ./$link -> $dir"
 }
 
-fetch_model() { fetch "$MODEL_REPO" "$MODEL_REV" "$MODEL_NAME" "$MODEL_FILES" qwasar-model "$MODEL_GB"; }
-fetch_mtp()   { fetch "$MTP_REPO"   "$MTP_REV"   "$MTP_NAME"   "$MTP_FILES"   qwasar-mtp   "$MTP_GB"; }
-fetch_9b() {
-    fetch "$NINEB_REPO" "$NINEB_REV" "$NINEB_NAME" "$NINEB_FILES" qwasar-9b "$NINEB_GB"
-    if [ "$AS_DEFAULT" -eq 1 ]; then
-        ln -sfn "$OUT_DIR/$NINEB_NAME" "$ROOT/qwasar-model"
-        echo "Linked ./qwasar-model -> $OUT_DIR/$NINEB_NAME"
-    fi
-}
-fetch_flash() {
-    fetch "$FLASH_REPO" "$FLASH_REV" "$FLASH_NAME" "$FLASH_FILES" qwasar-flash-next "$FLASH_GB"
-    if [ "$AS_DEFAULT" -eq 1 ]; then
-        ln -sfn "$OUT_DIR/$FLASH_NAME" "$ROOT/qwasar-model"
-        echo "Linked ./qwasar-model -> $OUT_DIR/$FLASH_NAME"
+# Points ./qwasar-model at a downloaded model: with --default, or when there
+# is none yet, so the binaries work with no -m after the first download.
+link_default() {
+    name=$1; target=$2
+    if [ "$AS_DEFAULT" -eq 1 ] && [ "$target" = "$DEFAULT_TARGET" ] \
+        || { [ ! -e "$ROOT/qwasar-model" ] && [ ! -L "$ROOT/qwasar-model" ]; }; then
+        ln -sfn "$OUT_DIR/$name" "$ROOT/qwasar-model"
+        echo "Linked ./qwasar-model -> $OUT_DIR/$name"
     fi
 }
 
-case "$TARGET" in
-    model)      fetch_model ;;
-    9b)         fetch_9b ;;
-    flash-next) fetch_flash ;;
-    mtp-head)   fetch_mtp ;;
-    all)        fetch_model; fetch_mtp ;;
-esac
+for t in $TARGETS; do
+    case "$t" in
+        9b)
+            fetch "$NINEB_REPO" "$NINEB_REV" "$NINEB_NAME" "$NINEB_FILES" qwasar-9b "$NINEB_GB"
+            link_default "$NINEB_NAME" 9b ;;
+        27b)
+            fetch "$MODEL_REPO" "$MODEL_REV" "$MODEL_NAME" "$MODEL_FILES" qwasar-27b "$MODEL_GB"
+            link_default "$MODEL_NAME" 27b ;;
+        flash-next)
+            fetch "$FLASH_REPO" "$FLASH_REV" "$FLASH_NAME" "$FLASH_FILES" qwasar-flash-next "$FLASH_GB"
+            link_default "$FLASH_NAME" flash-next ;;
+        27b-mtp)
+            fetch "$MTP_REPO" "$MTP_REV" "$MTP_NAME" "$MTP_FILES" qwasar-27b-mtp "$MTP_GB" ;;
+    esac
+done
 
+# What ./qwasar-model now is, by the folder it points at.
+current=$(readlink "$ROOT/qwasar-model" 2>/dev/null || true)
 echo
-case "$TARGET" in
-    model|all)
-        echo "Ready.  From this directory:"
-        echo "  ./qwasar -p \"Hello\""
-        echo "  ./qwasar-agent"
-        echo "  ./qwasar-server"
-        ;;
-    flash-next)
-        echo "Ready.  From this directory:"
-        if [ "$AS_DEFAULT" -eq 1 ]; then
-            echo "  ./qwasar -p \"Hello\""
-            echo "  ./qwasar-server"
+echo "Ready.  From this directory:"
+for t in $TARGETS; do
+    case "$t" in
+        9b) name=$NINEB_NAME ;;
+        27b) name=$MODEL_NAME ;;
+        flash-next) name=$FLASH_NAME ;;
+        *) continue ;;
+    esac
+    if [ "$current" = "$OUT_DIR/$name" ]; then
+        echo "  ./qwasar -p \"Hello\"                     ($name, the default)"
+    else
+        echo "  ./qwasar -m ./qwasar-$t -p \"Hello\""
+        echo "    (or make it the default: ./download_model.sh $t --default)"
+    fi
+done
+case " $TARGETS " in
+    *" 27b-mtp "*)
+        if [ -e "$ROOT/qwasar-27b" ]; then
+            echo "  ./qwasar -m ./qwasar-27b --mtp ./qwasar-27b-mtp --spec -p \"Hello\"   (speculative)"
         else
-            echo "  ./qwasar -m ./qwasar-flash-next -p \"Hello\""
-            echo "  ./qwasar-server -m ./qwasar-flash-next"
-            echo "or make it the default: ./download_model.sh flash-next --default"
+            echo "  The draft head speeds up the 27B, which is not here yet: ./download_model.sh 27b"
         fi
-        echo "In Qwasar.app, choose models/$FLASH_NAME in the Model menu."
-        ;;
-    9b)
-        echo "Ready.  From this directory:"
-        if [ "$AS_DEFAULT" -eq 1 ]; then
-            echo "  ./qwasar -p \"Hello\""
-            echo "  ./qwasar-server"
-        else
-            echo "  ./qwasar -m ./qwasar-9b -p \"Hello\""
-            echo "  ./qwasar-server -m ./qwasar-9b"
-            echo "or make it the default: ./download_model.sh 9b --default"
-        fi
-        echo "In Qwasar.app, choose models/$NINEB_NAME in the Model menu."
         ;;
 esac
-case "$TARGET" in
-    mtp-head|all)
-        echo
-        echo "Draft head at ./qwasar-mtp; speculative decoding with the 27B:"
-        echo "  ./qwasar --mtp ./qwasar-mtp --spec -p \"Hello\""
-        ;;
-esac
+echo "./qwasar-server and ./qwasar-agent take the same -m; in Qwasar.app, choose"
+echo "the model's folder under models/ in the Model menu."

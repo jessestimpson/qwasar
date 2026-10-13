@@ -1413,8 +1413,8 @@ static bool resolve_model(qwasar_options *opts, const char *prog) {
     fprintf(stderr,
         "%s: no model given and none found.\n"
         "\n"
-        "Download it once:\n"
-        "    ./download_model.sh model\n"
+        "Download one (run it bare for a suggestion for this Mac):\n"
+        "    ./download_model.sh\n"
         "\n"
         "or point at an existing copy with -m <dir>, or set QWASAR_MODEL.\n", prog);
     return false;

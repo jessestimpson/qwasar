@@ -28,9 +28,12 @@ qwasar_metal4_src.inc
 # downloaded weights and the symlinks download_model.sh points at them
 models/
 qwasar-model
-qwasar-mtp
-qwasar-flash-next
 qwasar-9b
+qwasar-27b
+qwasar-27b-mtp
+qwasar-flash-next
+# the names download_model.sh used before 27b and 27b-mtp
+qwasar-mtp
 
 # reference implementations, kept locally for study and for generating
 # golden vectors; not part of this project
