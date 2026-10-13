@@ -472,6 +472,39 @@ makes the cache matter: that session parked to a 6.33 GB checkpoint and
 resumed to its first new token in 11 s, or 16 s after a server restart,
 against 640 s to rebuild it ([PLAN-qwasar.md](PLAN-qwasar.md) M4).
 
+**Against mlx-vlm** on the same 4-bit weights, the same machine, 2026-10-13:
+a coding agent's first prompt, from a cold session — no checkpoint, no prompt
+cache, no shared prefix on either side. Two sizes: 4,872 tokens, what
+Qwasar.app's agent sends first (its system prompt and tools are 4,846), and
+16,384, a heavier agent's. Time to first token is the prefill through the
+first token's argmax; decode is 256 greedy tokens after it. Both engines
+warm up in-process first, both take the same token ids, every run starts from
+a die cooled to ~44.5 C; two runs each.
+
+| Prompt | | qwasar | mlx-vlm `main` | mlx-vlm `d1bd74ed` |
+|---|---|---:|---:|---:|
+| 4,872 tokens | time to first token | 4.20 / 4.34 s | 4.43 / 4.66 s | 4.05 / 3.91 s |
+| | prefill | 1,159 / 1,122 t/s | 1,100 / 1,045 t/s | 1,204 / 1,246 t/s |
+| | decode | 62.9 / 62.2 t/s | 36.6 / 38.8 t/s | 29.3 / 30.2 t/s |
+| 16,384 tokens | time to first token | 16.6 / 16.0 s | 16.5 / 16.9 s | 15.9 / 15.5 s |
+| | prefill | 988 / 1,025 t/s | 993 / 968 t/s | 1,031 / 1,057 t/s |
+| | decode | 57.1 / 57.9 t/s | 35.8 / 36.8 t/s | 29.5 / 29.4 t/s |
+
+mlx-vlm `main` is commit `e928101a` with mlx 0.32.3; `d1bd74ed` (mlx
+0.32.2) is the commit `tests/fixtures` were recorded against. Prefill is
+level: within ~6% of current mlx-vlm either way, and the older commit was
+3–10% quicker than both. Decode is qwasar's: 1.6–1.7× current mlx-vlm,
+~2× the older commit. Not in these numbers: loading, ~22 s for qwasar (most
+of it copying shards to align them) against ~7 s for mlx-vlm, which counts
+once per process. mlx-vlm runs as it ships — BF16 activations, 2,048-token
+prefill steps — and qwasar in fp32 with 1,024-token chunks; their greedy
+outputs agree for a few tokens and then part, as two precisions do.
+
+The harnesses are `tools/bench/ttftbench` and `tools/bench/mlx_ttft.py`; the
+ids were `qwasar.c`, `qwasar_graph.c`, `qwasar_metal.m`,
+`qwasar_sessions.c`, `README.md` and `PLAN.md`, concatenated and encoded by
+the model's tokenizer.
+
 ## Qwen3.5 9B
 
 Measured on the same **M5 Max with 128 GB**: ~90 t/s decode, and prefill
