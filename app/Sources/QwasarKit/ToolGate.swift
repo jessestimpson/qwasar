@@ -72,6 +72,38 @@ public final class StandingApprovals: @unchecked Sendable {
     }
 }
 
+/// The secrets a session has read (§16.4), as shown to the user: once there
+/// is one, a call that would reach the network always asks, and says which.
+public final class SecretLedger: @unchecked Sendable {
+    private let lock = NSLock()
+    private var names: [String]
+    private let onAdd: @Sendable ([String]) -> Void
+
+    /// `onAdd` hears each new one, to persist it: a reopened session's
+    /// context is restored, so its model still holds what it read.
+    public init(_ initial: [String] = [], onAdd: @escaping @Sendable ([String]) -> Void = { _ in }) {
+        names = initial
+        self.onAdd = onAdd
+    }
+
+    public var all: [String] { lock.withLock { names } }
+
+    public func add(_ new: [String]) {
+        let fresh: [String] = lock.withLock {
+            var f: [String] = []
+            for n in new where !names.contains(n) { names.append(n); f.append(n) }
+            return f
+        }
+        if !fresh.isEmpty { onAdd(fresh) }
+    }
+}
+
+/// Who is making the call.  DelegateToolRunner sets `remote` around a
+/// remote model's calls, whose results leave this Mac.
+public enum ToolOrigin {
+    @TaskLocal public static var remote = false
+}
+
 /// Asks the user.  Called off the main actor, from inside a tool call, and
 /// may block until they answer.
 public typealias Approver = @Sendable (ApprovalRequest) -> ApprovalAnswer
@@ -82,13 +114,15 @@ public struct GatedToolRunner: ToolExecuting {
     public let approver: Approver
     public let mode: ToolApprovalMode
     public let approvals: StandingApprovals
+    public let secrets: SecretLedger
     /// A line for the transcript about every call that asked or was
     /// refused, and what became of it: nothing here is quiet.
     public let note: (@Sendable (String) -> Void)?
 
     public init(inner: ToolExecuting, context: PolicyContext, mode: ToolApprovalMode = .ask,
-                approvals: StandingApprovals = StandingApprovals(),
+                approvals: StandingApprovals = StandingApprovals(), secrets: SecretLedger = SecretLedger(),
                 note: (@Sendable (String) -> Void)? = nil, approver: @escaping Approver) {
+        self.secrets = secrets
         self.inner = inner
         self.context = context
         self.mode = mode
@@ -120,19 +154,55 @@ public struct GatedToolRunner: ToolExecuting {
     }
 
     public func run(_ call: ToolCall) -> String {
-        switch ToolPolicy.classify(call, context) {
+        let reads = ToolPolicy.secretsRead(call, context)
+        let verdict = ToolPolicy.classify(call, context)
+        // A remote model's results leave this Mac with every reply: a secret
+        // it asks for is named, never sent (§16.4).  A refusal says more, so
+        // it comes first.
+        if case .deny = verdict {} else if ToolOrigin.remote, !reads.isEmpty {
+            let what = reads.joined(separator: ", ")
+            note?("withheld from the delegate: \(what)")
+            return "withheld: this call would read \(what), and a delegated model's tool results leave this Mac, "
+                 + "so it was not run. The local model can read it if the task needs it."
+        }
+        // Recorded once the call has run: reading is what taints.
+        let ran = { (out: String) -> String in
+            self.secrets.add(reads)
+            return out
+        }
+        switch verdict {
         case .allow:
-            return inner.run(call)
+            return ran(inner.run(call))
         case .deny(let reason):
             note?("refused \(call.name): \(reason)")
             return "error: refused: \(reason). This is never run by the agent; "
                  + "if it is really needed, the user will run it themselves."
-        case .ask(let reasons, let high, let grant):
-            let what = reasons.joined(separator: "; ")
+        case .ask(var reasons, var high, let grant):
             // Approved, it runs with containment widened by exactly what it
             // was flagged for (spec §16.5) -- a task-local the model cannot
             // set, never an argument it could.
-            let approved = { ContainmentGrants.$current.withValue(grant) { inner.run(call) } }
+            let approved = { ran(ContainmentGrants.$current.withValue(grant) { inner.run(call) }) }
+            // After a secret has been read, nothing reaches the network on a
+            // standing approval or in trusted mode: the user sees which
+            // secrets this session holds, every time (§16.4).
+            let held = secrets.all + reads.filter { !secrets.all.contains($0) }
+            if grant.network, !held.isEmpty {
+                let base = reasons.joined(separator: "; ")
+                reasons.append("this session has read secrets (\(held.joined(separator: ", "))), "
+                               + "and what this sends could include them")
+                high = true
+                switch approver(ApprovalRequest(call: call, reasons: reasons, high: high)) {
+                case .allow, .allowForSession:
+                    note?("allowed, with secrets read this session: \(base)")
+                    return approved()
+                case .decline(let why):
+                    note?("declined, with secrets read this session: \(base)" + (why.map { " -- \($0)" } ?? ""))
+                    return "error: the user declined this call (" + reasons.joined(separator: "; ") + ")."
+                         + (why.map { " Their reason: " + $0 + (".!?".contains($0.last ?? ".") ? "" : ".") } ?? "")
+                         + " Do not retry it another way; choose a different approach, or ask the user."
+                }
+            }
+            let what = reasons.joined(separator: "; ")
             if mode == .trusted {
                 note?("ran without asking (tool_approval is trusted): \(what)")
                 return approved()

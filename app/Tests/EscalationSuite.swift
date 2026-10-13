@@ -336,6 +336,29 @@ enum EscalationSuite {
                             && remoteResults.contains { $0.contains("declined") && $0.contains("no network") },
                             "and the remote model is told why, as a tool result")
 
+        // Spec §16.4: through the real delegation loop, a remote model asking
+        // for a credentials file gets its name back, never its contents --
+        // the origin mark is DelegateToolRunner's, and this proves it is set.
+        Stub.script = .init(responses: [
+            .toolCall(name: "Read", args: #"{"file_path": "~/.aws/credentials"}"#, cost: 0.0),
+            .toolCall(name: "Read", args: #"{"file_path": "src/a.c"}"#, cost: 0.0),
+            handoff("done", cost: 0.0),
+        ])
+        ev = Events(); mb = DelegationMailbox()
+        let secretLog = CallLog()
+        let withholding = GatedToolRunner(inner: Inner(log: secretLog),
+                                          context: PolicyContext(root: "/nonexistent/home/proj",
+                                                                 home: "/nonexistent/home", scratch: []),
+                                          approver: { _ in .allow })
+        _ = runner(events: ev, mailbox: mb, inner: withholding).run(call(["task": "check the keys"]))
+        let sentBack = ev.all.compactMap { e -> String? in
+            if case .toolResult(_, let r) = e { return r } else { return nil }
+        }
+        f += TestMain.check(secretLog.all.map { $0.arguments["file_path"] ?? "" } == ["src/a.c"],
+                            "a delegated model's read of a secret never reaches the executor; project code does")
+        f += TestMain.check(sentBack.first?.hasPrefix("withheld") == true,
+                            "and what goes back to the provider is the refusal, not the file")
+
         // Nested escalation is refused as a tool result, not executed.
         Stub.script = .init(responses: [
             .toolCall(name: "delegate", args: #"{"task": "recurse"}"#, cost: 0.0),

@@ -569,7 +569,7 @@ final class AppState {
             }
         }
         return GatedToolRunner(inner: runner, context: PolicyContext(root: root.path), mode: mode,
-                               approvals: standingApprovals(rec), note: note,
+                               approvals: standingApprovals(rec), secrets: secretLedger(rec), note: note,
                                approver: { [weak self] req in
                                    guard let self else { return .decline(reason: "the app is closing") }
                                    return self.waitForApproval(req, session: sid)
@@ -592,6 +592,26 @@ final class AppState {
     }
 
     private var standing: [UUID: StandingApprovals] = [:]
+
+    /// The secrets each session has read (spec §16.4): a later network call
+    /// says which, every time.  Persisted, because a reopened session's
+    /// context is restored and its model still holds them.
+    private var secretLedgers: [UUID: SecretLedger] = [:]
+    private func secretLedger(_ rec: SessionRecord) -> SecretLedger {
+        if let l = secretLedgers[rec.id] { return l }
+        let sid = rec.id
+        let l = SecretLedger(rec.secretsRead ?? [], onAdd: { [weak self] new in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, let i = self.sessions.firstIndex(where: { $0.id == sid }) else { return }
+                    self.sessions[i].secretsRead = (self.sessions[i].secretsRead ?? []) + new
+                    self.store?.save(self.sessions[i])
+                }
+            }
+        })
+        secretLedgers[rec.id] = l
+        return l
+    }
 
     /// The session's "allow for this session" grants, restored from its
     /// record and written back to it as they are made.
@@ -989,8 +1009,9 @@ final class AppState {
                             }
                         },
                         logProvider: makeLogProvider())
+                    // Delegation sends tool results off this Mac (§16.4).
                     toolsStatus = (toolsStatus ?? "")
-                        + String(format: " · delegate: $%.2f", remaining)
+                        + String(format: " · delegate: $%.2f, its tool results go to OpenRouter", remaining)
                 }
             }
 

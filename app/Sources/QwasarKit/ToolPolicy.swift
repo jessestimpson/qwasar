@@ -76,6 +76,100 @@ public enum ToolPolicy {
         }
     }
 
+    // MARK: - secrets (§16.4)
+
+    /// The secrets `call` would read, as shown to the user; empty for most
+    /// calls.  Reading is harmless on its own -- inference is local -- and
+    /// this is what makes a later outbound call worth a closer look.  A path
+    /// the shell computes is not seen: this is a tripwire, not a boundary.
+    public static func secretsRead(_ call: ToolCall, _ ctx: PolicyContext) -> [String] {
+        switch call.name {
+        case "Read", "Grep":
+            guard let raw = call.argument("file_path") ?? call.argument("path"),
+                  let abs = HostBackend.absolutePath(raw, workDir: ctx.root, home: ctx.home) else { return [] }
+            let p = Paths.physical(abs)
+            return isSecret(p, ctx) || (call.name == "Grep" && holdsSecrets(p, ctx)) ? [shown(p, ctx)] : []
+        case "Bash":
+            guard let command = call.argument("command") else { return [] }
+            return shellSecrets(command, ctx, depth: 0)
+        default:
+            return []
+        }
+    }
+
+    static func shellSecrets(_ source: String, _ ctx: PolicyContext, depth: Int) -> [String] {
+        guard depth <= 6 else { return [] }
+        let parse = ShellLexer.parse(source, home: ctx.home)
+        var out: [String] = []
+        func add(_ s: String) { if !out.contains(s) { out.append(s) } }
+        var cwd: String? = ctx.root
+        for cmd in parse.commands {
+            let words = cmd.words
+            let name = words.first.map { Paths.base($0.text).lowercased() } ?? ""
+            if name == "cd", let t = words.dropFirst().first { cwd = path(t, cwd) }
+            if name == "security", let sub = words.dropFirst().first?.text,
+               sub.hasPrefix("find-") || sub == "dump-keychain" || sub == "export" {
+                add("the keychain")
+            }
+            if (name == "printenv" || name == "env") && words.count == 1 { add("the shell environment") }
+            // Names and metadata, not contents.
+            if metadataOnly.contains(name) { continue }
+            for w in words.dropFirst() + cmd.redirects.filter({ $0.op == "<" }).map(\.target) {
+                // `-d@file`, `--data=@file`: curl's way of sending a file.
+                var w = w
+                if w.text.hasPrefix("@") {
+                    w.text = String(w.text.dropFirst())
+                } else if let at = w.text.firstIndex(of: "@"), w.text.hasPrefix("-") || w.text.contains("=@") {
+                    w.text = String(w.text[w.text.index(after: at)...])
+                } else if w.text.hasPrefix("-") { continue }
+                guard let p = path(w, cwd) else { continue }
+                if isSecret(p, ctx) || (recursiveReaders.contains(name) && holdsSecrets(p, ctx)) { add(shown(p, ctx)) }
+            }
+        }
+        for s in parse.substitutions { shellSecrets(s, ctx, depth: depth + 1).forEach(add) }
+        return out
+    }
+
+    /// Commands that read a whole directory when given one.
+    static let recursiveReaders: Set<String> = ["grep", "egrep", "fgrep", "rg", "ag", "ack", "tar", "bsdtar", "gtar",
+                                                "zip", "cp", "rsync", "ditto", "scp", "cat", "base64", "xxd", "strings"]
+
+    static let metadataOnly: Set<String> = ["ls", "stat", "test", "[", "[[", "file", "du", "find", "tree", "realpath",
+                                            "readlink", "basename", "dirname", "mkdir", "touch", "chmod", "cd",
+                                            "pushd", "mdls", "xattr", "wc"]
+
+    /// Directories whose every file is a credential.
+    static let secretDirsInHome = [".ssh", ".aws", ".gnupg", "Library/Keychains", ".config/gh", ".kube"]
+    static let secretFilesInHome = [".netrc", ".git-credentials", ".npmrc", ".pypirc", ".cargo/credentials",
+                                    ".cargo/credentials.toml", ".docker/config.json", ".config/hub"]
+
+    static func isSecret(_ p: String, _ ctx: PolicyContext) -> Bool {
+        let name = Paths.base(p).lowercased()
+        if Paths.within(p, ctx.home + "/.ssh") {
+            return !(name.hasSuffix(".pub") || ["known_hosts", "known_hosts.old", "config",
+                                                "authorized_keys", ".ssh"].contains(name))
+        }
+        if secretDirsInHome.dropFirst().contains(where: { p != ctx.home + "/" + $0 && Paths.within(p, ctx.home + "/" + $0) }) {
+            return true
+        }
+        if secretFilesInHome.contains(where: { p.lowercased() == (ctx.home + "/" + $0).lowercased() }) { return true }
+        if name == ".env" || (name.hasPrefix(".env.")
+                              && !["example", "sample", "template", "dist", "defaults"].contains(where: name.hasSuffix)) {
+            return true
+        }
+        let ext = (name as NSString).pathExtension
+        if ["pem", "key", "p12", "pfx", "keystore", "jks", "ppk", "asc", "gpg"].contains(ext) { return true }
+        if ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"].contains(name) { return true }
+        return ["credentials.json", "secrets.json", "secrets.yml", "secrets.yaml", ".htpasswd",
+                "service-account.json", "client_secret.json"].contains(name)
+    }
+
+    /// A directory a recursive read would pull credentials out of.
+    static func holdsSecrets(_ p: String, _ ctx: PolicyContext) -> Bool {
+        secretDirsInHome.contains { p.lowercased() == (ctx.home + "/" + $0).lowercased() }
+            || p.lowercased() == ctx.home.lowercased()
+    }
+
     // MARK: - paths
 
     static let devices: Set<String> = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/zero"]

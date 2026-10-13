@@ -173,6 +173,9 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
     /// "Allow for this session" (spec §16.6): the policy reasons the user
     /// approved.  Only the approval card adds to it; nil decodes old records.
     public var approvals: [String]?
+    /// Secrets this session's tools have read (spec §16.4), as shown: its
+    /// model still holds them when the session reopens, so they persist.
+    public var secretsRead: [String]?
 
     public var effort: ReasoningEffort { storedEffort ?? .medium }
     public var placement: ToolPlacement { tools ?? .host }

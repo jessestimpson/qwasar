@@ -1,10 +1,11 @@
 ## 16. Tool safety: dangerous calls, detected and contained
 
-*Specified 2026-10-13. Steps 1–4 of §16.8 built the same day: ToolPolicy
+*Specified 2026-10-13. Steps 1–5 of §16.8 built the same day: ToolPolicy
 (+ ShellLexer), GatedToolRunner, the approval card, standing approvals,
-`tool_approval`, Seatbelt containment for Bash and `tool_containment`, with
-their suites. Every session's tools are gated and contained; the headless
-gate declines every question.*
+`tool_approval`, Seatbelt containment for Bash, `tool_containment`, and
+the exfiltration tripwires, with their suites. Every session's tools are
+gated and contained; the headless gate declines every question. Step 6,
+red-teaming, remains.*
 
 Since 2026-10-10 a session's tools run on the user's Mac, as the user, with
 their login-shell environment (HostToolRunner, ShellEnvironment), outside App
@@ -159,6 +160,42 @@ judges *what the call says it will do*. §16.5 bounds *what it can do*.
   "tool results go to <provider>". A Read of a secret path inside a
   delegation is withheld from the remote model: the result says the file
   exists and was not sent. Nothing about the local model's reads changes.
+
+#### As built (2026-10-13)
+
+- **What counts as reading a secret** is `ToolPolicy.secretsRead`:
+  - Read or Grep of a credential path: private keys in `~/.ssh` (not
+    `.pub`, `known_hosts` or `config`), `~/.aws`, `~/.gnupg`, `~/.kube`,
+    `~/.config/gh`, `~/Library/Keychains`, `.netrc`, `.git-credentials`,
+    `.npmrc`, `.pypirc`, `.env` and `.env.*` (not `.example`, `.sample` or
+    `.template`), and `*.pem`, `*.key`, `*.p12`.
+  - Grep of a directory that holds them, or of the home directory.
+  - Bash naming such a path, including curl's `-d @file`. Bash reading a
+    whole directory counts only for recursive readers (`grep`, `tar`, `cp`,
+    `rsync`); listing one (`ls`, `stat`, `find`) is names, not contents.
+  - `security find-*`, `dump-keychain` or `export` counts as reading the
+    keychain, and bare `env` or `printenv` as reading the shell environment.
+  - A path the shell computes is not seen. This is a tripwire, not a
+    boundary.
+- **Taint is recorded once the call has run** and persists on
+  `SessionRecord.secretsRead`, because a reopened session's context, and
+  everything it read, is restored. From then on, any ask whose grant
+  includes the network shows the card, flagged high and naming the secrets.
+  That holds on a standing approval and in trusted mode, and "Allow for
+  this session" does not stop it asking next time. A call that reads and
+  sends at once (`curl -d @.env`) names the secret too.
+- **Contained calls are the reason this is enough.** With containment on,
+  only approved network asks reach the network, so taint only has to guard
+  those. With `tool_containment off`, an allowed `make` could send what it
+  likes and the tripwire never sees it. That is the price of turning
+  containment off, and the setting's description should say so.
+- **A delegate never receives a detected secret.** DelegateToolRunner marks
+  a remote model's calls (`ToolOrigin.remote`, a task-local). The gate
+  answers a remote read of a secret with "withheld", naming the file, and
+  does not run it; a refusal still takes precedence. The local model may
+  read the same file, because inference is local.
+- **The session header says where delegation sends things:** "delegate:
+  $x, its tool results go to OpenRouter".
 
 ### 16.5 Containment: Seatbelt around Bash
 

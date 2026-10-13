@@ -362,8 +362,10 @@ public struct DelegateToolRunner: ToolExecuting {
                     if tc.name == "delegate" {
                         result = "error: nested escalation is not available"
                     } else {
-                        result = inner.run(ToolCall(name: tc.name,
-                                                    arguments: Self.arguments(from: tc.arguments)))
+                        // Remote: its result goes back to the provider, which
+                        // the gate must know (spec §16.4).
+                        let call = ToolCall(name: tc.name, arguments: Self.arguments(from: tc.arguments))
+                        result = ToolOrigin.$remote.withValue(true) { inner.run(call) }
                     }
                     emit(.toolResult(name: tc.name, result: result))
                     messages.append(["role": "tool", "tool_call_id": tc.id,

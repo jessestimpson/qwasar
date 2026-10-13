@@ -103,7 +103,8 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .toolContainment:
             return "on (default): Bash runs in a sandbox that can write only the project, temp directories and "
                 + "toolchain caches, with no network unless an approved command needs it; off: commands run "
-                + "unconfined, as the user"
+                + "unconfined, as the user -- and then any allowed command, a build included, can reach the "
+                + "network unseen, so the secrets tripwire no longer covers what leaves"
         }
     }
 
