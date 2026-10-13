@@ -38,7 +38,8 @@ make fast, and easier to read.
 | On disk (4-bit MLX) | ~6 GB | ~16 GB | ~111 GB |
 | Held in memory | ~6 GB (~8 GB with a 32K context) | ~16 GB | ~80 GB (the engram table stays on disk) |
 | Smallest Mac | 16 GB | 32 GB | 128 GB |
-| Decode | ~90 t/s on an M5 Max | ~6 t/s on an M4 (1.5x with the draft head) | ~68 t/s on an M5 Max |
+| Decode | ~90 t/s on an M5 Max | ~6 t/s on an M4 (1.5x with the draft head); ~26 on an M5 Max | ~68 t/s on an M5 Max |
+| Prefill, 4K tokens, M5 Max | ~2,100 t/s | ~670 t/s | ~1,200 t/s |
 | Download | `./download_model.sh 9b` | `./download_model.sh model` | `./download_model.sh flash-next` |
 
 **Status:** beta, and young. Text, images, video, the app, the agent, the
@@ -59,9 +60,9 @@ memory.
   same). It gets a presence penalty of 1.5 by default, as Qwen recommends,
   which helps; `--effort low`, or `--no-think`, keeps it brief.
 * **Qwen3.8 27B (dense)** if you have a 32–64 GB Mac. Everything works,
-  including images and video, but at ~6 tokens a second a long agent task is
-  something you leave running. Its context is sized to what the machine
-  holds beside the weights.
+  including images and video, but at ~6 tokens a second on an M4 a long
+  agent task is something you leave running (an M5 Max decodes it at ~26).
+  Its context is sized to what the machine holds beside the weights.
 * **Flash-Next (MoE)** if you have a 128 GB Mac. ~68 tokens a second on an
   M5 Max against the 27B's ~6 on an M4, the full 262K window, and a 32K-token budget per step — the model the
   agent is at its best on. It takes ~80 GB of memory while it runs, so on a
@@ -370,6 +371,41 @@ its recurrent state a constant 49 MB.
 
 # Performance
 
+## On an M5 Max
+
+**MacBook Pro, Apple M5 Max**, 128 GB, measured 2026-10-12 with
+`tools/bench/sweep.py`: each point a fresh process that prefills exactly N
+tokens of this repository's sources, then decodes 128 greedy tokens at that
+depth, started from a die cooled to 42 C; medians of two runs.
+
+| Model | N | Prefill | Decode |
+|---|---:|---:|---:|
+| Qwen3.5 9B | 4,096 | 2,095 t/s | 88.0 t/s |
+| | 16,384 | 1,928 t/s | 75.5 t/s |
+| | 32,768 | 1,707 t/s | 68.1 t/s |
+| Qwen3.8 27B | 4,096 | 666 t/s | 26.1 t/s |
+| | 16,384 | 548 t/s | 23.1 t/s |
+| | 32,768 | 494 t/s | 21.0 t/s |
+| Qwen3.8 Flash-Next | 4,096 | 1,199 t/s | 65.8 t/s |
+| | 16,384 | 1,056 t/s | 58.1 t/s |
+| | 32,768 | 954 t/s | 57.3 t/s |
+
+The M5's GPU cores carry matrix units that only Metal 4 tensor ops reach,
+and on an M5 (GPU family Apple10) the engine takes kernels built for them:
+the quantised matmul (`metal4/qmm_tensor.metal`, 35–40 TFLOP/s on the 27B's
+MLP shapes against 10–11 for the simdgroup kernel), Flash-Next's grouped
+experts and sparse attention, prefill attention with half operands, and a
+split-key decode attention that reads the cache at 445–480 GB/s from 64K
+keys. Against the same machine before them, in back-to-back pairs: prefill
+at 4K 247 → 639 t/s for the 27B, 849 → 2,017 for the 9B, 512 → 1,180 for
+Flash-Next, and Flash-Next at 32K 399 → 944. The 27B's decode at 4K, 26
+t/s, is at the bandwidth roof: 14.95 GB of weights a token. Earlier GPUs
+keep the kernels tuned for the M4 below. The commit messages carry the
+measurements step by step.
+
+This chassis has a fan but still throttles: back-to-back runs drift by ~10%,
+so compare runs from the same starting temperature (`tools/bench/tempmon`).
+
 ## Qwen3.8 27B
 
 All numbers from one machine: **MacBook Air, Apple M4**, 10 CPU / 10 GPU cores,
@@ -428,17 +464,19 @@ large entries, taken at boundaries rather than per turn.
 
 ## Flash-Next
 
-Measured on an **M5 Max with 128 GB**: ~68 t/s decode and ~465 t/s prefill
-on short prompts; engine load ~22 s. At long context prefill slows as
-attention grows — 192,441 tokens took 640 s, about 300 t/s — which is what
+Measured on an **M5 Max with 128 GB**: ~68 t/s decode on a quiet machine,
+and prefill from ~1,200 t/s at 4K to ~950 at 32K (the table above); engine
+load ~22 s. At long context prefill slows as attention grows — before the
+tensor-op kernels, 192,441 tokens took 640 s, about 300 t/s — which is what
 makes the cache matter: that session parked to a 6.33 GB checkpoint and
 resumed to its first new token in 11 s, or 16 s after a server restart,
 against 640 s to rebuild it ([PLAN-qwasar.md](PLAN-qwasar.md) M4).
 
 ## Qwen3.5 9B
 
-Measured on the same **M5 Max with 128 GB**: ~90 t/s decode and 200–400 t/s
-prefill on short prompts; engine load under a second. Not yet measured on a
+Measured on the same **M5 Max with 128 GB**: ~90 t/s decode, and prefill
+from ~2,100 t/s at 4K to ~1,700 at 32K (the table above); engine load under a
+second. Not yet measured on a
 16 GB Mac, where the memory bandwidth — and so the decode rate — is several
 times lower. Against the mlx-lm reference its per-layer error matches the
 27B's (0.5% after the first layer), and greedy decoding agrees token for
@@ -501,6 +539,7 @@ qwasar_profile.c    context size and live sessions, from the model and machine
 qwasar_http.c       the HTTP/1.1 core the server's fronts share
 qwasar_agent.c      ./qwasar-agent: a Session API client, its tools, the REPL
 metal/*.metal       kernels
+metal4/*.metal      tensor-op kernels (Metal 4), built on first use
 tests/              unit, golden-vector and API regression
 tools/              build helper; dev-only fixture generators (never built)
 linenoise.c         vendored line editing (BSD-2, antirez)
