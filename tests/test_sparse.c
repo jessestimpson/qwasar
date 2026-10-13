@@ -1024,6 +1024,80 @@ static void test_grouped_experts(void) {
     }
 }
 
+/* Prefill's sparse attention at Flash-Next's shape -- 24 query heads on 2 kv
+ * heads, 256 wide -- over ragged lists of ~2,000 selected positions, as a
+ * chunk past the budget sees them.  64 rows takes the tensor-op kernel where
+ * there is one (qw_attn_masked_tensor, from QW_AM_MIN_ROWS rows); the same
+ * rows one at a time take the simdgroup kernel.  Both against a double
+ * softmax over the fp16 cache, and each other.  The list's last entries are
+ * poisoned past its count, so a kernel that reads them fails. */
+static void test_masked_shape(void) {
+    const int32_t rows = 64, QH = 24, KVH = 2, D = 256, base = 6000, max_ctx = base + rows + 8;
+    const int32_t topk = 576, cap = qw_qsa_list_cap(topk, 4);   /* the list's stride */
+    qw_buf q = mkbuf((size_t)rows * QH * D * 4), kc = mkbuf((size_t)KVH * max_ctx * D * 2),
+           vc = mkbuf((size_t)KVH * max_ctx * D * 2), lb = mkbuf((size_t)rows * (1 + cap) * 4),
+           ot = mkbuf((size_t)rows * QH * D * 4), os = mkbuf((size_t)rows * QH * D * 4);
+    const size_t nkv = (size_t)(base + rows) * KVH * D;
+    float *qq = qw_buf_contents(q), *kk = malloc(nkv * 4), *vv = malloc(nkv * 4);
+    fill_random(qq, (size_t)rows * QH * D, 71); fill_random(kk, nkv, 72); fill_random(vv, nkv, 73);
+    for (size_t i = 0; i < (size_t)rows * QH * D; i++) qq[i] *= 3.0f;   /* sharper softmax */
+    qw_cpu_kv_write(qw_buf_contents(kc), qw_buf_contents(vc), kk, vv, base + rows, KVH, D, max_ctx, 0);
+    uint32_t *lp = qw_buf_contents(lb);
+    uint32_t st = 5;
+    for (int32_t r = 0; r < rows; r++) {
+        uint32_t *l = lp + (size_t)r * (1 + cap);
+        const int32_t n_keys = base + r + 1;
+        int32_t n = 0;
+        /* about a third of the positions, ascending, then the newest few */
+        for (int32_t t = 0; t < n_keys - 4 && n < cap - 8 - (r % 5) * 37; t++) {
+            st = st * 1664525u + 1013904223u;
+            if ((st >> 16) % 3 == 0) l[1 + n++] = (uint32_t)t;
+        }
+        for (int32_t t = n_keys - 4; t < n_keys; t++) l[1 + n++] = (uint32_t)t;
+        l[0] = (uint32_t)n;
+        for (int32_t j = n; j < cap; j++) l[1 + j] = 0xFFFFFFF0u;
+    }
+    const float scale = 1.0f / sqrtf((float)D);
+    qw_cmd c = qw_cmd_begin();
+    qw_op_attn_masked(c, qw_ref_at(ot, 0), qw_ref_at(q, 0), qw_ref_at(kc, 0), qw_ref_at(vc, 0), qw_ref_at(lb, 0),
+                      rows, QH, KVH, D, max_ctx, base, scale, topk, 4);
+    run(c, "attn_masked, a chunk");
+    c = qw_cmd_begin();
+    for (int32_t r = 0; r < rows; r++)
+        qw_op_attn_masked(c, qw_ref_at(os, (size_t)r * QH * D * 4), qw_ref_at(q, (size_t)r * QH * D * 4),
+                          qw_ref_at(kc, 0), qw_ref_at(vc, 0), qw_ref_at(lb, (size_t)r * (1 + cap) * 4),
+                          1, QH, KVH, D, max_ctx, base + r, scale, topk, 4);
+    run(c, "attn_masked, a row at a time");
+    float *ref = calloc((size_t)rows * QH * D, 4);
+    const uint16_t *kcp = qw_buf_contents(kc), *vcp = qw_buf_contents(vc);
+    double *sc = malloc((size_t)cap * sizeof *sc), *o = malloc((size_t)D * sizeof *o);
+    for (int32_t r = 0; r < rows; r++) for (int32_t h = 0; h < QH; h++) {
+        const uint32_t *l = lp + (size_t)r * (1 + cap);
+        const int32_t n = (int32_t)l[0], kvh = h / (QH / KVH);
+        const float *qv = qq + ((size_t)r * QH + h) * D;
+        double m = -1e300, sum = 0.0;
+        for (int32_t j = 0; j < n; j++) {
+            const uint16_t *kr = kcp + ((size_t)kvh * max_ctx + l[1 + j]) * D;
+            double d = 0.0;
+            for (int32_t i = 0; i < D; i++) d += (double)qv[i] * qw_f16_to_f32_c(kr[i]);
+            sc[j] = d * scale; if (sc[j] > m) m = sc[j];
+        }
+        for (int32_t i = 0; i < D; i++) o[i] = 0.0;
+        for (int32_t j = 0; j < n; j++) {
+            const double p = exp(sc[j] - m);
+            sum += p;
+            const uint16_t *vr = vcp + ((size_t)kvh * max_ctx + l[1 + j]) * D;
+            for (int32_t i = 0; i < D; i++) o[i] += p * qw_f16_to_f32_c(vr[i]);
+        }
+        for (int32_t i = 0; i < D; i++) ref[((size_t)r * QH + h) * D + i] = (float)(o[i] / sum);
+    }
+    /* The tensor kernel rounds the scaled query and the weights to half. */
+    report("attn_masked, a chunk", qw_buf_contents(ot), ref, (size_t)rows * QH * D, 1e-3);
+    report("attn_masked, a row at a time", qw_buf_contents(os), ref, (size_t)rows * QH * D, 1e-4);
+    free(kk); free(vv); free(ref); free(sc); free(o);
+    qw_buf_free(q); qw_buf_free(kc); qw_buf_free(vc); qw_buf_free(lb); qw_buf_free(ot); qw_buf_free(os);
+}
+
 /* MLX's layout: split gate and up banks and a group-32 embedding, each
  * against scalar code over the same bound tensors. */
 static void test_mlx_layout(qwasar_engine *e) {
@@ -1089,6 +1163,7 @@ int main(void) {
     printf("== qsa\n");               test_qsa(e);
     printf("== qsa selection at scale\n"); test_select_scale();
     printf("== grouped experts\n");  test_grouped_experts();
+    printf("== sparse attention at the model's shape\n"); test_masked_shape();
     printf("== one-token matvec, few outputs\n"); test_splitk();
     printf("== decode banks, split\n"); test_bank_splitk();
     printf("== same-input matvecs, fused\n"); test_multi();

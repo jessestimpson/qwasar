@@ -481,11 +481,12 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
     qw_cmd_parallel(c, false);
 
     if (dense) {
-        qw_op_attn_decode(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->q, 0),
-                          qw_ref_at(s->kcache, kv_stride * fi * sizeof(uint16_t)),
-                          qw_ref_at(s->vcache, kv_stride * fi * sizeof(uint16_t)),
-                          rows, cfg->num_attention_heads, cfg->num_key_value_heads,
-                          hd, s->max_ctx, s->n_past, 1.0f / sqrtf((float)hd));
+        /* The tiled kernel for a chunk, where there is one (qw_op_attn). */
+        qw_op_attn(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->q, 0),
+                   qw_ref_at(s->kcache, kv_stride * fi * sizeof(uint16_t)),
+                   qw_ref_at(s->vcache, kv_stride * fi * sizeof(uint16_t)),
+                   rows, cfg->num_attention_heads, cfg->num_key_value_heads,
+                   hd, s->max_ctx, s->n_past, 1.0f / sqrtf((float)hd));
         qw_op_mul_sigmoid(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->gate, 0), rows * sh->q_dim);
         qw_encode_qlinear(c, &L->o_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->attn_out, 0), rows);
         return;

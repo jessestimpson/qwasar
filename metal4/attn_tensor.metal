@@ -150,3 +150,147 @@ kernel void qw_attn_prefill_tensor(
     auto o0 = O_out.slice(0, r0);
     O.store(o0);
 }
+
+/* ---- masked: prefill's sparse attention, on tensor ops ----------------------
+ *
+ * qw_attn_masked (metal/sparse.metal) over one row's selected positions,
+ * which qw_qsa_select lists once per row for every head.  That kernel runs a
+ * threadgroup per (row, query head), so each kv head's 2,048 selected keys
+ * and values were read once for each of the gqa (12) query heads that share
+ * them, by scalar FMAs.  Here a threadgroup takes (row, kv head): its query
+ * heads are the rows of a QW_AM_BQ-row Q tile, and the selected keys are
+ * gathered QW_AM_BK at a time into threadgroup memory --
+ *
+ *   S = Q K^T     matmul2d into threadgroup memory, an online softmax there
+ *   O = alpha O + P V    with the same rows of V gathered into the same tile
+ *
+ * so each key and value is read once per row.  Q (pre-scaled) and P are
+ * half, the cache already is; S, the softmax and O stay float. */
+
+#ifndef QW_AM_BQ
+#define QW_AM_BQ 16
+#define QW_AM_BK 32
+#define QW_AM_SG 8
+#endif
+#define QW_AM_T     (QW_AM_SG * 32)
+#define QW_AM_SPLIT (QW_AM_T / QW_AM_BQ)   /* threads a row in the softmax */
+
+struct qw_am_args {
+    uint  rows, q_heads, kv_heads, gqa, max_ctx, base_pos;
+    float scale;
+    uint  list_cap;
+};
+
+kernel void qw_attn_masked_tensor(
+    device const float  *q    [[buffer(0)]],   /* [rows, q_heads, D] fp32 */
+    device const half   *kc   [[buffer(1)]],   /* [kv_heads, max_ctx, D] fp16 */
+    device const half   *vc   [[buffer(2)]],
+    device       float  *out  [[buffer(3)]],   /* [rows, q_heads, D] fp32 */
+    device const uint   *list [[buffer(4)]],   /* [rows, 1 + list_cap]: count, positions */
+    constant qw_am_args &a    [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup half  Qs[QW_AM_BQ * QW_FA_D];    /* [BQ][D] */
+    threadgroup half  KV[QW_AM_BK * QW_FA_D];    /* [BK][D]: keys, then values */
+    threadgroup float S[QW_AM_BQ * QW_AM_BK];    /* [BQ][BK] */
+    threadgroup half  P[QW_AM_BQ * QW_AM_BK];
+    threadgroup float m_run[QW_AM_BQ], l_run[QW_AM_BQ], alpha[QW_AM_BQ];
+
+    const uint row = tgid.x, kvh = tgid.y;
+    device const uint *lr = list + (ulong)row * (1 + a.list_cap);
+    const uint n_sel = lr[0];
+    device const half *kbase = kc + (ulong)kvh * a.max_ctx * QW_FA_D;
+    device const half *vbase = vc + (ulong)kvh * a.max_ctx * QW_FA_D;
+
+    /* This kv head's query heads, scaled, as half; rows past gqa are zero. */
+    device const float *qrow = q + ((ulong)row * a.q_heads + kvh * a.gqa) * QW_FA_D;
+    for (uint i = tid; i < QW_AM_BQ * QW_FA_D / 4; i += QW_AM_T) {
+        const uint h = i / (QW_FA_D / 4);
+        const float4 v = h < a.gqa ? ((device const float4 *)qrow)[i] * a.scale : float4(0.0f);
+        ((threadgroup half4 *)Qs)[i] = half4(v);
+    }
+    if (tid < QW_AM_BQ) { m_run[tid] = -FLT_MAX; l_run[tid] = 0.0f; }
+
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>
+        Qt(Qs, dextents<int32_t, 2>(QW_FA_D, QW_AM_BQ));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>
+        KVt(KV, dextents<int32_t, 2>(QW_FA_D, QW_AM_BK));
+    tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>
+        St(S, dextents<int32_t, 2>(QW_AM_BK, QW_AM_BQ));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>
+        Pt(P, dextents<int32_t, 2>(QW_AM_BK, QW_AM_BQ));
+    constexpr auto qk_desc = matmul2d_descriptor(QW_AM_BQ, QW_AM_BK, QW_FA_D, false, true, false,
+                                                 matmul2d_descriptor::mode::multiply);
+    constexpr auto pv_desc = matmul2d_descriptor(QW_AM_BQ, QW_FA_D, QW_AM_BK, false, false, false,
+                                                 matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroups<QW_AM_SG>> qk;
+    matmul2d<pv_desc, execution_simdgroups<QW_AM_SG>> pv;
+    auto O = pv.template get_destination_cooperative_tensor<decltype(Pt), decltype(KVt), float>();
+#pragma unroll
+    for (uint16_t i = 0; i < O.get_capacity(); ++i)
+        if (O.is_valid_element(i)) O[i] = 0.0f;
+
+    /* Gathers BK selected rows of one cache into KV, eight halves a step;
+     * slots past the list are zero. */
+    auto gather = [&](device const half *base, uint j0) {
+        for (uint i = tid; i < QW_AM_BK * QW_FA_D / 8; i += QW_AM_T) {
+            const uint j = i / (QW_FA_D / 8), c = i % (QW_FA_D / 8);
+            uint4 v = uint4(0);
+            if (j0 + j < n_sel) v = ((device const uint4 *)(base + (ulong)lr[1 + j0 + j] * QW_FA_D))[c];
+            ((threadgroup uint4 *)KV)[i] = v;
+        }
+    };
+
+    for (uint j0 = 0; j0 < n_sel; j0 += QW_AM_BK) {
+        gather(kbase, j0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        qk.run(Qt, KVt, St);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Values into the same tile while the softmax runs on S. */
+        gather(vbase, j0);
+        {
+            const uint rr = tid / QW_AM_SPLIT, part = tid % QW_AM_SPLIT;
+            threadgroup float *srow = S + rr * QW_AM_BK;
+            const bool valid = rr < a.gqa;
+            const int live = valid ? min((int)QW_AM_BK, (int)n_sel - (int)j0) : 0;
+            const float m_old = m_run[rr];
+            float mx = m_old;
+            for (int j = (int)part; j < live; j += QW_AM_SPLIT) mx = max(mx, srow[j]);
+            for (uint o = 1; o < QW_AM_SPLIT; o <<= 1) mx = max(mx, simd_shuffle_xor(mx, (ushort)o));
+            float sum = 0.0f;
+            for (int j = (int)part; j < (int)QW_AM_BK; j += QW_AM_SPLIT) {
+                const float p = j < live ? exp(srow[j] - mx) : 0.0f;
+                P[rr * QW_AM_BK + j] = half(p);
+                sum += p;
+            }
+            for (uint o = 1; o < QW_AM_SPLIT; o <<= 1) sum += simd_shuffle_xor(sum, (ushort)o);
+            if (part == 0) {
+                const float al = valid ? exp(m_old - mx) : 1.0f;
+                if (valid) { m_run[rr] = mx; l_run[rr] = l_run[rr] * al + sum; }
+                alpha[rr] = al;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma unroll
+        for (uint16_t i = 0; i < O.get_capacity(); ++i) {
+            if (!O.is_valid_element(i)) continue;
+            O[i] *= alpha[O.get_multidimensional_index(i)[1]];
+        }
+        pv.run(Pt, KVt, O);
+        /* KV and P are written again next block. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float *orow = out + ((ulong)row * a.q_heads + kvh * a.gqa) * QW_FA_D;
+#pragma unroll
+    for (uint16_t i = 0; i < O.get_capacity(); ++i) {
+        if (!O.is_valid_element(i)) continue;
+        auto ix = O.get_multidimensional_index(i);   /* (d, head) */
+        if ((uint)ix[1] >= a.gqa) continue;
+        const float l = l_run[ix[1]];
+        orow[(uint)ix[1] * QW_FA_D + ix[0]] = l > 0.0f ? O[i] / l : 0.0f;
+    }
+}

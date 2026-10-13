@@ -458,6 +458,16 @@ void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
  * at 24K. */
 #define QW_ATTN_SPLIT_MIN_KEYS 20480
 
+/* Tiling for qw_attn_masked_tensor (prefill's sparse attention on an M5): a
+ * BQ-row Q tile of one kv head's query heads (gqa <= BQ), BK selected keys a
+ * step, SG simdgroups; used from QW_AM_MIN_ROWS rows a step. */
+#ifndef QW_AM_BQ
+#define QW_AM_BQ 16
+#define QW_AM_BK 32
+#define QW_AM_SG 8
+#endif
+#define QW_AM_MIN_ROWS 16
+
 /* ---- token selection ------------------------------------------------------
  *
  * Argmax and runner-up per row of a logits block, on the GPU.  This replaces a

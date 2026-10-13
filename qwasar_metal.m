@@ -620,6 +620,9 @@ static id<MTLLibrary> qw_tmm_library(void) {
                 @"QW_TGM_BN" : @(QW_TGM_BN),
                 @"QW_TGM_BK" : @(QW_TGM_BK),
                 @"QW_TGM_SG" : @(QW_TGM_SG),
+                @"QW_AM_BQ" : @(QW_AM_BQ),
+                @"QW_AM_BK" : @(QW_AM_BK),
+                @"QW_AM_SG" : @(QW_AM_SG),
                 @"QW_FA_BQ" : @(QW_FA_BQ),
                 @"QW_FA_BK" : @(QW_FA_BK),
                 @"QW_FA_SG" : @(QW_FA_SG),
@@ -1887,6 +1890,36 @@ void qw_op_qsa_select(qw_cmd c, qw_ref mask, qw_ref list, qw_ref scores, int32_t
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
 }
 
+/* Prefill's sparse attention on tensor ops (metal4/attn_tensor.metal): a
+ * threadgroup per (row, kv head) reads each selected key and value once for
+ * all the query heads that share it.  On an M5, for steps of QW_AM_MIN_ROWS
+ * rows or more -- a token's step is only kv_heads threadgroups -- unless
+ * QWASAR_ATTN_MASKED=simd.  Returns false, encoding nothing, otherwise. */
+static bool qw_attn_masked_tensor(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                                  qw_ref list, int32_t rows, int32_t q_heads, int32_t kv_heads,
+                                  int32_t max_ctx, int32_t base_pos, float scale,
+                                  int32_t block_topk, int32_t ratio) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("QWASAR_ATTN_MASKED");
+        on = v && !strcmp(v, "simd") ? 0 : v && !strcmp(v, "tensor") ? 1 : qw_gpu_has_matrix_units();
+    }
+    if (!on || rows < QW_AM_MIN_ROWS || kv_heads <= 0 || q_heads % kv_heads
+        || q_heads / kv_heads > QW_AM_BQ) return false;
+    id<MTLComputePipelineState> ps = qw_tmm_pipeline(@"qw_attn_masked_tensor");
+    if (!ps) return false;
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    [enc setComputePipelineState:ps];
+    qw_set(enc, q, 0); qw_set(enc, kcache, 1); qw_set(enc, vcache, 2); qw_set(enc, out, 3); qw_set(enc, list, 4);
+    struct { uint32_t rows, q_heads, kv_heads, gqa, max_ctx, base_pos; float scale; uint32_t list_cap; } args = {
+        (uint32_t)rows, (uint32_t)q_heads, (uint32_t)kv_heads, (uint32_t)(q_heads / kv_heads),
+        (uint32_t)max_ctx, (uint32_t)base_pos, scale, (uint32_t)qw_qsa_list_cap(block_topk, ratio) };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, (NSUInteger)kv_heads, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * QW_AM_SG, 1, 1)];
+    return true;
+}
+
 void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache, qw_ref list,
                        int32_t rows, int32_t q_heads, int32_t kv_heads, int32_t head_dim,
                        int32_t max_ctx, int32_t base_pos, float scale, int32_t block_topk, int32_t ratio) {
@@ -1894,6 +1927,8 @@ void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vca
         fprintf(stderr, "qwasar: attention head_dim %d unsupported (kernel is built for 256)\n", head_dim);
         return;
     }
+    if (qw_attn_masked_tensor(c, out, q, kcache, vcache, list, rows, q_heads, kv_heads,
+                              max_ctx, base_pos, scale, block_topk, ratio)) return;
     QW_BEGIN("qw_attn_masked")
     qw_set(enc, q, 0); qw_set(enc, kcache, 1); qw_set(enc, vcache, 2); qw_set(enc, out, 3); qw_set(enc, list, 4);
     qw_attn_args args = { (uint32_t)rows, (uint32_t)q_heads, (uint32_t)kv_heads,
