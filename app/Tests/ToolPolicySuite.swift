@@ -289,6 +289,23 @@ enum ToolPolicySuite {
         return (GatedToolRunner(inner: inner, context: ctx, approver: approver), backend)
     }
 
+    final class Notes: @unchecked Sendable {
+        private let lock = NSLock()
+        private var list: [String] = []
+        func add(_ s: String) { lock.withLock { list.append(s) } }
+        var all: [String] { lock.withLock { list } }
+    }
+
+    /// Answers in order.
+    final class Script: @unchecked Sendable {
+        private let lock = NSLock()
+        private var answers: [ApprovalAnswer]
+        init(_ a: [ApprovalAnswer]) { answers = a }
+        func next() -> ApprovalAnswer {
+            lock.withLock { answers.isEmpty ? .decline(reason: "script exhausted") : answers.removeFirst() }
+        }
+    }
+
     static func bashCall(_ c: String) -> ToolCall { ToolCall(name: "Bash", arguments: ["command": c]) }
 
     static func gate() -> Int {
@@ -338,6 +355,51 @@ enum ToolPolicySuite {
 
         f += TestMain.check(g.environmentDescription.hasPrefix("kit.") && g.environmentDescription.contains("ask the user first"),
                             "the model is told that some calls ask")
+
+        print("  -- standing approvals, trusted mode, notes")
+        let notes = Notes()
+        let persisted = Notes()
+        let standing = StandingApprovals(onAdd: { persisted.add($0.joined(separator: "|")) })
+        let sessionAsked = Asked()
+        b = RecordingBackend()
+        let kit = KitRunner(kit: ToolKit(backend: b, resultCap: 1 << 20))
+        let script = Script([.allowForSession, .decline(reason: "no")])
+        g = GatedToolRunner(inner: kit, context: ctx, approvals: standing, note: { notes.add($0) },
+                            approver: { r in sessionAsked.add(r); return script.next() })
+        asked = sessionAsked
+        _ = g.run(bashCall("curl https://a.invalid"))          // asks; allowed for the session
+        _ = g.run(bashCall("curl https://b.invalid"))          // same reason: runs unasked
+        f += TestMain.check(asked.all.count == 1 && b.log.count == 2,
+                            "allow for this session covers a later call with the same reason")
+        f += TestMain.check(persisted.all == ["uses the network (curl)"], "the grant is handed on to be persisted")
+        out = g.run(bashCall("curl https://c.invalid > ~/x"))   // a reason not yet approved: asks again
+        f += TestMain.check(asked.all.count == 2 && b.log.count == 2 && out.contains("declined"),
+                            "a call with one reason not yet approved still asks, and is declined")
+        out = g.run(bashCall("sudo curl https://a.invalid"))
+        f += TestMain.check(b.log.count == 2 && out.hasPrefix("error: refused"),
+                            "a standing approval never covers the catastrophic set")
+        f += TestMain.check(notes.all.count == 4
+                            && notes.all[0].hasPrefix("allowed for this session")
+                            && notes.all[1].hasPrefix("ran on a standing approval")
+                            && notes.all[2].hasPrefix("declined") && notes.all[2].contains("-- no")
+                            && notes.all[3].hasPrefix("refused"),
+                            "every ask and refusal leaves a note")
+        let resumed = StandingApprovals(["uses the network (curl)"])
+        f += TestMain.check(resumed.covers(["uses the network (curl)"]) && !resumed.covers([])
+                            && !resumed.covers(["uses the network (curl)", "uses the network (wget)"]),
+                            "approvals restore from the record; covering needs every reason")
+
+        let trustedAsked = Asked()
+        asked = trustedAsked
+        (_, b) = gated(nil)
+        g = GatedToolRunner(inner: KitRunner(kit: ToolKit(backend: b, resultCap: 1 << 20)), context: ctx,
+                            mode: .trusted, approver: { r in trustedAsked.add(r); return .decline(reason: nil) })
+        _ = g.run(bashCall("git push"))
+        out = g.run(bashCall("rm -rf ~"))
+        f += TestMain.check(asked.all.isEmpty && b.log == ["exec git push"] && out.hasPrefix("error: refused"),
+                            "trusted: asks run unasked, the catastrophic set is still refused")
+        f += TestMain.check(!g.environmentDescription.contains("ask the user first"),
+                            "trusted: the model is not told calls ask")
         return f
     }
 }

@@ -411,7 +411,9 @@ extension AppState {
                          + String(format: "spent=$%.4f of $%.2f ", s.spentUSD ?? 0, eff.agentBudgetUSD)
                          + "top_n_sigma=\(eff.topNSigma > 0 ? String(format: "%g", eff.topNSigma) : "off") "
                          + "explore_nudge_after=\(eff.exploreNudgeAfter > 0 ? String(eff.exploreNudgeAfter) : "off") "
-                         + "thinking_budget=\(eff.thinkingBudget > 0 ? String(eff.thinkingBudget) : "none")")
+                         + "thinking_budget=\(eff.thinkingBudget > 0 ? String(eff.thinkingBudget) : "none") "
+                         + "tool_approval=\(eff.toolApproval.rawValue) "
+                         + "standing_approvals=\(s.approvals?.count ?? 0)")
                 out.append("    provenance: \(prov)")
             }
         }
@@ -423,6 +425,7 @@ extension AppState {
         return SettingsOverlay(toolTimeoutSeconds: d.toolTimeoutSeconds, agentModels: d.agentModels,
                                agentBudgetUSD: d.agentBudgetUSD,
                                agentTurnBudgetUSD: d.agentTurnBudgetUSD, topNSigma: d.topNSigma,
-                               exploreNudgeAfter: d.exploreNudgeAfter, thinkingBudget: d.thinkingBudget)
+                               exploreNudgeAfter: d.exploreNudgeAfter, thinkingBudget: d.thinkingBudget,
+                               toolApproval: d.toolApproval)
     }
 }

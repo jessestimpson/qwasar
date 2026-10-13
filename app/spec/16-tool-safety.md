@@ -1,8 +1,9 @@
 ## 16. Tool safety: dangerous calls, detected and contained
 
-*Specified 2026-10-13. Steps 1–2 of §16.8 built the same day: ToolPolicy
-(+ ShellLexer), GatedToolRunner, and their suites. The headless gate is
-gated; the app's gate is behind the `toolGate` default until the card exists.*
+*Specified 2026-10-13. Steps 1–3 of §16.8 built the same day: ToolPolicy
+(+ ShellLexer), GatedToolRunner, the approval card, standing approvals and
+`tool_approval`, with their suites. Every session's tools are gated; the
+headless gate declines every question.*
 
 Since 2026-10-10 a session's tools run on the user's Mac, as the user, with
 their login-shell environment (HostToolRunner, ShellEnvironment), outside App
@@ -212,6 +213,27 @@ Standing approvals live with the session record. They are never written by
 the model. The config project may *read* them but cannot *grant* them. That
 fixes §8.5's asymmetry here: loosening a safety rule is something only a
 person does, in the card.
+
+As built:
+
+- **Standing approvals are keyed by the policy's reasons.** "Allow for this
+  session" stores the reasons the card showed, and a later call runs
+  unasked only if *every* reason it carries is already approved. So an
+  approved `curl` does not cover `curl … > ~/x`, which adds a write outside
+  the project. A reworded reason in a later version asks again. They
+  persist on `SessionRecord.approvals`, and `config_show` reports their
+  count.
+- **The card hides nothing.** It shows the whole command, never clipped or
+  scrolled inside the transcript, and for Write and Edit the content too,
+  up to 60 lines with the remainder counted. Return approves nothing;
+  Escape denies.
+- **Stop declines every open card**, as do stopping a delegation and
+  quitting. A card is shown in its own session, and the Dock bounces,
+  critically for a high-risk ask. Not yet built: a sidebar mark for a
+  session waiting on a card while another is selected.
+- **The config session can set `tool_approval`.** That is §8.5's stated
+  asymmetry: it acts only on what the user typed into it. It cannot grant
+  standing approvals.
 
 A per-project `tool_approval` key: `ask` (default, everything above) or
 `trusted` (only `.deny` and taint escalation interrupt; the `--yes`

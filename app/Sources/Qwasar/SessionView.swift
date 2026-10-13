@@ -50,6 +50,12 @@ struct SessionView: View {
                                        costUSD: d.costUSD, ended: d.ended,
                                        waiting: d.waiting, state: state)
                     }
+                    // A tool call waiting on the user (spec §16.6) -- the
+                    // local model's or a delegation's; the turn holds.
+                    if let a = state.pendingApprovalHere {
+                        ApprovalCard(request: a.request) { state.answerApproval(a.id, $0) }
+                            .id(a.id)
+                    }
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -292,6 +298,115 @@ struct QuestionCard: View {
         .padding(14)
         .background(Color.accentColor.opacity(0.05), in: .rect(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.accentColor.opacity(0.35)))
+    }
+}
+
+/// A tool call the policy flagged, waiting on the user (spec §16.6): what it
+/// would do, exactly, and why it asks.  Nothing approves on Return -- an
+/// approval is a click -- and Escape denies.
+struct ApprovalCard: View {
+    let request: ApprovalRequest
+    let answer: (ApprovalAnswer) -> Void
+
+    @State private var reason = ""
+
+    private var call: ToolCall { request.call }
+    private var tint: Color { request.high ? .orange : .accentColor }
+
+    private var title: String {
+        switch call.name {
+        case "Bash": return "Run this command?"
+        case "Write": return "Write this file?"
+        case "Edit": return "Edit this file?"
+        default: return "Allow \(call.name)?"
+        }
+    }
+
+    /// The exact text that would act: the whole command, or the path.
+    private var subject: String {
+        call.argument("command") ?? call.argument("file_path") ?? call.argument("path") ?? call.name
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: request.high ? "exclamationmark.triangle.fill" : "hand.raised")
+                .font(.headline)
+                .foregroundStyle(request.high ? Color.orange : Color.primary)
+            if let d = call.argument("description"), !d.isEmpty {
+                Text(d).font(.callout).foregroundStyle(.secondary)
+            }
+            // All of it, never clipped or scrolled: what would run is the
+            // one thing this card must not hide.
+            Text(subject)
+                .font(.system(.callout, design: .monospaced))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(Color.primary.opacity(0.05), in: .rect(cornerRadius: 6))
+            // A write's risk is its content as much as its place: a hook, a
+            // shell rc file.
+            if call.name == "Write", let c = call.argument("content") {
+                excerpt("Content", c)
+            } else if call.name == "Edit" {
+                if let o = call.argument("old_string") { excerpt("Replacing", o) }
+                if let n = call.argument("new_string") { excerpt("With", n) }
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(request.reasons.count == 1 ? "Why it asks" : "Why it asks (\(request.reasons.count))")
+                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                ForEach(request.reasons, id: \.self) { r in
+                    Label(r, systemImage: "smallcircle.filled.circle")
+                        .font(.caption)
+                        .labelStyle(.titleAndIcon)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack(spacing: 8) {
+                TextField("Reason for denying (optional; the model is told)", text: $reason)
+                    .textFieldStyle(.roundedBorder)
+                Button("Deny") {
+                    let r = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+                    answer(.decline(reason: r.isEmpty ? nil : r))
+                }
+                .keyboardShortcut(.cancelAction)
+                .help("The call does not run; the model is told, with your reason if you gave one.")
+            }
+            HStack {
+                Spacer()
+                Button("Allow for This Session") { answer(.allowForSession) }
+                    .help("Runs it, and from now on runs calls flagged only for "
+                          + (request.reasons.count == 1 ? "this reason" : "these reasons")
+                          + " in this session without asking.")
+                Button("Allow Once") { answer(.allow) }
+                    .help("Runs this call; the next one like it asks again.")
+            }
+        }
+        .padding(14)
+        .background(tint.opacity(0.06), in: .rect(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(tint.opacity(0.45)))
+    }
+
+    private static let excerptLines = 60
+
+    /// Up to `excerptLines` lines, and how many more there are -- said,
+    /// never silently dropped.
+    @ViewBuilder private func excerpt(_ label: String, _ text: String) -> some View {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Text(lines.prefix(Self.excerptLines).joined(separator: "\n"))
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(8)
+                .background(Color.primary.opacity(0.04), in: .rect(cornerRadius: 6))
+            if lines.count > Self.excerptLines {
+                Text("… and \(lines.count - Self.excerptLines) more lines")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 }
 

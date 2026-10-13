@@ -170,6 +170,9 @@ public struct SessionRecord: Codable, Identifiable, Sendable {
     public var notes: String?
     public var notesAt: Date?
     public var notesTokens: Int?
+    /// "Allow for this session" (spec §16.6): the policy reasons the user
+    /// approved.  Only the approval card adds to it; nil decodes old records.
+    public var approvals: [String]?
 
     public var effort: ReasoningEffort { storedEffort ?? .medium }
     public var placement: ToolPlacement { tools ?? .host }

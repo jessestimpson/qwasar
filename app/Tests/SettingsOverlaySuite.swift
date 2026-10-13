@@ -72,6 +72,14 @@ enum SettingsOverlaySuite {
                             "top_n_sigma alone sends only top_n_sigma")
         f += TestMain.check(SettingsKey.exploreNudgeAfter.set("6", on: &o) == nil && o.exploreNudgeAfter == 6,
                             "explore_nudge_after parses")
+        f += TestMain.check(SessionSettings.defaults.toolApproval == .ask, "tool_approval defaults to ask")
+        f += TestMain.check(SettingsKey.toolApproval.set("Trusted", on: &o) == nil && o.toolApproval == .trusted
+                            && SettingsKey.toolApproval.set("yolo", on: &o) != nil && o.toolApproval == .trusted,
+                            "tool_approval parses ask/trusted and refuses anything else")
+        f += TestMain.check(SessionSettings.resolve(global: SettingsOverlay(toolApproval: .trusted), project: nil,
+                                                    session: SettingsOverlay(toolApproval: .ask)).toolApproval == .ask,
+                            "a session's ask overrides a global trusted")
+        SettingsKey.toolApproval.clear(on: &o)
         f += TestMain.check(SessionSettings.defaults.exploreNudgeAfter == 10,
                             "the exploration nudge is on by default, at 10")
 

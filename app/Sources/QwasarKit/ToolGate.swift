@@ -17,12 +17,59 @@ public struct ApprovalRequest: Sendable {
     public var call: ToolCall
     public var reasons: [String]
     public var high: Bool
+
+    public init(call: ToolCall, reasons: [String], high: Bool) {
+        self.call = call
+        self.reasons = reasons
+        self.high = high
+    }
 }
 
 public enum ApprovalAnswer: Sendable, Equatable {
     case allow
+    /// Allow, and stop asking about these reasons in this session.
+    case allowForSession
     /// `reason`, if the user gave one, goes to the model.
     case decline(reason: String?)
+}
+
+/// `ask`, the default, shows the card; `trusted` runs what would have asked
+/// and refuses only the catastrophic set.  A person's choice for a project
+/// (spec §16.6), never the default.
+public enum ToolApprovalMode: String, Codable, Sendable, CaseIterable {
+    case ask, trusted
+}
+
+/// "Allow for this session": the reasons a user has approved, so a later
+/// call flagged for the same reasons -- all of them -- runs without asking.
+/// A call with a reason not yet approved still asks; widening is always the
+/// user's, in the card.  Keyed by the policy's reason text, so a reason
+/// reworded in a later version simply asks again: the safe direction.
+public final class StandingApprovals: @unchecked Sendable {
+    private let lock = NSLock()
+    private var approved: Set<String>
+    private let onAdd: @Sendable ([String]) -> Void
+
+    /// `onAdd` hears each grant, to persist it.
+    public init(_ initial: [String] = [], onAdd: @escaping @Sendable ([String]) -> Void = { _ in }) {
+        approved = Set(initial)
+        self.onAdd = onAdd
+    }
+
+    public var all: [String] { lock.withLock { approved.sorted() } }
+
+    public func covers(_ reasons: [String]) -> Bool {
+        lock.withLock { !reasons.isEmpty && reasons.allSatisfy(approved.contains) }
+    }
+
+    public func add(_ reasons: [String]) {
+        let new: [String] = lock.withLock {
+            let n = reasons.filter { !approved.contains($0) }
+            approved.formUnion(n)
+            return n
+        }
+        if !new.isEmpty { onAdd(new) }
+    }
 }
 
 /// Asks the user.  Called off the main actor, from inside a tool call, and
@@ -33,10 +80,20 @@ public struct GatedToolRunner: ToolExecuting {
     public let inner: ToolExecuting
     public let context: PolicyContext
     public let approver: Approver
+    public let mode: ToolApprovalMode
+    public let approvals: StandingApprovals
+    /// A line for the transcript about every call that asked or was
+    /// refused, and what became of it: nothing here is quiet.
+    public let note: (@Sendable (String) -> Void)?
 
-    public init(inner: ToolExecuting, context: PolicyContext, approver: @escaping Approver) {
+    public init(inner: ToolExecuting, context: PolicyContext, mode: ToolApprovalMode = .ask,
+                approvals: StandingApprovals = StandingApprovals(),
+                note: (@Sendable (String) -> Void)? = nil, approver: @escaping Approver) {
         self.inner = inner
         self.context = context
+        self.mode = mode
+        self.approvals = approvals
+        self.note = note
         self.approver = approver
     }
 
@@ -48,7 +105,14 @@ public struct GatedToolRunner: ToolExecuting {
     public var schemas: [String] { inner.schemas }
 
     public var environmentDescription: String {
-        inner.environmentDescription + """
+        if mode == .trusted {
+            return inner.environmentDescription + """
+
+
+            A few commands are always refused, and the result says so: running as root, erasing disks, deleting the home directory or the project.
+            """
+        }
+        return inner.environmentDescription + """
 
 
         Some tool calls ask the user first: deleting or changing things outside the project directory, using the network, rewriting git history, installing software, and commands this app does not recognise. If the user declines, the result says so and why; do not retry the same thing another way -- choose a different approach or ask them. A few commands are always refused (running as root, erasing disks, deleting the home directory or the project).
@@ -60,15 +124,31 @@ public struct GatedToolRunner: ToolExecuting {
         case .allow:
             return inner.run(call)
         case .deny(let reason):
+            note?("refused \(call.name): \(reason)")
             return "error: refused: \(reason). This is never run by the agent; "
                  + "if it is really needed, the user will run it themselves."
         case .ask(let reasons, let high):
+            let what = reasons.joined(separator: "; ")
+            if mode == .trusted {
+                note?("ran without asking (tool_approval is trusted): \(what)")
+                return inner.run(call)
+            }
+            if approvals.covers(reasons) {
+                note?("ran on a standing approval: \(what)")
+                return inner.run(call)
+            }
             switch approver(ApprovalRequest(call: call, reasons: reasons, high: high)) {
             case .allow:
+                note?("allowed once: \(what)")
+                return inner.run(call)
+            case .allowForSession:
+                approvals.add(reasons)
+                note?("allowed for this session: \(what)")
                 return inner.run(call)
             case .decline(let why):
+                note?("declined: \(what)" + (why.map { " -- \($0)" } ?? ""))
                 return "error: the user declined this call (" + reasons.joined(separator: "; ") + ")."
-                     + (why.map { " Their reason: \($0)" } ?? "")
+                     + (why.map { " Their reason: " + $0 + (".!?".contains($0.last ?? ".") ? "" : ".") } ?? "")
                      + " Do not retry it another way; choose a different approach, or ask the user."
             }
         }

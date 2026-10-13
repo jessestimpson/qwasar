@@ -38,11 +38,13 @@ public struct SettingsOverlay: Codable, Sendable, Equatable, Hashable {
     /// Reasoning tokens a step may spend before the server closes its
     /// thinking (API.md §4.4, sampling.thinking_budget); 0 is no cap.
     public var thinkingBudget: Int?
+    /// Spec §16.6: whether calls the policy flags ask first.
+    public var toolApproval: ToolApprovalMode?
 
     public init(toolTimeoutSeconds: Int? = nil, agentModels: [String]? = nil,
                 agentBudgetUSD: Double? = nil, agentTurnBudgetUSD: Double? = nil,
                 topNSigma: Double? = nil, exploreNudgeAfter: Int? = nil,
-                thinkingBudget: Int? = nil) {
+                thinkingBudget: Int? = nil, toolApproval: ToolApprovalMode? = nil) {
         self.toolTimeoutSeconds = toolTimeoutSeconds
         self.agentModels = agentModels
         self.agentBudgetUSD = agentBudgetUSD
@@ -50,12 +52,13 @@ public struct SettingsOverlay: Codable, Sendable, Equatable, Hashable {
         self.topNSigma = topNSigma
         self.exploreNudgeAfter = exploreNudgeAfter
         self.thinkingBudget = thinkingBudget
+        self.toolApproval = toolApproval
     }
 
     public var isEmpty: Bool {
         toolTimeoutSeconds == nil && agentModels == nil && agentBudgetUSD == nil
             && agentTurnBudgetUSD == nil && topNSigma == nil && exploreNudgeAfter == nil
-            && thinkingBudget == nil
+            && thinkingBudget == nil && toolApproval == nil
     }
 }
 
@@ -69,6 +72,7 @@ public enum SettingsKey: String, CaseIterable, Sendable {
     case topNSigma = "top_n_sigma"
     case exploreNudgeAfter = "explore_nudge_after"
     case thinkingBudget = "thinking_budget"
+    case toolApproval = "tool_approval"
 
     public var doc: String {
         switch self {
@@ -86,6 +90,10 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .thinkingBudget:
             return "reasoning tokens a step may spend before the server closes its thinking and the model "
                 + "acts on what it has; 0 is no cap (default), 2048-4096 is a reasonable start"
+        case .toolApproval:
+            return "ask (default): commands that delete, write outside the project, use the network, rewrite "
+                + "git history, install software, or are unrecognised show the user a card first; trusted: they run "
+                + "without asking. Catastrophic commands are refused either way"
         }
     }
 
@@ -125,6 +133,11 @@ public enum SettingsKey: String, CaseIterable, Sendable {
                 return "thinking_budget needs 0 (no cap) or an integer in 256...65536"
             }
             overlay.thinkingBudget = n
+        case .toolApproval:
+            guard let m = ToolApprovalMode(rawValue: value.trimmingCharacters(in: .whitespaces).lowercased()) else {
+                return "tool_approval is ask or trusted"
+            }
+            overlay.toolApproval = m
         }
         return nil
     }
@@ -138,6 +151,7 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .topNSigma: overlay.topNSigma = nil
         case .exploreNudgeAfter: overlay.exploreNudgeAfter = nil
         case .thinkingBudget: overlay.thinkingBudget = nil
+        case .toolApproval: overlay.toolApproval = nil
         }
     }
 
@@ -150,6 +164,7 @@ public enum SettingsKey: String, CaseIterable, Sendable {
         case .topNSigma: return overlay.topNSigma.map { String(format: "%g", $0) }
         case .exploreNudgeAfter: return overlay.exploreNudgeAfter.map(String.init)
         case .thinkingBudget: return overlay.thinkingBudget.map(String.init)
+        case .toolApproval: return overlay.toolApproval?.rawValue
         }
     }
 }
@@ -166,6 +181,7 @@ public struct SessionSettings: Sendable, Equatable {
     public var topNSigma: Double
     public var exploreNudgeAfter: Int
     public var thinkingBudget: Int
+    public var toolApproval: ToolApprovalMode
 
     public static let defaults = SessionSettings(toolTimeoutSeconds: 180,
                                                  agentModels: [],
@@ -173,7 +189,8 @@ public struct SessionSettings: Sendable, Equatable {
                                                  agentTurnBudgetUSD: 1.0,
                                                  topNSigma: 0,
                                                  exploreNudgeAfter: 10,
-                                                 thinkingBudget: 0)
+                                                 thinkingBudget: 0,
+                                                 toolApproval: .ask)
 
     public enum Layer: String, Sendable { case session, project, global, builtin = "built-in" }
 
@@ -190,7 +207,8 @@ public struct SessionSettings: Sendable, Equatable {
             agentTurnBudgetUSD: pick({ $0.agentTurnBudgetUSD }, defaults.agentTurnBudgetUSD),
             topNSigma: pick({ $0.topNSigma }, defaults.topNSigma),
             exploreNudgeAfter: pick({ $0.exploreNudgeAfter }, defaults.exploreNudgeAfter),
-            thinkingBudget: pick({ $0.thinkingBudget }, defaults.thinkingBudget))
+            thinkingBudget: pick({ $0.thinkingBudget }, defaults.thinkingBudget),
+            toolApproval: pick({ $0.toolApproval }, defaults.toolApproval))
     }
 
     /// Which layer decided `key`, for display.

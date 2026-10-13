@@ -474,7 +474,12 @@ final class AppState {
         delegationMailbox?.hold(!delegationDraft.trimmingCharacters(in: .whitespaces).isEmpty)
     }
 
-    func stopDelegation() { delegationMailbox?.stop() }
+    func stopDelegation() {
+        delegationMailbox?.stop()
+        if let sid = delegationSessionID ?? selectedSessionID {
+            declineApprovals(session: sid, "the user stopped the delegation")
+        }
+    }
 
     /// Whether the selected session could delegate right now: models granted,
     /// a key present, budget remaining, and no delegation already live.
@@ -520,7 +525,7 @@ final class AppState {
         guard let root = root(of: rec) else { return }
         let inner = gated(HostToolRunner(root: root, environment: ShellEnvironment.resolve(in: root),
                                          timeout: settings.toolTimeoutSeconds, resultCap: resultCap),
-                          root: root)
+                          root: root, session: rec, mode: settings.toolApproval, inTurn: false)
 
         let mailbox = DelegationMailbox()
         delegationMailbox = mailbox
@@ -550,13 +555,90 @@ final class AppState {
     }
 
     /// The tool gate (spec §16.2), around the executor so a delegation's
-    /// calls pass it too.  Off by default until the approval card exists
-    /// (§16.8 step 3): `defaults write <bundle id> toolGate -bool YES`
-    /// turns it on, and then every question is a no.
-    private func gated(_ runner: ToolExecuting, root: URL) -> ToolExecuting {
-        guard UserDefaults.standard.bool(forKey: "toolGate") else { return runner }
-        return GatedToolRunner(inner: runner, context: PolicyContext(root: root.path),
-                               approver: { _ in .decline(reason: "the approval card is not built yet") })
+    /// calls pass it too.  `inTurn`: its notes go into the turn's
+    /// transcript; a delegation the user started on its own shows its calls
+    /// in its card instead.
+    private func gated(_ runner: ToolExecuting, root: URL, session rec: SessionRecord,
+                       mode: ToolApprovalMode, inTurn: Bool) -> ToolExecuting {
+        let sid = rec.id
+        var note: (@Sendable (String) -> Void)?
+        if inTurn {
+            note = { @Sendable [weak self] text in
+                DispatchQueue.main.async { MainActor.assumeIsolated { self?.apply(.note(text)) } }
+            }
+        }
+        return GatedToolRunner(inner: runner, context: PolicyContext(root: root.path), mode: mode,
+                               approvals: standingApprovals(rec), note: note,
+                               approver: { [weak self] req in
+                                   guard let self else { return .decline(reason: "the app is closing") }
+                                   return self.waitForApproval(req, session: sid)
+                               })
+    }
+
+    // MARK: Approvals (spec §16.6)
+
+    /// A call waiting on the user's card.
+    struct PendingApproval: Identifiable {
+        let id = UUID()
+        let request: ApprovalRequest
+        let session: UUID
+        let answer: ApprovalBox
+    }
+    /// In the order asked; the selected session's first is the card shown.
+    private(set) var pendingApprovals: [PendingApproval] = []
+    var pendingApprovalHere: PendingApproval? {
+        pendingApprovals.first { $0.session == selectedSessionID }
+    }
+
+    private var standing: [UUID: StandingApprovals] = [:]
+
+    /// The session's "allow for this session" grants, restored from its
+    /// record and written back to it as they are made.
+    private func standingApprovals(_ rec: SessionRecord) -> StandingApprovals {
+        if let a = standing[rec.id] { return a }
+        let sid = rec.id
+        let a = StandingApprovals(rec.approvals ?? [], onAdd: { [weak self] new in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, let i = self.sessions.firstIndex(where: { $0.id == sid }) else { return }
+                    self.sessions[i].approvals = (self.sessions[i].approvals ?? []) + new
+                    self.store?.save(self.sessions[i])
+                }
+            }
+        })
+        standing[rec.id] = a
+        return a
+    }
+
+    /// Called from inside a tool call, off the main actor: shows the card
+    /// and blocks this thread -- never the window -- until the user answers
+    /// or stops the turn.
+    nonisolated private func waitForApproval(_ req: ApprovalRequest, session sid: UUID) -> ApprovalAnswer {
+        // On the main thread this would wait on itself forever.
+        if Thread.isMainThread { return .decline(reason: "asked on the main thread, where no card can be shown") }
+        if ToolInterrupt.shared.isInterrupted { return .decline(reason: "the user stopped the turn") }
+        let box = ApprovalBox()
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                self.pendingApprovals.append(PendingApproval(request: req, session: sid, answer: box))
+                NSApp.requestUserAttention(req.high ? .criticalRequest : .informationalRequest)
+            }
+        }
+        return box.wait()
+    }
+
+    /// The card's answer.
+    func answerApproval(_ id: UUID, _ answer: ApprovalAnswer) {
+        guard let i = pendingApprovals.firstIndex(where: { $0.id == id }) else { return }
+        let p = pendingApprovals.remove(at: i)
+        p.answer.resolve(answer)
+    }
+
+    /// Stop answers every open card -- `session` nil for all of them.
+    private func declineApprovals(session: UUID?, _ why: String) {
+        let open = pendingApprovals.filter { session == nil || $0.session == session }
+        pendingApprovals.removeAll { session == nil || $0.session == session }
+        for p in open { p.answer.resolve(.decline(reason: why)) }
     }
 
     /// The tail of the conversation, for the delegation brief: the last user
@@ -790,6 +872,7 @@ final class AppState {
     /// session re-prefills from zero on the next open.
     func shutdown() async {
         shuttingDown = true
+        declineApprovals(session: nil, "the app is quitting")
         // AppKit has stopped delivering events by now (terminateLater), so a
         // turn still generating would sit in front of the checkpoint on the
         // serial engine queue for as long as it runs -- minutes, for an
@@ -879,7 +962,7 @@ final class AppState {
                 runner = gated(HostToolRunner(root: root, environment: env,
                                               timeout: settings.toolTimeoutSeconds,
                                               resultCap: resultCap, ledger: readLedger(rec.id)),
-                               root: root)
+                               root: root, session: rec, mode: settings.toolApproval, inTurn: true)
                 toolsStatus = "on this Mac · \(URL(fileURLWithPath: ShellEnvironment.loginShell).lastPathComponent) environment"
                 // Delegation (spec §15): advertised only when models are
                 // granted, a key exists, and budget remains.
@@ -1262,6 +1345,7 @@ final class AppState {
         // A running command -- Bash, a search -- is killed, not waited out.
         ToolInterrupt.shared.interrupt()
         if pendingQuestion != nil { answerQuestions(nil) }
+        declineApprovals(session: nil, "the user stopped the turn")
         guard let rec = liveSessionID.flatMap({ id in sessions.first { $0.id == id } }),
               let sid = rec.serverSessionID, let client else { return }
         Task { try? await client.cancel(sid) }
@@ -1751,3 +1835,24 @@ final class CancelFlag: @unchecked Sendable {
     func clear() { lock.lock(); value = false; lock.unlock() }
 }
 
+/// One answer, handed from the card (main actor) to the tool call waiting
+/// for it (a background thread).  The first answer wins.
+final class ApprovalBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private let ready = DispatchSemaphore(value: 0)
+    private var answer: ApprovalAnswer?
+
+    func resolve(_ a: ApprovalAnswer) {
+        let first: Bool = lock.withLock {
+            guard answer == nil else { return false }
+            answer = a
+            return true
+        }
+        if first { ready.signal() }
+    }
+
+    func wait() -> ApprovalAnswer {
+        ready.wait()
+        return lock.withLock { answer ?? .decline(reason: nil) }
+    }
+}
