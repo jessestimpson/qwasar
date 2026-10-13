@@ -421,6 +421,12 @@ bool qw_op_attn_prefill(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vc
                         int32_t head_dim, int32_t max_ctx, int32_t base_pos,
                         float scale);
 
+/* One form or the other, whatever the machine: half_form stages Q and the
+ * weights as half (an M5's default), otherwise they stay float. */
+bool qw_op_attn_prefill_as(qw_cmd c, bool half_form, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                           int32_t rows, int32_t q_heads, int32_t kv_heads,
+                           int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale);
+
 /* Few query rows at depth (metal/attn.metal, qw_attn_decode_gqa): each
  * threadgroup reads a slice of one KV head's keys once for all
  * QW_ATTN_GQA query heads that share it, and a second pass merges the
@@ -431,7 +437,8 @@ bool qw_op_attn_decode_split(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_r
                              int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale);
 
 /* What the graph calls: the tiled kernel from QW_FA_MIN_ROWS query rows; below
- * that, the split one from QW_ATTN_SPLIT_MIN_KEYS keys and the per-query one
+ * that, the split one from QW_ATTN_SPLIT_MIN_KEYS keys -- on an M5 the
+ * tensor-op split one from QW_ATTN_TENSOR_MIN_KEYS -- and the per-query one
  * under it; and the per-query one wherever another declines.
  * QWASAR_ATTN=decode keeps the per-query kernel throughout. */
 void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
@@ -450,6 +457,13 @@ void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
 #define QW_FA_BK 128
 #define QW_FA_SG 4
 #endif
+/* The half form's tile, an M5's (qw_attn_prefill_tensor_half): Q and the
+ * weights staged as half beside S leave room for 16 rows.  On the M5 Max a
+ * 256-row chunk 32K deep over 16 layers (tools/bench/fabench): 108 ms, 30.6
+ * TFLOP/s, against the float form's 275 ms (12.0) -- whose own best tiling
+ * there, 16 x 256, reached only 13.4.  The half form at 16 x 128 with 8
+ * simdgroups: 22-26. */
+#define QW_FAH_BQ 16
 #define QW_FA_MIN_ROWS 16
 #define QW_ATTN_GQA 6
 #define QW_ATTN_GS 8
@@ -467,6 +481,27 @@ void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
 #define QW_AM_SG 8
 #endif
 #define QW_AM_MIN_ROWS 16
+/* Decode's tensor-op split kernel, on an M5: 64 keys a step, 4 simdgroups,
+ * about 256 threadgroups.  Against the per-query kernel on the M5 Max, 16 of
+ * the 27B's layers (tools/bench/attnbench): even at 2K keys, 1.1 -> 0.9 ms at
+ * 4K, 2.0 -> 1.3 at 8K, 8.4 -> 5.1 at 32K, 16.5 -> 9.5 at 64K, 65.5 -> 35.7
+ * at 256K -- 445-480 GB/s from 64K.  Below 2K the per-query kernel's lighter
+ * step wins (0.42 against 0.68 ms at 1K).  The simdgroup split kernel lost to
+ * the per-query one at every depth there, 18.8 against 16.5 ms at 64K. */
+#ifndef QW_DS_BK
+#define QW_DS_BK 64
+#define QW_DS_SG 4
+#endif
+#define QW_DS_TGS 256
+#define QW_ATTN_TENSOR_MIN_KEYS 2048
+
+/* Decode on tensor ops (metal4/attn_tensor.metal, qw_attn_split_tensor): a
+ * threadgroup per (key slice, kv head), its query heads as the rows of one
+ * tile, the slices merged by qw_attn_merge.  Returns false where the shape
+ * does not fit (head 256 wide, gqa <= QW_AM_BQ) or tensor ops are absent. */
+bool qw_op_attn_decode_tensor(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                              int32_t rows, int32_t q_heads, int32_t kv_heads,
+                              int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale);
 
 /* ---- token selection ------------------------------------------------------
  *

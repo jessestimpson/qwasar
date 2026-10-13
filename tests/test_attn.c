@@ -49,8 +49,8 @@ static double rel_l2(const float *a, const float *b, size_t n) {
 /* Which kernel: the per-query one, the tiled prefill one (metal4/
  * attn_tensor.metal), or the split one for decode at depth -- the same answer
  * from each, to float rounding in another order. */
-typedef enum { PER_QUERY, TILED, SPLIT } attn_kernel;
-static const char *kernel_name[] = { "      ", " tiled", " split" };
+typedef enum { PER_QUERY, TILED, TILED_HALF, SPLIT, SPLIT_TENSOR } attn_kernel;
+static const char *kernel_name[] = { "      ", " tiled", " tiled, half", " split", " split, tensor" };
 
 static void test_attention(const qw_config *cfg, int32_t base_pos, int32_t rows, attn_kernel kern) {
     const int32_t qh = cfg->num_attention_heads, kvh = cfg->num_key_value_heads;
@@ -109,10 +109,14 @@ static void test_attention(const qw_config *cfg, int32_t base_pos, int32_t rows,
     if (kern == PER_QUERY)
         qw_op_attn_decode(c, qw_ref_at(ob, 0), qw_ref_at(qb, 0), qw_ref_at(kcb, 0),
                           qw_ref_at(vcb, 0), rows, qh, kvh, hd, MAX_CTX, base_pos, scale);
-    else if (kern == TILED)
-        CHECK(qw_op_attn_prefill(c, qw_ref_at(ob, 0), qw_ref_at(qb, 0), qw_ref_at(kcb, 0),
-                                 qw_ref_at(vcb, 0), rows, qh, kvh, hd, MAX_CTX, base_pos, scale),
+    else if (kern == TILED || kern == TILED_HALF)
+        CHECK(qw_op_attn_prefill_as(c, kern == TILED_HALF, qw_ref_at(ob, 0), qw_ref_at(qb, 0), qw_ref_at(kcb, 0),
+                                    qw_ref_at(vcb, 0), rows, qh, kvh, hd, MAX_CTX, base_pos, scale),
               "the tiled kernel declined");
+    else if (kern == SPLIT_TENSOR)
+        CHECK(qw_op_attn_decode_tensor(c, qw_ref_at(ob, 0), qw_ref_at(qb, 0), qw_ref_at(kcb, 0),
+                                       qw_ref_at(vcb, 0), rows, qh, kvh, hd, MAX_CTX, base_pos, scale),
+              "the tensor split kernel declined");
     else
         CHECK(qw_op_attn_decode_split(c, qw_ref_at(ob, 0), qw_ref_at(qb, 0), qw_ref_at(kcb, 0),
                                       qw_ref_at(vcb, 0), rows, qh, kvh, hd, MAX_CTX, base_pos, scale),
@@ -129,7 +133,9 @@ static void test_attention(const qw_config *cfg, int32_t base_pos, int32_t rows,
     qw_cpu_attn_decode(ref, q, kc_ref, vc_ref, rows, qh, kvh, hd, MAX_CTX, base_pos, scale);
 
     double e = rel_l2(o, ref, qn);
-    CHECK(e < 2e-5, "attn%s base_pos=%d rows=%d: rel l2 %.3g", kernel_name[kern], base_pos, rows, e);
+    /* The half form rounds Q and the weights to half: ~2e-4, and the 27B's
+     * per-layer drift against mlx-vlm (tests/test_forward) is unchanged by it. */
+    CHECK(e < (kern == TILED_HALF ? 5e-4 : 2e-5), "attn%s base_pos=%d rows=%d: rel l2 %.3g", kernel_name[kern], base_pos, rows, e);
     printf("  attention%s keys=%-4d rows=%-3d  rel l2 %.2e\n", kernel_name[kern], base_pos + rows, rows, e);
 
     free(ref); free(kc_ref); free(vc_ref);
@@ -259,6 +265,12 @@ int main(int argc, char **argv) {
     test_attention(cfg, 5, 64, TILED);
     test_attention(cfg, 300, 100, TILED);
     test_attention(cfg, 1500, 256, TILED);
+    /* The half form, an M5's, on the same shapes: its tile is QW_FAH_BQ rows. */
+    test_attention(cfg, 0, 16, TILED_HALF);
+    test_attention(cfg, 0, 37, TILED_HALF);
+    test_attention(cfg, 5, 64, TILED_HALF);
+    test_attention(cfg, 300, 100, TILED_HALF);
+    test_attention(cfg, 1500, 256, TILED_HALF);
 
     /* The split kernel: one token and a speculative verify's few, a cache
      * shallower than one slice, slice and simdgroup boundaries, and deep. */
@@ -269,6 +281,18 @@ int main(int argc, char **argv) {
     test_attention(cfg, 2000, 1, SPLIT);
     test_attention(cfg, 1990, 5, SPLIT);
     test_attention(cfg, 1000, 8, SPLIT);
+
+    /* The same on tensor ops: slices of whole 64-key steps, the last one
+     * ragged, rows past the head's own reading as zeros. */
+    if (qw_tmm_available()) {
+        test_attention(cfg, 0, 1, SPLIT_TENSOR);
+        test_attention(cfg, 40, 1, SPLIT_TENSOR);
+        test_attention(cfg, 255, 1, SPLIT_TENSOR);
+        test_attention(cfg, 256, 1, SPLIT_TENSOR);
+        test_attention(cfg, 2000, 1, SPLIT_TENSOR);
+        test_attention(cfg, 1990, 5, SPLIT_TENSOR);
+        test_attention(cfg, 1000, 8, SPLIT_TENSOR);
+    }
 
     test_causality(cfg);
     test_gqa_and_normalisation(cfg);

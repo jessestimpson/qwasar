@@ -11,15 +11,16 @@
  * block is read once for BQ queries:
  *
  *   S = Q K^T             matmul2d into threadgroup memory (BQ x BK, float)
- *   online softmax        per row, over QW_FA_SPLIT threads: running max m
+ *   online softmax        per row, over SG*32/BQ threads: running max m
  *                         and sum l, the block's
  *                         weights written over S in place, and the factor
  *                         alpha = exp(m_old - m_new) the output is rescaled by
  *   O = alpha O + P V     matmul2d accumulating into a cooperative tensor
  *
- * and O / l is stored at the end.  Q is read as float and the weights stay
- * float, so the only rounding beyond qw_attn_decode's is the order of the
- * sums: the cache is half either way.
+ * and O / l is stored at the end.  In the float form Q is read as float and
+ * the weights stay float, so the only rounding beyond qw_attn_decode's is the
+ * order of the sums: the cache is half either way.  The half form, for an M5,
+ * is below.
  *
  * Causality: a query at row r sees keys [0, base_pos + r].  Blocks past a
  * tile's last row are never visited; within the diagonal block the excess is
@@ -31,8 +32,6 @@
 #define QW_FA_BK 128
 #define QW_FA_SG 4
 #endif
-/* Threads per row in the softmax step: all of them, BQ rows to SG*32. */
-#define QW_FA_SPLIT ((QW_FA_SG * 32) / QW_FA_BQ)
 #define QW_FA_D  256
 
 struct qw_fa_args {
@@ -45,7 +44,16 @@ struct qw_fa_args {
     float scale;
 };
 
-kernel void qw_attn_prefill_tensor(
+/* Two forms of one kernel.  The float one feeds Q and the softmax weights to
+ * the ops as float: the M4's, where it matches qw_attn_decode to rounding
+ * order.  The half one stages Q (scaled) and the weights as half -- the M5's
+ * matrix units run half several times faster than float, 30.6 TFLOP/s
+ * against 12-13 on the M5 Max -- at the precision of the operands qmm and the
+ * expert kernels already round to, and finer than the bf16 the reference
+ * runs this attention in.  Its tile is QW_FAH_BQ rows: Q and the weights
+ * have to fit beside S. */
+template <uint BQ, bool H>
+kernel void qw_attn_prefill_impl(
     device float        *q   [[buffer(0)]],   /* [rows, q_heads, D] fp32 */
     device half         *kc  [[buffer(1)]],   /* [kv_heads, max_ctx, D] fp16 */
     device half         *vc  [[buffer(2)]],
@@ -54,15 +62,21 @@ kernel void qw_attn_prefill_tensor(
     uint2 tgid [[threadgroup_position_in_grid]],
     uint  tid  [[thread_index_in_threadgroup]])
 {
-    threadgroup float S[QW_FA_BQ * QW_FA_BK];   /* scores, then weights, [BQ][BK] */
-    threadgroup float m_run[QW_FA_BQ], l_run[QW_FA_BQ], alpha[QW_FA_BQ];
+    /* Threads per row in the softmax step: all of them, BQ rows to SG*32. */
+    constexpr uint SPLIT = (QW_FA_SG * 32) / BQ;
+    threadgroup float S[BQ * QW_FA_BK];          /* scores, then (float) weights, [BQ][BK] */
+    threadgroup half  Qs[H ? BQ * QW_FA_D : 1];  /* half: Q, scaled */
+    threadgroup half  Ph[H ? BQ * QW_FA_BK : 1]; /* half: the weights */
+    threadgroup float m_run[BQ], l_run[BQ], alpha[BQ];
 
     const uint qh = tgid.y, kvh = qh / a.gqa;
-    const uint r0 = tgid.x * QW_FA_BQ;
+    const uint r0 = tgid.x * BQ;
     const int  qstride = (int)(a.q_heads * QW_FA_D);
     const uint n_keys = a.base_pos + a.rows;
     /* The last key any row of this tile sees, plus one. */
-    const uint k_end = a.base_pos + min(r0 + QW_FA_BQ, a.rows);
+    const uint k_end = a.base_pos + min(r0 + BQ, a.rows);
+    /* The half form folds the scale into Q. */
+    const float sc = H ? 1.0f : a.scale;
 
     /* One head's rows are strided by the whole row: (d, r) is at r*qstride + d. */
     tensor<device float, dextents<int32_t, 2>, tensor_inline>
@@ -74,54 +88,71 @@ kernel void qw_attn_prefill_tensor(
     tensor<device half, dextents<int32_t, 2>, tensor_inline>
         V(vc + (ulong)kvh * a.max_ctx * QW_FA_D, dextents<int32_t, 2>(QW_FA_D, n_keys));
     tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>
-        St(S, dextents<int32_t, 2>(QW_FA_BK, QW_FA_BQ));
+        St(S, dextents<int32_t, 2>(QW_FA_BK, BQ));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>
+        Qh(Qs, dextents<int32_t, 2>(QW_FA_D, BQ));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>
+        Pt(Ph, dextents<int32_t, 2>(QW_FA_BK, BQ));
 
     /* K is [keys][D]: as the right operand of Q K^T that is B^T, so
      * transpose_right; V is [keys][D], B itself. */
-    constexpr auto qk_desc = matmul2d_descriptor(QW_FA_BQ, QW_FA_BK, QW_FA_D, false, true, false,
+    constexpr auto qk_desc = matmul2d_descriptor(BQ, QW_FA_BK, QW_FA_D, false, true, false,
                                                  matmul2d_descriptor::mode::multiply);
-    constexpr auto pv_desc = matmul2d_descriptor(QW_FA_BQ, QW_FA_D, QW_FA_BK, false, false, false,
+    constexpr auto pv_desc = matmul2d_descriptor(BQ, QW_FA_D, QW_FA_BK, false, false, false,
                                                  matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<qk_desc, execution_simdgroups<QW_FA_SG>> qk;
     matmul2d<pv_desc, execution_simdgroups<QW_FA_SG>> pv;
 
+    if (H) {
+        for (uint i = tid; i < BQ * QW_FA_D / 4; i += QW_FA_SG * 32) {
+            const uint rr = i / (QW_FA_D / 4), d4 = i % (QW_FA_D / 4);
+            const float4 v = r0 + rr < a.rows
+                ? *(device const float4 *)(q + (ulong)(r0 + rr) * qstride + qh * QW_FA_D + d4 * 4) * a.scale
+                : float4(0.0f);
+            ((threadgroup half4 *)Qs)[i] = half4(v);
+        }
+    }
     auto q0 = Q.slice(0, r0);
     auto v0 = V.slice(0, 0);
-    auto O = pv.template get_destination_cooperative_tensor<decltype(St), decltype(v0), float>();
+    /* The accumulator's layout follows the weights' type. */
+    using P_t = typename metal::conditional<H, decltype(Pt), decltype(St)>::type;
+    auto O = pv.template get_destination_cooperative_tensor<P_t, decltype(v0), float>();
 #pragma unroll
     for (uint16_t i = 0; i < O.get_capacity(); ++i)
         if (O.is_valid_element(i)) O[i] = 0.0f;
-    if (tid < QW_FA_BQ) { m_run[tid] = -FLT_MAX; l_run[tid] = 0.0f; }
+    if (tid < BQ) { m_run[tid] = -FLT_MAX; l_run[tid] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint k0 = 0; k0 < k_end; k0 += QW_FA_BK) {
         auto kb = K.slice(0, k0);
-        qk.run(q0, kb, St);
+        if constexpr (H) qk.run(Qh, kb, St);
+        else             qk.run(q0, kb, St);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        /* QW_FA_SPLIT threads a row, adjacent lanes of one simdgroup, each
-         * taking every QW_FA_SPLIT-th key: the block's max and sum are
-         * shuffled across the group, and its first thread keeps the row's
-         * running state. */
+        /* SPLIT threads a row, adjacent lanes of one simdgroup, each taking
+         * every SPLIT-th key: the block's max and sum are shuffled across the
+         * group, and its first thread keeps the row's running state. */
         {
-            const uint rr = tid / QW_FA_SPLIT, part = tid % QW_FA_SPLIT;
+            const uint rr = tid / SPLIT, part = tid % SPLIT;
             const uint r = r0 + rr;
             threadgroup float *row = S + rr * QW_FA_BK;
-            const bool valid = rr < QW_FA_BQ && r < a.rows;
+            const bool valid = rr < BQ && r < a.rows;
             /* Not -INFINITY: fast-math may assume there are none. */
             const int live = valid ? min((int)QW_FA_BK, (int)(a.base_pos + r) - (int)k0 + 1) : 0;
             const float m_old = valid ? m_run[rr] : -FLT_MAX;
             float mx = m_old;
-            for (int j = (int)part; j < live; j += QW_FA_SPLIT) mx = max(mx, row[j] * a.scale);
-            for (uint o = 1; o < QW_FA_SPLIT; o <<= 1) mx = max(mx, simd_shuffle_xor(mx, (ushort)o));
+            for (int j = (int)part; j < live; j += SPLIT) mx = max(mx, row[j] * sc);
+            for (uint o = 1; o < SPLIT; o <<= 1) mx = max(mx, simd_shuffle_xor(mx, (ushort)o));
             float sum = 0.0f;
-            if (rr < QW_FA_BQ)
-                for (int j = (int)part; j < (int)QW_FA_BK; j += QW_FA_SPLIT) {
-                    const float p = j < live ? exp(row[j] * a.scale - mx) : 0.0f;
-                    row[j] = p;
+            if (rr < BQ)
+                for (int j = (int)part; j < (int)QW_FA_BK; j += SPLIT) {
+                    const float p = j < live ? exp(row[j] * sc - mx) : 0.0f;
+                    if (H) Ph[rr * QW_FA_BK + j] = half(p);
+                    else   row[j] = p;
                     sum += p;
                 }
-            for (uint o = 1; o < QW_FA_SPLIT; o <<= 1) sum += simd_shuffle_xor(sum, (ushort)o);
-            if (rr < QW_FA_BQ && part == 0) {
+            for (uint o = 1; o < SPLIT; o <<= 1) sum += simd_shuffle_xor(sum, (ushort)o);
+            if (rr < BQ && part == 0) {
                 const float al = valid ? exp(m_old - mx) : 1.0f;
                 if (valid) { m_run[rr] = mx; l_run[rr] = l_run[rr] * al + sum; }
                 alpha[rr] = al;
@@ -136,7 +167,8 @@ kernel void qw_attn_prefill_tensor(
             O[i] *= alpha[ix[1]];
         }
         auto vb = V.slice(0, k0);
-        pv.run(St, vb, O);
+        if constexpr (H) pv.run(Pt, vb, O);
+        else             pv.run(St, vb, O);
         /* S is written again next block. */
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -150,6 +182,16 @@ kernel void qw_attn_prefill_tensor(
     auto o0 = O_out.slice(0, r0);
     O.store(o0);
 }
+
+#ifndef QW_FAH_BQ
+#define QW_FAH_BQ 16
+#endif
+#define QW_FA_INSTANCE(name, BQ, H)                                                       \
+    template [[host_name(name)]] kernel void qw_attn_prefill_impl<BQ, H>(                \
+        device float *, device half *, device half *, device float *,                     \
+        constant qw_fa_args &, uint2, uint);
+QW_FA_INSTANCE("qw_attn_prefill_tensor", QW_FA_BQ, false)
+QW_FA_INSTANCE("qw_attn_prefill_tensor_half", QW_FAH_BQ, true)
 
 /* ---- masked: prefill's sparse attention, on tensor ops ----------------------
  *
@@ -292,5 +334,129 @@ kernel void qw_attn_masked_tensor(
         if ((uint)ix[1] >= a.gqa) continue;
         const float l = l_run[ix[1]];
         orow[(uint)ix[1] * QW_FA_D + ix[0]] = l > 0.0f ? O[i] / l : 0.0f;
+    }
+}
+
+/* ---- split: decode at depth, on tensor ops ----------------------------------
+ *
+ * A token's attention is one query row: the per-query kernel's threadgroups
+ * are (row, query head), 24 of them for the 27B -- too few to fill an M5 Max,
+ * and each kv head's keys read once for each of its query heads.  Here a
+ * threadgroup takes one slice of keys and one kv head, its query heads the
+ * rows of a QW_AM_BQ-row Q tile as in qw_attn_masked_tensor, and walks the
+ * slice QW_DS_BK keys a step with K and V read straight from the cache as
+ * tensor operands, and Q and the weights float as in qw_attn_prefill_tensor.
+ * Each slice leaves its unnormalised output and its
+ * softmax's max and sum in the layout qw_attn_merge (metal/attn.metal)
+ * combines: [rows, q_heads, parts, D] and [rows, q_heads, parts, 2]. */
+
+#ifndef QW_DS_BK
+#define QW_DS_BK 64
+#define QW_DS_SG 4
+#endif
+#define QW_DS_T     (QW_DS_SG * 32)
+#define QW_DS_SPLIT (QW_DS_T / QW_AM_BQ)
+
+struct qw_ds_args {
+    uint  rows, q_heads, kv_heads, gqa, max_ctx, base_pos;
+    uint  splits, per_split;
+    float scale;
+};
+
+kernel void qw_attn_split_tensor(
+    device       float *q     [[buffer(0)]],   /* [rows, q_heads, D] fp32 */
+    device       half  *kc    [[buffer(1)]],   /* [kv_heads, max_ctx, D] fp16 */
+    device       half  *vc    [[buffer(2)]],
+    device       float *pacc  [[buffer(3)]],   /* [rows, q_heads, splits, D] */
+    device       float *pstat [[buffer(4)]],   /* [rows, q_heads, splits, 2]: max, sum */
+    constant qw_ds_args &a    [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    threadgroup float S[QW_AM_BQ * QW_DS_BK];   /* scores, then weights, [BQ][BK] */
+    threadgroup float m_run[QW_AM_BQ], l_run[QW_AM_BQ], alpha[QW_AM_BQ];
+
+    const uint split = tgid.x;
+    const uint row = tgid.y / a.kv_heads, kvh = tgid.y % a.kv_heads;
+    const uint n_keys = a.base_pos + row + 1;   /* causal */
+    const uint k_begin = split * a.per_split;
+    const uint k_end = min(k_begin + a.per_split, n_keys);
+    if (tid < QW_AM_BQ) { m_run[tid] = -FLT_MAX; l_run[tid] = 0.0f; }
+
+    /* Q is float and its extents are this kv head's query heads, so the
+     * tile's rows past them read as zeros.  K and V get extents of exactly
+     * the keys this slice may see: reads past them are zeros, never another
+     * slice's keys or stale cache. */
+    tensor<device float, dextents<int32_t, 2>, tensor_inline>
+        Q(q + ((ulong)row * a.q_heads + kvh * a.gqa) * QW_FA_D, dextents<int32_t, 2>(QW_FA_D, (int32_t)a.gqa));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline>
+        K(kc + (ulong)kvh * a.max_ctx * QW_FA_D, dextents<int32_t, 2>(QW_FA_D, (int32_t)k_end));
+    tensor<device half, dextents<int32_t, 2>, tensor_inline>
+        V(vc + (ulong)kvh * a.max_ctx * QW_FA_D, dextents<int32_t, 2>(QW_FA_D, (int32_t)k_end));
+    tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>
+        St(S, dextents<int32_t, 2>(QW_DS_BK, QW_AM_BQ));
+    constexpr auto qk_desc = matmul2d_descriptor(QW_AM_BQ, QW_DS_BK, QW_FA_D, false, true, false,
+                                                 matmul2d_descriptor::mode::multiply);
+    constexpr auto pv_desc = matmul2d_descriptor(QW_AM_BQ, QW_FA_D, QW_DS_BK, false, false, false,
+                                                 matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroups<QW_DS_SG>> qk;
+    matmul2d<pv_desc, execution_simdgroups<QW_DS_SG>> pv;
+    auto q0 = Q.slice(0, 0);
+    auto v0 = V.slice(0, 0);
+    auto O = pv.template get_destination_cooperative_tensor<decltype(St), decltype(v0), float>();
+#pragma unroll
+    for (uint16_t i = 0; i < O.get_capacity(); ++i)
+        if (O.is_valid_element(i)) O[i] = 0.0f;
+
+    for (uint k0 = k_begin; k0 < k_end; k0 += QW_DS_BK) {
+        auto kb = K.slice(0, (int32_t)k0);
+        qk.run(q0, kb, St);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            const uint rr = tid / QW_DS_SPLIT, part = tid % QW_DS_SPLIT;
+            threadgroup float *srow = S + rr * QW_DS_BK;
+            const bool valid = rr < a.gqa;
+            const int live = valid ? min((int)QW_DS_BK, (int)(k_end - k0)) : 0;
+            const float m_old = m_run[rr];
+            float mx = m_old;
+            for (int j = (int)part; j < live; j += QW_DS_SPLIT) mx = max(mx, srow[j] * a.scale);
+            for (uint o = 1; o < QW_DS_SPLIT; o <<= 1) mx = max(mx, simd_shuffle_xor(mx, (ushort)o));
+            float sum = 0.0f;
+            for (int j = (int)part; j < (int)QW_DS_BK; j += QW_DS_SPLIT) {
+                const float p = j < live ? exp(srow[j] * a.scale - mx) : 0.0f;
+                srow[j] = p;
+                sum += p;
+            }
+            for (uint o = 1; o < QW_DS_SPLIT; o <<= 1) sum += simd_shuffle_xor(sum, (ushort)o);
+            if (part == 0) {
+                const float al = valid ? exp(m_old - mx) : 1.0f;
+                if (valid) { m_run[rr] = mx; l_run[rr] = l_run[rr] * al + sum; }
+                alpha[rr] = al;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint16_t i = 0; i < O.get_capacity(); ++i) {
+            if (!O.is_valid_element(i)) continue;
+            O[i] *= alpha[O.get_multidimensional_index(i)[1]];
+        }
+        auto vb = V.slice(0, (int32_t)k0);
+        pv.run(St, vb, O);
+        /* S is written again next block. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const ulong base = ((ulong)row * a.q_heads + kvh * a.gqa) * a.splits + split;
+#pragma unroll
+    for (uint16_t i = 0; i < O.get_capacity(); ++i) {
+        if (!O.is_valid_element(i)) continue;
+        auto ix = O.get_multidimensional_index(i);   /* (d, head) */
+        if ((uint)ix[1] >= a.gqa) continue;
+        pacc[(base + (ulong)ix[1] * a.splits) * QW_FA_D + ix[0]] = O[i];
+    }
+    if (tid < a.gqa) {
+        const ulong idx = base + (ulong)tid * a.splits;
+        pstat[idx * 2] = m_run[tid];
+        pstat[idx * 2 + 1] = l_run[tid];
     }
 }

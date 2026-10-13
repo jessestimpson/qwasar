@@ -623,9 +623,12 @@ static id<MTLLibrary> qw_tmm_library(void) {
                 @"QW_AM_BQ" : @(QW_AM_BQ),
                 @"QW_AM_BK" : @(QW_AM_BK),
                 @"QW_AM_SG" : @(QW_AM_SG),
+                @"QW_DS_BK" : @(QW_DS_BK),
+                @"QW_DS_SG" : @(QW_DS_SG),
                 @"QW_FA_BQ" : @(QW_FA_BQ),
                 @"QW_FA_BK" : @(QW_FA_BK),
                 @"QW_FA_SG" : @(QW_FA_SG),
+                @"QW_FAH_BQ" : @(QW_FAH_BQ),
             };
             NSError *err = nil;
             g_tmm_library = [g_device newLibraryWithSource:[NSString stringWithUTF8String:qwasar_metal4_source]
@@ -1375,12 +1378,13 @@ void qw_op_attn_decode(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vca
         threadsPerThreadgroup:MTLSizeMake(32 * 32, 1, 1)];
 }
 
-bool qw_op_attn_prefill(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
-                        int32_t rows, int32_t q_heads, int32_t kv_heads,
-                        int32_t head_dim, int32_t max_ctx, int32_t base_pos,
-                        float scale) {
+bool qw_op_attn_prefill_as(qw_cmd c, bool half_form, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                           int32_t rows, int32_t q_heads, int32_t kv_heads,
+                           int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale) {
     if (!c || !c->enc || rows <= 0 || head_dim != 256 || kv_heads <= 0 || q_heads % kv_heads) return false;
-    id<MTLComputePipelineState> ps = qw_tmm_pipeline(@"qw_attn_prefill_tensor");
+    const NSUInteger bq = half_form ? QW_FAH_BQ : QW_FA_BQ;
+    id<MTLComputePipelineState> ps = qw_tmm_pipeline(half_form ? @"qw_attn_prefill_tensor_half"
+                                                               : @"qw_attn_prefill_tensor");
     if (!ps) return false;
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
     [enc setComputePipelineState:ps];
@@ -1392,10 +1396,24 @@ bool qw_op_attn_prefill(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vc
                           (uint32_t)(q_heads / kv_heads), (uint32_t)max_ctx,
                           (uint32_t)base_pos, scale };
     [enc setBytes:&args length:sizeof args atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows + QW_FA_BQ - 1) / QW_FA_BQ,
-                                          (NSUInteger)q_heads, 1)
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows + bq - 1) / bq, (NSUInteger)q_heads, 1)
         threadsPerThreadgroup:MTLSizeMake(32 * QW_FA_SG, 1, 1)];
     return true;
+}
+
+/* The half form on an M5 (metal4/attn_tensor.metal says why), the float one
+ * elsewhere; QWASAR_FA=float or half overrides. */
+bool qw_op_attn_prefill(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                        int32_t rows, int32_t q_heads, int32_t kv_heads,
+                        int32_t head_dim, int32_t max_ctx, int32_t base_pos,
+                        float scale) {
+    static int half_form = -1;
+    if (half_form < 0) {
+        const char *v = getenv("QWASAR_FA");
+        half_form = v && !strcmp(v, "float") ? 0 : v && !strcmp(v, "half") ? 1 : qw_gpu_has_matrix_units();
+    }
+    return qw_op_attn_prefill_as(c, half_form != 0, out, q, kcache, vcache, rows, q_heads, kv_heads,
+                                 head_dim, max_ctx, base_pos, scale);
 }
 
 typedef struct {
@@ -1446,6 +1464,50 @@ bool qw_op_attn_decode_split(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_r
     return true;
 }
 
+bool qw_op_attn_decode_tensor(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+                              int32_t rows, int32_t q_heads, int32_t kv_heads,
+                              int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale) {
+    if (!c || !c->enc || rows <= 0 || head_dim != 256 || kv_heads <= 0 || q_heads % kv_heads
+        || q_heads / kv_heads > QW_AM_BQ) return false;
+    /* About QW_DS_TGS threadgroups in all, slices of whole steps and at least
+     * 256 keys.  128 to 512 threadgroups measured the same on the M5 Max. */
+    const uint32_t n_keys = (uint32_t)(base_pos + rows);
+    const uint32_t groups = (uint32_t)(rows * kv_heads);
+    uint32_t splits = (QW_DS_TGS + groups - 1) / groups;
+    uint32_t per = (n_keys + splits - 1) / splits;
+    if (per < 256) per = 256;
+    per = (per + QW_DS_BK - 1) / QW_DS_BK * QW_DS_BK;
+    splits = (n_keys + per - 1) / per;
+    const size_t n_part = (size_t)rows * q_heads * splits;
+    id<MTLBuffer> scratch = qw_cmd_scratch(c, n_part * (head_dim + 2) * sizeof(float));
+    if (!scratch) return false;
+    id<MTLComputePipelineState> ps = qw_tmm_pipeline(@"qw_attn_split_tensor");
+    id<MTLComputePipelineState> ms = qw_pipeline(@"qw_attn_merge");
+    if (!ps || !ms) return false;
+
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    const NSUInteger stat_off = n_part * (NSUInteger)head_dim * sizeof(float);
+    [enc setComputePipelineState:ps];
+    qw_set(enc, q, 0); qw_set(enc, kcache, 1); qw_set(enc, vcache, 2);
+    [enc setBuffer:scratch offset:0 atIndex:3];
+    [enc setBuffer:scratch offset:stat_off atIndex:4];
+    struct { uint32_t rows, q_heads, kv_heads, gqa, max_ctx, base_pos, splits, per_split; float scale; } args = {
+        (uint32_t)rows, (uint32_t)q_heads, (uint32_t)kv_heads, (uint32_t)(q_heads / kv_heads),
+        (uint32_t)max_ctx, (uint32_t)base_pos, splits, per, scale };
+    [enc setBytes:&args length:sizeof args atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(splits, groups, 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * QW_DS_SG, 1, 1)];
+    if (c->parallel > 0) [enc memoryBarrierWithResources:&scratch count:1];
+    [enc setComputePipelineState:ms];
+    [enc setBuffer:scratch offset:0 atIndex:0];
+    [enc setBuffer:scratch offset:stat_off atIndex:1];
+    qw_set(enc, out, 2);
+    [enc setBytes:&splits length:sizeof splits atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows * q_heads), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake((NSUInteger)head_dim, 1, 1)];
+    return true;
+}
+
 void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
                 int32_t rows, int32_t q_heads, int32_t kv_heads,
                 int32_t head_dim, int32_t max_ctx, int32_t base_pos, float scale) {
@@ -1457,7 +1519,14 @@ void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
     if (tiled && rows >= QW_FA_MIN_ROWS
         && qw_op_attn_prefill(c, out, q, kcache, vcache, rows, q_heads, kv_heads,
                               head_dim, max_ctx, base_pos, scale)) return;
-    if (tiled && rows < QW_FA_MIN_ROWS && base_pos + rows >= QW_ATTN_SPLIT_MIN_KEYS
+    /* On an M5 the tensor-op split kernel replaces the simdgroup one, which
+     * lost to the per-query kernel there at every depth up to 256K. */
+    static int matrix = -1;
+    if (matrix < 0) matrix = qw_gpu_has_matrix_units();
+    if (tiled && matrix && rows < QW_FA_MIN_ROWS && base_pos + rows >= QW_ATTN_TENSOR_MIN_KEYS
+        && qw_op_attn_decode_tensor(c, out, q, kcache, vcache, rows, q_heads, kv_heads,
+                                    head_dim, max_ctx, base_pos, scale)) return;
+    if (tiled && !matrix && rows < QW_FA_MIN_ROWS && base_pos + rows >= QW_ATTN_SPLIT_MIN_KEYS
         && qw_op_attn_decode_split(c, out, q, kcache, vcache, rows, q_heads, kv_heads,
                                    head_dim, max_ctx, base_pos, scale)) return;
     qw_op_attn_decode(c, out, q, kcache, vcache, rows, q_heads, kv_heads,

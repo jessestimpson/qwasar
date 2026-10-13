@@ -14,7 +14,7 @@ int main(void) {
     char err[256];
     if (!qw_gpu_init(err, sizeof err)) { fprintf(stderr, "%s\n", err); return 1; }
     const int qh = 24, kvh = 4, hd = 256, layers = 16;
-    int depths[] = { 2048, 8192, 16384, 20480, 24576, 32768, 65536 };
+    int depths[] = { 2048, 8192, 16384, 20480, 24576, 32768, 65536, 131072, 262144 };
     for (int di = 0; di < (int)(sizeof depths / sizeof *depths); di++) {
         int ctx = depths[di] + 8;
         size_t cn = (size_t)kvh * ctx * hd;
@@ -24,7 +24,7 @@ int main(void) {
         for (size_t i = 0; i < cn; i++) { k[i] = 0x2c00 + (i * 7 % 512); v[i] = 0x2c00 + (i * 13 % 512); }
         float *qp = qw_buf_contents(q);
         for (int i = 0; i < qh * hd; i++) qp[i] = (float)((i * 37) % 100) / 100.0f - 0.5f;
-        for (int kern = 0; kern < 2; kern++) {
+        for (int kern = 0; kern < 3; kern++) {
             double best = 1e9;
             for (int it = 0; it < 6; it++) {
                 qw_cmd c = qw_cmd_begin();
@@ -32,6 +32,8 @@ int main(void) {
                 for (int l = 0; l < layers; l++) {
                     if (kern == 0) qw_op_attn_decode(c, qw_ref_at(o, 0), qw_ref_at(q, 0), qw_ref_at(kc, 0), qw_ref_at(vc, 0),
                                                      1, qh, kvh, hd, ctx, depths[di], 0.0625f);
+                    else if (kern == 2) qw_op_attn_decode_tensor(c, qw_ref_at(o, 0), qw_ref_at(q, 0), qw_ref_at(kc, 0), qw_ref_at(vc, 0),
+                                                 1, qh, kvh, hd, ctx, depths[di], 0.0625f);
                     else qw_op_attn_decode_split(c, qw_ref_at(o, 0), qw_ref_at(q, 0), qw_ref_at(kc, 0), qw_ref_at(vc, 0),
                                                  1, qh, kvh, hd, ctx, depths[di], 0.0625f);
                 }
@@ -42,7 +44,7 @@ int main(void) {
             }
             double gb = (double)depths[di] * kvh * hd * 2 * 2 * layers / 1e9;
             printf("depth %6d  %-10s %7.2f ms for 16 layers  (%.0f GB/s of unique KV)\n", depths[di],
-                   kern ? "split" : "per-query", best * 1e3, gb / best);
+                   kern == 2 ? "tensor" : kern ? "split" : "per-query", best * 1e3, gb / best);
         }
         qw_buf_free(kc); qw_buf_free(vc); qw_buf_free(q); qw_buf_free(o);
     }
