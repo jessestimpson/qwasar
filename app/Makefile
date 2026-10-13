@@ -6,6 +6,8 @@
 # copied into the bundle as a helper.
 #
 #   make          build and sign Qwasar.app
+#   make install  ... and copy it to /Applications (INSTALL_DIR)
+#   make uninstall
 #   make run      build, then launch it (the menu bar item)
 #   make agent    ... with the coding agent's window open
 #   make gate     the helper on $(MODEL), headless
@@ -46,13 +48,15 @@ LDLIBS    := $(FRAMEWORKS)
 ENTITLEMENTS        ?= Qwasar.entitlements
 HELPER_ENTITLEMENTS ?= Helper.entitlements
 
-.PHONY: all help run agent gate gate-full test clean server
+.PHONY: all help run agent gate gate-full test clean server install uninstall
 
 all: $(APP)
 
 help:
 	@echo "Qwasar build targets (see README.md):"
 	@echo "  make              build and sign build/Qwasar.app"
+	@echo "  make install      ... and copy it to $(INSTALL_DIR)"
+	@echo "  make uninstall    remove it from $(INSTALL_DIR)"
 	@echo "  make run          build, then launch it"
 	@echo "  make agent        build, then launch it with the coding agent's window"
 	@echo "  make test         the host test suite"
@@ -75,6 +79,21 @@ $(KITLIB): $(KIT_SRCS)
 	    -emit-module -emit-module-path $(BUILD)/QwasarKit.swiftmodule \
 	    -emit-library -static -o $@ $(KIT_SRCS)
 
+# The icon, drawn by Tools/AppIcon.swift (the menu bar's Q on a tile) and
+# packed by iconutil: no binary asset in the tree.
+ICON_TOOL := $(BUILD)/AppIcon
+ICNS      := $(BUILD)/AppIcon.icns
+
+$(ICON_TOOL): Tools/AppIcon.swift
+	@mkdir -p $(BUILD)
+	$(SWIFT) -O -target $(TARGET) $< -o $@
+
+$(ICNS): $(ICON_TOOL)
+	@rm -rf $(BUILD)/AppIcon.iconset
+	@$(ICON_TOOL) $(BUILD)/AppIcon.iconset
+	iconutil -c icns $(BUILD)/AppIcon.iconset -o $@
+	@rm -rf $(BUILD)/AppIcon.iconset
+
 # highlight.js, concatenated from the vendored core and language modules.
 HLJS := vendor/highlight.js/highlight.bundle.js
 
@@ -86,8 +105,9 @@ $(BIN): $(KITLIB) $(APP_SRCS)
 	$(SWIFT) $(SWIFTFLAGS) -I $(BUILD) $(APP_SRCS) -o $@ \
 	    -L$(BUILD) -lQwasarKit $(LDLIBS)
 
-$(APP): $(BIN) server Resources/Info.plist $(ENTITLEMENTS) $(HELPER_ENTITLEMENTS) $(HLJS)
+$(APP): $(BIN) server Resources/Info.plist $(ENTITLEMENTS) $(HELPER_ENTITLEMENTS) $(HLJS) $(ICNS)
 	@cp Resources/Info.plist $(APP)/Contents/Info.plist
+	@cp $(ICNS) $(APP)/Contents/Resources/AppIcon.icns
 	@plutil -replace QWDefaultModel -string "$(MODEL)" $(APP)/Contents/Info.plist
 	@plutil -replace QWModelsDir -string "$(MODELS_DIR)" $(APP)/Contents/Info.plist
 	@cp $(HLJS) $(APP)/Contents/Resources/highlight.bundle.js
@@ -100,11 +120,36 @@ $(APP): $(BIN) server Resources/Info.plist $(ENTITLEMENTS) $(HELPER_ENTITLEMENTS
 	codesign --force --sign - --entitlements $(ENTITLEMENTS) \
 	         --options runtime --timestamp=none $(APP)
 	@codesign -d --entitlements - $(APP) 2>&1 | sed 's/^/  /'
+	@# Finder and the Dock cache icons by bundle; a new date makes them look again.
+	@touch $(APP)
 	@echo "built $(APP)"
 
 run:
 	@$(MAKE) --no-print-directory $(APP)
 	open $(APP)
+
+# Installed, it is the same bundle: it still finds this checkout's models
+# (QWDefaultModel and QWModelsDir in its Info.plist), and the Model menu can
+# point it anywhere else.  ditto keeps the signature intact; a running copy
+# is not replaced underneath itself.
+INSTALL_DIR ?= /Applications
+
+install: $(APP)
+	@if pgrep -xq Qwasar; then \
+	    echo "Qwasar is running; quit it (menu bar Q > Quit) and run make install again." >&2; \
+	    exit 1; \
+	fi
+	rm -rf "$(INSTALL_DIR)/Qwasar.app"
+	ditto $(APP) "$(INSTALL_DIR)/Qwasar.app"
+	@echo "installed $(INSTALL_DIR)/Qwasar.app"
+	@echo "  its default model: $$(plutil -extract QWDefaultModel raw "$(INSTALL_DIR)/Qwasar.app/Contents/Info.plist")"
+
+uninstall:
+	@if pgrep -xq Qwasar; then \
+	    echo "Qwasar is running; quit it first." >&2; exit 1; \
+	fi
+	rm -rf "$(INSTALL_DIR)/Qwasar.app"
+	@echo "removed $(INSTALL_DIR)/Qwasar.app (sessions and settings are kept)"
 
 agent:
 	@$(MAKE) --no-print-directory $(APP)
@@ -133,4 +178,5 @@ test: $(BUILD)/qwasar-test
 
 clean:
 	rm -rf $(BUILD)/Qwasar.app $(BUILD)/*.a $(BUILD)/*.swiftmodule $(BUILD)/*.swiftdoc \
-	       $(BUILD)/*.swiftsourceinfo $(BUILD)/*.abi.json $(BUILD)/qwasar-test
+	       $(BUILD)/*.swiftsourceinfo $(BUILD)/*.abi.json $(BUILD)/qwasar-test \
+	       $(ICON_TOOL) $(ICNS) $(BUILD)/AppIcon.iconset

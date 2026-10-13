@@ -238,6 +238,8 @@ make gate-full ROOT_DIR=/path/to/project PROMPT="what does qw_edit_apply do?"
 | target | what it does |
 |---|---|
 | `make` | build and sign `build/Qwasar.app` |
+| `make install` | ... and copy it to `/Applications` (`INSTALL_DIR=` elsewhere); it still uses this checkout's models |
+| `make uninstall` | remove it from `/Applications`; sessions and settings are kept |
 | `make run` | build, then launch it |
 | `make agent` | the same, with the coding agent's window open |
 | `make test` | the host suite: the tools, settings, delegation, persistence |

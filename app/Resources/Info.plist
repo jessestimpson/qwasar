@@ -6,6 +6,8 @@
     <key>CFBundleDisplayName</key>           <string>Qwasar</string>
     <key>CFBundleIdentifier</key>            <string>dev.qwasar.Qwasar</string>
     <key>CFBundleExecutable</key>            <string>Qwasar</string>
+    <!-- Contents/Resources/AppIcon.icns, drawn by Tools/AppIcon.swift. -->
+    <key>CFBundleIconFile</key>              <string>AppIcon</string>
     <key>CFBundlePackageType</key>           <string>APPL</string>
     <key>CFBundleShortVersionString</key>    <string>0.2.0</string>
     <key>CFBundleVersion</key>               <string>1</string>
