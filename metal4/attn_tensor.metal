@@ -460,3 +460,132 @@ kernel void qw_attn_split_tensor(
         pstat[idx * 2 + 1] = l_run[tid];
     }
 }
+
+/* ---- masked split: decode's sparse attention, on tensor ops -----------------
+ *
+ * A token's step of qw_attn_masked is one row: (row, query head) threadgroups
+ * are 24 of them for Flash-Next, each reading its kv head's ~2,050 selected
+ * keys and values -- 12 times over, the query heads sharing a kv head.  Here
+ * qw_attn_split_tensor's shape over the selection list: a threadgroup per
+ * (slice of the list, kv head), its query heads the rows of one tile, the
+ * slice's keys gathered QW_AM_BK at a time into threadgroup memory as in
+ * qw_attn_masked_tensor, Q and the weights float.  Each slice leaves its
+ * partial softmax for qw_attn_merge; a slice past the list's count leaves a
+ * sum of 0, which the merge drops. */
+
+struct qw_ams_args {
+    uint  rows, q_heads, kv_heads, gqa, max_ctx, list_cap;
+    uint  splits, per_split;
+    float scale;
+};
+
+kernel void qw_attn_masked_split_tensor(
+    device       float  *q     [[buffer(0)]],   /* [rows, q_heads, D] fp32 */
+    device const half   *kc    [[buffer(1)]],   /* [kv_heads, max_ctx, D] fp16 */
+    device const half   *vc    [[buffer(2)]],
+    device       float  *pacc  [[buffer(3)]],   /* [rows, q_heads, splits, D] */
+    device       float  *pstat [[buffer(4)]],   /* [rows, q_heads, splits, 2]: max, sum */
+    device const uint   *list  [[buffer(5)]],   /* [rows, 1 + list_cap]: count, positions */
+    constant qw_ams_args &a    [[buffer(6)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint T = QW_DS_SG * 32, SPLIT = T / QW_AM_BQ;
+    threadgroup half  KV[QW_AM_BK * QW_FA_D];    /* [BK][D]: keys, then values */
+    threadgroup float S[QW_AM_BQ * QW_AM_BK];    /* scores, then weights */
+    threadgroup float m_run[QW_AM_BQ], l_run[QW_AM_BQ], alpha[QW_AM_BQ];
+
+    const uint split = tgid.x;
+    const uint row = tgid.y / a.kv_heads, kvh = tgid.y % a.kv_heads;
+    device const uint *lr = list + (ulong)row * (1 + a.list_cap);
+    const uint n_sel = lr[0];
+    const uint j_begin = split * a.per_split;
+    const uint j_end = min(j_begin + a.per_split, n_sel);
+    device const half *kbase = kc + (ulong)kvh * a.max_ctx * QW_FA_D;
+    device const half *vbase = vc + (ulong)kvh * a.max_ctx * QW_FA_D;
+    if (tid < QW_AM_BQ) { m_run[tid] = -FLT_MAX; l_run[tid] = 0.0f; }
+
+    /* Q's extents are this kv head's query heads: the tile's rows past them
+     * read as zeros. */
+    tensor<device float, dextents<int32_t, 2>, tensor_inline>
+        Q(q + ((ulong)row * a.q_heads + kvh * a.gqa) * QW_FA_D, dextents<int32_t, 2>(QW_FA_D, (int32_t)a.gqa));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>
+        KVt(KV, dextents<int32_t, 2>(QW_FA_D, QW_AM_BK));
+    tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>
+        St(S, dextents<int32_t, 2>(QW_AM_BK, QW_AM_BQ));
+    constexpr auto qk_desc = matmul2d_descriptor(QW_AM_BQ, QW_AM_BK, QW_FA_D, false, true, false,
+                                                 matmul2d_descriptor::mode::multiply);
+    constexpr auto pv_desc = matmul2d_descriptor(QW_AM_BQ, QW_FA_D, QW_AM_BK, false, false, false,
+                                                 matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroups<QW_DS_SG>> qk;
+    matmul2d<pv_desc, execution_simdgroups<QW_DS_SG>> pv;
+    auto q0 = Q.slice(0, 0);
+    auto O = pv.template get_destination_cooperative_tensor<decltype(St), decltype(KVt), float>();
+#pragma unroll
+    for (uint16_t i = 0; i < O.get_capacity(); ++i)
+        if (O.is_valid_element(i)) O[i] = 0.0f;
+
+    auto gather = [&](device const half *base, uint j0) {
+        for (uint i = tid; i < QW_AM_BK * QW_FA_D / 8; i += T) {
+            const uint j = i / (QW_FA_D / 8), c = i % (QW_FA_D / 8);
+            uint4 v = uint4(0);
+            if (j0 + j < j_end) v = ((device const uint4 *)(base + (ulong)lr[1 + j0 + j] * QW_FA_D))[c];
+            ((threadgroup uint4 *)KV)[i] = v;
+        }
+    };
+
+    for (uint j0 = j_begin; j0 < j_end; j0 += QW_AM_BK) {
+        gather(kbase, j0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        qk.run(q0, KVt, St);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Values into the same tile while the softmax runs on S. */
+        gather(vbase, j0);
+        {
+            const uint rr = tid / SPLIT, part = tid % SPLIT;
+            threadgroup float *srow = S + rr * QW_AM_BK;
+            const bool valid = rr < a.gqa;
+            const int live = valid ? min((int)QW_AM_BK, (int)(j_end - j0)) : 0;
+            const float m_old = m_run[rr];
+            float mx = m_old;
+            for (int j = (int)part; j < live; j += SPLIT) mx = max(mx, srow[j] * a.scale);
+            for (uint o = 1; o < SPLIT; o <<= 1) mx = max(mx, simd_shuffle_xor(mx, (ushort)o));
+            float sum = 0.0f;
+            for (int j = (int)part; j < (int)QW_AM_BK; j += SPLIT) {
+                const float p = j < live ? exp(srow[j] * a.scale - mx) : 0.0f;
+                srow[j] = p;
+                sum += p;
+            }
+            for (uint o = 1; o < SPLIT; o <<= 1) sum += simd_shuffle_xor(sum, (ushort)o);
+            if (part == 0) {
+                const float al = valid ? exp(m_old - mx) : 1.0f;
+                if (valid) { m_run[rr] = mx; l_run[rr] = l_run[rr] * al + sum; }
+                alpha[rr] = al;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint16_t i = 0; i < O.get_capacity(); ++i) {
+            if (!O.is_valid_element(i)) continue;
+            O[i] *= alpha[O.get_multidimensional_index(i)[1]];
+        }
+        pv.run(St, KVt, O);
+        /* KV and S are written again next block. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const ulong base = ((ulong)row * a.q_heads + kvh * a.gqa) * a.splits + split;
+#pragma unroll
+    for (uint16_t i = 0; i < O.get_capacity(); ++i) {
+        if (!O.is_valid_element(i)) continue;
+        auto ix = O.get_multidimensional_index(i);   /* (d, head) */
+        if ((uint)ix[1] >= a.gqa) continue;
+        pacc[(base + (ulong)ix[1] * a.splits) * QW_FA_D + ix[0]] = O[i];
+    }
+    if (tid < a.gqa) {
+        const ulong idx = base + (ulong)tid * a.splits;
+        pstat[idx * 2] = m_run[tid];
+        pstat[idx * 2 + 1] = l_run[tid];
+    }
+}

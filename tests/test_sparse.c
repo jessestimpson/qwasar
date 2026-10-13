@@ -1026,9 +1026,11 @@ static void test_grouped_experts(void) {
 
 /* Prefill's sparse attention at Flash-Next's shape -- 24 query heads on 2 kv
  * heads, 256 wide -- over ragged lists of ~2,000 selected positions, as a
- * chunk past the budget sees them.  64 rows takes the tensor-op kernel where
- * there is one (qw_attn_masked_tensor, from QW_AM_MIN_ROWS rows); the same
- * rows one at a time take the simdgroup kernel.  Both against a double
+ * chunk past the budget sees them, and a few short ones.  64 rows takes the
+ * tensor-op kernel where there is one (qw_attn_masked_tensor, from
+ * QW_AM_MIN_ROWS rows); the same rows one at a time take decode's path, on an
+ * M5 the tensor-op split kernel (qw_attn_masked_split_tensor), elsewhere the
+ * simdgroup kernel.  Both against a double
  * softmax over the fp16 cache, and each other.  The list's last entries are
  * poisoned past its count, so a kernel that reads them fails. */
 static void test_masked_shape(void) {
@@ -1049,7 +1051,9 @@ static void test_masked_shape(void) {
         const int32_t n_keys = base + r + 1;
         int32_t n = 0;
         /* about a third of the positions, ascending, then the newest few */
-        for (int32_t t = 0; t < n_keys - 4 && n < cap - 8 - (r % 5) * 37; t++) {
+        /* every 16th row only a handful: most decode slices then see none */
+        const int32_t want = r % 16 == 3 ? 3 : cap - 8 - (r % 5) * 37;
+        for (int32_t t = 0; t < n_keys - 4 && n < want; t++) {
             st = st * 1664525u + 1013904223u;
             if ((st >> 16) % 3 == 0) l[1 + n++] = (uint32_t)t;
         }
@@ -1068,6 +1072,20 @@ static void test_masked_shape(void) {
                           qw_ref_at(kc, 0), qw_ref_at(vc, 0), qw_ref_at(lb, (size_t)r * (1 + cap) * 4),
                           1, QH, KVH, D, max_ctx, base + r, scale, topk, 4);
     run(c, "attn_masked, a row at a time");
+    /* Gated, both ways: the output times sigmoid(gate). */
+    qw_buf gb = mkbuf((size_t)rows * QH * D * 4), gt = mkbuf((size_t)rows * QH * D * 4),
+           gs = mkbuf((size_t)rows * QH * D * 4);
+    fill_random(qw_buf_contents(gb), (size_t)rows * QH * D, 74);
+    c = qw_cmd_begin();
+    qw_op_attn_masked_gated(c, qw_ref_at(gt, 0), qw_ref_at(gb, 0), qw_ref_at(q, 0), qw_ref_at(kc, 0),
+                            qw_ref_at(vc, 0), qw_ref_at(lb, 0), rows, QH, KVH, D, max_ctx, base, scale, topk, 4);
+    for (int32_t r = 0; r < rows; r++) {
+        const size_t o = (size_t)r * QH * D * 4;
+        qw_op_attn_masked_gated(c, qw_ref_at(gs, o), qw_ref_at(gb, o), qw_ref_at(q, o), qw_ref_at(kc, 0),
+                                qw_ref_at(vc, 0), qw_ref_at(lb, (size_t)r * (1 + cap) * 4),
+                                1, QH, KVH, D, max_ctx, base + r, scale, topk, 4);
+    }
+    run(c, "attn_masked gated");
     float *ref = calloc((size_t)rows * QH * D, 4);
     const uint16_t *kcp = qw_buf_contents(kc), *vcp = qw_buf_contents(vc);
     double *sc = malloc((size_t)cap * sizeof *sc), *o = malloc((size_t)D * sizeof *o);
@@ -1094,6 +1112,11 @@ static void test_masked_shape(void) {
     /* The tensor kernel rounds the scaled query and the weights to half. */
     report("attn_masked, a chunk", qw_buf_contents(ot), ref, (size_t)rows * QH * D, 1e-3);
     report("attn_masked, a row at a time", qw_buf_contents(os), ref, (size_t)rows * QH * D, 1e-4);
+    const float *gp = qw_buf_contents(gb);
+    for (size_t i = 0; i < (size_t)rows * QH * D; i++) ref[i] *= 1.0f / (1.0f + expf(-gp[i]));
+    report("attn_masked gated, a chunk", qw_buf_contents(gt), ref, (size_t)rows * QH * D, 1e-3);
+    report("attn_masked gated, a row", qw_buf_contents(gs), ref, (size_t)rows * QH * D, 1e-4);
+    qw_buf_free(gb); qw_buf_free(gt); qw_buf_free(gs);
     free(kk); free(vv); free(ref); free(sc); free(o);
     qw_buf_free(q); qw_buf_free(kc); qw_buf_free(vc); qw_buf_free(lb); qw_buf_free(ot); qw_buf_free(os);
 }

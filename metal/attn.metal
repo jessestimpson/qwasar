@@ -258,9 +258,50 @@ kernel void qw_attn_decode_gqa(
     }
 }
 
-/* Combines qw_attn_decode_gqa's partial softmaxes: one threadgroup per
- * (row, query head), a thread per output dimension.  A part that saw no keys
- * has sum 0 and drops out. */
+/* Combines the split kernels' partial softmaxes (qw_attn_decode_gqa, and on
+ * an M5 qw_attn_split_tensor and qw_attn_masked_split_tensor): one
+ * threadgroup per (row, query head), a thread per output dimension.  A part
+ * that saw no keys has sum 0 and drops out.
+ *
+ * Each part's weight exp(m_p - m) / sum is found once, by a thread a part, into
+ * threadgroup memory; then every dimension's sum over the parts is loads that
+ * do not wait on each other.  Walking the parts in one thread, max, then sum
+ * and output, made each step wait on a device load: 8 us of a Flash-Next
+ * layer's 29 at 37 parts. */
+#define QW_MERGE_MAX 256   /* parts a pass; more take several */
+
+inline float qw_attn_merge_one(device const float *pacc, device const float *pstat,
+                               uint parts, uint tgid, uint d, threadgroup float *w,
+                               threadgroup float *red) {
+    const device float *st = pstat + (ulong)tgid * parts * 2;
+    const device float *ac = pacc + (ulong)tgid * parts * QW_ATTN_D + d;
+    /* The max over live parts, d threads striding the parts. */
+    float m = -FLT_MAX;
+    for (uint p = d; p < parts; p += QW_ATTN_D) if (st[p * 2 + 1] > 0.0f) m = max(m, st[p * 2]);
+    m = simd_max(m);
+    if (d % 32 == 0) red[d / 32] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = red[0];
+    for (uint i = 1; i < QW_ATTN_D / 32; ++i) m = max(m, red[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sum = 0.0f, o = 0.0f;
+    for (uint p0 = 0; p0 < parts; p0 += QW_MERGE_MAX) {
+        const uint n = min(parts - p0, (uint)QW_MERGE_MAX);
+        for (uint p = d; p < n; p += QW_ATTN_D) {
+            const float l = st[(p0 + p) * 2 + 1];
+            w[p] = l > 0.0f ? exp(st[(p0 + p) * 2] - m) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint p = 0; p < n; ++p) {
+            sum += st[(p0 + p) * 2 + 1] * w[p];
+            o += ac[(ulong)(p0 + p) * QW_ATTN_D] * w[p];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return sum > 0.0f ? o / sum : 0.0f;
+}
+
 kernel void qw_attn_merge(
     device const float *pacc  [[buffer(0)]],
     device const float *pstat [[buffer(1)]],
@@ -269,16 +310,22 @@ kernel void qw_attn_merge(
     uint tgid [[threadgroup_position_in_grid]],
     uint d    [[thread_index_in_threadgroup]])
 {
-    const device float *st = pstat + (ulong)tgid * parts * 2;
-    float m = -FLT_MAX;
-    for (uint p = 0; p < parts; ++p) if (st[p * 2 + 1] > 0.0f) m = max(m, st[p * 2]);
-    float sum = 0.0f, o = 0.0f;
-    const device float *ac = pacc + (ulong)tgid * parts * QW_ATTN_D + d;
-    for (uint p = 0; p < parts; ++p) {
-        if (st[p * 2 + 1] <= 0.0f) continue;
-        const float f = exp(st[p * 2] - m);
-        sum += st[p * 2 + 1] * f;
-        o += ac[(ulong)p * QW_ATTN_D] * f;
-    }
-    out[(ulong)tgid * QW_ATTN_D + d] = sum > 0.0f ? o / sum : 0.0f;
+    threadgroup float w[QW_MERGE_MAX], red[QW_ATTN_D / 32];
+    out[(ulong)tgid * QW_ATTN_D + d] = qw_attn_merge_one(pacc, pstat, parts, tgid, d, w, red);
+}
+
+/* The same with the output gate applied as it is written, out = merged *
+ * sigmoid(gate) -- qw_mul_sigmoid's step folded in. */
+kernel void qw_attn_merge_gated(
+    device const float *pacc  [[buffer(0)]],
+    device const float *pstat [[buffer(1)]],
+    device       float *out   [[buffer(2)]],   /* [rows, q_heads, D] */
+    constant uint      &parts [[buffer(3)]],
+    device const float *gate  [[buffer(4)]],   /* [rows, q_heads, D] */
+    uint tgid [[threadgroup_position_in_grid]],
+    uint d    [[thread_index_in_threadgroup]])
+{
+    threadgroup float w[QW_MERGE_MAX], red[QW_ATTN_D / 32];
+    const ulong i = (ulong)tgid * QW_ATTN_D + d;
+    out[i] = qw_attn_merge_one(pacc, pstat, parts, tgid, d, w, red) * qw_sigmoid(gate[i]);
 }

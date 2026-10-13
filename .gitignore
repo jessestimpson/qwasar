@@ -10,6 +10,7 @@ tools/bench/qwbench
 tools/bench/attnbench
 tools/bench/fabench
 tools/bench/gmmbench
+tools/bench/qsabench
 tools/bench/tempmon
 
 # compiled test binaries, but keep their sources

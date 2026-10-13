@@ -1959,12 +1959,16 @@ void qw_op_qsa_select(qw_cmd c, qw_ref mask, qw_ref list, qw_ref scores, int32_t
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
 }
 
+static bool qw_attn_masked_split(qw_cmd c, qw_ref out, qw_ref gate, qw_ref q, qw_ref kcache, qw_ref vcache,
+                                 qw_ref list, int32_t rows, int32_t q_heads, int32_t kv_heads,
+                                 int32_t max_ctx, float scale, int32_t block_topk, int32_t ratio);
+
 /* Prefill's sparse attention on tensor ops (metal4/attn_tensor.metal): a
  * threadgroup per (row, kv head) reads each selected key and value once for
  * all the query heads that share it.  On an M5, for steps of QW_AM_MIN_ROWS
  * rows or more -- a token's step is only kv_heads threadgroups -- unless
  * QWASAR_ATTN_MASKED=simd.  Returns false, encoding nothing, otherwise. */
-static bool qw_attn_masked_tensor(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
+static bool qw_attn_masked_tensor(qw_cmd c, qw_ref out, qw_ref gate, qw_ref q, qw_ref kcache, qw_ref vcache,
                                   qw_ref list, int32_t rows, int32_t q_heads, int32_t kv_heads,
                                   int32_t max_ctx, int32_t base_pos, float scale,
                                   int32_t block_topk, int32_t ratio) {
@@ -1973,8 +1977,10 @@ static bool qw_attn_masked_tensor(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache,
         const char *v = getenv("QWASAR_ATTN_MASKED");
         on = v && !strcmp(v, "simd") ? 0 : v && !strcmp(v, "tensor") ? 1 : qw_gpu_has_matrix_units();
     }
-    if (!on || rows < QW_AM_MIN_ROWS || kv_heads <= 0 || q_heads % kv_heads
-        || q_heads / kv_heads > QW_AM_BQ) return false;
+    if (!on || kv_heads <= 0 || q_heads % kv_heads || q_heads / kv_heads > QW_AM_BQ) return false;
+    if (rows < QW_AM_MIN_ROWS)
+        return qw_attn_masked_split(c, out, gate, q, kcache, vcache, list, rows, q_heads, kv_heads,
+                                    max_ctx, scale, block_topk, ratio);
     id<MTLComputePipelineState> ps = qw_tmm_pipeline(@"qw_attn_masked_tensor");
     if (!ps) return false;
     id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
@@ -1986,17 +1992,68 @@ static bool qw_attn_masked_tensor(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache,
     [enc setBytes:&args length:sizeof args atIndex:5];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, (NSUInteger)kv_heads, 1)
         threadsPerThreadgroup:MTLSizeMake(32 * QW_AM_SG, 1, 1)];
+    if (gate.buf) qw_op_mul_sigmoid(c, out, gate, rows * q_heads * 256);
+    return true;
+}
+
+/* Decode's sparse attention on tensor ops: qw_attn_masked_split_tensor over
+ * slices of the selection list, merged by qw_attn_merge.  The count is on the
+ * GPU, so the list's capacity is what is sliced; slices past the count drop
+ * out of the merge. */
+static bool qw_attn_masked_split(qw_cmd c, qw_ref out, qw_ref gate, qw_ref q, qw_ref kcache, qw_ref vcache,
+                                 qw_ref list, int32_t rows, int32_t q_heads, int32_t kv_heads,
+                                 int32_t max_ctx, float scale, int32_t block_topk, int32_t ratio) {
+    const uint32_t cap = (uint32_t)qw_qsa_list_cap(block_topk, ratio);
+    const uint32_t per = (QW_AMS_PER + QW_AM_BK - 1) / QW_AM_BK * QW_AM_BK;
+    const uint32_t splits = (cap + per - 1) / per;
+    const size_t n_part = (size_t)rows * q_heads * splits;
+    id<MTLBuffer> scratch = qw_cmd_scratch(c, n_part * ((NSUInteger)256 + 2) * sizeof(float));
+    if (!scratch) return false;
+    const bool gated = gate.buf != NULL;
+    id<MTLComputePipelineState> ps = qw_tmm_pipeline(@"qw_attn_masked_split_tensor");
+    id<MTLComputePipelineState> ms = qw_pipeline(gated ? @"qw_attn_merge_gated" : @"qw_attn_merge");
+    if (!ps || !ms) return false;
+
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)c->enc;
+    const NSUInteger stat_off = n_part * (NSUInteger)256 * sizeof(float);
+    [enc setComputePipelineState:ps];
+    qw_set(enc, q, 0); qw_set(enc, kcache, 1); qw_set(enc, vcache, 2);
+    [enc setBuffer:scratch offset:0 atIndex:3];
+    [enc setBuffer:scratch offset:stat_off atIndex:4];
+    qw_set(enc, list, 5);
+    struct { uint32_t rows, q_heads, kv_heads, gqa, max_ctx, list_cap, splits, per_split; float scale; } args = {
+        (uint32_t)rows, (uint32_t)q_heads, (uint32_t)kv_heads, (uint32_t)(q_heads / kv_heads),
+        (uint32_t)max_ctx, cap, splits, per, scale };
+    [enc setBytes:&args length:sizeof args atIndex:6];
+    [enc dispatchThreadgroups:MTLSizeMake(splits, (NSUInteger)(rows * kv_heads), 1)
+        threadsPerThreadgroup:MTLSizeMake(32 * QW_DS_SG, 1, 1)];
+    if (c->parallel > 0) [enc memoryBarrierWithResources:&scratch count:1];
+    [enc setComputePipelineState:ms];
+    [enc setBuffer:scratch offset:0 atIndex:0];
+    [enc setBuffer:scratch offset:stat_off atIndex:1];
+    qw_set(enc, out, 2);
+    [enc setBytes:&splits length:sizeof splits atIndex:3];
+    if (gated) qw_set(enc, gate, 4);
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows * q_heads), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake((NSUInteger)256, 1, 1)];
     return true;
 }
 
 void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache, qw_ref list,
                        int32_t rows, int32_t q_heads, int32_t kv_heads, int32_t head_dim,
                        int32_t max_ctx, int32_t base_pos, float scale, int32_t block_topk, int32_t ratio) {
+    qw_op_attn_masked_gated(c, out, (qw_ref){ 0 }, q, kcache, vcache, list, rows, q_heads, kv_heads,
+                            head_dim, max_ctx, base_pos, scale, block_topk, ratio);
+}
+
+void qw_op_attn_masked_gated(qw_cmd c, qw_ref out, qw_ref gate, qw_ref q, qw_ref kcache, qw_ref vcache,
+                             qw_ref list, int32_t rows, int32_t q_heads, int32_t kv_heads, int32_t head_dim,
+                             int32_t max_ctx, int32_t base_pos, float scale, int32_t block_topk, int32_t ratio) {
     if (head_dim != 256) {
         fprintf(stderr, "qwasar: attention head_dim %d unsupported (kernel is built for 256)\n", head_dim);
         return;
     }
-    if (qw_attn_masked_tensor(c, out, q, kcache, vcache, list, rows, q_heads, kv_heads,
+    if (qw_attn_masked_tensor(c, out, gate, q, kcache, vcache, list, rows, q_heads, kv_heads,
                               max_ctx, base_pos, scale, block_topk, ratio)) return;
     QW_BEGIN("qw_attn_masked")
     qw_set(enc, q, 0); qw_set(enc, kcache, 1); qw_set(enc, vcache, 2); qw_set(enc, out, 3); qw_set(enc, list, 4);
@@ -2007,6 +2064,7 @@ void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vca
     [enc setBytes:&list_cap length:sizeof list_cap atIndex:6];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(rows * q_heads), 1, 1)
         threadsPerThreadgroup:MTLSizeMake(32 * 32, 1, 1)];
+    if (gate.buf) qw_op_mul_sigmoid(c, out, gate, rows * q_heads * head_dim);
 }
 
 void qw_op_ple_gate(qw_cmd c, qw_ref gv, qw_ref keyn, qw_ref qn, qw_ref value,

@@ -481,6 +481,17 @@ void qw_op_attn(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache,
 #define QW_AM_SG 8
 #endif
 #define QW_AM_MIN_ROWS 16
+/* Keys a slice in decode's tensor-op split over the selection list
+ * (qw_attn_masked_split_tensor).  Flash-Next's 2,052 keys, 12 layers a token,
+ * 20 tokens a command buffer (tools/bench/qsabench), the gated merge
+ * included: 32 or 64 keys 0.305 ms a token, 96 0.37, 128 0.40; the
+ * simdgroup kernel and its gate 0.455.  A layer is ~4 MB of keys and values,
+ * so this is dispatch latency, not bandwidth: the split kernel alone is
+ * 0.24, and the merge was 0.107 before it stopped walking the parts in
+ * series. */
+#ifndef QW_AMS_PER
+#define QW_AMS_PER 64
+#endif
 /* Decode's tensor-op split kernel, on an M5: 64 keys a step, 4 simdgroups,
  * about 256 threadgroups.  Against the per-query kernel on the M5 Max, 16 of
  * the 27B's layers (tools/bench/attnbench): even at 2K keys, 1.1 -> 0.9 ms at
@@ -631,6 +642,13 @@ void qw_op_qsa_select(qw_cmd c, qw_ref mask, qw_ref list, qw_ref scores, int32_t
 void qw_op_attn_masked(qw_cmd c, qw_ref out, qw_ref q, qw_ref kcache, qw_ref vcache, qw_ref list,
                        int32_t rows, int32_t q_heads, int32_t kv_heads, int32_t head_dim,
                        int32_t max_ctx, int32_t base_pos, float scale, int32_t block_topk, int32_t ratio);
+/* The same, then out *= sigmoid(gate) ([rows, q_heads, head_dim]), as the
+ * layer's output gate does.  For a token's step on an M5 the gate is applied
+ * in the slices' merge (qw_attn_merge_gated), so the step is two dispatches;
+ * elsewhere it is qw_op_mul_sigmoid after. */
+void qw_op_attn_masked_gated(qw_cmd c, qw_ref out, qw_ref gate, qw_ref q, qw_ref kcache, qw_ref vcache,
+                             qw_ref list, int32_t rows, int32_t q_heads, int32_t kv_heads, int32_t head_dim,
+                             int32_t max_ctx, int32_t base_pos, float scale, int32_t block_topk, int32_t ratio);
 /* PLE: the per-stream gate, and the dilated depthwise conv (kernel 4, dilation 3). */
 void qw_op_ple_gate(qw_cmd c, qw_ref gv, qw_ref keyn, qw_ref qn, qw_ref value,
                     int32_t rows, int32_t H, int32_t S);

@@ -498,14 +498,15 @@ static void encode_qsa_layer(qwasar_session *s, qw_cmd c, const qw_layer *L, int
     qw_op_qsa_select(c, qw_ref_at(f->mask, 0), qw_ref_at(f->qlist, 0), qw_ref_at(f->iscores, 0), rows,
                      cfg->indexer_compress_ratio, s->n_past, block_topk, s->max_ctx, f->max_blocks);
 
-    qw_op_attn_masked(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->q, 0),
-                      qw_ref_at(s->kcache, kv_stride * fi * sizeof(uint16_t)),
-                      qw_ref_at(s->vcache, kv_stride * fi * sizeof(uint16_t)),
-                      qw_ref_at(f->qlist, 0),
-                      rows, cfg->num_attention_heads, cfg->num_key_value_heads,
-                      hd, s->max_ctx, s->n_past, 1.0f / sqrtf((float)hd),
-                      block_topk, cfg->indexer_compress_ratio);
-    qw_op_mul_sigmoid(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->gate, 0), rows * sh->q_dim);
+    /* The output gate with it: on an M5 a token's step folds it into the
+     * attention's own last dispatch. */
+    qw_op_attn_masked_gated(c, qw_ref_at(s->attn_out, 0), qw_ref_at(s->gate, 0), qw_ref_at(s->q, 0),
+                            qw_ref_at(s->kcache, kv_stride * fi * sizeof(uint16_t)),
+                            qw_ref_at(s->vcache, kv_stride * fi * sizeof(uint16_t)),
+                            qw_ref_at(f->qlist, 0),
+                            rows, cfg->num_attention_heads, cfg->num_key_value_heads,
+                            hd, s->max_ctx, s->n_past, 1.0f / sqrtf((float)hd),
+                            block_topk, cfg->indexer_compress_ratio);
     qw_encode_qlinear(c, &L->o_proj, qw_ref_at(s->hn2, 0), qw_ref_at(s->attn_out, 0), rows);
 }
 

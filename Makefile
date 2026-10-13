@@ -209,11 +209,11 @@ test-api-toy: qwasar-server
 # Benchmarks, kept out of `all`: tools/bench/sweep.py drives qwbench and
 # tempmon through a long unattended sweep; attnbench and fabench time the
 # attention kernels alone.
-BENCH_BINS := tools/bench/qwbench tools/bench/attnbench tools/bench/fabench tools/bench/gmmbench tools/bench/tempmon
+BENCH_BINS := tools/bench/qwbench tools/bench/attnbench tools/bench/fabench tools/bench/gmmbench tools/bench/qsabench tools/bench/tempmon
 
 bench: $(BENCH_BINS)
 
-tools/bench/qwbench tools/bench/attnbench tools/bench/fabench tools/bench/gmmbench: tools/bench/%: tools/bench/%.c $(CORE_OBJS) qwasar.h qwasar_gpu.h
+tools/bench/qwbench tools/bench/attnbench tools/bench/fabench tools/bench/gmmbench tools/bench/qsabench: tools/bench/%: tools/bench/%.c $(CORE_OBJS) qwasar.h qwasar_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(LDLIBS)
 
 # Reads SoC temperatures through IOKit's HID event system, without root.
